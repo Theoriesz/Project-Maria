@@ -1,0 +1,15 @@
+2026-08-05 20:33:12,722 | INFO | maria | Logging configured.
+2026-08-05 20:33:12,724 | INFO | maria.memory | Database initialized at C:\Users\ExC\Documents\Personal\My A.I\Maria\database\maria.db
+2026-08-05 20:33:12,727 | INFO | maria.tool_manager | Loaded tool: calculator
+2026-08-05 20:33:12,737 | INFO | maria.tool_manager | Loaded tool: filesystem
+2026-08-05 20:33:12,739 | INFO | maria.tool_manager | Loaded tool: notes
+2026-08-05 20:33:12,750 | INFO | maria.tool_manager | Loaded tool: system
+2026-08-05 20:33:17,451 | INFO | maria.brain | Received user request.
+2026-08-05 20:33:17,452 | INFO | maria.planner | Creating plan for request.
+2026-08-05 20:33:17,469 | INFO | maria.memory | Recorded interaction 1.
+2026-08-05 20:33:28,519 | INFO | maria.brain | Received user request.
+2026-08-05 20:33:28,523 | INFO | maria.planner | Creating plan for request.
+2026-08-05 20:33:28,523 | INFO | maria.permissions | Allowed action system.current_time.
+2026-08-05 20:33:28,523 | INFO | maria.tool_manager | Executing tool action: system.current_time
+2026-08-05 20:33:28,523 | INFO | maria.system | Current time read.
+2026-08-05 20:33:28,535 | INFO | maria.memory | Recorded interaction 2.

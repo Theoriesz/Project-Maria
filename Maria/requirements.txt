@@ -1,0 +1,2 @@
+# Maria v0.1 uses only the Python standard library.
+# Python 3.11+ is required for TOML support through tomllib.

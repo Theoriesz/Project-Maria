@@ -1,0 +1,145 @@
+"""Safe filesystem tool for Maria."""
+
+from __future__ import annotations
+
+import shutil
+from logging import Logger
+from pathlib import Path
+from typing import Any
+
+from core.config import MariaConfig
+from core.constants import DEFAULT_TEXT_READ_LIMIT_BYTES
+from core.logger import get_logger
+from core.tool_manager import ToolExecutionResult
+
+
+class FilesystemTool:
+    """Perform safe filesystem operations inside a configured root."""
+
+    name = "filesystem"
+    description = "Reads, lists, renames, and moves files inside a safe root."
+    actions = frozenset({"read", "list", "rename", "move"})
+
+    def __init__(
+        self,
+        root_path: Path,
+        logger: Logger | None = None,
+    ) -> None:
+        self.root_path = root_path.resolve()
+        self.logger = logger or get_logger(__name__)
+
+    def execute(
+        self,
+        action: str,
+        arguments: dict[str, Any],
+    ) -> ToolExecutionResult:
+        """Execute a filesystem action."""
+        if action == "read":
+            return self._read(arguments)
+        if action == "list":
+            return self._list(arguments)
+        if action == "rename":
+            return self._rename(arguments)
+        if action == "move":
+            return self._move(arguments)
+        return ToolExecutionResult(False, f"Unsupported filesystem action: {action}")
+
+    def _read(self, arguments: dict[str, Any]) -> ToolExecutionResult:
+        """Read a text file inside the safe root."""
+        try:
+            path = self._safe_path(str(arguments.get("path", "")))
+            if not path.is_file():
+                return ToolExecutionResult(False, f"Not a file: {path}")
+            if path.stat().st_size > DEFAULT_TEXT_READ_LIMIT_BYTES:
+                return ToolExecutionResult(False, "File is too large for v0.1 reading.")
+
+            text = path.read_text(encoding="utf-8", errors="replace")
+            self.logger.info("Read file: %s", path)
+            return ToolExecutionResult(True, text, {"path": str(path)})
+        except (OSError, ValueError) as exc:
+            self.logger.warning("File read failed: %s", exc)
+            return ToolExecutionResult(False, f"File read failed: {exc}")
+
+    def _list(self, arguments: dict[str, Any]) -> ToolExecutionResult:
+        """List a directory inside the safe root."""
+        try:
+            path = self._safe_path(str(arguments.get("path", ".")))
+            if not path.is_dir():
+                return ToolExecutionResult(False, f"Not a directory: {path}")
+
+            entries = [
+                {
+                    "name": child.name,
+                    "type": "directory" if child.is_dir() else "file",
+                }
+                for child in sorted(path.iterdir(), key=lambda item: item.name.lower())
+            ]
+            self.logger.info("Listed directory: %s", path)
+            if not entries:
+                return ToolExecutionResult(True, "Directory is empty.", entries)
+            listing = "\n".join(f"{entry['type']}: {entry['name']}" for entry in entries)
+            return ToolExecutionResult(True, listing, entries)
+        except (OSError, ValueError) as exc:
+            self.logger.warning("Directory listing failed: %s", exc)
+            return ToolExecutionResult(False, f"Directory listing failed: {exc}")
+
+    def _rename(self, arguments: dict[str, Any]) -> ToolExecutionResult:
+        """Rename a file or directory inside the safe root."""
+        try:
+            source = self._safe_path(str(arguments.get("source", "")))
+            destination = self._safe_path(str(arguments.get("destination", "")))
+            if not source.exists():
+                return ToolExecutionResult(False, f"Source does not exist: {source}")
+            if destination.exists():
+                return ToolExecutionResult(False, f"Destination already exists: {destination}")
+
+            source.rename(destination)
+            self.logger.info("Renamed %s to %s", source, destination)
+            return ToolExecutionResult(
+                True,
+                f"Renamed {source.name} to {destination.name}.",
+                {"source": str(source), "destination": str(destination)},
+            )
+        except (OSError, ValueError) as exc:
+            self.logger.warning("Rename failed: %s", exc)
+            return ToolExecutionResult(False, f"Rename failed: {exc}")
+
+    def _move(self, arguments: dict[str, Any]) -> ToolExecutionResult:
+        """Move a file or directory inside the safe root."""
+        try:
+            source = self._safe_path(str(arguments.get("source", "")))
+            destination = self._safe_path(str(arguments.get("destination", "")))
+            if not source.exists():
+                return ToolExecutionResult(False, f"Source does not exist: {source}")
+            if destination.exists():
+                return ToolExecutionResult(False, f"Destination already exists: {destination}")
+
+            destination.parent.mkdir(parents=True, exist_ok=True)
+            shutil.move(str(source), str(destination))
+            self.logger.info("Moved %s to %s", source, destination)
+            return ToolExecutionResult(
+                True,
+                f"Moved {source.name} to {destination}.",
+                {"source": str(source), "destination": str(destination)},
+            )
+        except (OSError, ValueError) as exc:
+            self.logger.warning("Move failed: %s", exc)
+            return ToolExecutionResult(False, f"Move failed: {exc}")
+
+    def _safe_path(self, value: str) -> Path:
+        """Resolve a path and ensure it remains inside the safe root."""
+        if not value.strip():
+            raise ValueError("Path is required.")
+
+        raw_path = Path(value).expanduser()
+        candidate = raw_path if raw_path.is_absolute() else self.root_path / raw_path
+        resolved = candidate.resolve()
+
+        if not resolved.is_relative_to(self.root_path):
+            raise ValueError("Path is outside Maria's configured safe root.")
+        return resolved
+
+
+def build_tool(config: MariaConfig, **_: Any) -> FilesystemTool:
+    """Build a filesystem tool instance."""
+    return FilesystemTool(root_path=config.safe_filesystem_root)

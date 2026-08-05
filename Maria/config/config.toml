@@ -1,0 +1,24 @@
+[app]
+name = "Maria"
+version = "0.1.0"
+environment = "development"
+
+[paths]
+database = "database/maria.db"
+logs = "logs"
+system_prompt = "prompts/system_prompt.txt"
+safe_filesystem_root = "."
+
+[logging]
+level = "INFO"
+
+[permissions]
+require_confirmation = [
+  "filesystem.rename",
+  "filesystem.move"
+]
+
+deny = [
+  "filesystem.delete",
+  "filesystem.write"
+]
