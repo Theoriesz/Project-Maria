@@ -1,0 +1,36 @@
+# Python bytecode and caches
+**pycache**/
+*.py[cod]
+*$py.class
+
+# Virtual environments
+.venv/
+venv/
+env/
+
+# Test, type-check, and linter caches
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+
+# Runtime logs
+logs/*.log
+logs/*.log.*
+
+# SQLite runtime files
+database/*.db
+database/*.db-journal
+database/*.db-shm
+database/*.db-wal
+
+# Local CLI smoke-test artifacts
+maria_cli_test/
+
+# Local environment files
+.env
+.env.*
+!.env.example
+
+# Temporary and backup files
+*.tmp
+*.bak
