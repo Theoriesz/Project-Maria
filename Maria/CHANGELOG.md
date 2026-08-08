@@ -2,6 +2,11 @@
 
 ## Unreleased
 
+- Hardened calculator evaluation with bounded intermediate and final values,
+  predictive oversized integer multiplication and power checks, and controlled
+  rejection of booleans, complex numbers, and non-finite floats.
+- Added focused calculator regression tests for supported boundary cases and
+  oversized or unsupported numeric inputs.
 - Added explicit persistent memory storage and the strict `remember`, `recall`,
   and `memories` CLI commands.
 - Added an additive, idempotent `memories` SQLite schema that preserves existing
