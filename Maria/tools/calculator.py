@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import ast
+import math
 import operator
 from logging import Logger
 from typing import Any, Callable
@@ -11,8 +12,17 @@ from core.logger import get_logger
 from core.tool_manager import ToolExecutionResult
 
 
-BinaryOperator = Callable[[float, float], float]
-UnaryOperator = Callable[[float], float]
+NumericValue = int | float
+BinaryOperator = Callable[[NumericValue, NumericValue], object]
+UnaryOperator = Callable[[NumericValue], object]
+
+MAX_EXPRESSION_LENGTH = 200
+MAX_ABSOLUTE_EXPONENT = 100
+MAX_INTEGER_BITS = 4096
+NUMERIC_LIMIT_MESSAGE = "Calculation exceeds supported numeric limits."
+UNSUPPORTED_NUMERIC_TYPE_MESSAGE = (
+    "Only integer and floating-point values are supported."
+)
 
 ALLOWED_BINARY_OPERATORS: dict[type[ast.operator], BinaryOperator] = {
     ast.Add: operator.add,
@@ -55,8 +65,14 @@ class CalculatorTool:
 
         try:
             result = evaluate_expression(expression)
-        except (ValueError, ZeroDivisionError) as exc:
-            self.logger.warning("Calculation failed: %s", exc)
+        except (OverflowError, FloatingPointError):
+            self.logger.warning("Calculation exceeded supported numeric limits.")
+            return ToolExecutionResult(
+                False,
+                f"Calculation failed: {NUMERIC_LIMIT_MESSAGE}",
+            )
+        except (ValueError, ArithmeticError) as exc:
+            self.logger.warning("Calculation failed.")
             return ToolExecutionResult(False, f"Calculation failed: {exc}")
 
         self.logger.info("Calculation completed.")
@@ -69,7 +85,7 @@ class CalculatorTool:
 
 def evaluate_expression(expression: str) -> float | int:
     """Evaluate a small arithmetic expression using Python's AST."""
-    if len(expression) > 200:
+    if len(expression) > MAX_EXPRESSION_LENGTH:
         raise ValueError("Expression is too long.")
 
     try:
@@ -77,7 +93,7 @@ def evaluate_expression(expression: str) -> float | int:
     except SyntaxError as exc:
         raise ValueError("Expression syntax is invalid.") from exc
 
-    return _evaluate_node(parsed)
+    return _validate_numeric(_evaluate_node(parsed))
 
 
 def _evaluate_node(node: ast.AST) -> float | int:
@@ -85,8 +101,13 @@ def _evaluate_node(node: ast.AST) -> float | int:
     if isinstance(node, ast.Expression):
         return _evaluate_node(node.body)
 
-    if isinstance(node, ast.Constant) and isinstance(node.value, (int, float)):
-        return node.value
+    if isinstance(node, ast.Constant) and type(node.value) in (
+        bool,
+        complex,
+        float,
+        int,
+    ):
+        return _validate_numeric(node.value)
 
     if isinstance(node, ast.BinOp):
         operator_type = type(node.op)
@@ -96,18 +117,97 @@ def _evaluate_node(node: ast.AST) -> float | int:
 
         left = _evaluate_node(node.left)
         right = _evaluate_node(node.right)
-        if operator_type is ast.Pow and abs(right) > 100:
-            raise ValueError("Exponent is too large.")
-        return operation(left, right)
+        if operator_type is ast.Pow:
+            return _checked_power(left, right, operation)
+        if operator_type is ast.Mult:
+            return _checked_multiply(left, right, operation)
+        return _apply_binary_operation(operation, left, right)
 
     if isinstance(node, ast.UnaryOp):
         operation = ALLOWED_UNARY_OPERATORS.get(type(node.op))
         if operation is None:
             raise ValueError("Unary operator is not allowed.")
         operand = _evaluate_node(node.operand)
-        return operation(operand)
+        return _apply_unary_operation(operation, operand)
 
     raise ValueError("Only basic arithmetic is supported.")
+
+
+def _validate_numeric(value: object) -> NumericValue:
+    """Validate one calculator value without changing it."""
+    if type(value) is int:
+        if value.bit_length() > MAX_INTEGER_BITS:
+            raise ValueError(NUMERIC_LIMIT_MESSAGE)
+        return value
+
+    if type(value) is float:
+        if not math.isfinite(value):
+            raise ValueError(NUMERIC_LIMIT_MESSAGE)
+        return value
+
+    raise ValueError(UNSUPPORTED_NUMERIC_TYPE_MESSAGE)
+
+
+def _checked_power(
+    base: NumericValue,
+    exponent: NumericValue,
+    operation: BinaryOperator,
+) -> NumericValue:
+    """Raise a bounded power after rejecting guaranteed oversized integers."""
+    if abs(exponent) > MAX_ABSOLUTE_EXPONENT:
+        raise ValueError(NUMERIC_LIMIT_MESSAGE)
+
+    if type(base) is int and type(exponent) is int and exponent >= 0:
+        absolute_base = abs(base)
+        if exponent and absolute_base > 1:
+            minimum_result_bits = (
+                (absolute_base.bit_length() - 1) * exponent + 1
+            )
+            if minimum_result_bits > MAX_INTEGER_BITS:
+                raise ValueError(NUMERIC_LIMIT_MESSAGE)
+
+    return _apply_binary_operation(operation, base, exponent)
+
+
+def _checked_multiply(
+    left: NumericValue,
+    right: NumericValue,
+    operation: BinaryOperator,
+) -> NumericValue:
+    """Multiply values after rejecting guaranteed oversized integers."""
+    if type(left) is int and type(right) is int and left and right:
+        minimum_result_bits = (
+            abs(left).bit_length() + abs(right).bit_length() - 1
+        )
+        if minimum_result_bits > MAX_INTEGER_BITS:
+            raise ValueError(NUMERIC_LIMIT_MESSAGE)
+
+    return _apply_binary_operation(operation, left, right)
+
+
+def _apply_binary_operation(
+    operation: BinaryOperator,
+    left: NumericValue,
+    right: NumericValue,
+) -> NumericValue:
+    """Apply a binary operation and validate its result."""
+    try:
+        result = operation(left, right)
+    except (OverflowError, FloatingPointError) as exc:
+        raise ValueError(NUMERIC_LIMIT_MESSAGE) from exc
+    return _validate_numeric(result)
+
+
+def _apply_unary_operation(
+    operation: UnaryOperator,
+    operand: NumericValue,
+) -> NumericValue:
+    """Apply a unary operation and validate its result."""
+    try:
+        result = operation(operand)
+    except (OverflowError, FloatingPointError) as exc:
+        raise ValueError(NUMERIC_LIMIT_MESSAGE) from exc
+    return _validate_numeric(result)
 
 
 def build_tool(**_: Any) -> CalculatorTool:

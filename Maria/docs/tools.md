@@ -10,6 +10,22 @@ Tools are small modules that expose controlled capabilities to Maria.
 - `notes`: create, list, and read SQLite-backed notes
 - `system`: read-only OS, CPU, RAM, disk, and time information
 
+## Calculator Tool
+
+The calculator parses expressions with Python's AST and evaluates only a strict
+arithmetic subset. It supports integer and finite floating-point literals; the
+binary operators `+`, `-`, `*`, `/`, `//`, `%`, and `**`; and unary `+` and `-`.
+Booleans, complex numbers, names, calls, and other syntax are unsupported.
+
+Version 0.1 limits expressions to 200 characters, absolute exponent values to
+100, and integer intermediate or final values to 4,096 bits. All floating-point
+intermediate and final values must be finite. Integer multiplication and power
+are checked before evaluation when their result is predictably oversized, and
+any value that exceeds a bound produces a controlled calculation failure.
+
+These bounds protect version 0.1 execution; they are not arbitrary-precision
+math guarantees.
+
 ## Memory Tool
 
 The memory tool supports exactly three actions:
