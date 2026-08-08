@@ -15,6 +15,7 @@ from core.memory import Memory
 BUILT_IN_TOOL_MODULES = (
     "tools.calculator",
     "tools.filesystem",
+    "tools.memory",
     "tools.notes",
     "tools.system",
 )

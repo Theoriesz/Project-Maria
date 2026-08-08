@@ -42,6 +42,14 @@ class Memory:
                         updated_at TEXT NOT NULL
                     );
 
+                    CREATE TABLE IF NOT EXISTS memories (
+                        id INTEGER PRIMARY KEY AUTOINCREMENT,
+                        fact TEXT NOT NULL CHECK (length(fact) > 0),
+                        normalized_fact TEXT NOT NULL UNIQUE
+                            CHECK (length(normalized_fact) > 0),
+                        created_at TEXT NOT NULL
+                    );
+
                     CREATE INDEX IF NOT EXISTS idx_interactions_created_at
                         ON interactions (created_at);
 
@@ -91,6 +99,115 @@ class Memory:
         except sqlite3.Error as exc:
             self.logger.exception("Failed to fetch recent interactions.")
             raise RuntimeError("Unable to fetch recent interactions.") from exc
+
+    def store_memory(self, fact: str) -> tuple[int, bool]:
+        """Store a fact and return its database id and creation status."""
+        clean_fact = fact.strip()
+        if not clean_fact:
+            raise ValueError("Memory fact is required.")
+
+        normalized_fact = clean_fact.casefold()
+        timestamp = _utc_timestamp()
+        try:
+            with self._connection() as connection:
+                cursor = connection.execute(
+                    """
+                    INSERT INTO memories (fact, normalized_fact, created_at)
+                    VALUES (?, ?, ?)
+                    ON CONFLICT(normalized_fact) DO NOTHING
+                    """,
+                    (clean_fact, normalized_fact, timestamp),
+                )
+                created = cursor.rowcount == 1
+                if created:
+                    memory_id = int(cursor.lastrowid)
+                else:
+                    row = connection.execute(
+                        """
+                        SELECT id
+                        FROM memories
+                        WHERE normalized_fact = ?
+                        """,
+                        (normalized_fact,),
+                    ).fetchone()
+                    if row is None:
+                        raise sqlite3.IntegrityError(
+                            "Unable to resolve duplicate memory."
+                        )
+                    memory_id = int(row["id"])
+            if created:
+                self.logger.info("Stored memory %s.", memory_id)
+            else:
+                self.logger.info("Memory %s already exists.", memory_id)
+            return memory_id, created
+        except sqlite3.Error as exc:
+            self.logger.exception("Failed to store memory.")
+            raise RuntimeError("Unable to store memory.") from exc
+
+    def get_memory(self, memory_id: int) -> dict[str, Any] | None:
+        """Return one memory by its database id."""
+        try:
+            with self._connection() as connection:
+                row = connection.execute(
+                    """
+                    SELECT id, fact, created_at
+                    FROM memories
+                    WHERE id = ?
+                    """,
+                    (memory_id,),
+                ).fetchone()
+            return dict(row) if row else None
+        except sqlite3.Error as exc:
+            self.logger.exception("Failed to read memory.")
+            raise RuntimeError("Unable to read memory.") from exc
+
+    def search_memories(
+        self,
+        query: str,
+        limit: int = 20,
+    ) -> list[dict[str, Any]]:
+        """Return memories containing a literal case-insensitive query."""
+        clean_query = query.strip()
+        if not clean_query:
+            raise ValueError("Memory search query is required.")
+
+        normalized_query = clean_query.casefold()
+        safe_limit = max(1, min(limit, 100))
+        try:
+            with self._connection() as connection:
+                rows = connection.execute(
+                    """
+                    SELECT id, fact, created_at
+                    FROM memories
+                    WHERE instr(normalized_fact, ?) > 0
+                    ORDER BY created_at DESC, id DESC
+                    LIMIT ?
+                    """,
+                    (normalized_query, safe_limit),
+                ).fetchall()
+            return [dict(row) for row in rows]
+        except sqlite3.Error as exc:
+            self.logger.exception("Failed to search memories.")
+            raise RuntimeError("Unable to search memories.") from exc
+
+    def list_memories(self, limit: int = 20) -> list[dict[str, Any]]:
+        """Return stored memories in newest-first order."""
+        safe_limit = max(1, min(limit, 100))
+        try:
+            with self._connection() as connection:
+                rows = connection.execute(
+                    """
+                    SELECT id, fact, created_at
+                    FROM memories
+                    ORDER BY created_at DESC, id DESC
+                    LIMIT ?
+                    """,
+                    (safe_limit,),
+                ).fetchall()
+            return [dict(row) for row in rows]
+        except sqlite3.Error as exc:
+            self.logger.exception("Failed to list memories.")
+            raise RuntimeError("Unable to list memories.") from exc
 
     def create_note(self, title: str, body: str) -> int:
         """Create a note and return its database id."""
