@@ -48,6 +48,8 @@ class Planner:
 
         text = user_input.strip()
         lowered = text.lower()
+        command_parts = text.split(maxsplit=1)
+        command = command_parts[0].lower() if command_parts else ""
         self.logger.info("Creating plan for request.")
 
         if lowered in {"help", "commands"}:
@@ -61,6 +63,21 @@ class Planner:
                 "calculate",
                 {"expression": expression},
             )
+
+        if command == "remember":
+            if len(command_parts) == 1:
+                return self._no_action(text, "Use: remember <fact>")
+            fact = command_parts[1].strip()
+            return self._single_step(text, "memory", "store", {"fact": fact})
+
+        if command == "recall":
+            if len(command_parts) == 1:
+                return self._no_action(text, "Use: recall <query>")
+            query = command_parts[1].strip()
+            return self._single_step(text, "memory", "search", {"query": query})
+
+        if lowered == "memories":
+            return self._single_step(text, "memory", "list", {})
 
         if lowered.startswith(("list ", "ls ")):
             path = _remove_first_word(text)
@@ -193,6 +210,9 @@ def _help_text() -> str:
         "- create note <title>: <body>\n"
         "- notes\n"
         "- read note <id or exact title>\n"
+        "- remember <fact>\n"
+        "- recall <query>\n"
+        "- memories\n"
         "- system\n"
         "- time"
     )

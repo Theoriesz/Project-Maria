@@ -30,12 +30,63 @@ move source.txt to docs/source.txt
 create note Idea: Keep the foundation simple.
 notes
 read note 1
+remember My editor is VS Code
+recall editor
+memories
 system
 time
 ```
 
 File rename and move operations require explicit confirmation. Delete
 functionality is intentionally not implemented in version 0.1.
+
+## Persistent Memory
+
+Maria stores deliberately remembered facts in SQLite, so they remain available
+after the application restarts. The supported syntax is strict:
+
+- `remember <fact>` stores one fact.
+- `recall <query>` performs a literal, case-insensitive substring search.
+- `memories` lists the newest stored facts.
+
+Command keywords are case-insensitive, and surrounding whitespace is removed
+from facts and queries without changing their display casing. `remember` and
+`recall` must start the request directly, while `memories` must be the complete
+command. Conversational forms such as `please remember ...` are not supported.
+
+```text
+remember My editor is VS Code
+Remembered memory 1: My editor is VS Code
+
+recall editor
+1: My editor is VS Code
+
+remember MY EDITOR IS VS CODE
+Already remembered as memory 1: My editor is VS Code
+
+memories
+1: My editor is VS Code
+```
+
+After restarting Maria, the fact remains available:
+
+```text
+recall editor
+1: My editor is VS Code
+```
+
+Memory commands and their responses are also recorded in Maria's general
+interaction history, so a fact can appear in both places. Do not store
+passwords, API keys, access tokens, or other highly sensitive secrets. Version
+0.1 has no forget or delete-memory command.
+
+## Tests
+
+From the `Maria` directory:
+
+```text
+python -m unittest discover -s tests -v
+```
 
 ## Project Layout
 
