@@ -36,6 +36,22 @@ factory contract alongside the calculator, notes, filesystem, and system
 tools. Memory actions therefore pass through the normal permission and result
 handling flow.
 
+## CLI Boundary
+
+`run_cli()` constructs `MariaBrain.from_defaults()` inside the controlled
+command-line entrypoint boundary, before printing the banner. Except for
+`MemoryError`, an `Exception` raised during construction is converted to stable
+stderr output and status 1, while startup `KeyboardInterrupt` maps to status
+130. `MemoryError` and `SystemExit` are not converted into ordinary startup
+failures.
+
+EOF or Ctrl+C at the main prompt exits normally. At the confirmation prompt,
+either interruption cancels the pending action without executing it. This
+boundary intentionally does not add a broad exception handler around Brain
+processing after startup. Confirmation still uses deterministic re-planning
+with `brain.process(original_input, confirmed=True)`; binding confirmation to
+an immutable plan remains deferred.
+
 ## Permission Policy
 
 All planned actions pass through `PermissionManager`. In v0.1,

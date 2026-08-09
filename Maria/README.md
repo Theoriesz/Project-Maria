@@ -19,6 +19,20 @@ python -m pip install -r requirements.txt
 python main.py
 ```
 
+## CLI Exit and Interruption Behavior
+
+Normal CLI completion, including `exit`, `quit`, `q`, EOF, or Ctrl+C at the
+main prompt, returns status 0. A startup failure prints a stable, sanitized
+message to stderr and returns status 1; startup Ctrl+C prints an interruption
+message and returns status 130. Startup failures do not print raw tracebacks or
+exception details. Review the configuration and available logs when startup
+fails.
+
+At a confirmation prompt, only an exact `yes`, ignoring casing and surrounding
+whitespace, approves the pending action. EOF or Ctrl+C cancels the pending
+action without executing it. Ctrl+C returns to the main prompt; if input
+remains closed after EOF, the next main prompt exits cleanly.
+
 ## Supported v0.1 Commands
 
 ```text
