@@ -79,3 +79,19 @@ Tools must expose `name`, `description`, `actions`, and an `execute` method.
 `PermissionManager.check(tool_name, action) -> PermissionResult`
 
 Permission results are one of `allowed`, `requires_confirmation`, or `denied`.
+Decisions follow denied, confirmation-required, then allowed precedence.
+
+`load_config` requires a present `[permissions]` value to be a TOML table and
+validates `require_confirmation` and `deny` as arrays of lowercase
+`tool.action` identifiers. Each identifier contains exactly one period, and
+its tool and action segments start with a letter and otherwise contain only
+lowercase ASCII letters, digits, or underscores. Duplicate identifiers within
+one array are rejected, while syntactically valid identifiers for future tools
+are retained. Malformed permission values raise `ValueError`.
+
+Missing permission arrays and explicitly empty arrays use the mandatory secure
+baseline: `filesystem.rename` and `filesystem.move` require confirmation, while
+`filesystem.delete` and `filesystem.write` are denied. Configuration can add
+restrictions but cannot remove this baseline. `PermissionManager` applies the
+same mandatory policy when constructed directly, and denial wins if an action
+also requires confirmation.

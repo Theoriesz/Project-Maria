@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import re
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
@@ -12,6 +13,15 @@ except ModuleNotFoundError as exc:  # pragma: no cover - Python < 3.11 only.
     raise RuntimeError("Maria requires Python 3.11 or newer for TOML support.") from exc
 
 from core.constants import CONFIG_PATH, PROJECT_ROOT
+from core.permissions import (
+    MANDATORY_CONFIRMATION_ACTIONS,
+    MANDATORY_DENIED_ACTIONS,
+)
+
+
+_PERMISSION_ACTION_PATTERN = re.compile(
+    r"[a-z][a-z0-9_]*\.[a-z][a-z0-9_]*"
+)
 
 
 @dataclass(frozen=True)
@@ -42,6 +52,14 @@ def load_config(config_path: Path = CONFIG_PATH) -> MariaConfig:
     paths = raw_config.get("paths", {})
     logging_config = raw_config.get("logging", {})
     permissions = raw_config.get("permissions", {})
+    if not isinstance(permissions, dict):
+        raise ValueError("The [permissions] section must be a TOML table.")
+
+    configured_confirmation_actions = _permission_action_set(
+        permissions,
+        "require_confirmation",
+    )
+    configured_denied_actions = _permission_action_set(permissions, "deny")
 
     return MariaConfig(
         app_name=str(app.get("name", "Maria")),
@@ -57,9 +75,11 @@ def load_config(config_path: Path = CONFIG_PATH) -> MariaConfig:
         ),
         log_level=str(logging_config.get("level", "INFO")),
         confirmation_required=frozenset(
-            _string_list(permissions.get("require_confirmation", []))
+            configured_confirmation_actions | MANDATORY_CONFIRMATION_ACTIONS
         ),
-        denied_actions=frozenset(_string_list(permissions.get("deny", []))),
+        denied_actions=frozenset(
+            configured_denied_actions | MANDATORY_DENIED_ACTIONS
+        ),
     )
 
 
@@ -71,8 +91,38 @@ def _resolve_project_path(value: Any) -> Path:
     return (PROJECT_ROOT / path).resolve()
 
 
-def _string_list(value: Any) -> list[str]:
-    """Return a list of strings from TOML array values."""
+def _permission_action_set(
+    permissions: dict[str, Any],
+    key: str,
+) -> frozenset[str]:
+    """Validate and return one configured permission-action array."""
+    value = permissions.get(key, [])
+    qualified_key = f"permissions.{key}"
+
     if not isinstance(value, list):
-        return []
-    return [str(item) for item in value]
+        raise ValueError(
+            f"{qualified_key} must be a TOML array of lowercase "
+            "tool.action identifiers."
+        )
+
+    actions: set[str] = set()
+    for item in value:
+        if not isinstance(item, str):
+            raise ValueError(
+                f"{qualified_key} entries must be strings using lowercase "
+                "tool.action identifiers."
+            )
+        if _PERMISSION_ACTION_PATTERN.fullmatch(item) is None:
+            raise ValueError(
+                f"{qualified_key} entries must use lowercase tool.action "
+                "identifiers with one period; each segment must start with a "
+                "lowercase ASCII letter and contain only lowercase ASCII "
+                "letters, digits, or underscores."
+            )
+        if item in actions:
+            raise ValueError(
+                f"{qualified_key} contains duplicate action identifier: {item}."
+            )
+        actions.add(item)
+
+    return frozenset(actions)

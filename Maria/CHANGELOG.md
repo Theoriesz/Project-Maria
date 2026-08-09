@@ -2,6 +2,11 @@
 
 ## Unreleased
 
+- Made permission configuration fail closed with strict lowercase
+  `tool.action` array validation and duplicate rejection.
+- Enforced mandatory confirmation for filesystem rename and move, mandatory
+  denial for filesystem delete and write, and added focused configuration and
+  permission regression tests.
 - Hardened calculator evaluation with bounded intermediate and final values,
   predictive oversized integer multiplication and power checks, and controlled
   rejection of booleans, complex numbers, and non-finite floats.
