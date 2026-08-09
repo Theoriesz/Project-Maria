@@ -9,6 +9,21 @@ from logging import Logger
 from core.logger import get_logger
 
 
+MANDATORY_CONFIRMATION_ACTIONS = frozenset(
+    {
+        "filesystem.rename",
+        "filesystem.move",
+    }
+)
+
+MANDATORY_DENIED_ACTIONS = frozenset(
+    {
+        "filesystem.delete",
+        "filesystem.write",
+    }
+)
+
+
 class PermissionDecision(str, Enum):
     """Possible permission outcomes."""
 
@@ -34,8 +49,12 @@ class PermissionManager:
         denied_actions: frozenset[str],
         logger: Logger | None = None,
     ) -> None:
-        self.confirmation_required = confirmation_required
-        self.denied_actions = denied_actions
+        self.confirmation_required = frozenset(confirmation_required).union(
+            MANDATORY_CONFIRMATION_ACTIONS
+        )
+        self.denied_actions = frozenset(denied_actions).union(
+            MANDATORY_DENIED_ACTIONS
+        )
         self.logger = logger or get_logger(__name__)
 
     def check(self, tool_name: str, action: str) -> PermissionResult:
@@ -53,7 +72,7 @@ class PermissionManager:
             self.logger.info("Action %s requires confirmation.", action_id)
             return PermissionResult(
                 PermissionDecision.REQUIRES_CONFIRMATION,
-                f"{action_id} can modify files and must be explicitly confirmed.",
+                f"{action_id} requires explicit confirmation.",
             )
 
         self.logger.info("Allowed action %s.", action_id)

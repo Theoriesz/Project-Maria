@@ -36,6 +36,19 @@ factory contract alongside the calculator, notes, filesystem, and system
 tools. Memory actions therefore pass through the normal permission and result
 handling flow.
 
+## Permission Policy
+
+All planned actions pass through `PermissionManager`. In v0.1,
+`filesystem.rename` and `filesystem.move` always require confirmation, while
+`filesystem.delete` and `filesystem.write` are always denied. TOML
+configuration may add restrictions but cannot remove these mandatory
+protections. Missing permission arrays retain the secure baseline, and
+malformed present arrays stop configuration loading instead of weakening it.
+When an action is both denied and confirmation-required, denial wins.
+
+Direct tool invocation bypasses planning and permission checks and therefore
+remains an internal trusted-code boundary.
+
 ## Persistence Models
 
 Maria keeps three kinds of persistent data separate:
