@@ -2,6 +2,10 @@
 
 ## Unreleased
 
+- Added controlled, sanitized CLI startup failure messages and process
+  statuses: `1` for ordinary startup failures and `130` for startup Ctrl+C.
+- Made confirmation-prompt EOF and Ctrl+C safely cancel pending actions, and
+  added focused CLI and module-entrypoint regression tests.
 - Made permission configuration fail closed with strict lowercase
   `tool.action` array validation and duplicate rejection.
 - Enforced mandatory confirmation for filesystem rename and move, mandatory

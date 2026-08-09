@@ -2,16 +2,30 @@
 
 from __future__ import annotations
 
+import sys
+from collections.abc import Callable
+
 from core.brain import BrainResponse, MariaBrain
 from core.constants import APP_NAME, APP_VERSION
 
 
 EXIT_COMMANDS = {"exit", "quit", "q"}
+_EXIT_SUCCESS = 0
+_EXIT_STARTUP_FAILURE = 1
+_EXIT_STARTUP_INTERRUPTED = 130
+_STARTUP_FAILURE_MESSAGE = (
+    f"{APP_NAME}: Startup failed. Review the configuration and available logs."
+)
+_STARTUP_INTERRUPTED_MESSAGE = f"{APP_NAME}: Startup interrupted."
 
 
 def ask_for_confirmation() -> bool:
     """Ask the user to explicitly confirm a sensitive action."""
-    answer = input("Confirm action? Type 'yes' to continue: ").strip().lower()
+    try:
+        answer = input("Confirm action? Type 'yes' to continue: ").strip().lower()
+    except (EOFError, KeyboardInterrupt):
+        print()
+        return False
     return answer == "yes"
 
 
@@ -20,9 +34,22 @@ def print_response(response: BrainResponse) -> None:
     print(f"{APP_NAME}: {response.text}")
 
 
-def run_cli() -> None:
+def run_cli(
+    brain_factory: Callable[[], MariaBrain] | None = None,
+) -> int:
     """Run Maria's minimal v0.1 command line interface."""
-    brain = MariaBrain.from_defaults()
+    factory = MariaBrain.from_defaults if brain_factory is None else brain_factory
+
+    try:
+        brain = factory()
+    except KeyboardInterrupt:
+        print(_STARTUP_INTERRUPTED_MESSAGE, file=sys.stderr)
+        return _EXIT_STARTUP_INTERRUPTED
+    except MemoryError:
+        raise
+    except Exception:
+        print(_STARTUP_FAILURE_MESSAGE, file=sys.stderr)
+        return _EXIT_STARTUP_FAILURE
 
     print(f"{APP_NAME} v{APP_VERSION}")
     print("Type 'help' for supported v0.1 commands. Type 'exit' to quit.")
@@ -54,6 +81,8 @@ def run_cli() -> None:
 
         print_response(response)
 
+    return _EXIT_SUCCESS
+
 
 if __name__ == "__main__":
-    run_cli()
+    raise SystemExit(run_cli())
