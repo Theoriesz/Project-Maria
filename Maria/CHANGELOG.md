@@ -2,6 +2,10 @@
 
 ## Unreleased
 
+- Added broad v0.1 regression suites for Logger, Tool Manager, notes,
+  filesystem, system information, Brain, Planner, and clean startup
+  integration, using only temporary runtime resources and preserving existing
+  production behavior.
 - Added controlled, sanitized CLI startup failure messages and process
   statuses: `1` for ordinary startup failures and `130` for startup Ctrl+C.
 - Made confirmation-prompt EOF and Ctrl+C safely cancel pending actions, and

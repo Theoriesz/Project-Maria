@@ -96,11 +96,17 @@ passwords, API keys, access tokens, or other highly sensitive secrets. Version
 
 ## Tests
 
-From the `Maria` directory:
+Run the standard-library test suite from the nested `Maria` application
+directory:
 
 ```text
 python -m unittest discover -s tests -v
 ```
+
+Tests use temporary databases, log directories, and filesystem roots, so
+production runtime files are not required. The suite covers the CLI,
+configuration, permissions, calculator, memory, Logger, Tool Manager, notes,
+filesystem, system information, Brain, Planner, and clean startup wiring.
 
 ## Project Layout
 

@@ -1,0 +1,355 @@
+"""Regression tests for Maria's non-memory planner commands."""
+
+from __future__ import annotations
+
+import logging
+import unittest
+
+from core.planner import Plan, Planner, PlanStep
+
+
+UNSUPPORTED_RESPONSE = (
+    "I do not have an executable v0.1 plan for that yet. "
+    "Type 'help' to see supported commands."
+)
+
+
+class PlannerRegressionTests(unittest.TestCase):
+    """Verify the strict v0.1 mappings outside the focused memory suite."""
+
+    def setUp(self) -> None:
+        logger = logging.Logger("tests.planner_regression")
+        logger.addHandler(logging.NullHandler())
+        self.planner = Planner(logger=logger)
+
+    def test_calculate_maps_to_exact_step(self) -> None:
+        self._assert_single_step(
+            "calculate 12 / 3",
+            PlanStep("calculator", "calculate", {"expression": "12 / 3"}),
+        )
+
+    def test_list_maps_to_exact_step(self) -> None:
+        self._assert_single_step(
+            "list reports/2026",
+            PlanStep("filesystem", "list", {"path": "reports/2026"}),
+        )
+
+    def test_read_file_maps_to_exact_step(self) -> None:
+        self._assert_single_step(
+            "read file reports/summary.txt",
+            PlanStep(
+                "filesystem",
+                "read",
+                {"path": "reports/summary.txt"},
+            ),
+        )
+
+    def test_rename_maps_to_exact_step(self) -> None:
+        self._assert_single_step(
+            "rename draft.txt to final.txt",
+            PlanStep(
+                "filesystem",
+                "rename",
+                {"source": "draft.txt", "destination": "final.txt"},
+            ),
+        )
+
+    def test_move_maps_to_exact_step(self) -> None:
+        self._assert_single_step(
+            "move final.txt to archive/final.txt",
+            PlanStep(
+                "filesystem",
+                "move",
+                {
+                    "source": "final.txt",
+                    "destination": "archive/final.txt",
+                },
+            ),
+        )
+
+    def test_create_note_maps_to_exact_step(self) -> None:
+        self._assert_single_step(
+            "create note Release: Ship the test suite",
+            PlanStep(
+                "notes",
+                "create",
+                {"title": "Release", "body": "Ship the test suite"},
+            ),
+        )
+
+    def test_notes_maps_to_exact_step(self) -> None:
+        self._assert_single_step("notes", PlanStep("notes", "list", {}))
+
+    def test_read_note_maps_id_and_exact_title_to_exact_steps(self) -> None:
+        cases = (
+            ("read note 17", {"target": "17"}),
+            ("read note Exact Release Title", {"target": "Exact Release Title"}),
+        )
+
+        for request, arguments in cases:
+            with self.subTest(request=request):
+                self._assert_single_step(
+                    request,
+                    PlanStep("notes", "read", arguments),
+                )
+
+    def test_system_maps_to_exact_step(self) -> None:
+        self._assert_single_step("system", PlanStep("system", "overview", {}))
+
+    def test_time_maps_to_exact_step(self) -> None:
+        self._assert_single_step(
+            "time",
+            PlanStep("system", "current_time", {}),
+        )
+
+    def test_supported_keywords_are_case_insensitive(self) -> None:
+        cases = (
+            (
+                "CaLc 2 + 3",
+                PlanStep("calculator", "calculate", {"expression": "2 + 3"}),
+            ),
+            (
+                "LiSt Mixed/Path Name",
+                PlanStep("filesystem", "list", {"path": "Mixed/Path Name"}),
+            ),
+            (
+                "READ FILE Mixed/Path Name",
+                PlanStep("filesystem", "read", {"path": "Mixed/Path Name"}),
+            ),
+            (
+                "ReNaMe Old Name to New Name",
+                PlanStep(
+                    "filesystem",
+                    "rename",
+                    {"source": "Old Name", "destination": "New Name"},
+                ),
+            ),
+            (
+                "MoVe Old Name to New Name",
+                PlanStep(
+                    "filesystem",
+                    "move",
+                    {"source": "Old Name", "destination": "New Name"},
+                ),
+            ),
+            (
+                "CREATE NOTE Mixed Title: Mixed Body",
+                PlanStep(
+                    "notes",
+                    "create",
+                    {"title": "Mixed Title", "body": "Mixed Body"},
+                ),
+            ),
+            ("NoTeS", PlanStep("notes", "list", {})),
+            (
+                "READ NOTE Exact Mixed Title",
+                PlanStep("notes", "read", {"target": "Exact Mixed Title"}),
+            ),
+            ("SyStEm", PlanStep("system", "overview", {})),
+            ("TiMe", PlanStep("system", "current_time", {})),
+        )
+
+        for request, expected_step in cases:
+            with self.subTest(request=request):
+                self.assertEqual(
+                    self.planner.create_plan(request).steps,
+                    (expected_step,),
+                )
+
+    def test_operand_casing_and_internal_spacing_are_preserved(self) -> None:
+        calculate = self.planner.create_plan("CALCULATE MixedCase + VALUE")
+        path = self.planner.create_plan("list Folder  With  Spaces/File.TXT")
+        note = self.planner.create_plan(
+            "create note MiXeD Title: Body  With  Spacing"
+        )
+
+        self.assertEqual(
+            calculate.steps[0].arguments,
+            {"expression": "MixedCase + VALUE"},
+        )
+        self.assertEqual(
+            path.steps[0].arguments,
+            {"path": "Folder  With  Spaces/File.TXT"},
+        )
+        self.assertEqual(
+            note.steps[0].arguments,
+            {"title": "MiXeD Title", "body": "Body  With  Spacing"},
+        )
+
+    def test_paths_with_ordinary_spaces_are_preserved(self) -> None:
+        cases = (
+            (
+                "read file Project Files/Release Notes.txt",
+                {"path": "Project Files/Release Notes.txt"},
+            ),
+            (
+                "rename Project Files/Draft One.txt to Archive/Final One.txt",
+                {
+                    "source": "Project Files/Draft One.txt",
+                    "destination": "Archive/Final One.txt",
+                },
+            ),
+            (
+                "move Project Files/Final One.txt to Shipped Files/Final One.txt",
+                {
+                    "source": "Project Files/Final One.txt",
+                    "destination": "Shipped Files/Final One.txt",
+                },
+            ),
+        )
+
+        for request, expected_arguments in cases:
+            with self.subTest(request=request):
+                plan = self.planner.create_plan(request)
+                self.assertEqual(plan.steps[0].arguments, expected_arguments)
+
+    def test_quote_characters_remain_literal_path_characters(self) -> None:
+        listed = self.planner.create_plan('list "Project Files"')
+        renamed = self.planner.create_plan(
+            'rename "Draft One.txt" to "Final One.txt"'
+        )
+
+        self.assertEqual(listed.steps[0].arguments, {"path": '"Project Files"'})
+        self.assertEqual(
+            renamed.steps[0].arguments,
+            {
+                "source": '"Draft One.txt"',
+                "destination": '"Final One.txt"',
+            },
+        )
+
+    def test_bare_commands_keep_the_current_unsupported_response(self) -> None:
+        requests = (
+            "calculate",
+            "list",
+            "read file",
+            "create note",
+            "read note",
+        )
+
+        for request in requests:
+            with self.subTest(request=request):
+                self._assert_unsupported(request)
+
+    def test_malformed_rename_and_move_return_exact_usage(self) -> None:
+        cases = (
+            ("rename source-only", "Use: rename <source> to <destination>"),
+            ("rename to destination-only", "Use: rename <source> to <destination>"),
+            ("move source-only", "Use: move <source> to <destination>"),
+            ("move to destination-only", "Use: move <source> to <destination>"),
+        )
+
+        for request, expected_response in cases:
+            with self.subTest(request=request):
+                plan = self.planner.create_plan(request)
+                self.assertEqual(plan.steps, ())
+                self.assertEqual(plan.response_if_no_action, expected_response)
+
+    def test_near_prefix_commands_do_not_become_executable(self) -> None:
+        requests = (
+            "calculator 2 + 2",
+            "listing reports",
+            "reader file.txt",
+            "systematic report",
+        )
+
+        for request in requests:
+            with self.subTest(request=request):
+                self._assert_unsupported(request)
+
+    def test_rename_and_move_require_the_exact_lowercase_to_delimiter(self) -> None:
+        supported = (
+            ("rename Alpha to Beta", "rename"),
+            ("move Alpha to Beta", "move"),
+        )
+        unsupported = (
+            (
+                "rename Alpha TO Beta",
+                "Use: rename <source> to <destination>",
+            ),
+            (
+                "move Alpha TO Beta",
+                "Use: move <source> to <destination>",
+            ),
+        )
+
+        for request, action in supported:
+            with self.subTest(request=request):
+                plan = self.planner.create_plan(request)
+                self.assertEqual(plan.steps[0].action, action)
+                self.assertEqual(
+                    plan.steps[0].arguments,
+                    {"source": "Alpha", "destination": "Beta"},
+                )
+
+        for request, expected_response in unsupported:
+            with self.subTest(request=request):
+                plan = self.planner.create_plan(request)
+                self.assertEqual(plan.steps, ())
+                self.assertEqual(plan.response_if_no_action, expected_response)
+
+    def test_conversational_multi_action_requests_do_not_add_planning(self) -> None:
+        self._assert_unsupported("please calculate 2 + 2 and then show time")
+        self._assert_unsupported("system and then time")
+
+        strict_first_command = self.planner.create_plan(
+            "calculate 2 + 2 and then show time"
+        )
+        self.assertEqual(
+            strict_first_command.steps,
+            (
+                PlanStep(
+                    "calculator",
+                    "calculate",
+                    {"expression": "2 + 2 and then show time"},
+                ),
+            ),
+        )
+
+    def test_help_retains_every_canonical_command(self) -> None:
+        plan = self.planner.create_plan("HELP")
+        response = plan.response_if_no_action
+        self.assertIsNotNone(response)
+        assert response is not None
+        expected_lines = (
+            "- calculate <expression>",
+            "- list <path>",
+            "- read file <path>",
+            "- rename <source> to <destination>",
+            "- move <source> to <destination>",
+            "- create note <title>: <body>",
+            "- notes",
+            "- read note <id or exact title>",
+            "- remember <fact>",
+            "- recall <query>",
+            "- memories",
+            "- system",
+            "- time",
+        )
+
+        self.assertEqual(plan.steps, ())
+        for command_line in expected_lines:
+            with self.subTest(command=command_line):
+                self.assertIn(command_line, response.splitlines())
+
+    def _assert_single_step(self, request: str, expected_step: PlanStep) -> None:
+        """Assert the complete public plan for one deterministic command."""
+        self.assertEqual(
+            self.planner.create_plan(request),
+            Plan(original_request=request, steps=(expected_step,)),
+        )
+
+    def _assert_unsupported(self, request: str) -> None:
+        """Assert Maria's exact unsupported-plan response."""
+        self.assertEqual(
+            self.planner.create_plan(request),
+            Plan(
+                original_request=request,
+                steps=(),
+                response_if_no_action=UNSUPPORTED_RESPONSE,
+            ),
+        )
+
+
+if __name__ == "__main__":
+    unittest.main()
