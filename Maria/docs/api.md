@@ -8,7 +8,7 @@ public network APIs.
 `MariaBrain.process(user_input: str, confirmed: bool = False) -> BrainResponse`
 
 Coordinates a request from input to plan, permission check, tool execution, and
-memory recording.
+interaction-history recording.
 
 ## Planner
 
@@ -21,6 +21,36 @@ Returns a `Plan` containing zero or more `PlanStep` objects.
 The memory layer owns all SQLite access. Other modules should call methods such
 as `record_interaction`, `get_recent_interactions`, `create_note`, `list_notes`,
 and `get_note` instead of writing SQL directly.
+
+### Interaction History
+
+`Memory.record_interaction(user_input: str, response: str) -> int`
+
+Stores the supplied request and response strings as full text, adds a UTC ISO
+8601 `created_at` timestamp, and returns the inserted interaction ID. The method
+does not strip, summarize, or validate its inputs as non-empty; Brain calls it
+with the stripped request and final response text on recorded paths. SQLite
+failures raise `RuntimeError("Unable to record interaction.")`.
+
+Passing complete request and response text means tool output such as file or
+note contents can become persistent interaction history. Callers must not treat
+these rows as facts deliberately saved to explicit memory.
+
+`Memory.get_recent_interactions(limit: int = 5) -> list[dict[str, Any]]`
+
+Returns interaction dictionaries containing exactly `id`, `user_input`,
+`response`, and `created_at`. Rows are ordered by `created_at` descending and
+then `id` descending; an empty table returns an empty list. Requested integer
+limits are clamped to a minimum of 1 and maximum of 50. SQLite failures raise
+`RuntimeError("Unable to fetch recent interactions.")`.
+
+"Recent" limits the query result and does not delete, expire, or prune older
+rows. Maria v0.1 exposes no interaction-history delete or prune API method or
+CLI command. Brain requests up to three rows for context; retrieval failure
+falls back to empty context, while recording failure is logged without
+replacing the user response.
+
+### Explicit Memories
 
 `Memory.store_memory(fact: str) -> tuple[int, bool]`
 

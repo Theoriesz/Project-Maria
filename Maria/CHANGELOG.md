@@ -2,6 +2,12 @@
 
 ## Unreleased
 
+- Expanded documentation of persistent request/response interaction history,
+  separate notes, explicit memories, and operational logs; content that may be
+  retained or duplicated; local-by-default configurable storage; the absence
+  of application-level encryption, automatic pruning, and in-app deletion
+  controls; the shipped runtime's lack of built-in network upload; and
+  sensitive-content guidance. Runtime behavior is unchanged.
 - Added broad v0.1 regression suites for Logger, Tool Manager, notes,
   filesystem, system information, Brain, Planner, and clean startup
   integration, using only temporary runtime resources and preserving existing
