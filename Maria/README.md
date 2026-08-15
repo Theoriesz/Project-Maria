@@ -89,10 +89,46 @@ recall editor
 1: My editor is VS Code
 ```
 
-Memory commands and their responses are also recorded in Maria's general
-interaction history, so a fact can appear in both places. Do not store
-passwords, API keys, access tokens, or other highly sensitive secrets. Version
-0.1 has no forget or delete-memory command.
+Memory commands and their responses also follow the interaction-history
+behavior described below, so a fact can appear in both places.
+
+## Data Retention and Privacy
+
+Maria v0.1 stores most non-empty requests it processes and their final response
+text as persistent interaction history in its configured SQLite database,
+located inside the project directory by default. This can retain file contents
+returned by `read file`, note titles and bodies, note-creation requests,
+calculator expressions and results, explicit memory facts and their
+recall/list output, filesystem paths, system information, and failure or denial
+messages. Asking Maria to display a sensitive file or note can therefore copy
+that returned content into interaction history.
+
+Interaction history, notes, and facts deliberately saved with `remember` are
+three separate record types in the same SQLite database, although the same text
+can appear in more than one table. The configured operational log
+(`logs/maria.log` by default) is a separate store for application events,
+warnings, and failures rather than the interaction store. Avoiding full content
+in an operational log message does not mean that content is absent from SQLite
+interaction history.
+
+Maria v0.1 provides no application-level database encryption, automatic
+retention period, or pruning. It has no CLI command to list, clear, delete, or
+prune interaction history, no note-delete command, and no memory-forget
+command. Retrieval limits affect only how many rows are read; they do not remove
+stored rows, and restarting Maria does not clear them. Protection depends on
+access to the machine, user account, and database file and on any storage
+encryption in use.
+
+The shipped v0.1 runtime has no built-in networking or cloud integration and
+does not itself transmit this history. Configured network-mounted or
+synchronized paths and operating-system backup or sync services remain outside
+Maria's boundary.
+
+Avoid submitting or requesting display of passwords, API keys, access tokens,
+private keys, recovery codes, confidential credentials, or other highly
+sensitive secrets. Blank input and CLI-only exit or cancelled-confirmation
+paths are not completed interaction records; detailed recording boundaries are
+documented in `docs/architecture.md`.
 
 ## Tests
 

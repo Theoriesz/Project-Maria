@@ -19,15 +19,41 @@ Maria does not copy or infer explicit memories from existing interaction rows.
 
 ### interactions
 
-Stores user requests and Maria responses. The application can retrieve a recent
-subset as context.
+Stores recorded processed requests and Maria's final response text. These
+fields contain the text supplied to the interaction-recording layer, not
+summaries or metadata-only representations. Brain supplies the stripped user
+request and final response; direct `Memory.record_interaction()` callers supply
+their strings unchanged.
 
 | Column | Type | Purpose |
 | --- | --- | --- |
-| id | INTEGER | Autoincrementing primary key |
-| user_input | TEXT NOT NULL | User request |
-| response | TEXT NOT NULL | Maria's response |
+| id | INTEGER PRIMARY KEY AUTOINCREMENT | Stable interaction identifier |
+| user_input | TEXT NOT NULL | Recorded request text |
+| response | TEXT NOT NULL | Recorded final response text |
 | created_at | TEXT NOT NULL | UTC ISO 8601 timestamp |
+
+The `idx_interactions_created_at` index supports timestamp-based retrieval.
+Recent rows are returned newest first by `created_at` and then descending `id`.
+The default direct retrieval limit is 5 and requested integer limits are
+clamped to 1 through 50. These limits restrict query results only; they do not
+delete or prune older rows.
+
+When a request reaches a recorded path and the database write succeeds, rows
+can include file text returned by `read file`, note titles and bodies returned
+by `read note`, note-creation requests, calculator expressions and results,
+remembered or retrieved facts, filesystem paths and failure messages,
+system-information output, and unsupported, malformed, denied, or failed
+request responses. Blank input, CLI-only exit and cancellation paths, startup
+failures, and the initial confirmation-required response are not recorded. An
+approved confirmation is processed again and its completed result follows the
+normal recording path.
+
+Successful writes are committed to the configured SQLite file and remain
+available across normal restarts until the database is removed or altered
+externally. Maria v0.1 provides no automatic retention period, pruning,
+archival, or interaction-history deletion feature, and no CLI command to list
+or clear interaction history. Calling data "recent" does not imply that older
+rows expire.
 
 ### notes
 
@@ -84,10 +110,36 @@ for memories in v0.1.
 
 ## Data Considerations
 
-The brain records memory commands and Maria's responses in `interactions` like
-other normal requests. A deliberately stored fact can therefore appear in both
-the `memories` table and interaction history. Passwords, API keys, access tokens,
-and other highly sensitive secrets should not be stored as memories.
+Interaction history, notes, and explicit memories are distinct persistent
+concepts and use separate tables in the same configured database. The same
+text may nevertheless appear more than once: an explicit fact can occur in its
+`remember` request, the `memories` table, and later recall or list responses;
+a note body can remain in an interaction response as well as the `notes` table.
+Likewise, file or note content returned in a response remains independent of
+its original source. Removing or changing source data outside Maria does not
+automatically remove matching text from existing interaction rows. All three
+tables share one database file; external removal or replacement affects all
+three datasets.
+
+Maria v0.1 exposes no API or CLI operation to delete or prune interaction
+history, delete notes, or delete or forget explicit memories. It also provides
+no application-level database encryption. Protection depends on access to the
+machine, user account, and database file and on any storage encryption in use;
+local storage alone is not a confidentiality guarantee. The v0.1 persistence
+layer contains no network-transmission path, and the shipped runtime does not
+itself upload this history. Configured network-mounted or synchronized storage
+and operating-system backup or sync services remain outside Maria's boundary.
+
+The configured operational log (`logs/maria.log` by default) is separate from
+SQLite interaction history. The log records application events, warnings, and
+failures; the `interactions` table records request and response text. Omitting
+full content from an operational log entry does not mean the content is absent
+from an interaction row.
+
+Do not submit or request display of passwords, API keys, access tokens, private
+keys, recovery codes, confidential credentials, or other highly sensitive
+secrets. In particular, reading a sensitive file or note can copy its returned
+content into interaction history.
 
 ## Ownership
 

@@ -12,9 +12,10 @@ Maria v0.1 is organized around a small set of modules with clear ownership.
 6. Tools perform their focused work and return a `ToolExecutionResult`.
 7. `memory.py` owns persistent interactions, notes, and explicit memories in
    SQLite.
-8. `brain.py` formats the tool result and records the normal request and
-   response as an interaction.
-9. `logger.py` records important application events.
+8. `brain.py` forms the final response and, on recordable completion paths,
+   attempts to record the cleaned request and response as an interaction.
+9. `logger.py` configures Maria's named logger; application modules emit
+   operational events through it.
 
 An explicit memory request uses the same execution path as every other tool
 request:
@@ -35,6 +36,63 @@ actions. `ToolManager` registers `tools.memory` through the standard tool
 factory contract alongside the calculator, notes, filesystem, and system
 tools. Memory actions therefore pass through the normal permission and result
 handling flow.
+
+## Interaction Recording Boundary
+
+For a normal completed tool request, interaction recording follows this
+boundary:
+
+```text
+CLI
+-> Brain
+-> Planner
+-> PermissionManager
+-> ToolManager
+-> Tool
+-> Brain final response
+-> Memory.record_interaction
+-> SQLite interactions table
+```
+
+`MariaBrain.process()` strips non-empty input before planning. On the zero-step,
+permission-denial, and post-tool-result branches, Brain passes that cleaned
+request and the full final response text to `Memory.record_interaction()`. This
+includes help, unsupported commands, malformed-command usage responses,
+denials, successful tool results, and returned unsuccessful
+`ToolExecutionResult` values. The recording layer stores the supplied text
+rather than summaries or only metadata, subject to existing command and tool
+output limits. A recording `RuntimeError` is logged without replacing the
+primary response, so recording is attempted but a row is not guaranteed when
+the database write fails.
+
+Some paths return before this boundary. Blank CLI input is not processed, and
+blank input passed directly to `process()` returns before logging, context
+retrieval, planning, or recording. `exit`, `quit`, `q`, main-prompt EOF or
+Ctrl+C, and startup failures do not become interaction rows. An initial
+confirmation-required response returns before completed-interaction recording.
+If confirmation is cancelled, the CLI-only cancellation response is not
+recorded. If it is approved, the CLI calls `process()` again with
+`confirmed=True`; Brain retrieves context, re-plans, rechecks permission, and
+attempts to record only the second call's completed result through the normal
+path.
+
+Post-startup processing has no broad exception handler. If an exception
+propagates before a recordable branch calls `Memory.record_interaction()`, no
+interaction write is attempted.
+
+For each non-empty `process()` call, Brain attempts to retrieve up to three
+recent interaction rows and supplies them to Planner as context. A retrieval
+`RuntimeError` is logged and produces empty context instead. The v0.1 Planner
+currently accepts and discards that context, so retained history does not alter
+plans. The retrieval limit controls query results; it is not a retention or
+deletion policy.
+
+Operational logging and interaction persistence are separate boundaries.
+`logger.py` configures Maria's namespaced file logger; default startup targets
+`logs/maria.log` for application events, warnings, and failures.
+`Memory.record_interaction()` separately writes request and response text to
+SQLite. A log message that omits full request or response content does not
+prevent that content from appearing in interaction history.
 
 ## CLI Boundary
 
@@ -69,19 +127,20 @@ remains an internal trusted-code boundary.
 
 Maria keeps three kinds of persistent data separate:
 
-- **Interaction history** records general user requests and Maria responses.
-  The brain retrieves recent rows and supplies them to the planner as context,
-  although the strict v0.1 planner does not use that context to infer actions.
-  Interaction rows are never converted automatically into explicit memories.
+- **Interaction history** records cleaned requests and final Maria responses
+  on the completed paths described above. The brain retrieves recent rows and
+  supplies them to the planner as context, although the strict v0.1 planner
+  discards that context. Interaction rows are never converted automatically
+  into explicit memories.
 - **Notes** are structured title-and-body records deliberately created by the
   user. The notes tool uses the shared `Memory` persistence interface.
 - **Explicit memories** are deliberately stored facts. They are created only
   through the strict `remember <fact>` command or the public `Memory` API,
   searched through `recall <query>`, and listed through `memories`.
 
-Because the brain records normal requests and responses, memory commands and
-their responses also appear in interaction history. A stored fact can therefore
-exist both as an explicit memory and as part of an interaction.
+On the completed paths described above, memory commands and their responses
+also appear in interaction history when recording succeeds. A stored fact can
+therefore exist both as an explicit memory and as part of an interaction.
 
 ## Boundaries
 
