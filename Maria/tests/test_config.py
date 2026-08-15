@@ -9,7 +9,7 @@ from tempfile import TemporaryDirectory
 from unittest.mock import Mock
 
 from core.config import MariaConfig, load_config
-from core.constants import CONFIG_PATH, PROJECT_ROOT
+from core.constants import APP_VERSION, CONFIG_PATH, PROJECT_ROOT
 from core.permissions import (
     MANDATORY_CONFIRMATION_ACTIONS,
     MANDATORY_DENIED_ACTIONS,
@@ -47,6 +47,15 @@ class ConfigTests(unittest.TestCase):
             MANDATORY_CONFIRMATION_ACTIONS <= config.confirmation_required
         )
         self.assertTrue(MANDATORY_DENIED_ACTIONS <= config.denied_actions)
+
+    def test_shipped_configuration_version_matches_runtime_version(self) -> None:
+        config = load_config(CONFIG_PATH)
+
+        self.assertEqual(
+            config.version,
+            APP_VERSION,
+            "Shipped configuration version must match APP_VERSION.",
+        )
 
     def test_missing_permissions_section_uses_mandatory_baseline(self) -> None:
         config = self._load("[app]\nname = \"Temporary Maria\"\n")
