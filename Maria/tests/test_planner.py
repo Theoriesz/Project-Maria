@@ -151,7 +151,11 @@ class PlannerMemoryTests(unittest.TestCase):
             ("read note Project Plan", "notes", "read", {"target": "Project Plan"}),
             ("read file README.md", "filesystem", "read", {"path": "README.md"}),
             ("system", "system", "overview", {}),
+            ("status", "system", "overview", {}),
+            ("sys", "system", "overview", {}),
             ("time", "system", "current_time", {}),
+            ("current time", "system", "current_time", {}),
+            ("time now", "system", "current_time", {}),
         )
 
         for request, tool_name, action, arguments in cases:

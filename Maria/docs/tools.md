@@ -55,6 +55,39 @@ It is registered as `tools.memory` through Tool Manager's standard
 `build_tool(...)` factory contract and travels through the normal permission
 path. The tool contains no SQL; `core/memory.py` owns all database operations.
 
+## System Tool
+
+The system tool supports exactly two actions:
+
+- `overview`: OS, CPU, RAM, disk, and current-time summary
+- `current_time`: a dedicated, readable current-time report
+
+Both actions are read-only. Planner command aliases:
+
+- `system`, `system info`, `status`, `sys`, and `sys info` map to `overview`
+- `time`, `current time`, and `time now` map to `current_time`
+
+The `current_time` action's message is a readable, timezone-aware four-line
+report:
+
+```text
+Date: 2030-01-02
+Time: 03:04:05
+UTC offset: +08:00
+ISO-8601: 2030-01-02T03:04:05+08:00
+```
+
+The `overview` action's final line is a compact reading of the same fields:
+
+```text
+Current time: 2030-01-02 03:04:05 UTC+08:00
+```
+
+Both formats are derived from a single timezone-aware local datetime capture
+per action call, so every value describes the same instant. The UTC offset is
+always signed and colonized, including `+00:00` for UTC itself, and formatting
+uses only numeric, locale-independent fields.
+
 ## Tool Interface
 
 A tool should provide:

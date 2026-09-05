@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import logging
 import unittest
+from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from types import SimpleNamespace
 from unittest.mock import Mock, call, patch
@@ -50,6 +51,7 @@ class SystemToolTests(unittest.TestCase):
             free=60 * 1024**3,
         )
         home = Path("mocked-home")
+        moment = datetime(2030, 1, 2, 3, 4, 5, tzinfo=timezone(timedelta(hours=8)))
         timestamp = "2030-01-02T03:04:05+08:00"
 
         with (
@@ -64,8 +66,8 @@ class SystemToolTests(unittest.TestCase):
                 "_get_total_ram_bytes",
                 return_value=8 * 1024**3,
             ) as total_ram,
-            patch.object(system_module, "_local_time", return_value=timestamp)
-            as local_time,
+            patch.object(system_module, "_current_moment", return_value=moment)
+            as current_moment,
         ):
             result = self.tool.execute("overview", {})
 
@@ -83,7 +85,7 @@ class SystemToolTests(unittest.TestCase):
             "CPU count: 12\n"
             "RAM: 8.00 GB\n"
             "Disk: 40.00 GB used / 100.00 GB total (60.00 GB free)\n"
-            f"Current time: {timestamp}"
+            "Current time: 2030-01-02 03:04:05 UTC+08:00"
         )
         self.assertEqual(
             result,
@@ -94,24 +96,94 @@ class SystemToolTests(unittest.TestCase):
         path_home.assert_called_once_with()
         disk_usage.assert_called_once_with(home)
         total_ram.assert_called_once_with()
-        local_time.assert_called_once_with()
+        current_moment.assert_called_once_with()
         self.logger.info.assert_called_once_with("System overview read.")
 
-    def test_current_time_returns_mocked_timezone_aware_timestamp(self) -> None:
+    def test_current_time_returns_mocked_timezone_aware_report(self) -> None:
+        moment = datetime(2040, 5, 6, 7, 8, 9, tzinfo=timezone(timedelta(hours=-4)))
         timestamp = "2040-05-06T07:08:09-04:00"
+        expected_message = (
+            "Date: 2040-05-06\n"
+            "Time: 07:08:09\n"
+            "UTC offset: -04:00\n"
+            f"ISO-8601: {timestamp}"
+        )
 
-        with patch.object(system_module, "_local_time", return_value=timestamp):
+        with patch.object(system_module, "_current_moment", return_value=moment):
             result = self.tool.execute("current_time", {})
 
         self.assertEqual(
             result,
             ToolExecutionResult(
                 True,
-                timestamp,
+                expected_message,
                 {"current_time": timestamp},
             ),
         )
         self.logger.info.assert_called_once_with("Current time read.")
+
+    def test_time_report_formats_utc_offsets_correctly(self) -> None:
+        cases = (
+            (
+                timezone(timedelta(hours=8)),
+                "Date: 2030-01-02\nTime: 03:04:05\nUTC offset: +08:00\n"
+                "ISO-8601: 2030-01-02T03:04:05+08:00",
+            ),
+            (
+                timezone(timedelta(hours=-4)),
+                "Date: 2030-01-02\nTime: 03:04:05\nUTC offset: -04:00\n"
+                "ISO-8601: 2030-01-02T03:04:05-04:00",
+            ),
+            (
+                timezone.utc,
+                "Date: 2030-01-02\nTime: 03:04:05\nUTC offset: +00:00\n"
+                "ISO-8601: 2030-01-02T03:04:05+00:00",
+            ),
+            (
+                timezone(timedelta(hours=5, minutes=30)),
+                "Date: 2030-01-02\nTime: 03:04:05\nUTC offset: +05:30\n"
+                "ISO-8601: 2030-01-02T03:04:05+05:30",
+            ),
+        )
+
+        for tzinfo, expected_message in cases:
+            with self.subTest(tzinfo=tzinfo):
+                moment = datetime(2030, 1, 2, 3, 4, 5, tzinfo=tzinfo)
+                self.assertEqual(
+                    system_module._time_report(moment),
+                    expected_message,
+                )
+
+    def test_compact_time_formats_offsets_correctly(self) -> None:
+        cases = (
+            (
+                timezone(timedelta(hours=8)),
+                "2030-01-02 03:04:05 UTC+08:00",
+            ),
+            (
+                timezone.utc,
+                "2030-01-02 03:04:05 UTC+00:00",
+            ),
+            (
+                timezone(timedelta(hours=5, minutes=30)),
+                "2030-01-02 03:04:05 UTC+05:30",
+            ),
+        )
+
+        for tzinfo, expected_line in cases:
+            with self.subTest(tzinfo=tzinfo):
+                moment = datetime(2030, 1, 2, 3, 4, 5, tzinfo=tzinfo)
+                self.assertEqual(system_module._compact_time(moment), expected_line)
+
+    def test_current_moment_is_a_real_timezone_aware_capture(self) -> None:
+        before = datetime.now().astimezone()
+        moment = system_module._current_moment()
+        after = datetime.now().astimezone()
+
+        self.assertIsNotNone(moment.tzinfo)
+        self.assertIsNotNone(moment.utcoffset())
+        self.assertLessEqual(before, moment)
+        self.assertLessEqual(moment, after)
 
     def test_unknown_action_is_rejected(self) -> None:
         result = self.tool.execute("write", {"value": "ignored"})
@@ -148,8 +220,8 @@ class SystemToolTests(unittest.TestCase):
             patch.object(system_module, "_get_total_ram_bytes", return_value=None),
             patch.object(
                 system_module,
-                "_local_time",
-                return_value="2050-01-01T00:00:00+00:00",
+                "_current_moment",
+                return_value=datetime(2050, 1, 1, tzinfo=timezone.utc),
             ),
         ):
             result = self.tool.execute("overview", {})
@@ -271,8 +343,8 @@ class SystemToolTests(unittest.TestCase):
 
         with patch.object(
             system_module,
-            "_local_time",
-            return_value="2030-01-02T03:04:05+08:00",
+            "_current_moment",
+            return_value=datetime(2030, 1, 2, 3, 4, 5, tzinfo=timezone(timedelta(hours=8))),
         ):
             result = self.tool.execute("current_time", arguments)
 
@@ -296,8 +368,8 @@ class SystemToolTests(unittest.TestCase):
             patch.object(system_module, "_get_total_ram_bytes", return_value=123456),
             patch.object(
                 system_module,
-                "_local_time",
-                return_value="2060-01-01T00:00:00+00:00",
+                "_current_moment",
+                return_value=datetime(2060, 1, 1, tzinfo=timezone.utc),
             ),
         ):
             result = self.tool.execute("overview", {})
