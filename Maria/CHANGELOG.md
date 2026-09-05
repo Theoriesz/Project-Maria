@@ -6,6 +6,14 @@
   `n` or `no` to cancel, case- and whitespace-insensitively, with blank or
   unrecognized input re-prompting instead of cancelling; EOF and Ctrl+C still
   cancel immediately and safely, including after earlier invalid input.
+- Added `sys` and `sys info` as aliases for the `system` overview command, and
+  `time now` as an alias for the `time` current-time command; `status` and
+  `current time` continue to work unchanged.
+- Replaced the dedicated `time` command's single ISO-8601 line with a
+  readable, timezone-aware four-line report (`Date`, `Time`, `UTC offset`,
+  `ISO-8601`), and replaced the `system` overview's `Current time` line with
+  a compact reading of the same fields. Both are derived from a single
+  timezone-aware datetime capture per command and remain locale-independent.
 
 ## 0.1.0 - 2026-08-15
 

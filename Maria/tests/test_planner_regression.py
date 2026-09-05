@@ -102,6 +102,39 @@ class PlannerRegressionTests(unittest.TestCase):
             PlanStep("system", "current_time", {}),
         )
 
+    def test_system_and_time_alias_variants_map_to_exact_step(self) -> None:
+        overview_step = PlanStep("system", "overview", {})
+        current_time_step = PlanStep("system", "current_time", {})
+        cases = (
+            ("system", overview_step),
+            ("system info", overview_step),
+            ("status", overview_step),
+            ("sys", overview_step),
+            ("sys info", overview_step),
+            ("time", current_time_step),
+            ("current time", current_time_step),
+            ("time now", current_time_step),
+        )
+
+        for request, expected_step in cases:
+            with self.subTest(request=request):
+                self._assert_single_step(request, expected_step)
+
+    def test_leading_and_trailing_whitespace_is_stripped_for_aliases(self) -> None:
+        system_plan = self.planner.create_plan("  SYSTEM  ")
+        self.assertEqual(system_plan.original_request, "SYSTEM")
+        self.assertEqual(
+            system_plan.steps,
+            (PlanStep("system", "overview", {}),),
+        )
+
+        time_plan = self.planner.create_plan("  TIME NOW  ")
+        self.assertEqual(time_plan.original_request, "TIME NOW")
+        self.assertEqual(
+            time_plan.steps,
+            (PlanStep("system", "current_time", {}),),
+        )
+
     def test_supported_keywords_are_case_insensitive(self) -> None:
         cases = (
             (
@@ -146,7 +179,12 @@ class PlannerRegressionTests(unittest.TestCase):
                 PlanStep("notes", "read", {"target": "Exact Mixed Title"}),
             ),
             ("SyStEm", PlanStep("system", "overview", {})),
+            ("STATUS", PlanStep("system", "overview", {})),
+            ("SyS", PlanStep("system", "overview", {})),
+            ("Sys Info", PlanStep("system", "overview", {})),
             ("TiMe", PlanStep("system", "current_time", {})),
+            ("Current Time", PlanStep("system", "current_time", {})),
+            ("Time Now", PlanStep("system", "current_time", {})),
         )
 
         for request, expected_step in cases:
@@ -251,6 +289,15 @@ class PlannerRegressionTests(unittest.TestCase):
             "listing reports",
             "reader file.txt",
             "systematic report",
+            "systeminfo",
+            "sysinfo",
+            "syscall",
+            "timer",
+            "timestamp",
+            "sys  info",
+            "time  now",
+            "system info now",
+            "sys info now",
         )
 
         for request in requests:

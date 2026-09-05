@@ -41,6 +41,7 @@ class SystemTool:
 
     def _overview(self) -> ToolExecutionResult:
         """Return OS, CPU, RAM, disk, and time information."""
+        moment = _current_moment()
         disk = shutil.disk_usage(Path.home())
         total_ram = _get_total_ram_bytes()
         data = {
@@ -50,7 +51,7 @@ class SystemTool:
             "disk_total": _format_bytes(disk.total),
             "disk_used": _format_bytes(disk.used),
             "disk_free": _format_bytes(disk.free),
-            "current_time": _local_time(),
+            "current_time": _iso_format(moment),
         }
         message = (
             f"OS: {data['os']}\n"
@@ -58,16 +59,21 @@ class SystemTool:
             f"RAM: {data['total_ram']}\n"
             f"Disk: {data['disk_used']} used / {data['disk_total']} total "
             f"({data['disk_free']} free)\n"
-            f"Current time: {data['current_time']}"
+            f"Current time: {_compact_time(moment)}"
         )
         self.logger.info("System overview read.")
         return ToolExecutionResult(True, message, data)
 
     def _current_time(self) -> ToolExecutionResult:
-        """Return the local current time."""
-        current_time = _local_time()
+        """Return a readable, timezone-aware current-time report."""
+        moment = _current_moment()
+        current_time = _iso_format(moment)
         self.logger.info("Current time read.")
-        return ToolExecutionResult(True, current_time, {"current_time": current_time})
+        return ToolExecutionResult(
+            True,
+            _time_report(moment),
+            {"current_time": current_time},
+        )
 
 
 class _MemoryStatusEx(ctypes.Structure):
@@ -117,9 +123,35 @@ def _format_bytes(value: int) -> str:
     return f"{size:.2f} TB"
 
 
-def _local_time() -> str:
-    """Return the local time as an ISO 8601 string."""
-    return datetime.now().astimezone().isoformat(timespec="seconds")
+def _current_moment() -> datetime:
+    """Capture the current local time as a single timezone-aware datetime."""
+    return datetime.now().astimezone()
+
+
+def _iso_format(moment: datetime) -> str:
+    """Format a moment as a timezone-aware ISO-8601 string."""
+    return moment.isoformat(timespec="seconds")
+
+
+def _utc_offset(moment: datetime) -> str:
+    """Format a moment's UTC offset as a signed, colonized string."""
+    offset = moment.strftime("%z")
+    return f"{offset[:3]}:{offset[3:]}"
+
+
+def _time_report(moment: datetime) -> str:
+    """Build the readable four-line current-time report for a moment."""
+    return (
+        f"Date: {moment.strftime('%Y-%m-%d')}\n"
+        f"Time: {moment.strftime('%H:%M:%S')}\n"
+        f"UTC offset: {_utc_offset(moment)}\n"
+        f"ISO-8601: {_iso_format(moment)}"
+    )
+
+
+def _compact_time(moment: datetime) -> str:
+    """Build the compact overview current-time line for a moment."""
+    return f"{moment.strftime('%Y-%m-%d %H:%M:%S')} UTC{_utc_offset(moment)}"
 
 
 def build_tool(**_: Any) -> SystemTool:

@@ -128,10 +128,10 @@ class Planner:
             target = text[len("read note ") :].strip()
             return self._single_step(text, "notes", "read", {"target": target})
 
-        if lowered in {"system", "system info", "status"}:
+        if lowered in {"system", "system info", "status", "sys", "sys info"}:
             return self._single_step(text, "system", "overview", {})
 
-        if lowered in {"time", "current time"}:
+        if lowered in {"time", "current time", "time now"}:
             return self._single_step(text, "system", "current_time", {})
 
         return self._no_action(
