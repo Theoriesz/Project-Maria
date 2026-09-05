@@ -2,6 +2,11 @@
 
 ## Unreleased
 
+- Widened the CLI confirmation prompt to accept `y` or `yes` to approve and
+  `n` or `no` to cancel, case- and whitespace-insensitively, with blank or
+  unrecognized input re-prompting instead of cancelling; EOF and Ctrl+C still
+  cancel immediately and safely, including after earlier invalid input.
+
 ## 0.1.0 - 2026-08-15
 
 - Created the initial Maria project foundation.

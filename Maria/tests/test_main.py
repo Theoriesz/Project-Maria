@@ -16,7 +16,9 @@ from core.brain import BrainResponse
 MAIN_PATH = Path(__file__).resolve().parents[1] / "main.py"
 BANNER = "Maria v0.1.0"
 HELP_HINT = "Type 'help' for supported v0.1 commands. Type 'exit' to quit."
-CONFIRMATION_PROMPT = "Confirm action? Type 'yes' to continue: "
+CONFIRMATION_PROMPT = (
+    "Confirm action? Type 'y' or 'yes' to continue, or 'n' or 'no' to cancel: "
+)
 STARTUP_FAILURE_MESSAGE = (
     "Maria: Startup failed. Review the configuration and available logs."
 )
@@ -253,7 +255,9 @@ class MainCliTests(unittest.TestCase):
                 self.assertNotIn("Traceback", stderr)
                 self.assertEqual(stderr, "")
 
-    def test_confirmation_accepts_only_case_insensitive_exact_yes(self) -> None:
+    def test_confirmation_accepts_y_or_yes_case_insensitive_with_whitespace(
+        self,
+    ) -> None:
         request = "rename old.txt to new.txt"
         confirmation = BrainResponse(
             "Confirmation required: filesystem.rename requires explicit confirmation.",
@@ -261,7 +265,7 @@ class MainCliTests(unittest.TestCase):
         )
         completed = BrainResponse("Renamed old.txt to new.txt")
 
-        for approval in ("yes", " YeS \t"):
+        for approval in ("yes", " YeS \t", "y", " Y \t"):
             with self.subTest(approval=approval):
                 brain = Mock(spec=main_module.MariaBrain)
                 brain.process.side_effect = [confirmation, completed]
@@ -294,7 +298,7 @@ class MainCliTests(unittest.TestCase):
         )
         next_response = BrainResponse("System ready.")
 
-        for cancellation in ("no", "y", "", "not today"):
+        for cancellation in ("no", "n", "NO", "N", " No \t"):
             with self.subTest(cancellation=cancellation):
                 brain = Mock(spec=main_module.MariaBrain)
                 brain.process.side_effect = [confirmation, next_response]
@@ -322,6 +326,115 @@ class MainCliTests(unittest.TestCase):
                     ],
                 )
                 self.assertEqual(stderr, "")
+
+    def test_blank_or_unrecognized_confirmation_reprompts_then_resolves(
+        self,
+    ) -> None:
+        request = "rename old.txt to new.txt"
+        confirmation = BrainResponse(
+            "Confirmation required: filesystem.rename requires explicit confirmation.",
+            needs_confirmation=True,
+        )
+        completed = BrainResponse("Renamed old.txt to new.txt")
+
+        cases = (
+            ("blank_then_yes", "", "yes", True),
+            ("unrecognized_then_yes", "maybe", "yes", True),
+            ("blank_then_no", "", "no", False),
+            ("unrecognized_then_no", "not today", "no", False),
+        )
+
+        for description, bad_answer, resolution, approves in cases:
+            with self.subTest(description=description):
+                brain = Mock(spec=main_module.MariaBrain)
+                if approves:
+                    brain.process.side_effect = [confirmation, completed]
+                else:
+                    brain.process.return_value = confirmation
+                factory = Mock(return_value=brain)
+
+                status, stdout, stderr, input_mock = self._run_cli(
+                    factory,
+                    [request, bad_answer, resolution, "exit"],
+                )
+
+                self.assertEqual(status, 0)
+                self.assertEqual(
+                    input_mock.call_args_list,
+                    [
+                        call("You: "),
+                        call(CONFIRMATION_PROMPT),
+                        call(CONFIRMATION_PROMPT),
+                        call("You: "),
+                    ],
+                )
+                if approves:
+                    self.assertEqual(
+                        brain.process.call_args_list,
+                        [call(request), call(request, confirmed=True)],
+                    )
+                    self.assertNotIn("Action cancelled", stdout)
+                else:
+                    brain.process.assert_called_once_with(request)
+                    self.assertEqual(stdout.count("Maria: Action cancelled.\n"), 1)
+                self.assertEqual(stderr, "")
+
+    def test_confirmation_reprompt_loop_advances_once_per_invalid_answer(
+        self,
+    ) -> None:
+        request = "rename old.txt to new.txt"
+        confirmation = BrainResponse(
+            "Confirmation required: filesystem.rename requires explicit confirmation.",
+            needs_confirmation=True,
+        )
+        completed = BrainResponse("Renamed old.txt to new.txt")
+        brain = Mock(spec=main_module.MariaBrain)
+        brain.process.side_effect = [confirmation, completed]
+        factory = Mock(return_value=brain)
+
+        status, stdout, stderr, input_mock = self._run_cli(
+            factory,
+            [request, "", "maybe", "nope", "yes", "exit"],
+        )
+
+        self.assertEqual(status, 0)
+        self.assertEqual(
+            input_mock.call_args_list,
+            [
+                call("You: "),
+                call(CONFIRMATION_PROMPT),
+                call(CONFIRMATION_PROMPT),
+                call(CONFIRMATION_PROMPT),
+                call(CONFIRMATION_PROMPT),
+                call("You: "),
+            ],
+        )
+        self.assertEqual(
+            brain.process.call_args_list,
+            [call(request), call(request, confirmed=True)],
+        )
+        self.assertNotIn("Action cancelled", stdout)
+        self.assertEqual(stderr, "")
+
+    def test_confirmation_reprompt_loop_interrupted_after_invalid_answers_cancels(
+        self,
+    ) -> None:
+        for interruption in (EOFError(), KeyboardInterrupt()):
+            with self.subTest(interruption=type(interruption).__name__):
+                stdout = StringIO()
+
+                with (
+                    patch(
+                        "builtins.input",
+                        side_effect=["", "maybe", interruption],
+                    ) as input_mock,
+                    redirect_stdout(stdout),
+                ):
+                    approved = main_module.ask_for_confirmation()
+
+                self.assertFalse(approved)
+                self.assertEqual(input_mock.call_count, 3)
+                self.assertEqual(stdout.getvalue(), "\n")
 
     def test_confirmation_prompt_interruptions_print_one_newline(self) -> None:
         for interruption in (EOFError(), KeyboardInterrupt()):
