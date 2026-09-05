@@ -10,6 +10,11 @@ from core.constants import APP_NAME, APP_VERSION
 
 
 EXIT_COMMANDS = {"exit", "quit", "q"}
+CONFIRMATION_APPROVE_ANSWERS = frozenset({"y", "yes"})
+CONFIRMATION_CANCEL_ANSWERS = frozenset({"n", "no"})
+_CONFIRMATION_PROMPT = (
+    "Confirm action? Type 'y' or 'yes' to continue, or 'n' or 'no' to cancel: "
+)
 _EXIT_SUCCESS = 0
 _EXIT_STARTUP_FAILURE = 1
 _EXIT_STARTUP_INTERRUPTED = 130
@@ -20,13 +25,17 @@ _STARTUP_INTERRUPTED_MESSAGE = f"{APP_NAME}: Startup interrupted."
 
 
 def ask_for_confirmation() -> bool:
-    """Ask the user to explicitly confirm a sensitive action."""
-    try:
-        answer = input("Confirm action? Type 'yes' to continue: ").strip().lower()
-    except (EOFError, KeyboardInterrupt):
-        print()
-        return False
-    return answer == "yes"
+    """Ask until the user gives an explicit yes/no answer for a sensitive action."""
+    while True:
+        try:
+            answer = input(_CONFIRMATION_PROMPT).strip().lower()
+        except (EOFError, KeyboardInterrupt):
+            print()
+            return False
+        if answer in CONFIRMATION_APPROVE_ANSWERS:
+            return True
+        if answer in CONFIRMATION_CANCEL_ANSWERS:
+            return False
 
 
 def print_response(response: BrainResponse) -> None:

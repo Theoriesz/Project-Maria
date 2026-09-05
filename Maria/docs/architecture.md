@@ -104,11 +104,14 @@ stderr output and status 1, while startup `KeyboardInterrupt` maps to status
 failures.
 
 EOF or Ctrl+C at the main prompt exits normally. At the confirmation prompt,
-either interruption cancels the pending action without executing it. This
-boundary intentionally does not add a broad exception handler around Brain
-processing after startup. Confirmation still uses deterministic re-planning
-with `brain.process(original_input, confirmed=True)`; binding confirmation to
-an immutable plan remains deferred.
+`y` or `yes` approves and `n` or `no` cancels, case- and whitespace-
+insensitively; blank or unrecognized input re-prompts rather than approving or
+cancelling. Either interruption (EOF or Ctrl+C) cancels the pending action
+immediately without executing it, even if it occurs after one or more invalid
+answers. This boundary intentionally does not add a broad exception handler
+around Brain processing after startup. Confirmation still uses deterministic
+re-planning with `brain.process(original_input, confirmed=True)`; binding
+confirmation to an immutable plan remains deferred.
 
 ## Permission Policy
 

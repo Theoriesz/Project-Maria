@@ -28,9 +28,11 @@ message and returns status 130. Startup failures do not print raw tracebacks or
 exception details. Review the configuration and available logs when startup
 fails.
 
-At a confirmation prompt, only an exact `yes`, ignoring casing and surrounding
-whitespace, approves the pending action. EOF or Ctrl+C cancels the pending
-action without executing it. Ctrl+C returns to the main prompt; if input
+At a confirmation prompt, `y` or `yes` approves and `n` or `no` cancels the
+pending action, ignoring casing and surrounding whitespace. Blank or
+unrecognized input re-prompts instead of approving or cancelling. EOF or
+Ctrl+C cancels the pending action immediately, without executing it, even
+after earlier invalid input. Ctrl+C returns to the main prompt; if input
 remains closed after EOF, the next main prompt exits cleanly.
 
 ## Supported v0.1 Commands
