@@ -2,6 +2,17 @@
 
 ## Unreleased
 
+- Made filesystem responses show paths relative to the configured safe root using
+  forward slashes, with the safe root itself shown as `.`, instead of absolute host
+  paths; operating-system failure reasons are now derived from the numeric `errno`,
+  Maria's two fixed path-validation messages remain supported, and raw
+  exception-supplied text and filename fields such as `strerror`, `filename`, and
+  `filename2` never reach response text. The improvement is prospective and does
+  not rewrite existing interaction-history rows, and a path a user typed
+  explicitly can still be retained as request text. Path resolution, safe-root
+  containment, symlink handling, collision behavior, move parent-directory
+  creation, read size limits, UTF-8 replacement decoding, confirmation policy,
+  command grammar, tool result `data`, and operational logging are all unchanged.
 - Made the existing newest-20 display limit visible for `notes`, `memories`, and
   `recall <query>`: when more than 20 rows exist, only the newest 20 are shown
   and one line is appended stating that more results exist. Output for 20 or

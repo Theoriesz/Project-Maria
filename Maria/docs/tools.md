@@ -26,6 +26,75 @@ any value that exceeds a bound produces a controlled calculation failure.
 These bounds protect version 0.1 execution; they are not arbitrary-precision
 math guarantees.
 
+## Filesystem Tool
+
+The filesystem tool supports `read`, `list`, `rename`, and `move` inside the configured
+safe root. Rename and move always require explicit confirmation.
+
+Internally the tool still resolves every operand to a canonical absolute path, and all
+containment validation, symlink resolution, and actual filesystem work happen on those
+absolute paths. Only the user-facing message text is rendered differently.
+
+User-facing messages show paths relative to the configured safe root, always using
+forward slashes so output is identical on every platform. The safe root itself displays
+as `.`:
+
+```text
+Not a file: archive/processed/Customer Order.txt
+Not a directory: main.py
+Source does not exist: inbox/missing.txt
+Destination already exists: archive/report.txt
+Renamed inbox/old name.txt to archive/new name.txt.
+Moved inbox/Customer Order.txt to archive/processed/Customer Order.txt.
+```
+
+Displayed paths are derived after resolution, so redundant `.` and `..` components are
+removed and an absolute operand inside the safe root is still shown relative to it.
+Spaces, Unicode, casing, and quote characters are preserved as literal path characters;
+the tool performs no shell or quote parsing.
+
+A path that resolves outside the safe root is rejected with one generic message that
+never names the rejected path:
+
+```text
+Path is outside Maria's configured safe root.
+```
+
+Failures are reported with a sanitized reason. Raw `OSError` and `shutil.Error` text is
+never copied into a response, and neither are the `filename`, `filename2`, `strerror`, or
+`args` fields those exceptions carry. A reason is chosen as follows:
+
+- For an `OSError`, the reason comes from `os.strerror(exc.errno)`.
+- For a `ValueError`, only these two fixed Maria-controlled messages are preserved:
+
+  ```text
+  Path is required.
+  Path is outside Maria's configured safe root.
+  ```
+
+- Every other `ValueError`, and any failure without a usable numeric error code —
+  including `shutil.Error` — uses the fixed fallback:
+
+  ```text
+  The operating system reported an unspecified error.
+  ```
+
+So a response carries one of these forms:
+
+```text
+File read failed: Permission denied
+File read failed: Path is outside Maria's configured safe root.
+Move failed: The operating system reported an unspecified error.
+```
+
+Path-bearing tool result `data` and the operational log are unchanged and still contain
+canonical absolute paths and full raw exception diagnostics, which is where the
+per-filename detail omitted from responses remains available.
+
+Two limits are worth stating plainly. Recorded request text is not sanitized, so an
+absolute path a user typed explicitly can still be retained in interaction history. The
+change is also prospective only: existing interaction-history rows are not rewritten.
+
 ## Notes Tool
 
 The notes tool supports `create`, `list`, and `read`. `list` returns notes newest
