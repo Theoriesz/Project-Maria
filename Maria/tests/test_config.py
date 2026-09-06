@@ -30,7 +30,7 @@ class ConfigTests(unittest.TestCase):
         config = load_config(CONFIG_PATH)
 
         self.assertEqual(config.app_name, "Maria")
-        self.assertEqual(config.version, "0.1.0")
+        self.assertEqual(config.version, "0.1.1")
         self.assertEqual(config.environment, "development")
         self.assertEqual(
             config.database_path,
@@ -313,7 +313,7 @@ class ConfigTests(unittest.TestCase):
         config = self._load("")
 
         self.assertEqual(config.app_name, "Maria")
-        self.assertEqual(config.version, "0.1.0")
+        self.assertEqual(config.version, APP_VERSION)
         self.assertEqual(config.environment, "development")
         self.assertEqual(config.log_level, "INFO")
 

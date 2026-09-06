@@ -2,6 +2,8 @@
 
 ## Unreleased
 
+## 0.1.1 - 2026-09-06
+
 - Made `create note` require an explicit first-colon separator between title
   and body; `create note : <body>` still creates an explicitly untitled
   (`Untitled`) note, and `create note <text>` with no colon now returns a
