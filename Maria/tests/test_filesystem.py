@@ -5,6 +5,7 @@ from __future__ import annotations
 import errno
 import logging
 import os
+import shutil
 import unittest
 from pathlib import Path
 from tempfile import TemporaryDirectory
@@ -14,7 +15,14 @@ import tools.filesystem as filesystem_module
 from core.config import MariaConfig
 from core.constants import DEFAULT_TEXT_READ_LIMIT_BYTES
 from core.tool_manager import ToolExecutionResult
-from tools.filesystem import FilesystemTool, build_tool
+from tools.filesystem import (
+    PATH_OUTSIDE_ROOT_MESSAGE,
+    PATH_REQUIRED_MESSAGE,
+    UNCONTAINED_DISPLAY,
+    UNSPECIFIED_FAILURE_REASON,
+    FilesystemTool,
+    build_tool,
+)
 
 
 class FilesystemToolTests(unittest.TestCase):
@@ -90,24 +98,21 @@ class FilesystemToolTests(unittest.TestCase):
         self.assertEqual(result.message, "before\ufffdafter")
 
     def test_missing_file_is_a_controlled_failure(self) -> None:
-        missing = (self.root / "missing.txt").resolve()
-
         result = self.tool.execute("read", {"path": "missing.txt"})
 
         self.assertEqual(
             result,
-            ToolExecutionResult(False, f"Not a file: {missing}"),
+            ToolExecutionResult(False, "Not a file: missing.txt"),
         )
 
     def test_reading_a_directory_as_a_file_is_rejected(self) -> None:
-        directory = self.root / "documents"
-        directory.mkdir()
+        (self.root / "documents").mkdir()
 
         result = self.tool.execute("read", {"path": "documents"})
 
         self.assertEqual(
             result,
-            ToolExecutionResult(False, f"Not a file: {directory.resolve()}"),
+            ToolExecutionResult(False, "Not a file: documents"),
         )
 
     def test_maximum_file_read_limit_is_enforced_at_its_boundary(self) -> None:
@@ -159,20 +164,18 @@ class FilesystemToolTests(unittest.TestCase):
         )
 
     def test_missing_directory_and_file_as_directory_are_rejected(self) -> None:
-        file_path = self.root / "plain.txt"
-        file_path.write_text("plain", encoding="utf-8")
-        missing = (self.root / "missing-directory").resolve()
+        (self.root / "plain.txt").write_text("plain", encoding="utf-8")
 
         cases = (
-            ("missing-directory", missing),
-            ("plain.txt", file_path.resolve()),
+            ("missing-directory", "missing-directory"),
+            ("plain.txt", "plain.txt"),
         )
-        for value, resolved in cases:
+        for value, displayed in cases:
             with self.subTest(path=value):
                 result = self.tool.execute("list", {"path": value})
                 self.assertEqual(
                     result,
-                    ToolExecutionResult(False, f"Not a directory: {resolved}"),
+                    ToolExecutionResult(False, f"Not a directory: {displayed}"),
                 )
 
     def test_relative_and_absolute_paths_inside_root_are_accepted(self) -> None:
@@ -310,8 +313,6 @@ class FilesystemToolTests(unittest.TestCase):
         )
 
     def test_rename_rejects_missing_source(self) -> None:
-        source = (self.root / "missing.txt").resolve()
-
         result = self.tool.execute(
             "rename",
             {"source": "missing.txt", "destination": "new.txt"},
@@ -319,7 +320,7 @@ class FilesystemToolTests(unittest.TestCase):
 
         self.assertEqual(
             result,
-            ToolExecutionResult(False, f"Source does not exist: {source}"),
+            ToolExecutionResult(False, "Source does not exist: missing.txt"),
         )
 
     def test_rename_rejects_existing_destination_and_preserves_it(self) -> None:
@@ -337,7 +338,7 @@ class FilesystemToolTests(unittest.TestCase):
             result,
             ToolExecutionResult(
                 False,
-                f"Destination already exists: {destination.resolve()}",
+                "Destination already exists: destination.txt",
             ),
         )
         self.assertEqual(source.read_text(encoding="utf-8"), "source content")
@@ -418,7 +419,7 @@ class FilesystemToolTests(unittest.TestCase):
             result,
             ToolExecutionResult(
                 False,
-                f"Destination already exists: {destination.resolve()}",
+                "Destination already exists: destination.txt",
             ),
         )
         self.assertEqual(source.read_text(encoding="utf-8"), "source content")
@@ -466,8 +467,12 @@ class FilesystemToolTests(unittest.TestCase):
 
         self.assertEqual(
             result,
-            ToolExecutionResult(False, "File read failed: read blocked"),
+            ToolExecutionResult(
+                False,
+                f"File read failed: {UNSPECIFIED_FAILURE_REASON}",
+            ),
         )
+        self.assertNotIn("read blocked", result.message)
 
     def test_mocked_shutil_move_failure_does_not_report_success(self) -> None:
         source = self.root / "source.txt"
@@ -486,8 +491,12 @@ class FilesystemToolTests(unittest.TestCase):
 
         self.assertEqual(
             result,
-            ToolExecutionResult(False, "Move failed: move blocked"),
+            ToolExecutionResult(
+                False,
+                f"Move failed: {UNSPECIFIED_FAILURE_REASON}",
+            ),
         )
+        self.assertNotIn("move blocked", result.message)
         self.assertTrue(source.exists())
         self.assertFalse(destination.exists())
 
@@ -507,9 +516,10 @@ class FilesystemToolTests(unittest.TestCase):
                 {"source": source.name, "destination": destination.name},
             )
 
-        self.assertFalse(result.success)
-        self.assertTrue(result.message.startswith("Move failed: "))
-        self.assertIn("Invalid cross-device link", result.message)
+        self.assertEqual(
+            result.message,
+            f"Move failed: {os.strerror(errno.EXDEV)}",
+        )
         self.assertTrue(source.exists())
         self.assertFalse(destination.exists())
 
@@ -525,6 +535,363 @@ class FilesystemToolTests(unittest.TestCase):
         self.logger.info.assert_called_once_with("Read file: %s", path.resolve())
         logged_calls = " ".join(str(entry) for entry in self.logger.method_calls)
         self.assertNotIn(content, logged_calls)
+
+
+class FilesystemDisplayPathTests(unittest.TestCase):
+    """Exercise safe-root-relative display paths in user-facing messages."""
+
+    def setUp(self) -> None:
+        self.temporary_directory = TemporaryDirectory()
+        self.addCleanup(self.temporary_directory.cleanup)
+        self.temporary_path = Path(self.temporary_directory.name)
+        self.root = self.temporary_path / "safe root"
+        self.root.mkdir()
+        self.logger = Mock(spec=logging.Logger)
+        self.tool = FilesystemTool(self.root, logger=self.logger)
+
+    def test_safe_root_itself_displays_as_a_single_dot(self) -> None:
+        result = self.tool.execute("read", {"path": "."})
+
+        self.assertEqual(result, ToolExecutionResult(False, "Not a file: ."))
+
+    def test_nested_display_paths_use_forward_slashes(self) -> None:
+        (self.root / "a b" / "c d").mkdir(parents=True)
+
+        result = self.tool.execute("list", {"path": "a b/c d/missing"})
+
+        self.assertEqual(
+            result,
+            ToolExecutionResult(False, "Not a directory: a b/c d/missing"),
+        )
+        self.assertNotIn("\\", result.message)
+
+    def test_absolute_input_inside_root_is_displayed_relatively(self) -> None:
+        (self.root / "nested").mkdir()
+        absolute = (self.root / "nested" / "missing.txt").resolve()
+
+        result = self.tool.execute("read", {"path": str(absolute)})
+
+        self.assertEqual(
+            result,
+            ToolExecutionResult(False, "Not a file: nested/missing.txt"),
+        )
+        self.assertNotIn(str(self.tool.root_path), result.message)
+
+    def test_redundant_dot_and_parent_components_are_resolved_away(self) -> None:
+        (self.root / "nested").mkdir()
+
+        result = self.tool.execute("read", {"path": "nested/../missing.txt"})
+
+        self.assertEqual(
+            result,
+            ToolExecutionResult(False, "Not a file: missing.txt"),
+        )
+
+    def test_spaces_and_unicode_survive_display_conversion(self) -> None:
+        result = self.tool.execute(
+            "read",
+            {"path": "Ünïcode dir/naïve Müller.txt"},
+        )
+
+        self.assertEqual(
+            result,
+            ToolExecutionResult(False, "Not a file: Ünïcode dir/naïve Müller.txt"),
+        )
+
+    def test_quote_characters_remain_literal_in_display_paths(self) -> None:
+        result = self.tool.execute("read", {"path": "'quoted note.txt'"})
+
+        self.assertEqual(
+            result,
+            ToolExecutionResult(False, "Not a file: 'quoted note.txt'"),
+        )
+
+    def test_nested_rename_success_displays_both_relative_paths(self) -> None:
+        source = self.root / "nest" / "old name.txt"
+        destination = self.root / "other" / "new name.txt"
+        source.parent.mkdir()
+        destination.parent.mkdir()
+        source.write_text("preserved", encoding="utf-8")
+
+        result = self.tool.execute(
+            "rename",
+            {"source": "nest/old name.txt", "destination": "other/new name.txt"},
+        )
+
+        self.assertEqual(
+            result,
+            ToolExecutionResult(
+                True,
+                "Renamed nest/old name.txt to other/new name.txt.",
+                {
+                    "source": str(source.resolve()),
+                    "destination": str(destination.resolve()),
+                },
+            ),
+        )
+        self.assertEqual(destination.read_text(encoding="utf-8"), "preserved")
+
+    def test_nested_move_success_displays_both_relative_paths(self) -> None:
+        source = self.root / "inbox" / "Customer Order.txt"
+        destination = self.root / "archive" / "processed" / "Customer Order.txt"
+        source.parent.mkdir()
+        source.write_text("order", encoding="utf-8")
+
+        result = self.tool.execute(
+            "move",
+            {
+                "source": "inbox/Customer Order.txt",
+                "destination": "archive/processed/Customer Order.txt",
+            },
+        )
+
+        self.assertEqual(
+            result,
+            ToolExecutionResult(
+                True,
+                "Moved inbox/Customer Order.txt to "
+                "archive/processed/Customer Order.txt.",
+                {
+                    "source": str(source.resolve()),
+                    "destination": str(destination.resolve()),
+                },
+            ),
+        )
+        self.assertNotIn(str(self.tool.root_path), result.message)
+        self.assertEqual(destination.read_text(encoding="utf-8"), "order")
+
+    def test_successful_data_fields_remain_canonical_absolute_paths(self) -> None:
+        path = self.root / "nested" / "inside.txt"
+        path.parent.mkdir()
+        path.write_text("inside", encoding="utf-8")
+
+        result = self.tool.execute("read", {"path": "nested/inside.txt"})
+
+        self.assertEqual(result.data, {"path": str(path.resolve())})
+        self.assertTrue(Path(result.data["path"]).is_absolute())
+
+    def test_outside_root_rejection_stays_generic_and_hides_the_path(self) -> None:
+        outside = self.temporary_path / "outside.txt"
+        outside.write_text("outside", encoding="utf-8")
+
+        for value in (str(outside.resolve()), "../outside.txt"):
+            with self.subTest(path=value):
+                result = self.tool.execute("read", {"path": value})
+                self.assertEqual(
+                    result,
+                    ToolExecutionResult(
+                        False,
+                        f"File read failed: {PATH_OUTSIDE_ROOT_MESSAGE}",
+                    ),
+                )
+                self.assertNotIn(str(outside.resolve()), result.message)
+                self.assertNotIn(str(self.tool.root_path), result.message)
+
+    def test_display_helper_fallback_never_exposes_the_safe_root(self) -> None:
+        escaped = (self.temporary_path / "elsewhere.txt").resolve()
+
+        displayed = self.tool._display_path(escaped)
+
+        self.assertEqual(displayed, UNCONTAINED_DISPLAY)
+        self.assertNotIn(str(self.tool.root_path), displayed)
+        self.assertNotIn(str(escaped), displayed)
+
+    def test_empty_path_keeps_its_controlled_value_error_message(self) -> None:
+        result = self.tool.execute("read", {"path": "   "})
+
+        self.assertEqual(
+            result,
+            ToolExecutionResult(False, f"File read failed: {PATH_REQUIRED_MESSAGE}"),
+        )
+
+
+class FilesystemFailureSanitizationTests(unittest.TestCase):
+    """Prove failure reasons never carry exception-supplied host paths."""
+
+    def setUp(self) -> None:
+        self.temporary_directory = TemporaryDirectory()
+        self.addCleanup(self.temporary_directory.cleanup)
+        self.temporary_path = Path(self.temporary_directory.name)
+        self.root = self.temporary_path / "safe root"
+        self.root.mkdir()
+        self.logger = Mock(spec=logging.Logger)
+        self.tool = FilesystemTool(self.root, logger=self.logger)
+        self.source = self.root / "source.txt"
+        self.source.write_text("source", encoding="utf-8")
+        self.directory = self.root / "listing"
+        self.directory.mkdir()
+
+    def _poisoned_error(self) -> OSError:
+        """Build an OSError whose every text field carries an absolute path."""
+        return OSError(
+            errno.EACCES,
+            f"strerror leaking {self.tool.root_path}",
+            str(self.source.resolve()),
+            None,
+            str((self.root / "destination.txt").resolve()),
+        )
+
+    def _assert_sanitized(self, message: str, prefix: str) -> None:
+        """Assert a message keeps only the errno-derived reason."""
+        error = self._poisoned_error()
+        self.assertEqual(message, f"{prefix}: {os.strerror(errno.EACCES)}")
+        self.assertNotIn(str(self.tool.root_path), message)
+        self.assertNotIn(error.strerror, message)
+        self.assertNotIn(error.filename, message)
+        self.assertNotIn(error.filename2, message)
+
+    def test_every_action_reports_only_the_errno_derived_reason(self) -> None:
+        cases = (
+            (
+                "read",
+                {"path": "source.txt"},
+                "File read failed",
+                lambda exc: patch.object(Path, "read_text", side_effect=exc),
+            ),
+            (
+                "list",
+                {"path": "listing"},
+                "Directory listing failed",
+                lambda exc: patch.object(Path, "iterdir", side_effect=exc),
+            ),
+            (
+                "rename",
+                {"source": "source.txt", "destination": "renamed.txt"},
+                "Rename failed",
+                lambda exc: patch.object(Path, "rename", side_effect=exc),
+            ),
+            (
+                "move",
+                {"source": "source.txt", "destination": "moved.txt"},
+                "Move failed",
+                lambda exc: patch.object(
+                    filesystem_module.shutil,
+                    "move",
+                    side_effect=exc,
+                ),
+            ),
+        )
+
+        for action, arguments, prefix, patcher in cases:
+            with self.subTest(action=action):
+                with patcher(self._poisoned_error()):
+                    result = self.tool.execute(action, arguments)
+
+                self.assertFalse(result.success)
+                self._assert_sanitized(result.message, prefix)
+
+    def test_oserror_without_a_usable_errno_uses_the_generic_fallback(self) -> None:
+        blocked = OSError(f"no errno but leaking {self.tool.root_path}")
+        self.assertIsNone(blocked.errno)
+
+        with patch.object(Path, "read_text", side_effect=blocked):
+            result = self.tool.execute("read", {"path": "source.txt"})
+
+        self.assertEqual(
+            result,
+            ToolExecutionResult(
+                False,
+                f"File read failed: {UNSPECIFIED_FAILURE_REASON}",
+            ),
+        )
+        self.assertNotIn(str(self.tool.root_path), result.message)
+
+    def test_shutil_error_with_absolute_paths_uses_the_generic_fallback(self) -> None:
+        destination = self.root / "nested" / "destination.txt"
+        failure = shutil.Error(
+            f"Cannot move a directory '{self.source.resolve()}' "
+            f"into itself '{destination.resolve()}'."
+        )
+        self.assertIsInstance(failure, OSError)
+        self.assertIsNone(failure.errno)
+
+        with patch.object(filesystem_module.shutil, "move", side_effect=failure):
+            result = self.tool.execute(
+                "move",
+                {"source": "source.txt", "destination": "nested/destination.txt"},
+            )
+
+        self.assertEqual(
+            result,
+            ToolExecutionResult(
+                False,
+                f"Move failed: {UNSPECIFIED_FAILURE_REASON}",
+            ),
+        )
+        self.assertNotIn(str(self.tool.root_path), result.message)
+
+    def test_unexpected_value_error_uses_the_generic_fallback(self) -> None:
+        leaking = ValueError(f"unexpected failure at {self.source.resolve()}")
+
+        with patch.object(Path, "read_text", side_effect=leaking):
+            result = self.tool.execute("read", {"path": "source.txt"})
+
+        self.assertEqual(
+            result,
+            ToolExecutionResult(
+                False,
+                f"File read failed: {UNSPECIFIED_FAILURE_REASON}",
+            ),
+        )
+        self.assertNotIn(str(self.tool.root_path), result.message)
+
+    def test_controlled_value_error_messages_are_preserved(self) -> None:
+        cases = (
+            ({"path": ""}, PATH_REQUIRED_MESSAGE),
+            ({"path": "../escape.txt"}, PATH_OUTSIDE_ROOT_MESSAGE),
+        )
+
+        for arguments, expected in cases:
+            with self.subTest(path=arguments["path"]):
+                result = self.tool.execute("read", arguments)
+                self.assertEqual(
+                    result,
+                    ToolExecutionResult(False, f"File read failed: {expected}"),
+                )
+
+    def test_safe_path_raises_exactly_the_controlled_messages(self) -> None:
+        with self.assertRaises(ValueError) as required:
+            self.tool._safe_path("   ")
+        with self.assertRaises(ValueError) as outside:
+            self.tool._safe_path("../escape.txt")
+
+        self.assertEqual(str(required.exception), PATH_REQUIRED_MESSAGE)
+        self.assertEqual(str(outside.exception), PATH_OUTSIDE_ROOT_MESSAGE)
+
+    def test_temporary_log_keeps_diagnostics_the_response_no_longer_shows(self) -> None:
+        log_directory = self.temporary_path / "logs"
+        log_directory.mkdir()
+        log_file = log_directory / "maria-test.log"
+        file_logger = logging.getLogger("maria-filesystem-sanitization-test")
+        file_logger.setLevel(logging.INFO)
+        file_logger.propagate = False
+        handler = logging.FileHandler(log_file, encoding="utf-8")
+        handler.setFormatter(logging.Formatter("%(levelname)s | %(message)s"))
+        file_logger.addHandler(handler)
+        self.addCleanup(file_logger.removeHandler, handler)
+        self.addCleanup(handler.close)
+        tool = FilesystemTool(self.root, logger=file_logger)
+        error = self._poisoned_error()
+
+        with patch.object(filesystem_module.shutil, "move", side_effect=error):
+            result = tool.execute(
+                "move",
+                {"source": "source.txt", "destination": "destination.txt"},
+            )
+
+        handler.flush()
+        logged = log_file.read_text(encoding="utf-8")
+
+        self.assertEqual(
+            result.message,
+            f"Move failed: {os.strerror(errno.EACCES)}",
+        )
+        self.assertNotIn(str(tool.root_path), result.message)
+        self.assertIn(str(tool.root_path), logged)
+        # OSError renders filenames through repr(), so the log holds the
+        # escaped form of each absolute path.
+        self.assertIn(repr(error.filename), logged)
+        self.assertIn(repr(error.filename2), logged)
 
 
 if __name__ == "__main__":
