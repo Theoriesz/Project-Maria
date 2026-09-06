@@ -77,6 +77,67 @@ class PlannerRegressionTests(unittest.TestCase):
             ),
         )
 
+    def test_create_note_with_only_colon_creates_untitled_note(self) -> None:
+        self._assert_single_step(
+            "create note : Ship the test suite",
+            PlanStep(
+                "notes",
+                "create",
+                {"title": "Untitled", "body": "Ship the test suite"},
+            ),
+        )
+
+    def test_create_note_missing_colon_returns_controlled_usage_response(
+        self,
+    ) -> None:
+        cases = (
+            "create note Project Plan",
+            "note Project Plan",
+            "CREATE NOTE Project Plan",
+        )
+
+        for request in cases:
+            with self.subTest(request=request):
+                plan = self.planner.create_plan(request)
+                self.assertEqual(plan.steps, ())
+                self.assertEqual(
+                    plan.response_if_no_action,
+                    "Use: create note <title>: <body>",
+                )
+
+    def test_create_note_splits_only_on_the_first_colon(self) -> None:
+        self._assert_single_step(
+            "create note Links: Documentation: https://example.com/path?a=1",
+            PlanStep(
+                "notes",
+                "create",
+                {
+                    "title": "Links",
+                    "body": "Documentation: https://example.com/path?a=1",
+                },
+            ),
+        )
+
+    def test_create_note_trims_outer_whitespace_and_preserves_internal_spacing(
+        self,
+    ) -> None:
+        self._assert_single_step(
+            "create note   Title  :   Body with   spaces",
+            PlanStep(
+                "notes",
+                "create",
+                {"title": "Title", "body": "Body with   spaces"},
+            ),
+        )
+
+    def test_create_note_with_colon_and_empty_body_still_creates_a_step(
+        self,
+    ) -> None:
+        self._assert_single_step(
+            "create note Title:",
+            PlanStep("notes", "create", {"title": "Title", "body": ""}),
+        )
+
     def test_notes_maps_to_exact_step(self) -> None:
         self._assert_single_step("notes", PlanStep("notes", "list", {}))
 

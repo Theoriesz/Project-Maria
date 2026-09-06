@@ -113,7 +113,10 @@ class Planner:
 
         if lowered.startswith(("create note ", "note ")):
             note_text = _remove_note_prefix(text)
-            title, body = _parse_note(note_text)
+            parsed_note = _parse_note(note_text)
+            if parsed_note is None:
+                return self._no_action(text, "Use: create note <title>: <body>")
+            title, body = parsed_note
             return self._single_step(
                 text,
                 "notes",
@@ -190,12 +193,12 @@ def _remove_note_prefix(text: str) -> str:
     return text[len("note ") :].strip()
 
 
-def _parse_note(note_text: str) -> tuple[str, str]:
-    """Parse note text into title and body."""
-    if ":" in note_text:
-        title, body = note_text.split(":", maxsplit=1)
-        return title.strip() or "Untitled", body.strip()
-    return "Untitled", note_text.strip()
+def _parse_note(note_text: str) -> tuple[str, str] | None:
+    """Parse note text, or return None when the required colon is missing."""
+    if ":" not in note_text:
+        return None
+    title, body = note_text.split(":", maxsplit=1)
+    return title.strip() or "Untitled", body.strip()
 
 
 def _help_text() -> str:

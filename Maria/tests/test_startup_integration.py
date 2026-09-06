@@ -117,6 +117,54 @@ class StartupIntegrationTests(unittest.TestCase):
         )
         self.assertEqual(self.brain.memory.database_path, self.database_path)
 
+    def test_missing_colon_note_command_performs_no_note_action(self) -> None:
+        def _row_counts() -> tuple[int, int]:
+            connection = sqlite3.connect(self.database_path)
+            try:
+                notes = connection.execute(
+                    "SELECT COUNT(*) FROM notes"
+                ).fetchone()[0]
+                interactions = connection.execute(
+                    "SELECT COUNT(*) FROM interactions"
+                ).fetchone()[0]
+            finally:
+                connection.close()
+            return notes, interactions
+
+        notes_before, interactions_before = _row_counts()
+
+        response = self.brain.process("create note Project Plan")
+
+        self.assertEqual(response.text, "Use: create note <title>: <body>")
+        self.assertFalse(response.needs_confirmation)
+
+        notes_after, interactions_after = _row_counts()
+        self.assertEqual(notes_after, notes_before)
+        self.assertEqual(interactions_after, interactions_before + 1)
+
+    def test_missing_colon_note_command_does_not_reach_notes_tool(self) -> None:
+        notes_tool = self.brain.tool_manager._tools["notes"]
+
+        with patch.object(
+            notes_tool,
+            "execute",
+            wraps=notes_tool.execute,
+        ) as notes_execute:
+            response = self.brain.process("create note Project Plan")
+
+        notes_execute.assert_not_called()
+        self.assertEqual(response.text, "Use: create note <title>: <body>")
+
+    def test_explicit_untitled_note_creation_still_works(self) -> None:
+        created = self.brain.process("create note : Stored without a title")
+        retrieved = self.brain.process("read note Untitled")
+
+        self.assertEqual(created.text, "Created note 1: Untitled")
+        self.assertEqual(
+            retrieved.text,
+            "Untitled\nStored without a title",
+        )
+
     def test_explicit_memory_round_trip_uses_only_temporary_database(self) -> None:
         fact = "Startup integration token is TEMPORARY-ONLY"
 
