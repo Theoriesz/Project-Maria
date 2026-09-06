@@ -109,7 +109,25 @@ class NotesToolTests(unittest.TestCase):
             [second_id, first_id],
         )
 
-    def test_listing_uses_the_current_default_limit(self) -> None:
+    def test_listing_with_exactly_twenty_rows_has_no_suffix(self) -> None:
+        note_ids = [
+            self.memory.create_note(f"Note {index}", f"Body {index}")
+            for index in range(20)
+        ]
+
+        result = self.tool.execute("list", {})
+
+        self.assertTrue(result.success)
+        self.assertEqual(len(result.data), 20)
+        self.assertEqual(
+            [note["id"] for note in result.data],
+            list(reversed(note_ids)),
+        )
+        self.assertNotIn("More notes exist.", result.message)
+
+    def test_listing_with_more_than_twenty_rows_shows_newest_twenty_and_suffix(
+        self,
+    ) -> None:
         note_ids = [
             self.memory.create_note(f"Note {index}", f"Body {index}")
             for index in range(21)
@@ -123,6 +141,56 @@ class NotesToolTests(unittest.TestCase):
             [note["id"] for note in result.data],
             list(reversed(note_ids[1:])),
         )
+        expected_lines = [
+            f"{note_ids[index]}: Note {index}" for index in range(20, 0, -1)
+        ]
+        self.assertEqual(
+            result.message,
+            "\n".join(expected_lines)
+            + "\nShowing the newest 20 notes. More notes exist.",
+        )
+
+    def test_listing_with_many_more_than_twenty_rows_still_shows_newest_twenty(
+        self,
+    ) -> None:
+        note_ids = [
+            self.memory.create_note(f"Note {index}", f"Body {index}")
+            for index in range(30)
+        ]
+
+        result = self.tool.execute("list", {})
+
+        self.assertTrue(result.success)
+        self.assertEqual(len(result.data), 20)
+        self.assertEqual(
+            [note["id"] for note in result.data],
+            list(reversed(note_ids[10:])),
+        )
+        self.assertTrue(
+            result.message.endswith(
+                "Showing the newest 20 notes. More notes exist."
+            )
+        )
+        self.assertEqual(
+            result.message.count("Showing the newest 20 notes. More notes exist."),
+            1,
+        )
+
+    def test_explicit_non_default_limit_preserves_existing_behavior(self) -> None:
+        note_ids = [
+            self.memory.create_note(f"Note {index}", f"Body {index}")
+            for index in range(21)
+        ]
+
+        result = self.tool.execute("list", {"limit": 5})
+
+        self.assertTrue(result.success)
+        self.assertEqual(len(result.data), 5)
+        self.assertEqual(
+            [note["id"] for note in result.data],
+            list(reversed(note_ids[16:])),
+        )
+        self.assertNotIn("More notes exist.", result.message)
 
     def test_memory_note_limits_are_clamped_to_public_boundaries(self) -> None:
         note_ids = [

@@ -135,6 +135,103 @@ class MemoryToolTests(unittest.TestCase):
             [second_id, first_id],
         )
 
+    def test_search_with_exactly_twenty_matches_has_no_suffix(self) -> None:
+        memory_ids = [
+            self.memory.store_memory(f"Fact {index}")[0] for index in range(20)
+        ]
+
+        result = self.tool.execute("search", {"query": "FACT"})
+
+        self.assertTrue(result.success)
+        self.assertEqual(len(result.data), 20)
+        self.assertEqual(
+            [memory["id"] for memory in result.data],
+            list(reversed(memory_ids)),
+        )
+        self.assertNotIn("Showing the newest", result.message)
+
+    def test_search_with_more_than_twenty_matches_shows_newest_twenty_and_suffix(
+        self,
+    ) -> None:
+        memory_ids = [
+            self.memory.store_memory(f"Fact {index}")[0] for index in range(21)
+        ]
+
+        result = self.tool.execute("search", {"query": "FACT"})
+
+        self.assertTrue(result.success)
+        self.assertEqual(len(result.data), 20)
+        self.assertEqual(
+            [memory["id"] for memory in result.data],
+            list(reversed(memory_ids[1:])),
+        )
+        expected_lines = [
+            f"{memory_ids[index]}: Fact {index}" for index in range(20, 0, -1)
+        ]
+        expected_suffix = "Showing the newest 20 matches. More matching memories exist."
+        self.assertEqual(
+            result.message,
+            "\n".join(expected_lines) + "\n" + expected_suffix,
+        )
+        self.assertEqual(result.message.count(expected_suffix), 1)
+
+    def test_list_with_exactly_twenty_rows_has_no_suffix(self) -> None:
+        memory_ids = [
+            self.memory.store_memory(f"Fact {index}")[0] for index in range(20)
+        ]
+
+        result = self.tool.execute("list", {})
+
+        self.assertTrue(result.success)
+        self.assertEqual(len(result.data), 20)
+        self.assertEqual(
+            [memory["id"] for memory in result.data],
+            list(reversed(memory_ids)),
+        )
+        self.assertNotIn("Showing the newest", result.message)
+
+    def test_list_with_more_than_twenty_rows_shows_newest_twenty_and_suffix(
+        self,
+    ) -> None:
+        memory_ids = [
+            self.memory.store_memory(f"Fact {index}")[0] for index in range(21)
+        ]
+
+        result = self.tool.execute("list", {})
+
+        self.assertTrue(result.success)
+        self.assertEqual(len(result.data), 20)
+        self.assertEqual(
+            [memory["id"] for memory in result.data],
+            list(reversed(memory_ids[1:])),
+        )
+        expected_lines = [
+            f"{memory_ids[index]}: Fact {index}" for index in range(20, 0, -1)
+        ]
+        expected_suffix = "Showing the newest 20 memories. More memories exist."
+        self.assertEqual(
+            result.message,
+            "\n".join(expected_lines) + "\n" + expected_suffix,
+        )
+        self.assertEqual(result.message.count(expected_suffix), 1)
+
+    def test_explicit_non_default_limit_preserves_existing_behavior(self) -> None:
+        memory_ids = [
+            self.memory.store_memory(f"Fact {index}")[0] for index in range(21)
+        ]
+
+        search_result = self.tool.execute("search", {"query": "FACT", "limit": 5})
+        list_result = self.tool.execute("list", {"limit": 5})
+
+        for result in (search_result, list_result):
+            self.assertTrue(result.success)
+            self.assertEqual(len(result.data), 5)
+            self.assertEqual(
+                [memory["id"] for memory in result.data],
+                list(reversed(memory_ids[16:])),
+            )
+            self.assertNotIn("Showing the newest", result.message)
+
     def test_no_match_is_a_successful_result(self) -> None:
         self.memory.store_memory("My editor is VS Code")
 

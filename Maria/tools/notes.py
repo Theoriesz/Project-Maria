@@ -10,6 +10,10 @@ from core.memory import Memory
 from core.tool_manager import ToolExecutionResult
 
 
+_DEFAULT_LIST_LIMIT = 20
+_MORE_NOTES_SUFFIX = "Showing the newest 20 notes. More notes exist."
+
+
 class NotesTool:
     """Create and retrieve notes through the memory layer."""
 
@@ -58,12 +62,14 @@ class NotesTool:
     def _list(self, arguments: dict[str, Any]) -> ToolExecutionResult:
         """List notes."""
         try:
-            limit = int(arguments.get("limit", 20))
+            limit = int(arguments.get("limit", _DEFAULT_LIST_LIMIT))
         except (TypeError, ValueError):
             return ToolExecutionResult(False, "Notes limit must be a number.")
 
+        probe_default = limit == _DEFAULT_LIST_LIMIT
+        query_limit = limit + 1 if probe_default else limit
         try:
-            notes = self.memory.list_notes(limit=limit)
+            notes = self.memory.list_notes(limit=query_limit)
         except RuntimeError as exc:
             self.logger.warning("Note listing failed: %s", exc)
             return ToolExecutionResult(False, f"Note listing failed: {exc}")
@@ -71,8 +77,14 @@ class NotesTool:
         if not notes:
             return ToolExecutionResult(True, "No notes found.", [])
 
-        lines = [f"{note['id']}: {note['title']}" for note in notes]
-        return ToolExecutionResult(True, "\n".join(lines), notes)
+        has_more = probe_default and len(notes) > _DEFAULT_LIST_LIMIT
+        visible_notes = notes[:_DEFAULT_LIST_LIMIT] if probe_default else notes
+
+        lines = [f"{note['id']}: {note['title']}" for note in visible_notes]
+        message = "\n".join(lines)
+        if has_more:
+            message = f"{message}\n{_MORE_NOTES_SUFFIX}"
+        return ToolExecutionResult(True, message, visible_notes)
 
     def _read(self, arguments: dict[str, Any]) -> ToolExecutionResult:
         """Read one note by id or exact title."""

@@ -107,8 +107,8 @@ class BrainMemoryIntegrationTests(unittest.TestCase):
             ],
         )
         store_memory.assert_called_once_with(fact)
-        search_memories.assert_called_once_with("EDITOR", limit=20)
-        list_memories.assert_called_once_with(limit=20)
+        search_memories.assert_called_once_with("EDITOR", limit=21)
+        list_memories.assert_called_once_with(limit=21)
         self.assertEqual(record_interaction.call_count, 3)
 
         interactions = self.memory.get_recent_interactions(limit=10)

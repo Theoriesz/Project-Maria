@@ -2,6 +2,12 @@
 
 ## Unreleased
 
+- Made the existing newest-20 display limit visible for `notes`, `memories`, and
+  `recall <query>`: when more than 20 rows exist, only the newest 20 are shown
+  and one line is appended stating that more results exist. Output for 20 or
+  fewer results, ordering, storage, schema, permissions, and command grammar are
+  all unchanged.
+
 ## 0.1.1 - 2026-09-06
 
 - Made `create note` require an explicit first-colon separator between title
