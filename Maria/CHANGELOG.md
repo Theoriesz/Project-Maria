@@ -2,6 +2,11 @@
 
 ## Unreleased
 
+- Made `create note` require an explicit first-colon separator between title
+  and body; `create note : <body>` still creates an explicitly untitled
+  (`Untitled`) note, and `create note <text>` with no colon now returns a
+  controlled `Use: create note <title>: <body>` response instead of silently
+  creating an Untitled note.
 - Widened the CLI confirmation prompt to accept `y` or `yes` to approve and
   `n` or `no` to cancel, case- and whitespace-insensitively, with blank or
   unrecognized input re-prompting instead of cancelling; EOF and Ctrl+C still

@@ -64,6 +64,27 @@ The planner does not infer commands from recent interaction context. Requests
 such as `please remember ...`, `what do you remember about ...`, and
 `memories extra` remain unsupported.
 
+## Note Creation Grammar
+
+`create note <title>: <body>` requires an explicit colon separator between
+the title and the body. Only the first colon is treated as the separator, so
+body text containing additional colons (including URLs) is preserved intact.
+
+`create note : <body>` is the explicit way to create an untitled note; the
+title is stored as `Untitled`.
+
+When operand text follows the note command but contains no colon, the
+planner creates no executable note step and returns the matching usage
+response instead. For example, `create note Project Plan` returns:
+
+```text
+Use: create note <title>: <body>
+```
+
+The truly bare `create note` command (no operand text at all) is unaffected
+by this grammar and keeps the planner's existing generic unsupported-command
+response.
+
 ## Plan Shape
 
 A plan contains:
