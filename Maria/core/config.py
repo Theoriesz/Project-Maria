@@ -12,7 +12,7 @@ try:
 except ModuleNotFoundError as exc:  # pragma: no cover - Python < 3.11 only.
     raise RuntimeError("Maria requires Python 3.11 or newer for TOML support.") from exc
 
-from core.constants import CONFIG_PATH, PROJECT_ROOT
+from core.constants import APP_VERSION, CONFIG_PATH, PROJECT_ROOT
 from core.permissions import (
     MANDATORY_CONFIRMATION_ACTIONS,
     MANDATORY_DENIED_ACTIONS,
@@ -63,7 +63,7 @@ def load_config(config_path: Path = CONFIG_PATH) -> MariaConfig:
 
     return MariaConfig(
         app_name=str(app.get("name", "Maria")),
-        version=str(app.get("version", "0.1.0")),
+        version=str(app.get("version", APP_VERSION)),
         environment=str(app.get("environment", "development")),
         database_path=_resolve_project_path(paths.get("database", "database/maria.db")),
         log_dir=_resolve_project_path(paths.get("logs", "logs")),
