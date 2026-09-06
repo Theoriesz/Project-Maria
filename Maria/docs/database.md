@@ -67,6 +67,14 @@ Stores simple notes created by the notes tool.
 | created_at | TEXT NOT NULL | UTC ISO 8601 timestamp |
 | updated_at | TEXT NOT NULL | UTC ISO 8601 timestamp |
 
+Notes are returned newest first by `updated_at` descending and then `id`
+descending. The CLI normally returns at most 20 rows. When the notes tool's
+`list` action runs at the default limit of 20, it requests one additional row
+solely to prove whether a 21st (older) row exists; that extra row is never
+included in the displayed message or returned tool data, which both remain
+capped at 20. If the extra row is present, the tool appends one line stating
+that more notes exist. This does not delete, expire, or prune any row.
+
 ### memories
 
 Stores facts that the user deliberately saves as explicit memories.
@@ -103,6 +111,15 @@ Search and list results contain `id`, `fact`, and `created_at`. Both operations
 order rows by `created_at` descending and then `id` descending. The CLI normally
 returns at most 20 rows. Direct `search_memories()` and `list_memories()` calls
 default to 20 and clamp requested limits to the range 1 through 100.
+
+When the memory tool's `search` or `list` action runs at the default limit of 20,
+it requests one additional row from `search_memories()`/`list_memories()` solely
+to prove whether a 21st (older) row exists; that extra row is never included in
+the displayed message or returned tool data, which both remain capped at 20. If
+the extra row is present, the tool appends one line stating that more results
+exist. This probing does not apply when an explicit non-default limit is
+requested, and it does not delete, expire, or prune any row — it only affects
+how the tool decides whether to mention that older rows were left out.
 
 Literal substring retrieval scans the stored normalized text and is intended
 for a small personal database. No update, deletion, or `forget` operation exists

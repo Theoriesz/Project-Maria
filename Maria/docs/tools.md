@@ -26,6 +26,20 @@ any value that exceeds a bound produces a controlled calculation failure.
 These bounds protect version 0.1 execution; they are not arbitrary-precision
 math guarantees.
 
+## Notes Tool
+
+The notes tool supports `create`, `list`, and `read`. `list` returns notes newest
+first (by `updated_at`, then descending `id`) and shows at most the newest 20 by
+default. When exactly 20 or fewer notes exist, the output is unchanged. When more
+than 20 notes exist, only the newest 20 are shown and one line is appended:
+
+```text
+Showing the newest 20 notes. More notes exist.
+```
+
+An explicit non-default `limit` argument passed to the tool is honored as before
+and never produces this suffix. Empty results remain `No notes found.`.
+
 ## Memory Tool
 
 The memory tool supports exactly three actions:
@@ -42,8 +56,19 @@ Already remembered as memory <id>: <fact>
 ```
 
 The duplicate form uses the original stored fact and ID. Search and list output
-one memory per line as `<id>: <fact>`. Empty results are successful operations
-with these messages:
+one memory per line as `<id>: <fact>`, newest first. Both show at most the newest
+20 results by default; exactly 20 or fewer results leave the output unchanged.
+When more than 20 results exist, only the newest 20 are shown and one line is
+appended:
+
+```text
+Showing the newest 20 memories. More memories exist.
+Showing the newest 20 matches. More matching memories exist.
+```
+
+`list` appends the first form; `search` appends the second. An explicit
+non-default `limit` argument is honored as before and never produces either
+suffix. Empty results are successful operations with these messages:
 
 ```text
 No matching memories found.
