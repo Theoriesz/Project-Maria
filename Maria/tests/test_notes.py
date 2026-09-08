@@ -338,6 +338,43 @@ class NotesToolTests(unittest.TestCase):
                     ToolExecutionResult(False, expected_message),
                 )
 
+    def test_expected_busy_database_failures_are_controlled(self) -> None:
+        busy_text = "Database is busy. Try again shortly."
+        cases = (
+            (
+                "create",
+                "create_note",
+                {"title": "Title", "body": "Body"},
+                f"Note creation failed: {busy_text}",
+            ),
+            (
+                "list",
+                "list_notes",
+                {},
+                f"Note listing failed: {busy_text}",
+            ),
+            (
+                "read",
+                "get_note",
+                {"target": "Title"},
+                f"Note read failed: {busy_text}",
+            ),
+        )
+
+        for action, method_name, arguments, expected_message in cases:
+            with self.subTest(action=action):
+                with patch.object(
+                    self.memory,
+                    method_name,
+                    side_effect=RuntimeError(busy_text),
+                ):
+                    result = self.tool.execute(action, arguments)
+                self.assertEqual(
+                    result,
+                    ToolExecutionResult(False, expected_message),
+                )
+                self.assertNotIn(str(self.database_path), result.message)
+
     def test_second_memory_and_tool_instance_retrieves_persisted_note(self) -> None:
         created = self.tool.execute(
             "create",

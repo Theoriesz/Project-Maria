@@ -10,7 +10,19 @@ from logging import Logger
 from pathlib import Path
 from typing import Any
 
+from core.constants import DEFAULT_DATABASE_BUSY_TIMEOUT_SECONDS
 from core.logger import get_logger
+
+_DATABASE_BUSY_MESSAGE = "Database is busy. Try again shortly."
+
+_SQLITE_PRIMARY_RESULT_CODE_MASK = 0xFF
+
+_BUSY_OR_LOCKED_PRIMARY_CODES = frozenset(
+    {
+        sqlite3.SQLITE_BUSY,
+        sqlite3.SQLITE_LOCKED,
+    }
+)
 
 
 class Memory:
@@ -293,6 +305,12 @@ class Memory:
         try:
             yield connection
             connection.commit()
+        except sqlite3.Error as exc:
+            connection.rollback()
+            if _is_busy_or_locked(exc):
+                self.logger.exception("Database busy or locked.")
+                raise RuntimeError(_DATABASE_BUSY_MESSAGE) from exc
+            raise
         except Exception:
             connection.rollback()
             raise
@@ -301,9 +319,21 @@ class Memory:
 
     def _connect(self) -> sqlite3.Connection:
         """Open a SQLite connection with row dictionaries enabled."""
-        connection = sqlite3.connect(self.database_path)
+        connection = sqlite3.connect(
+            self.database_path,
+            timeout=DEFAULT_DATABASE_BUSY_TIMEOUT_SECONDS,
+        )
         connection.row_factory = sqlite3.Row
         return connection
+
+
+def _is_busy_or_locked(exc: sqlite3.Error) -> bool:
+    """Return whether exc's primary SQLite result code is BUSY or LOCKED."""
+    error_code = getattr(exc, "sqlite_errorcode", None)
+    if not isinstance(error_code, int):
+        return False
+    primary_code = error_code & _SQLITE_PRIMARY_RESULT_CODE_MASK
+    return primary_code in _BUSY_OR_LOCKED_PRIMARY_CODES
 
 
 def _utc_timestamp() -> str:

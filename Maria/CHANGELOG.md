@@ -18,6 +18,18 @@
   and one line is appended stating that more results exist. Output for 20 or
   fewer results, ordering, storage, schema, permissions, and command grammar are
   all unchanged.
+- Made SQLite busy/locked contention bounded and explicit: every database
+  connection now sets a documented 5.0-second SQLite busy timeout instead of
+  relying on the implicit default, governing SQLite's own bounded waiting for
+  `SQLITE_BUSY` contention, with no added Python retry loop, sleep, backoff,
+  or whole-operation replay. `SQLITE_BUSY` and `SQLITE_LOCKED`, including
+  extended variants of either, are classified by SQLite's numeric primary
+  result code rather than by exception text, and Maria now returns a fixed
+  `Database is busy. Try again shortly.` message if SQLite ultimately reports
+  either code, instead of that operation's generic failure text. Every other
+  SQLite failure keeps its existing operation-specific message. No Python
+  retry loop, schema, transaction, permission, command, or data-contract
+  change was introduced.
 
 ## 0.1.1 - 2026-09-06
 

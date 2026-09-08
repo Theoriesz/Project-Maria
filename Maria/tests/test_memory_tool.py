@@ -306,6 +306,66 @@ class MemoryToolTests(unittest.TestCase):
                 self.assertEqual(result.message, expected_message)
                 self.assertIsNone(result.data)
 
+    def test_expected_busy_database_failures_are_controlled(self) -> None:
+        busy_text = "Database is busy. Try again shortly."
+        cases = (
+            (
+                "store",
+                "store_memory",
+                {"fact": "A fact"},
+                f"Memory storage failed: {busy_text}",
+            ),
+            (
+                "search",
+                "search_memories",
+                {"query": "fact"},
+                f"Memory search failed: {busy_text}",
+            ),
+            (
+                "list",
+                "list_memories",
+                {},
+                f"Memory listing failed: {busy_text}",
+            ),
+        )
+
+        for action, method_name, arguments, expected_message in cases:
+            with self.subTest(action=action):
+                with patch.object(
+                    self.memory,
+                    method_name,
+                    side_effect=RuntimeError(busy_text),
+                ):
+                    result = self.tool.execute(action, arguments)
+                self.assertFalse(result.success)
+                self.assertEqual(result.message, expected_message)
+                self.assertIsNone(result.data)
+                self.assertNotIn(str(self.memory.database_path), result.message)
+
+    def test_duplicate_read_busy_failure_is_controlled(self) -> None:
+        busy_text = "Database is busy. Try again shortly."
+        first = self.tool.execute("store", {"fact": "My editor is VS Code"})
+
+        with patch.object(
+            self.memory,
+            "get_memory",
+            side_effect=RuntimeError(busy_text),
+        ):
+            duplicate = self.tool.execute(
+                "store",
+                {"fact": "MY EDITOR IS VS CODE"},
+            )
+
+        self.assertFalse(duplicate.success)
+        self.assertEqual(
+            duplicate.message,
+            f"Memory storage failed: {busy_text}",
+        )
+        self.assertIsNone(duplicate.data)
+        stored = self.memory.list_memories()
+        self.assertEqual(len(stored), 1)
+        self.assertEqual(stored[0]["id"], first.data["id"])
+
     def test_unknown_action_is_rejected(self) -> None:
         result = self.tool.execute("forget", {"id": 1})
 

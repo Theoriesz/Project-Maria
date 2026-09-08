@@ -4,12 +4,15 @@ from __future__ import annotations
 
 import logging
 import sqlite3
+import threading
+import time
 import unittest
 from contextlib import closing
 from pathlib import Path
 from tempfile import TemporaryDirectory
-from unittest.mock import patch
+from unittest.mock import MagicMock, Mock, patch
 
+from core import memory as memory_module
 from core.memory import Memory
 
 
@@ -194,6 +197,168 @@ class MemoryTests(unittest.TestCase):
 
         self.assertIsInstance(raised.exception.__cause__, sqlite3.OperationalError)
 
+    def test_connect_passes_explicit_busy_timeout(self) -> None:
+        self.memory.initialize()
+
+        with patch(
+            "core.memory.sqlite3.connect",
+            wraps=sqlite3.connect,
+        ) as connect_spy:
+            self.memory.list_memories()
+
+        connect_spy.assert_called_once_with(
+            self.database_path,
+            timeout=memory_module.DEFAULT_DATABASE_BUSY_TIMEOUT_SECONDS,
+        )
+
+    def test_busy_error_during_execution_becomes_fixed_message(self) -> None:
+        self.memory.initialize()
+        busy_exc = sqlite3.OperationalError("database is locked")
+        busy_exc.sqlite_errorcode = sqlite3.SQLITE_BUSY
+        busy_exc.sqlite_errorname = "SQLITE_BUSY"
+
+        mock_connection = MagicMock(spec=sqlite3.Connection)
+        mock_connection.execute.side_effect = busy_exc
+
+        with patch.object(self.memory, "_connect", return_value=mock_connection):
+            with self.assertRaisesRegex(
+                RuntimeError,
+                r"^Database is busy\. Try again shortly\.$",
+            ) as raised:
+                self.memory.list_memories()
+
+        self.assertIs(raised.exception.__cause__, busy_exc)
+        mock_connection.rollback.assert_called_once()
+        mock_connection.close.assert_called_once()
+
+    def test_busy_error_during_commit_becomes_fixed_message(self) -> None:
+        self.memory.initialize()
+        locked_exc = sqlite3.OperationalError("database is locked")
+        locked_exc.sqlite_errorcode = sqlite3.SQLITE_LOCKED
+        locked_exc.sqlite_errorname = "SQLITE_LOCKED"
+
+        mock_cursor = MagicMock()
+        mock_cursor.lastrowid = 1
+        mock_connection = MagicMock(spec=sqlite3.Connection)
+        mock_connection.execute.return_value = mock_cursor
+        mock_connection.commit.side_effect = locked_exc
+
+        with patch.object(self.memory, "_connect", return_value=mock_connection):
+            with self.assertRaisesRegex(
+                RuntimeError,
+                r"^Database is busy\. Try again shortly\.$",
+            ) as raised:
+                self.memory.record_interaction("hello", "hi there")
+
+        self.assertIs(raised.exception.__cause__, locked_exc)
+        mock_connection.rollback.assert_called_once()
+        mock_connection.close.assert_called_once()
+
+    def test_non_busy_error_during_execution_keeps_existing_message(self) -> None:
+        self.memory.initialize()
+        io_error = sqlite3.OperationalError("disk I/O error")
+        io_error.sqlite_errorcode = 10  # SQLITE_IOERR: unrelated to busy/locked.
+
+        mock_connection = MagicMock(spec=sqlite3.Connection)
+        mock_connection.execute.side_effect = io_error
+
+        with patch.object(self.memory, "_connect", return_value=mock_connection):
+            with self.assertRaisesRegex(
+                RuntimeError,
+                r"^Unable to list memories\.$",
+            ) as raised:
+                self.memory.list_memories()
+
+        self.assertIs(raised.exception.__cause__, io_error)
+        mock_connection.rollback.assert_called_once()
+        mock_connection.close.assert_called_once()
+
+    def test_successful_operation_commits_and_closes(self) -> None:
+        self.memory.initialize()
+        mock_cursor = MagicMock()
+        mock_cursor.fetchall.return_value = []
+        mock_connection = MagicMock(spec=sqlite3.Connection)
+        mock_connection.execute.return_value = mock_cursor
+
+        with patch.object(self.memory, "_connect", return_value=mock_connection):
+            result = self.memory.list_memories()
+
+        self.assertEqual(result, [])
+        mock_connection.commit.assert_called_once()
+        mock_connection.rollback.assert_not_called()
+        mock_connection.close.assert_called_once()
+
+    def test_busy_logging_retains_original_exception_and_response_is_path_free(
+        self,
+    ) -> None:
+        mock_logger = Mock(spec=logging.Logger)
+        memory = Memory(self.database_path, logger=mock_logger)
+        memory.initialize()
+        mock_logger.reset_mock()
+
+        busy_exc = sqlite3.OperationalError("database is locked")
+        busy_exc.sqlite_errorcode = sqlite3.SQLITE_BUSY
+
+        mock_connection = MagicMock(spec=sqlite3.Connection)
+        mock_connection.execute.side_effect = busy_exc
+
+        with patch.object(memory, "_connect", return_value=mock_connection):
+            with self.assertRaises(RuntimeError) as raised:
+                memory.list_memories()
+
+        mock_logger.exception.assert_called_once()
+        self.assertEqual(
+            str(raised.exception),
+            "Database is busy. Try again shortly.",
+        )
+        self.assertNotIn(str(self.database_path), str(raised.exception))
+
+    def test_operation_completes_normally_after_lock_releases_within_window(
+        self,
+    ) -> None:
+        """A brief real lock resolves silently once it clears within the window."""
+        self.memory.initialize()
+        test_timeout = 2.0
+
+        holder = sqlite3.connect(
+            self.database_path,
+            timeout=test_timeout,
+            check_same_thread=False,
+        )
+        releaser: threading.Thread | None = None
+        try:
+            holder.execute("BEGIN IMMEDIATE")
+            holder.execute(
+                """
+                INSERT INTO memories (fact, normalized_fact, created_at)
+                VALUES (?, ?, ?)
+                """,
+                ("Held fact", "held fact", "2026-01-01T00:00:00+00:00"),
+            )
+
+            def release_holder() -> None:
+                time.sleep(0.2)
+                holder.commit()
+
+            releaser = threading.Thread(target=release_holder)
+            releaser.start()
+
+            with patch(
+                "core.memory.DEFAULT_DATABASE_BUSY_TIMEOUT_SECONDS",
+                test_timeout,
+            ):
+                memory_id, created = self.memory.store_memory("Contends briefly")
+
+            self.assertTrue(created)
+            self.assertGreater(memory_id, 0)
+        finally:
+            if releaser is not None:
+                releaser.join(timeout=5)
+            try:
+                holder.close()
+            except sqlite3.Error:
+                pass
+
     def test_casefolded_duplicate_keeps_original_fact_and_timestamp(self) -> None:
         self.memory.initialize()
         original_timestamp = "2026-02-01T00:00:00+00:00"
@@ -325,6 +490,49 @@ class MemoryTests(unittest.TestCase):
         self.assertEqual(notes[0]["title"], "Editor")
         self.assertIsNotNone(note)
         self.assertEqual(note["body"], "VS Code")
+
+
+class BusyLockedClassificationTests(unittest.TestCase):
+    """Exercise _is_busy_or_locked's numeric primary-result-code matching."""
+
+    def test_classifies_primary_busy_code(self) -> None:
+        exc = sqlite3.OperationalError("synthetic busy")
+        exc.sqlite_errorcode = sqlite3.SQLITE_BUSY
+        self.assertTrue(memory_module._is_busy_or_locked(exc))
+
+    def test_classifies_primary_locked_code(self) -> None:
+        exc = sqlite3.OperationalError("synthetic locked")
+        exc.sqlite_errorcode = sqlite3.SQLITE_LOCKED
+        self.assertTrue(memory_module._is_busy_or_locked(exc))
+
+    def test_classifies_extended_busy_code_by_primary_low_byte(self) -> None:
+        exc = sqlite3.OperationalError("synthetic extended busy")
+        exc.sqlite_errorcode = sqlite3.SQLITE_BUSY | (1 << 8)
+        self.assertTrue(memory_module._is_busy_or_locked(exc))
+
+    def test_classifies_extended_locked_code_by_primary_low_byte(self) -> None:
+        exc = sqlite3.OperationalError("synthetic extended locked")
+        exc.sqlite_errorcode = sqlite3.SQLITE_LOCKED | (1 << 8)
+        self.assertTrue(memory_module._is_busy_or_locked(exc))
+
+    def test_rejects_non_busy_operational_error_code(self) -> None:
+        exc = sqlite3.OperationalError("synthetic disk I/O error")
+        exc.sqlite_errorcode = 10  # SQLITE_IOERR: unrelated to busy/locked.
+        self.assertFalse(memory_module._is_busy_or_locked(exc))
+
+    def test_rejects_missing_sqlite_errorcode(self) -> None:
+        exc = sqlite3.OperationalError("synthetic, no error code attribute")
+        self.assertFalse(memory_module._is_busy_or_locked(exc))
+
+    def test_rejects_none_error_code(self) -> None:
+        exc = sqlite3.OperationalError("synthetic, None error code")
+        exc.sqlite_errorcode = None
+        self.assertFalse(memory_module._is_busy_or_locked(exc))
+
+    def test_rejects_non_integer_error_code(self) -> None:
+        exc = sqlite3.OperationalError("synthetic, non-integer error code")
+        exc.sqlite_errorcode = "SQLITE_BUSY"
+        self.assertFalse(memory_module._is_busy_or_locked(exc))
 
 
 if __name__ == "__main__":

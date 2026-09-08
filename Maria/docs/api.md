@@ -22,6 +22,21 @@ The memory layer owns all SQLite access. Other modules should call methods such
 as `record_interaction`, `get_recent_interactions`, `create_note`, `list_notes`,
 and `get_note` instead of writing SQL directly.
 
+Every connection uses an explicit 5.0-second SQLite busy timeout
+(`DEFAULT_DATABASE_BUSY_TIMEOUT_SECONDS`), which governs SQLite's built-in
+busy waiting for `SQLITE_BUSY` contention. When statement execution or commit
+ultimately raises a SQLite error whose numeric primary result code is
+`SQLITE_BUSY` or `SQLITE_LOCKED` (including extended variants of either,
+classified by that numeric code, not by matching exception text), every
+method below raises `RuntimeError("Database is busy. Try again shortly.")`
+instead of its listed operation-specific message; `SQLITE_LOCKED` is
+classified the same way but is not guaranteed to use or exhaust the
+busy-timeout window. A failure while opening the connection itself is not
+covered by this fixed message and continues through that method's existing
+operation-specific static `RuntimeError` message. Every other SQLite failure
+likewise continues to raise that method's existing operation-specific
+`RuntimeError` message, unchanged.
+
 ### Interaction History
 
 `Memory.record_interaction(user_input: str, response: str) -> int`
