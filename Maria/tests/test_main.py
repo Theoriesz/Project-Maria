@@ -94,6 +94,22 @@ class MainCliTests(unittest.TestCase):
                 self.assertNotIn(private_message, stderr)
                 self.assertNotIn(BANNER, stdout)
 
+    def test_startup_busy_database_failure_is_sanitized(self) -> None:
+        busy_message = "Database is busy. Try again shortly."
+        factory = Mock(side_effect=RuntimeError(busy_message))
+
+        status, stdout, stderr, input_mock = self._run_cli(factory, [])
+
+        self.assertEqual(status, 1)
+        factory.assert_called_once_with()
+        input_mock.assert_not_called()
+        self.assertEqual(stdout, "")
+        self.assertEqual(stderr, f"{STARTUP_FAILURE_MESSAGE}\n")
+        self.assertNotIn("Traceback", stderr)
+        self.assertNotIn(busy_message, stderr)
+        self.assertNotIn("busy", stderr.lower())
+        self.assertNotIn(BANNER, stdout)
+
     def test_startup_keyboard_interrupt_returns_130(self) -> None:
         factory = Mock(side_effect=KeyboardInterrupt())
 

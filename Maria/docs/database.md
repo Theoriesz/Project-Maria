@@ -158,6 +158,35 @@ keys, recovery codes, confidential credentials, or other highly sensitive
 secrets. In particular, reading a sensitive file or note can copy its returned
 content into interaction history.
 
+## Connection Timeouts and Contention
+
+Every `Memory` connection is opened with an explicit SQLite busy-timeout of
+5.0 seconds (`DEFAULT_DATABASE_BUSY_TIMEOUT_SECONDS` in `core/constants.py`,
+passed as `sqlite3.connect(..., timeout=...)`). This configures SQLite's
+built-in busy waiting for `SQLITE_BUSY` contention; Maria adds no Python-level
+retry loop, sleep, backoff, or whole-operation replay on top of it. A `BUSY`
+operation may complete normally if contention clears while SQLite is still
+waiting, with no sign that a brief wait occurred, and SQLite may also return
+`BUSY` before the full configured window is consumed. The 5.0-second value
+configures this busy-wait policy; it is not a guaranteed wall-clock duration
+for a complete `Memory` method call.
+
+Separately, when statement execution or commit ultimately raises a SQLite
+error whose numeric primary result code is `SQLITE_BUSY` or `SQLITE_LOCKED`
+(including extended variants of either), `Memory` converts it into
+`RuntimeError("Database is busy. Try again shortly.")`, classified by that
+numeric code rather than by matching exception text. `SQLITE_LOCKED` is
+classified into this same controlled response, but — unlike `SQLITE_BUSY` —
+it is not guaranteed to use or exhaust the busy-timeout window; SQLite can
+report it independently of that setting. Every other SQLite failure
+(corruption, constraint violations, disk-full, permission errors, schema
+problems, and so on) keeps its existing static, operation-specific
+`RuntimeError` message, unchanged by this behavior.
+
+This affects only connection-level timeout and error classification. Schema,
+the transaction model, commit/rollback ordering, and deterministic connection
+closing on both success and failure are unchanged.
+
 ## Ownership
 
 Only `core/memory.py` should open SQLite connections or execute SQL.
