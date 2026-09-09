@@ -6,7 +6,7 @@ from pathlib import Path
 
 
 APP_NAME = "Maria"
-APP_VERSION = "0.1.1"
+APP_VERSION = "0.1.2"
 
 PROJECT_ROOT = Path(__file__).resolve().parents[1]
 CONFIG_PATH = PROJECT_ROOT / "config" / "config.toml"

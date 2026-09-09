@@ -2,6 +2,8 @@
 
 ## Unreleased
 
+## 0.1.2 - 2026-09-09
+
 - Made filesystem responses show paths relative to the configured safe root using
   forward slashes, with the safe root itself shown as `.`, instead of absolute host
   paths; operating-system failure reasons are now derived from the numeric `errno`,
