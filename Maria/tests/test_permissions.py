@@ -47,6 +47,28 @@ class PermissionManagerTests(unittest.TestCase):
                     ),
                 )
 
+    def test_empty_construction_requires_confirmation_for_history_delete(self) -> None:
+        manager = self._manager()
+
+        self.assertEqual(
+            manager.check("history", "delete"),
+            PermissionResult(
+                PermissionDecision.REQUIRES_CONFIRMATION,
+                "history.delete requires explicit confirmation.",
+            ),
+        )
+
+    def test_configured_denial_wins_over_mandatory_history_delete_confirmation(
+        self,
+    ) -> None:
+        manager = self._manager(denied_actions={"history.delete"})
+
+        self.assertIn("history.delete", manager.confirmation_required)
+        self.assertEqual(
+            manager.check("history", "delete").decision,
+            PermissionDecision.DENIED,
+        )
+
     def test_ordinary_unconfigured_action_remains_allowed(self) -> None:
         result = self._manager().check("notes", "list")
 
@@ -204,7 +226,9 @@ class PermissionManagerTests(unittest.TestCase):
         self.assertIsInstance(MANDATORY_DENIED_ACTIONS, frozenset)
         self.assertEqual(
             MANDATORY_CONFIRMATION_ACTIONS,
-            frozenset({"filesystem.rename", "filesystem.move"}),
+            frozenset(
+                {"filesystem.rename", "filesystem.move", "history.delete"}
+            ),
         )
         self.assertEqual(
             MANDATORY_DENIED_ACTIONS,

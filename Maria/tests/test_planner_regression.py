@@ -175,11 +175,24 @@ class PlannerRegressionTests(unittest.TestCase):
             PlanStep("history", "read", {"id": 7}),
         )
 
+    def test_delete_interaction_maps_to_exact_step(self) -> None:
+        self._assert_single_step(
+            "delete interaction 42",
+            PlanStep("history", "delete", {"id": 42}),
+        )
+
+    def test_delete_interaction_accepts_leading_zeroes(self) -> None:
+        self._assert_single_step(
+            "delete interaction 007",
+            PlanStep("history", "delete", {"id": 7}),
+        )
+
     def test_history_command_keywords_are_case_insensitive(self) -> None:
         cases = (
             ("HISTORY", PlanStep("history", "list", {})),
             ("Search History trip", PlanStep("history", "search", {"query": "trip"})),
             ("READ INTERACTION 9", PlanStep("history", "read", {"id": 9})),
+            ("DELETE INTERACTION 9", PlanStep("history", "delete", {"id": 9})),
         )
 
         for request, expected_step in cases:
@@ -205,6 +218,9 @@ class PlannerRegressionTests(unittest.TestCase):
             ("read interaction", "Use: read interaction <id>"),
             ("read interaction   ", "Use: read interaction <id>"),
             ("READ INTERACTION", "Use: read interaction <id>"),
+            ("delete interaction", "Use: delete interaction <id>"),
+            ("delete interaction   ", "Use: delete interaction <id>"),
+            ("DELETE INTERACTION", "Use: delete interaction <id>"),
         )
 
         for request, expected_response in cases:
@@ -237,6 +253,31 @@ class PlannerRegressionTests(unittest.TestCase):
                     "Interaction id must be a positive whole number.",
                 )
 
+    def test_invalid_delete_interaction_id_returns_exact_usage_response(self) -> None:
+        # Mirrors the read-interaction invalid-id cases: the operand after the
+        # fixed "delete interaction " prefix is parsed as one value, so an
+        # embedded extra token (e.g. "1 extra") is an invalid id, not a
+        # separate unsupported command.
+        invalid_ids = (
+            "0",
+            "-1",
+            "+1",
+            "1.5",
+            "abc",
+            "1 extra",
+            "１２",
+            "١٢",
+        )
+
+        for invalid_id in invalid_ids:
+            with self.subTest(invalid_id=invalid_id):
+                plan = self.planner.create_plan(f"delete interaction {invalid_id}")
+                self.assertEqual(plan.steps, ())
+                self.assertEqual(
+                    plan.response_if_no_action,
+                    "Interaction id must be a positive whole number.",
+                )
+
     def test_history_near_prefix_and_plural_variants_remain_unsupported(self) -> None:
         requests = (
             "histories",
@@ -247,6 +288,14 @@ class PlannerRegressionTests(unittest.TestCase):
             "read interactions 5",
             "read interactionfoo 5",
             "reading interaction 5",
+            "delete interactions 5",
+            "delete interactionfoo 5",
+            "deleting interaction 5",
+            "delete interaction1",
+            "delete history 1",
+            "clear interaction 1",
+            "clear history",
+            "purge interaction 1",
         )
 
         for request in requests:
@@ -535,13 +584,17 @@ class PlannerRegressionTests(unittest.TestCase):
             "- history",
             "- search history <query>",
             "- read interaction <id>",
+            "- delete interaction <id>",
         )
 
         self.assertEqual(plan.steps, ())
         for command_line in expected_lines:
             with self.subTest(command=command_line):
                 self.assertIn(command_line, response.splitlines())
-        self.assertNotIn("- delete interaction", response.splitlines())
+        self.assertEqual(
+            response.splitlines().count("- delete interaction <id>"),
+            1,
+        )
 
     def _assert_single_step(self, request: str, expected_step: PlanStep) -> None:
         """Assert the complete public plan for one deterministic command."""

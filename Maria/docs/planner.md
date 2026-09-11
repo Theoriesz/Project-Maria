@@ -142,9 +142,41 @@ An invalid `read interaction` ID returns:
 Interaction id must be a positive whole number.
 ```
 
+`delete interaction <id>` creates this step:
+
+```text
+PlanStep(
+    tool_name="history",
+    action="delete",
+    arguments={"id": interaction_id},
+)
+```
+
+`delete interaction <id>` reuses `read interaction`'s exact `id` grammar and
+validation, unmodified. A bare or whitespace-only `delete interaction`
+returns:
+
+```text
+Use: delete interaction <id>
+```
+
+An invalid `delete interaction` ID returns the same message as an invalid
+`read interaction` ID:
+
+```text
+Interaction id must be a positive whole number.
+```
+
+Because the operand after the fixed `delete interaction ` prefix is parsed as
+one value, an embedded extra token (for example `delete interaction 1
+extra`) is an invalid ID, not a separate unsupported command. `history.delete`
+requires mandatory explicit confirmation before it executes; see
+`docs/architecture.md`'s Permission Policy section.
+
 Near-prefix and plural variants such as `histories`, `history list`,
-`search historyfoo`, and `read interactions <id>` remain unsupported and
-receive the planner's existing generic unsupported-command response.
+`search historyfoo`, `read interactions <id>`, `delete interactions <id>`,
+and `delete interaction1` remain unsupported and receive the planner's
+existing generic unsupported-command response.
 
 ## Plan Shape
 

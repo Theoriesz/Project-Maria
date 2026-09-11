@@ -165,6 +165,38 @@ class Memory:
             self.logger.exception("Failed to search interactions.")
             raise RuntimeError("Unable to search interactions.") from exc
 
+    def delete_interaction(self, interaction_id: int) -> bool:
+        """Delete one interaction by its database id.
+
+        Returns True if a row was deleted, False if no row matched
+        interaction_id. Raises ValueError for a non-positive-integer id,
+        since this is a destructive operation validated independently of
+        its callers.
+        """
+        if (
+            not isinstance(interaction_id, int)
+            or isinstance(interaction_id, bool)
+            or interaction_id < 1
+        ):
+            raise ValueError("Interaction id must be a positive whole number.")
+
+        try:
+            with self._connection() as connection:
+                cursor = connection.execute(
+                    """
+                    DELETE FROM interactions
+                    WHERE id = ?
+                    """,
+                    (interaction_id,),
+                )
+                deleted = cursor.rowcount == 1
+            if deleted:
+                self.logger.info("Deleted interaction %s.", interaction_id)
+            return deleted
+        except sqlite3.Error as exc:
+            self.logger.exception("Failed to delete interaction.")
+            raise RuntimeError("Unable to delete interaction.") from exc
+
     def store_memory(self, fact: str) -> tuple[int, bool]:
         """Store a fact and return its database id and creation status."""
         clean_fact = fact.strip()

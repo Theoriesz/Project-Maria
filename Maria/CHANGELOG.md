@@ -11,8 +11,25 @@
   response, and timestamp but records only a fixed, content-free audit
   summary instead of duplicating that content into a new interaction row, via
   a new generic, optional `ToolExecutionResult.recorded_message` field that
-  Brain consumes without any tool-specific branch. `history.delete` does not
-  exist yet. No schema, permission, or version change was introduced.
+  Brain consumes without any tool-specific branch. No schema, permission, or
+  version change was introduced.
+- Added interaction-history deletion: `delete interaction <id>`, backed by a
+  new `HistoryTool` `delete` action and a new `Memory.delete_interaction`
+  method (`DELETE FROM interactions WHERE id = ?`). The command accepts only
+  a single positive ASCII-decimal ID, targets at most one row, and removes it
+  when found. It requires mandatory explicit confirmation — `history.delete`
+  is a new entry in `MANDATORY_CONFIRMATION_ACTIONS` alongside
+  `filesystem.rename` and `filesystem.move` — with no preview of stored
+  content before confirmation.
+  Deletion commits independently, and Maria then separately attempts to
+  record a short, content-free audit interaction (`Deleted interaction
+  <id>.`); when that later recording succeeds, the total interaction row
+  count may remain unchanged even though the selected historical content is
+  gone, and if it fails, the deletion remains committed with no audit row
+  guaranteed. There is no bulk, wildcard, range, or cascading deletion, no
+  renumbering of remaining IDs, and no guarantee of secure erasure from
+  SQLite file pages, backups, or external copies. No schema or version
+  change was introduced.
 
 ## 0.1.2 - 2026-09-09
 

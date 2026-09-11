@@ -54,10 +54,14 @@ time
 history
 search history editor
 read interaction 1
+delete interaction 1
 ```
 
-File rename and move operations require explicit confirmation. Delete
-functionality is intentionally not implemented in version 0.1.
+File rename and move operations, and `delete interaction <id>`, require
+explicit confirmation. `delete interaction <id>` targets at most one
+interaction row by ID and removes it when found; it never cascades to notes
+or memories. Filesystem
+delete functionality remains intentionally not implemented in version 0.1.
 
 ## Persistent Memory
 
@@ -119,12 +123,21 @@ interaction history.
 Maria currently provides no application-level database encryption, automatic
 retention period, or pruning. `history`, `search history <query>`, and
 `read interaction <id>` provide read-only listing, searching, and reading of
-interaction history; they do not modify or remove any row. There is still no
-CLI command to clear, delete, or prune interaction history, no note-delete
+interaction history; they do not modify or remove any row. `delete interaction
+<id>` targets at most one interaction row by ID and removes it when found,
+after mandatory explicit confirmation, with no cascade to notes or memories
+and no content preview before confirmation. Deletion commits independently,
+and Maria then separately attempts to record the short response `Deleted
+interaction <id>.` as a new interaction-history row; when that later
+recording succeeds, deleting one old row and adding that audit row may leave
+the total interaction-row count unchanged, and if it fails, the deletion
+remains committed with no audit row guaranteed. There is still no CLI
+command to clear, bulk-delete, or prune interaction history, no note-delete
 command, and no memory-forget command. Retrieval limits affect only how many
-rows are read; they do not remove stored rows, and restarting Maria does not
-clear them. Protection depends on access to the machine, user account, and
-database file and on any storage encryption in use.
+rows are read; they do not
+remove stored rows, and restarting Maria does not clear them. Protection
+depends on access to the machine, user account, and database file and on any
+storage encryption in use.
 
 The shipped v0.1 runtime has no built-in networking or cloud integration and
 does not itself transmit this history. Configured network-mounted or

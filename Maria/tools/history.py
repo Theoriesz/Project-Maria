@@ -37,11 +37,11 @@ def _row_summary(row: dict[str, Any]) -> dict[str, Any]:
 
 
 class HistoryTool:
-    """List, search, and read interaction-history rows through the memory layer."""
+    """List, search, read, and delete interaction-history rows through the memory layer."""
 
     name = "history"
-    description = "Lists, searches, and reads interaction-history rows."
-    actions = frozenset({"list", "search", "read"})
+    description = "Lists, searches, reads, and deletes interaction-history rows."
+    actions = frozenset({"list", "search", "read", "delete"})
 
     def __init__(self, memory: Memory, logger: Logger | None = None) -> None:
         self.memory = memory
@@ -55,6 +55,8 @@ class HistoryTool:
             return self._search(arguments)
         if action == "read":
             return self._read(arguments)
+        if action == "delete":
+            return self._delete(arguments)
         return ToolExecutionResult(False, f"Unsupported history action: {action}")
 
     def _list(self, arguments: dict[str, Any]) -> ToolExecutionResult:
@@ -137,6 +139,34 @@ class HistoryTool:
             message,
             interaction,
             recorded_message=f"Displayed interaction {interaction_id}.",
+        )
+
+    def _delete(self, arguments: dict[str, Any]) -> ToolExecutionResult:
+        """Delete one interaction by id."""
+        interaction_id = arguments.get("id")
+        if (
+            not isinstance(interaction_id, int)
+            or isinstance(interaction_id, bool)
+            or interaction_id < 1
+        ):
+            return ToolExecutionResult(
+                False, "Interaction id must be a positive whole number."
+            )
+
+        try:
+            deleted = self.memory.delete_interaction(interaction_id)
+        except RuntimeError as exc:
+            self.logger.warning("History deletion failed: %s", exc)
+            return ToolExecutionResult(False, f"History deletion failed: {exc}")
+
+        if not deleted:
+            return ToolExecutionResult(False, f"Interaction not found: {interaction_id}.")
+
+        self.logger.info("Deleted interaction %s through history tool.", interaction_id)
+        return ToolExecutionResult(
+            True,
+            f"Deleted interaction {interaction_id}.",
+            {"id": interaction_id},
         )
 
 

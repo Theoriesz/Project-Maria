@@ -41,19 +41,21 @@ class HistoryToolTests(unittest.TestCase):
         self.assertEqual(self.tool.name, "history")
         self.assertEqual(
             self.tool.description,
-            "Lists, searches, and reads interaction-history rows.",
+            "Lists, searches, reads, and deletes interaction-history rows.",
         )
-        self.assertEqual(self.tool.actions, frozenset({"list", "search", "read"}))
+        self.assertEqual(
+            self.tool.actions, frozenset({"list", "search", "read", "delete"})
+        )
 
         built = build_tool(memory=self.memory)
         self.assertIsInstance(built, HistoryTool)
         self.assertIs(built.memory, self.memory)
 
     def test_unknown_action_is_rejected(self) -> None:
-        result = self.tool.execute("delete", {"id": 1})
+        result = self.tool.execute("purge", {"id": 1})
 
         self.assertFalse(result.success)
-        self.assertEqual(result.message, "Unsupported history action: delete")
+        self.assertEqual(result.message, "Unsupported history action: purge")
 
     # --- list ------------------------------------------------------------
 
@@ -349,6 +351,98 @@ class HistoryToolTests(unittest.TestCase):
         self.assertNotIn("boom", result.message)
         self.logger.warning.assert_called_once()
 
+    # --- delete ------------------------------------------------------------
+
+    def test_delete_removes_the_row_and_returns_content_free_success_message(
+        self,
+    ) -> None:
+        interaction_id = self.memory.record_interaction("request", "response")
+
+        result = self.tool.execute("delete", {"id": interaction_id})
+
+        self.assertEqual(
+            result,
+            ToolExecutionResult(
+                True,
+                f"Deleted interaction {interaction_id}.",
+                {"id": interaction_id},
+            ),
+        )
+        self.assertIsNone(result.recorded_message)
+        self.assertIsNone(self.memory.get_interaction(interaction_id))
+        self.logger.info.assert_called_once()
+
+    def test_delete_missing_interaction_is_a_controlled_failure(self) -> None:
+        result = self.tool.execute("delete", {"id": 999})
+
+        self.assertEqual(
+            result,
+            ToolExecutionResult(False, "Interaction not found: 999."),
+        )
+
+    def test_delete_missing_id_argument_is_a_controlled_failure(self) -> None:
+        result = self.tool.execute("delete", {})
+
+        self.assertEqual(
+            result,
+            ToolExecutionResult(
+                False, "Interaction id must be a positive whole number."
+            ),
+        )
+
+    def test_delete_rejects_invalid_direct_ids_without_calling_memory(self) -> None:
+        invalid_ids = (0, -1, "5", 5.0, True, False, None)
+
+        with patch.object(self.memory, "delete_interaction") as delete_mock:
+            for invalid_id in invalid_ids:
+                with self.subTest(invalid_id=invalid_id):
+                    result = self.tool.execute("delete", {"id": invalid_id})
+                    self.assertEqual(
+                        result,
+                        ToolExecutionResult(
+                            False,
+                            "Interaction id must be a positive whole number.",
+                        ),
+                    )
+            delete_mock.assert_not_called()
+
+    def test_delete_controlled_runtime_error(self) -> None:
+        self.memory.record_interaction("request", "response")
+        with patch.object(
+            self.memory,
+            "_connect",
+            side_effect=sqlite3.OperationalError("boom"),
+        ):
+            result = self.tool.execute("delete", {"id": 1})
+
+        self.assertFalse(result.success)
+        self.assertEqual(
+            result.message,
+            "History deletion failed: Unable to delete interaction.",
+        )
+        self.assertNotIn("boom", result.message)
+        self.logger.warning.assert_called_once()
+
+    def test_delete_busy_locked_error_reaches_the_caller_with_fixed_text(
+        self,
+    ) -> None:
+        self.memory.record_interaction("request", "response")
+        busy_exc = sqlite3.OperationalError("database is locked")
+        busy_exc.sqlite_errorcode = sqlite3.SQLITE_BUSY
+
+        mock_connection = Mock(spec=sqlite3.Connection)
+        mock_connection.execute.side_effect = busy_exc
+
+        with patch.object(self.memory, "_connect", return_value=mock_connection):
+            result = self.tool.execute("delete", {"id": 1})
+
+        self.assertFalse(result.success)
+        self.assertEqual(
+            result.message,
+            "History deletion failed: Database is busy. Try again shortly.",
+        )
+        self.logger.warning.assert_called_once()
+
     # --- logging privacy --------------------------------------------------
 
     def test_logs_never_include_request_response_or_query_content(self) -> None:
@@ -360,6 +454,7 @@ class HistoryToolTests(unittest.TestCase):
         self.tool.execute("list", {})
         self.tool.execute("search", {"query": secret_query})
         self.tool.execute("read", {"id": interaction_id})
+        self.tool.execute("delete", {"id": interaction_id})
 
         logged_calls = " ".join(str(entry) for entry in self.logger.method_calls)
         self.assertNotIn(secret_input, logged_calls)

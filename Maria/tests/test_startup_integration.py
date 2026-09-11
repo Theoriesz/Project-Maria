@@ -214,6 +214,7 @@ class StartupIntegrationTests(unittest.TestCase):
         move = self.brain.permissions.check("filesystem", "move")
         delete = self.brain.permissions.check("filesystem", "delete")
         write = self.brain.permissions.check("filesystem", "write")
+        history_delete = self.brain.permissions.check("history", "delete")
 
         self.assertEqual(
             rename.decision,
@@ -225,6 +226,10 @@ class StartupIntegrationTests(unittest.TestCase):
         )
         self.assertEqual(delete.decision, PermissionDecision.DENIED)
         self.assertEqual(write.decision, PermissionDecision.DENIED)
+        self.assertEqual(
+            history_delete.decision,
+            PermissionDecision.REQUIRES_CONFIRMATION,
+        )
 
         for action in ("list", "search", "read"):
             with self.subTest(action=action):
@@ -232,6 +237,118 @@ class StartupIntegrationTests(unittest.TestCase):
                     self.brain.permissions.check("history", action).decision,
                     PermissionDecision.ALLOWED,
                 )
+
+    def test_delete_interaction_removes_the_row_and_records_a_content_free_audit_summary(
+        self,
+    ) -> None:
+        self.brain.process("remember a distinctive marker EXC-DELETE-TOKEN")
+        self.brain.process("recall EXC-DELETE-TOKEN")
+
+        connection = sqlite3.connect(self.database_path)
+        try:
+            target_id, other_id = [
+                row[0]
+                for row in connection.execute(
+                    "SELECT id FROM interactions ORDER BY id DESC LIMIT 2"
+                ).fetchall()
+            ]
+            row_count_before = connection.execute(
+                "SELECT COUNT(*) FROM interactions"
+            ).fetchone()[0]
+        finally:
+            connection.close()
+
+        unconfirmed = self.brain.process(f"delete interaction {target_id}")
+
+        self.assertTrue(unconfirmed.needs_confirmation)
+        self.assertEqual(
+            unconfirmed.text,
+            "Confirmation required: history.delete requires explicit confirmation.",
+        )
+
+        connection = sqlite3.connect(self.database_path)
+        try:
+            still_present = connection.execute(
+                "SELECT id FROM interactions WHERE id = ?", (target_id,)
+            ).fetchone()
+            row_count_after_unconfirmed = connection.execute(
+                "SELECT COUNT(*) FROM interactions"
+            ).fetchone()[0]
+        finally:
+            connection.close()
+
+        self.assertIsNotNone(still_present)
+        self.assertEqual(row_count_after_unconfirmed, row_count_before)
+
+        confirmed = self.brain.process(
+            f"delete interaction {target_id}",
+            confirmed=True,
+        )
+
+        self.assertEqual(confirmed.text, f"Deleted interaction {target_id}.")
+        self.assertFalse(confirmed.needs_confirmation)
+
+        connection = sqlite3.connect(self.database_path)
+        try:
+            deleted_row = connection.execute(
+                "SELECT id FROM interactions WHERE id = ?", (target_id,)
+            ).fetchone()
+            other_row = connection.execute(
+                "SELECT id FROM interactions WHERE id = ?", (other_id,)
+            ).fetchone()
+            newest_input, newest_response = connection.execute(
+                "SELECT user_input, response FROM interactions ORDER BY id DESC LIMIT 1"
+            ).fetchone()
+            row_count_after_confirmed = connection.execute(
+                "SELECT COUNT(*) FROM interactions"
+            ).fetchone()[0]
+        finally:
+            connection.close()
+
+        self.assertIsNone(deleted_row)
+        self.assertIsNotNone(other_row)
+        self.assertEqual(newest_input, f"delete interaction {target_id}")
+        self.assertEqual(newest_response, f"Deleted interaction {target_id}.")
+        self.assertNotIn("EXC-DELETE-TOKEN", newest_response)
+        self.assertEqual(row_count_after_confirmed, row_count_before)
+
+    def test_delete_interaction_recording_failure_does_not_undo_the_deletion(
+        self,
+    ) -> None:
+        self.brain.process("remember a distinctive marker EXC-RECORD-FAILURE-TOKEN")
+
+        connection = sqlite3.connect(self.database_path)
+        try:
+            target_id = connection.execute(
+                "SELECT id FROM interactions ORDER BY id DESC LIMIT 1"
+            ).fetchone()[0]
+        finally:
+            connection.close()
+
+        self.brain.process(f"delete interaction {target_id}")
+
+        with patch.object(
+            self.brain.memory,
+            "record_interaction",
+            side_effect=RuntimeError("temporary interaction write failure"),
+        ):
+            confirmed = self.brain.process(
+                f"delete interaction {target_id}",
+                confirmed=True,
+            )
+
+        self.assertEqual(confirmed.text, f"Deleted interaction {target_id}.")
+        self.assertFalse(confirmed.needs_confirmation)
+
+        connection = sqlite3.connect(self.database_path)
+        try:
+            deleted_row = connection.execute(
+                "SELECT id FROM interactions WHERE id = ?", (target_id,)
+            ).fetchone()
+        finally:
+            connection.close()
+
+        self.assertIsNone(deleted_row)
 
     def test_all_runtime_paths_and_file_handlers_are_temporary(self) -> None:
         self.assertTrue(self.config.database_path.is_relative_to(self.temporary_root))
