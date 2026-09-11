@@ -35,7 +35,7 @@ Ctrl+C cancels the pending action immediately, without executing it, even
 after earlier invalid input. Ctrl+C returns to the main prompt; if input
 remains closed after EOF, the next main prompt exits cleanly.
 
-## Supported v0.1 Commands
+## Supported Commands
 
 ```text
 calculate 2 + 2
@@ -51,6 +51,9 @@ recall editor
 memories
 system
 time
+history
+search history editor
+read interaction 1
 ```
 
 File rename and move operations require explicit confirmation. Delete
@@ -113,13 +116,15 @@ warnings, and failures rather than the interaction store. Avoiding full content
 in an operational log message does not mean that content is absent from SQLite
 interaction history.
 
-Maria v0.1 provides no application-level database encryption, automatic
-retention period, or pruning. It has no CLI command to list, clear, delete, or
-prune interaction history, no note-delete command, and no memory-forget
-command. Retrieval limits affect only how many rows are read; they do not remove
-stored rows, and restarting Maria does not clear them. Protection depends on
-access to the machine, user account, and database file and on any storage
-encryption in use.
+Maria currently provides no application-level database encryption, automatic
+retention period, or pruning. `history`, `search history <query>`, and
+`read interaction <id>` provide read-only listing, searching, and reading of
+interaction history; they do not modify or remove any row. There is still no
+CLI command to clear, delete, or prune interaction history, no note-delete
+command, and no memory-forget command. Retrieval limits affect only how many
+rows are read; they do not remove stored rows, and restarting Maria does not
+clear them. Protection depends on access to the machine, user account, and
+database file and on any storage encryption in use.
 
 The shipped v0.1 runtime has no built-in networking or cloud integration and
 does not itself transmit this history. Configured network-mounted or

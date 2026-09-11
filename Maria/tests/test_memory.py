@@ -491,6 +491,161 @@ class MemoryTests(unittest.TestCase):
         self.assertIsNotNone(note)
         self.assertEqual(note["body"], "VS Code")
 
+    def test_get_interaction_returns_exact_row_or_none_for_missing_id(self) -> None:
+        self.memory.initialize()
+        created_at = "2026-02-01T00:00:00+00:00"
+        with patch("core.memory._utc_timestamp", return_value=created_at):
+            interaction_id = self.memory.record_interaction("system", "System details")
+
+        stored = self.memory.get_interaction(interaction_id)
+
+        self.assertEqual(
+            stored,
+            {
+                "id": interaction_id,
+                "user_input": "system",
+                "response": "System details",
+                "created_at": created_at,
+            },
+        )
+        self.assertIsNone(self.memory.get_interaction(interaction_id + 1))
+
+    def test_get_interaction_wraps_database_errors(self) -> None:
+        self.memory.initialize()
+
+        with patch.object(
+            self.memory,
+            "_connect",
+            side_effect=sqlite3.OperationalError("database unavailable"),
+        ):
+            with self.assertRaisesRegex(
+                RuntimeError,
+                r"^Unable to read interaction\.$",
+            ) as raised:
+                self.memory.get_interaction(1)
+
+        self.assertIsInstance(raised.exception.__cause__, sqlite3.OperationalError)
+
+    def test_search_interactions_matches_user_input_column(self) -> None:
+        self.memory.initialize()
+        interaction_id = self.memory.record_interaction(
+            "remember my editor is VS Code",
+            "Remembered memory 1: my editor is VS Code",
+        )
+        self.memory.record_interaction("time", "2026-01-01T00:00:00+00:00")
+
+        matches = self.memory.search_interactions("editor")
+
+        self.assertEqual([row["id"] for row in matches], [interaction_id])
+
+    def test_search_interactions_matches_response_column(self) -> None:
+        self.memory.initialize()
+        interaction_id = self.memory.record_interaction(
+            "recall editor",
+            "1: my editor is VS Code",
+        )
+        self.memory.record_interaction("time", "2026-01-01T00:00:00+00:00")
+
+        matches = self.memory.search_interactions("VS Code")
+
+        self.assertEqual([row["id"] for row in matches], [interaction_id])
+
+    def test_search_interactions_treats_percent_and_underscore_as_literals(
+        self,
+    ) -> None:
+        self.memory.initialize()
+        percent_id = self.memory.record_interaction(
+            "progress", "Progress is 100% complete"
+        )
+        underscore_id = self.memory.record_interaction(
+            "naming", "Use snake_case names"
+        )
+        self.memory.record_interaction("plain", "A plain fact")
+
+        percent_matches = self.memory.search_interactions("%")
+        underscore_matches = self.memory.search_interactions("_")
+
+        self.assertEqual([row["id"] for row in percent_matches], [percent_id])
+        self.assertEqual(
+            [row["id"] for row in underscore_matches], [underscore_id]
+        )
+
+    def test_search_interactions_is_ascii_case_insensitive_not_full_unicode_casefold(
+        self,
+    ) -> None:
+        self.memory.initialize()
+        interaction_id = self.memory.record_interaction("note", "Straße in Berlin")
+
+        ascii_matches = self.memory.search_interactions("BERLIN")
+        unicode_casefold_matches = self.memory.search_interactions("STRASSE")
+
+        self.assertEqual([row["id"] for row in ascii_matches], [interaction_id])
+        self.assertEqual(unicode_casefold_matches, [])
+
+    def test_search_interactions_is_substring_based_and_not_fuzzy(self) -> None:
+        self.memory.initialize()
+        interaction_id = self.memory.record_interaction("note", "My editor is VS Code")
+
+        substring_matches = self.memory.search_interactions("editor is")
+        fuzzy_matches = self.memory.search_interactions("edtor")
+
+        self.assertEqual([row["id"] for row in substring_matches], [interaction_id])
+        self.assertEqual(fuzzy_matches, [])
+
+    def test_search_interactions_orders_newest_first_then_descending_id(self) -> None:
+        self.memory.initialize()
+        with patch(
+            "core.memory._utc_timestamp",
+            side_effect=[
+                "2026-01-01T00:00:00+00:00",
+                "2026-02-01T00:00:00+00:00",
+                "2026-02-01T00:00:00+00:00",
+            ],
+        ):
+            old_id = self.memory.record_interaction("marker", "old marker")
+            first_new_id = self.memory.record_interaction("marker", "first new marker")
+            second_new_id = self.memory.record_interaction(
+                "marker", "second new marker"
+            )
+
+        matched_ids = [row["id"] for row in self.memory.search_interactions("marker")]
+        self.assertEqual(matched_ids, [second_new_id, first_new_id, old_id])
+
+    def test_search_interactions_clamps_limit_to_one_through_fifty(self) -> None:
+        self.memory.initialize()
+        for index in range(55):
+            self.memory.record_interaction(f"marker {index}", "marker response")
+
+        self.assertEqual(len(self.memory.search_interactions("marker", limit=0)), 1)
+        self.assertEqual(len(self.memory.search_interactions("marker", limit=200)), 50)
+
+    def test_search_interactions_raises_on_empty_or_whitespace_query(self) -> None:
+        self.memory.initialize()
+
+        for query in ("", "   ", "\t\r\n"):
+            with self.subTest(query=query):
+                with self.assertRaisesRegex(
+                    ValueError,
+                    r"^Search query is required\.$",
+                ):
+                    self.memory.search_interactions(query)
+
+    def test_search_interactions_wraps_database_errors(self) -> None:
+        self.memory.initialize()
+
+        with patch.object(
+            self.memory,
+            "_connect",
+            side_effect=sqlite3.OperationalError("database unavailable"),
+        ):
+            with self.assertRaisesRegex(
+                RuntimeError,
+                r"^Unable to search interactions\.$",
+            ) as raised:
+                self.memory.search_interactions("marker")
+
+        self.assertIsInstance(raised.exception.__cause__, sqlite3.OperationalError)
+
 
 class BusyLockedClassificationTests(unittest.TestCase):
     """Exercise _is_busy_or_locked's numeric primary-result-code matching."""

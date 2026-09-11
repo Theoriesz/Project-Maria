@@ -50,10 +50,11 @@ normal recording path.
 
 Successful writes are committed to the configured SQLite file and remain
 available across normal restarts until the database is removed or altered
-externally. Maria v0.1 provides no automatic retention period, pruning,
-archival, or interaction-history deletion feature, and no CLI command to list
-or clear interaction history. Calling data "recent" does not imply that older
-rows expire.
+externally. Maria provides no automatic retention period, pruning, archival,
+or interaction-history deletion feature. `history`, `search history <query>`,
+and `read interaction <id>` list, search, and read existing rows; there is
+still no CLI command to clear or delete interaction history. Calling data
+"recent" does not imply that older rows expire.
 
 ### notes
 
@@ -99,6 +100,37 @@ CREATE TABLE IF NOT EXISTS memories (
 The unique `normalized_fact` constraint makes case-insensitive exact duplicates
 idempotent. Storing a duplicate returns the existing ID and keeps the original
 display casing and creation timestamp; it does not add or update a row.
+
+## Interaction Retrieval
+
+`history` requests the newest interactions via `get_recent_interactions()`.
+`search history <query>` strips the query and uses SQLite's built-in
+`LOWER()` for ASCII case-insensitive comparison together with literal
+`instr()` substring matching against both `user_input` and `response`;
+percent (`%`) and underscore (`_`) are literal characters, not wildcards.
+This is not full Unicode casefold equivalence — unlike `recall`, which
+compares a precomputed casefolded column — so a search may fail to match
+text that differs only by non-ASCII casing. Search is not semantic, fuzzy,
+ranked, or model-based.
+
+Both operations order rows by `created_at` descending and then `id`
+descending. The CLI normally returns at most 20 rows. Direct
+`search_interactions()` calls default to 20 and clamp requested limits to
+the same 1-through-50 range as `get_recent_interactions()`.
+
+When `history` or `search history` runs, the tool requests one additional
+row solely to prove whether a 21st (older) row exists; that extra row is
+never included in the displayed message or returned tool data, which both
+remain capped at 20. If the extra row is present, the tool appends one line
+stating that more results exist. This does not delete, expire, or prune any
+row.
+
+`read interaction <id>` displays the complete stored request, response, and
+timestamp for one row, but records only a fixed, content-free audit summary
+(`Displayed interaction <id>.`) instead of the historical content it
+redisplayed, so repeatedly reading old rows does not duplicate their content
+into new interaction rows. `list`, `search`, and `read` are all read-only:
+none of them delete, clear, or prune any interaction row.
 
 ## Memory Retrieval
 

@@ -150,7 +150,7 @@ class MariaBrain:
                 break
 
         response = self._format_results(results)
-        self._record_interaction(cleaned_input, response)
+        self._record_interaction(cleaned_input, self._format_recorded_results(results))
         return BrainResponse(response, plan=plan)
 
     def _record_interaction(self, user_input: str, response: str) -> None:
@@ -168,3 +168,21 @@ class MariaBrain:
 
         messages = [result.message for result in results]
         return "\n".join(messages)
+
+    @staticmethod
+    def _format_recorded_results(results: list[ToolExecutionResult]) -> str:
+        """Format tool results for interaction-history recording.
+
+        Each result contributes its recorded_message when set, or its
+        displayed message when recorded_message is None, so a tool can
+        override what gets persisted without Brain inspecting its name or
+        action.
+        """
+        if not results:
+            return "No action was executed."
+
+        recorded_texts = [
+            result.message if result.recorded_message is None else result.recorded_message
+            for result in results
+        ]
+        return "\n".join(recorded_texts)

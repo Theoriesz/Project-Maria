@@ -2,6 +2,18 @@
 
 ## Unreleased
 
+- Added read-only interaction-history browsing: `history`, `search history
+  <query>`, and `read interaction <id>`, backed by a new `HistoryTool`
+  (`list`, `search`, `read` actions) and two new `Memory` methods
+  (`get_interaction`, `search_interactions`). `history` and `search history`
+  show at most the newest 20 rows with a more-results indicator when older
+  rows exist; `read interaction` displays the complete stored request,
+  response, and timestamp but records only a fixed, content-free audit
+  summary instead of duplicating that content into a new interaction row, via
+  a new generic, optional `ToolExecutionResult.recorded_message` field that
+  Brain consumes without any tool-specific branch. `history.delete` does not
+  exist yet. No schema, permission, or version change was introduced.
+
 ## 0.1.2 - 2026-09-09
 
 - Made filesystem responses show paths relative to the configured safe root using

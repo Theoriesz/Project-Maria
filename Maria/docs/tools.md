@@ -6,6 +6,7 @@ Tools are small modules that expose controlled capabilities to Maria.
 
 - `calculator`: basic arithmetic
 - `filesystem`: read, list, rename, and move inside the configured safe root
+- `history`: list, search, and read SQLite-backed interaction-history rows
 - `memory`: store, search, and list explicit SQLite-backed memories
 - `notes`: create, list, and read SQLite-backed notes
 - `system`: read-only OS, CPU, RAM, disk, and time information
@@ -94,6 +95,67 @@ per-filename detail omitted from responses remains available.
 Two limits are worth stating plainly. Recorded request text is not sanitized, so an
 absolute path a user typed explicitly can still be retained in interaction history. The
 change is also prospective only: existing interaction-history rows are not rewritten.
+
+## History Tool
+
+The history tool supports exactly three actions:
+
+- `list`: list the newest interaction-history rows
+- `search`: find interactions by literal, case-insensitive substring across
+  the stored request and response
+- `read`: display one interaction's complete stored request, response, and
+  timestamp
+
+`delete` does not exist in the current Unreleased development state.
+
+`list` and `search` output one row per line as `<id>: <user_input>`, newest
+first, using the same newest-20-with-more-exists convention as notes and
+memories:
+
+```text
+Showing the newest 20 interactions. More interactions exist.
+Showing the newest 20 matches. More matching interactions exist.
+```
+
+Empty results are successful operations with these messages:
+
+```text
+No interactions found.
+No matching interactions found.
+```
+
+`search` may match text found only in a row's `response`, but `list` and
+`search` results never expose `response` in their returned `data`, which
+contains only `id`, `user_input`, and `created_at` for each visible row. Any
+character in a displayed `list`/`search` row for which
+`character.isprintable()` is `False` (including newlines, tabs, carriage
+returns, and other control characters) is replaced with a single ordinary
+space; this affects only that row's display text, never the stored row,
+never `data`, and never `read`'s full display.
+
+`read` displays the complete stored request and response, unmodified:
+
+```text
+Interaction <id>
+Created at: <created_at>
+Request:
+<user_input>
+Response:
+<response>
+```
+
+and returns the complete row (including `response`) as `data`. A missing ID
+returns `Interaction not found: <id>.`. Rather than recording that full
+historical content again, `read` sets `ToolExecutionResult.recorded_message`
+to a fixed `Displayed interaction <id>.` string, so Brain persists that short
+summary instead of the redisplayed content.
+
+The tool receives the shared `Memory` instance through dependency injection.
+It is registered as `tools.history` through Tool Manager's standard
+`build_tool(...)` factory contract and travels through the normal permission
+path; `history.list`, `history.search`, and `history.read` are all allowed by
+default. The tool contains no SQL; `core/memory.py` owns all database
+operations.
 
 ## Notes Tool
 

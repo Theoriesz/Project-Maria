@@ -82,6 +82,7 @@ class StartupIntegrationTests(unittest.TestCase):
         expected_tool_names = {
             "calculator",
             "filesystem",
+            "history",
             "memory",
             "notes",
             "system",
@@ -175,6 +176,39 @@ class StartupIntegrationTests(unittest.TestCase):
         self.assertEqual(recalled.text, f"1: {fact}")
         self.assertEqual(self.brain.memory.database_path, self.database_path)
 
+    def test_read_interaction_records_a_content_free_audit_summary(self) -> None:
+        self.brain.process("remember a distinctive marker EXC-HISTORY-TOKEN")
+        self.brain.process("recall EXC-HISTORY-TOKEN")
+
+        connection = sqlite3.connect(self.database_path)
+        try:
+            recall_row_id = connection.execute(
+                "SELECT id FROM interactions ORDER BY id DESC LIMIT 1"
+            ).fetchone()[0]
+        finally:
+            connection.close()
+
+        read_response = self.brain.process(f"read interaction {recall_row_id}")
+
+        self.assertIn("EXC-HISTORY-TOKEN", read_response.text)
+        self.assertIn(f"Interaction {recall_row_id}", read_response.text)
+        self.assertIn("Request:\nrecall EXC-HISTORY-TOKEN", read_response.text)
+
+        connection = sqlite3.connect(self.database_path)
+        try:
+            newest_id, newest_response = connection.execute(
+                "SELECT id, response FROM interactions ORDER BY id DESC LIMIT 1"
+            ).fetchone()
+        finally:
+            connection.close()
+
+        self.assertGreater(newest_id, recall_row_id)
+        self.assertEqual(
+            newest_response,
+            f"Displayed interaction {recall_row_id}.",
+        )
+        self.assertNotIn("EXC-HISTORY-TOKEN", newest_response)
+
     def test_mandatory_permission_policy_remains_active(self) -> None:
         rename = self.brain.permissions.check("filesystem", "rename")
         move = self.brain.permissions.check("filesystem", "move")
@@ -191,6 +225,13 @@ class StartupIntegrationTests(unittest.TestCase):
         )
         self.assertEqual(delete.decision, PermissionDecision.DENIED)
         self.assertEqual(write.decision, PermissionDecision.DENIED)
+
+        for action in ("list", "search", "read"):
+            with self.subTest(action=action):
+                self.assertEqual(
+                    self.brain.permissions.check("history", action).decision,
+                    PermissionDecision.ALLOWED,
+                )
 
     def test_all_runtime_paths_and_file_handlers_are_temporary(self) -> None:
         self.assertTrue(self.config.database_path.is_relative_to(self.temporary_root))

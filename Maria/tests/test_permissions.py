@@ -58,6 +58,19 @@ class PermissionManagerTests(unittest.TestCase):
             ),
         )
 
+    def test_history_actions_default_to_allowed(self) -> None:
+        manager = self._manager()
+
+        for action in ("list", "search", "read"):
+            with self.subTest(action=action):
+                self.assertEqual(
+                    manager.check("history", action),
+                    PermissionResult(
+                        PermissionDecision.ALLOWED,
+                        f"history.{action} is allowed.",
+                    ),
+                )
+
     def test_configured_additional_action_can_require_confirmation(self) -> None:
         manager = self._manager(confirmation_required={"notes.create"})
 

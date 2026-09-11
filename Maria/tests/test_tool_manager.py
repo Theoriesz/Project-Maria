@@ -23,12 +23,13 @@ from core.tool_manager import (
 EXPECTED_MODULES = (
     "tools.calculator",
     "tools.filesystem",
+    "tools.history",
     "tools.memory",
     "tools.notes",
     "tools.system",
 )
 EXPECTED_TOOL_NAMES = frozenset(
-    {"calculator", "filesystem", "memory", "notes", "system"}
+    {"calculator", "filesystem", "history", "memory", "notes", "system"}
 )
 
 
@@ -97,7 +98,7 @@ class ToolManagerTests(unittest.TestCase):
             result = manager.execute_tool(tool_name, "run", {})
             self.assertEqual(result, ToolExecutionResult(True, f"ran {tool_name}"))
 
-    def test_real_temporary_load_exposes_all_five_public_tool_names(self) -> None:
+    def test_real_temporary_load_exposes_all_public_tool_names(self) -> None:
         self.memory.initialize()
         manager = ToolManager(self.config, self.memory, self.manager_logger)
 

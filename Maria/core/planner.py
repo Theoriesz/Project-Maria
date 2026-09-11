@@ -131,6 +131,33 @@ class Planner:
             target = text[len("read note ") :].strip()
             return self._single_step(text, "notes", "read", {"target": target})
 
+        if lowered == "history":
+            return self._single_step(text, "history", "list", {})
+
+        if lowered == "search history":
+            return self._no_action(text, "Use: search history <query>")
+
+        if lowered.startswith("search history "):
+            query = text[len("search history ") :].strip()
+            if not query:
+                return self._no_action(text, "Use: search history <query>")
+            return self._single_step(text, "history", "search", {"query": query})
+
+        if lowered == "read interaction":
+            return self._no_action(text, "Use: read interaction <id>")
+
+        if lowered.startswith("read interaction "):
+            operand = text[len("read interaction ") :].strip()
+            if not operand:
+                return self._no_action(text, "Use: read interaction <id>")
+            interaction_id = _parse_positive_ascii_id(operand)
+            if interaction_id is None:
+                return self._no_action(
+                    text,
+                    "Interaction id must be a positive whole number.",
+                )
+            return self._single_step(text, "history", "read", {"id": interaction_id})
+
         if lowered in {"system", "system info", "status", "sys", "sys info"}:
             return self._single_step(text, "system", "overview", {})
 
@@ -201,8 +228,20 @@ def _parse_note(note_text: str) -> tuple[str, str] | None:
     return title.strip() or "Untitled", body.strip()
 
 
+def _parse_positive_ascii_id(value: str) -> int | None:
+    """Return a positive decimal id, or None if invalid.
+
+    Accepts ASCII digits only, rejecting Unicode digit lookalikes that
+    str.isdigit() alone would allow through.
+    """
+    if not value.isascii() or not value.isdigit():
+        return None
+    parsed = int(value)
+    return parsed if parsed >= 1 else None
+
+
 def _help_text() -> str:
-    """Return the supported v0.1 command list."""
+    """Return the supported command list."""
     return (
         "Supported v0.1 commands:\n"
         "- calculate <expression>\n"
@@ -217,5 +256,8 @@ def _help_text() -> str:
         "- recall <query>\n"
         "- memories\n"
         "- system\n"
-        "- time"
+        "- time\n"
+        "- history\n"
+        "- search history <query>\n"
+        "- read interaction <id>"
     )

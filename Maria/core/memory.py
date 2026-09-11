@@ -112,6 +112,59 @@ class Memory:
             self.logger.exception("Failed to fetch recent interactions.")
             raise RuntimeError("Unable to fetch recent interactions.") from exc
 
+    def get_interaction(self, interaction_id: int) -> dict[str, Any] | None:
+        """Return one interaction by its database id."""
+        try:
+            with self._connection() as connection:
+                row = connection.execute(
+                    """
+                    SELECT id, user_input, response, created_at
+                    FROM interactions
+                    WHERE id = ?
+                    """,
+                    (interaction_id,),
+                ).fetchone()
+            return dict(row) if row else None
+        except sqlite3.Error as exc:
+            self.logger.exception("Failed to read interaction.")
+            raise RuntimeError("Unable to read interaction.") from exc
+
+    def search_interactions(
+        self,
+        query: str,
+        limit: int = 20,
+    ) -> list[dict[str, Any]]:
+        """Return interactions whose request or response contains a literal,
+        case-insensitive query.
+
+        Matching uses SQLite's built-in LOWER(), which is the accepted
+        default-build ASCII case-insensitive comparison. It is not full
+        Unicode casefold equivalence (unlike explicit-memory search, which
+        uses a precomputed casefolded column).
+        """
+        clean_query = query.strip()
+        if not clean_query:
+            raise ValueError("Search query is required.")
+
+        safe_limit = max(1, min(limit, 50))
+        try:
+            with self._connection() as connection:
+                rows = connection.execute(
+                    """
+                    SELECT id, user_input, response, created_at
+                    FROM interactions
+                    WHERE instr(LOWER(user_input), LOWER(?)) > 0
+                       OR instr(LOWER(response), LOWER(?)) > 0
+                    ORDER BY created_at DESC, id DESC
+                    LIMIT ?
+                    """,
+                    (clean_query, clean_query, safe_limit),
+                ).fetchall()
+            return [dict(row) for row in rows]
+        except sqlite3.Error as exc:
+            self.logger.exception("Failed to search interactions.")
+            raise RuntimeError("Unable to search interactions.") from exc
+
     def store_memory(self, fact: str) -> tuple[int, bool]:
         """Store a fact and return its database id and creation status."""
         clean_fact = fact.strip()

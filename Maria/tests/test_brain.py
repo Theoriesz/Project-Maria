@@ -365,6 +365,122 @@ class MariaBrainTests(unittest.TestCase):
             error,
         )
 
+    def test_recorded_message_none_persists_displayed_message_unchanged(self) -> None:
+        plan = _single_step_plan("calculate 2 + 2", arguments={"expression": "2 + 2"})
+        self.planner.create_plan.return_value = plan
+        self.tool_manager.execute_tool.return_value = ToolExecutionResult(True, "4")
+
+        response = self.brain.process("calculate 2 + 2")
+
+        self.assertEqual(response.text, "4")
+        self.memory.record_interaction.assert_called_once_with(
+            "calculate 2 + 2",
+            "4",
+        )
+
+    def test_recorded_message_overrides_persisted_text_for_a_single_step(self) -> None:
+        plan = _single_step_plan(
+            "read interaction 5",
+            tool_name="history",
+            action="read",
+            arguments={"id": 5},
+        )
+        self.planner.create_plan.return_value = plan
+        self.tool_manager.execute_tool.return_value = ToolExecutionResult(
+            True,
+            "Interaction 5\nCreated at: 2026-01-01T00:00:00+00:00\n"
+            "Request:\nsecret\nResponse:\nsecret answer",
+            {"id": 5},
+            recorded_message="Displayed interaction 5.",
+        )
+
+        response = self.brain.process("read interaction 5")
+
+        self.assertIn("secret answer", response.text)
+        self.memory.record_interaction.assert_called_once_with(
+            "read interaction 5",
+            "Displayed interaction 5.",
+        )
+
+    def test_recorded_message_empty_string_is_persisted_verbatim_not_treated_as_unset(
+        self,
+    ) -> None:
+        plan = _single_step_plan("calculate 2 + 2", arguments={"expression": "2 + 2"})
+        self.planner.create_plan.return_value = plan
+        self.tool_manager.execute_tool.return_value = ToolExecutionResult(
+            True,
+            "4",
+            None,
+            recorded_message="",
+        )
+
+        self.brain.process("calculate 2 + 2")
+
+        self.memory.record_interaction.assert_called_once_with(
+            "calculate 2 + 2",
+            "",
+        )
+
+    def test_recorded_message_is_applied_per_step_in_multi_step_plans(self) -> None:
+        first_arguments = {"expression": "1 + 1"}
+        second_arguments: dict[str, Any] = {}
+        plan = Plan(
+            original_request="synthetic multi step",
+            steps=(
+                PlanStep("calculator", "calculate", first_arguments),
+                PlanStep("history", "read", second_arguments),
+            ),
+        )
+        self.planner.create_plan.return_value = plan
+        self.tool_manager.execute_tool.side_effect = (
+            ToolExecutionResult(True, "2"),
+            ToolExecutionResult(
+                True,
+                "Interaction 9\nCreated at: 2026-01-01T00:00:00+00:00\n"
+                "Request:\nx\nResponse:\ny",
+                {"id": 9},
+                recorded_message="Displayed interaction 9.",
+            ),
+        )
+
+        response = self.brain.process("synthetic multi step")
+
+        expected_display = (
+            "2\nInteraction 9\nCreated at: 2026-01-01T00:00:00+00:00\n"
+            "Request:\nx\nResponse:\ny"
+        )
+        self.assertEqual(response.text, expected_display)
+        self.memory.record_interaction.assert_called_once_with(
+            "synthetic multi step",
+            "2\nDisplayed interaction 9.",
+        )
+
+    def test_recorded_message_failure_after_success_uses_executed_result_prefix(
+        self,
+    ) -> None:
+        first_arguments = {"expression": "1 + 1"}
+        second_arguments = {"path": "missing.txt"}
+        plan = Plan(
+            original_request="synthetic partial failure",
+            steps=(
+                PlanStep("calculator", "calculate", first_arguments),
+                PlanStep("filesystem", "read", second_arguments),
+            ),
+        )
+        self.planner.create_plan.return_value = plan
+        self.tool_manager.execute_tool.side_effect = (
+            ToolExecutionResult(True, "4", None, recorded_message="Custom four"),
+            ToolExecutionResult(False, "File not found: missing.txt"),
+        )
+
+        response = self.brain.process("synthetic partial failure")
+
+        self.assertEqual(response.text, "4\nFile not found: missing.txt")
+        self.memory.record_interaction.assert_called_once_with(
+            "synthetic partial failure",
+            "Custom four\nFile not found: missing.txt",
+        )
+
     def test_brain_delegates_to_manager_not_tool_implementations(self) -> None:
         plan = _single_step_plan("time", tool_name="system", action="current_time")
         self.planner.create_plan.return_value = plan
@@ -411,6 +527,14 @@ class MariaBrainTests(unittest.TestCase):
         self.assertNotRegex(
             source,
             r"(?:tool_name|step\.tool_name)\s*==\s*['\"]memory['\"]",
+        )
+        self.assertNotRegex(
+            source,
+            r"(?:tool_name|step\.tool_name|action)\s*==\s*['\"]history['\"]",
+        )
+        self.assertNotRegex(
+            source,
+            r"(?:action|step\.action)\s*==\s*['\"]read['\"]",
         )
 
 

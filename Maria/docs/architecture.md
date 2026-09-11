@@ -65,6 +65,22 @@ output limits. A recording `RuntimeError` is logged without replacing the
 primary response, so recording is attempted but a row is not guaranteed when
 the database write fails.
 
+`ToolExecutionResult` carries an optional `recorded_message` field. It
+defaults to `None`, and any result that does not opt in leaves it as `None`;
+`None` makes Brain record the same text it displays, exactly as before. A
+tool may instead set `recorded_message` to persist different text than the
+displayed `message` for that step; an explicit empty string is honored rather
+than falling back to `message`. Brain applies this generically, reading only
+`.message` and `.recorded_message`, with no branch on a tool's name or
+action.
+
+In the current Unreleased development state, `history.read` is the only
+result that supplies a non-`None` `recorded_message`, so that redisplaying
+old interaction content does not duplicate it into a new interaction row.
+Every other current tool result leaves the field as `None` and therefore
+retains the existing message-as-recorded behavior; `read file`, `read note`,
+and `recall` are unmodified and still record their full displayed content.
+
 Some paths return before this boundary. Blank CLI input is not processed, and
 blank input passed directly to `process()` returns before logging, context
 retrieval, planning, or recording. `exit`, `quit`, `q`, main-prompt EOF or
