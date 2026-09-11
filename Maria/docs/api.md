@@ -60,10 +60,29 @@ limits are clamped to a minimum of 1 and maximum of 50. SQLite failures raise
 `RuntimeError("Unable to fetch recent interactions.")`.
 
 "Recent" limits the query result and does not delete, expire, or prune older
-rows. Maria v0.1 exposes no interaction-history delete or prune API method or
-CLI command. Brain requests up to three rows for context; retrieval failure
-falls back to empty context, while recording failure is logged without
-replacing the user response.
+rows. Maria exposes no interaction-history delete or prune API method or CLI
+command. Brain requests up to three rows for context; retrieval failure falls
+back to empty context, while recording failure is logged without replacing
+the user response.
+
+`Memory.get_interaction(interaction_id: int) -> dict[str, Any] | None`
+
+Returns one interaction by ID with exactly `id`, `user_input`, `response`,
+and `created_at`, or `None` when the ID does not exist. SQLite failures raise
+`RuntimeError("Unable to read interaction.")`.
+
+`Memory.search_interactions(query: str, limit: int = 20) -> list[dict[str, Any]]`
+
+Strips the query and raises `ValueError("Search query is required.")` when it
+is empty. Matching uses SQLite's built-in `LOWER()` for ASCII
+case-insensitive comparison — not full Unicode casefold equivalence, unlike
+explicit-memory search — together with literal `instr()` substring matching
+against both `user_input` and `response`; percent (`%`) and underscore (`_`)
+are literal characters, not wildcards. Results contain `id`, `user_input`,
+`response`, and `created_at`, ordered by `created_at` descending and then
+`id` descending; no match returns an empty list. Requested integer limits are
+clamped to the same 1-through-50 range as `get_recent_interactions`. SQLite
+failures raise `RuntimeError("Unable to search interactions.")`.
 
 ### Explicit Memories
 
@@ -99,6 +118,23 @@ returns an empty list. SQLite failures raise
 Search and list default to 20 results. Direct API limits are clamped to a
 minimum of 1 and a maximum of 100.
 
+## Tool Execution Result
+
+`ToolExecutionResult(success: bool, message: str, data: Any = None, recorded_message: str | None = None)`
+
+`message` is the text Brain displays to the user. `recorded_message` is an
+optional override for what Brain persists to interaction history instead. It
+defaults to `None`, and any result that does not opt in leaves it as `None`;
+`None` makes Brain record `message` unchanged. An explicit empty string is
+honored and persisted as an empty string rather than falling back to
+`message`. Brain applies this generically and never branches on a tool's name
+or action.
+
+In the current Unreleased development state, `history.read` is the only
+result that supplies a non-`None` `recorded_message`. Every other current
+tool result leaves the field as `None` and therefore retains the existing
+message-as-recorded behavior.
+
 ## Memory Tool
 
 `MemoryTool.execute(action: str, arguments: dict[str, Any]) -> ToolExecutionResult`
@@ -112,6 +148,31 @@ successful result with `data=[]`.
 Expected validation and persistence failures are converted into unsuccessful
 `ToolExecutionResult` values. The tool calls the shared `Memory` interface and
 does not execute SQL.
+
+## History Tool
+
+`HistoryTool.execute(action: str, arguments: dict[str, Any]) -> ToolExecutionResult`
+
+The history tool supports `list`, `search`, and `read`; `delete` does not
+exist in the current Unreleased development state. `list` and `search`
+return at most the newest 20 rows, using the same limit-plus-one probing
+pattern as notes and memories; their `data` is a redacted list of `{"id",
+"user_input", "created_at"}` dictionaries that excludes `response`, even
+when `search` matched inside a row's `response` text. `read` returns the
+complete interaction row (including `response`) as `data`, since its
+`message` already displays the full stored request and response.
+Non-printable characters in a `list`/`search` display row are replaced with
+a single space; the underlying stored data and `read`'s full display are
+unaffected. `read` sets `recorded_message` to a fixed
+`Displayed interaction <id>.` string so redisplaying old content does not
+duplicate it into a new interaction row.
+
+The tool receives the shared `Memory` instance through dependency injection.
+It is registered as `tools.history` through Tool Manager's standard
+`build_tool(...)` factory contract and travels through the normal permission
+path; `history.list`, `history.search`, and `history.read` are all allowed
+by default. The tool contains no SQL; `core/memory.py` owns all database
+operations.
 
 ## Tool Manager
 

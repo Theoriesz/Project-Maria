@@ -154,6 +154,105 @@ class PlannerRegressionTests(unittest.TestCase):
                     PlanStep("notes", "read", arguments),
                 )
 
+    def test_history_maps_to_exact_step(self) -> None:
+        self._assert_single_step("history", PlanStep("history", "list", {}))
+
+    def test_search_history_maps_to_exact_step(self) -> None:
+        self._assert_single_step(
+            "search history weekend trip",
+            PlanStep("history", "search", {"query": "weekend trip"}),
+        )
+
+    def test_read_interaction_maps_to_exact_step(self) -> None:
+        self._assert_single_step(
+            "read interaction 42",
+            PlanStep("history", "read", {"id": 42}),
+        )
+
+    def test_read_interaction_accepts_leading_zeroes(self) -> None:
+        self._assert_single_step(
+            "read interaction 007",
+            PlanStep("history", "read", {"id": 7}),
+        )
+
+    def test_history_command_keywords_are_case_insensitive(self) -> None:
+        cases = (
+            ("HISTORY", PlanStep("history", "list", {})),
+            ("Search History trip", PlanStep("history", "search", {"query": "trip"})),
+            ("READ INTERACTION 9", PlanStep("history", "read", {"id": 9})),
+        )
+
+        for request, expected_step in cases:
+            with self.subTest(request=request):
+                self.assertEqual(
+                    self.planner.create_plan(request).steps,
+                    (expected_step,),
+                )
+
+    def test_search_history_query_preserves_casing_and_internal_spacing(self) -> None:
+        plan = self.planner.create_plan("SEARCH HISTORY  Mixed  CASE   Query")
+
+        self.assertEqual(
+            plan.steps[0].arguments,
+            {"query": "Mixed  CASE   Query"},
+        )
+
+    def test_bare_history_command_variants_return_exact_usage_response(self) -> None:
+        cases = (
+            ("search history", "Use: search history <query>"),
+            ("search history   ", "Use: search history <query>"),
+            ("SEARCH HISTORY", "Use: search history <query>"),
+            ("read interaction", "Use: read interaction <id>"),
+            ("read interaction   ", "Use: read interaction <id>"),
+            ("READ INTERACTION", "Use: read interaction <id>"),
+        )
+
+        for request, expected_response in cases:
+            with self.subTest(request=request):
+                plan = self.planner.create_plan(request)
+                self.assertEqual(plan.steps, ())
+                self.assertEqual(plan.response_if_no_action, expected_response)
+
+    def test_invalid_interaction_id_returns_exact_usage_response(self) -> None:
+        # The Unicode digit cases matter because str.isdigit() accepts them and
+        # int() converts the decimal ones; only the ASCII guard rejects them.
+        invalid_ids = (
+            "0",
+            "-5",
+            "+5",
+            "5.0",
+            "5a",
+            "5 6",
+            "²",
+            "１２",
+            "١٢",
+        )
+
+        for invalid_id in invalid_ids:
+            with self.subTest(invalid_id=invalid_id):
+                plan = self.planner.create_plan(f"read interaction {invalid_id}")
+                self.assertEqual(plan.steps, ())
+                self.assertEqual(
+                    plan.response_if_no_action,
+                    "Interaction id must be a positive whole number.",
+                )
+
+    def test_history_near_prefix_and_plural_variants_remain_unsupported(self) -> None:
+        requests = (
+            "histories",
+            "history list",
+            "history 5",
+            "search historyfoo",
+            "searching history trip",
+            "read interactions 5",
+            "read interactionfoo 5",
+            "reading interaction 5",
+        )
+
+        for request in requests:
+            with self.subTest(request=request):
+                self._assert_unsupported(request)
+
     def test_system_maps_to_exact_step(self) -> None:
         self._assert_single_step("system", PlanStep("system", "overview", {}))
 
@@ -433,12 +532,16 @@ class PlannerRegressionTests(unittest.TestCase):
             "- memories",
             "- system",
             "- time",
+            "- history",
+            "- search history <query>",
+            "- read interaction <id>",
         )
 
         self.assertEqual(plan.steps, ())
         for command_line in expected_lines:
             with self.subTest(command=command_line):
                 self.assertIn(command_line, response.splitlines())
+        self.assertNotIn("- delete interaction", response.splitlines())
 
     def _assert_single_step(self, request: str, expected_step: PlanStep) -> None:
         """Assert the complete public plan for one deterministic command."""

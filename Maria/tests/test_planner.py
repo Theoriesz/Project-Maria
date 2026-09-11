@@ -197,6 +197,9 @@ class PlannerMemoryTests(unittest.TestCase):
             "- memories",
             "- system",
             "- time",
+            "- history",
+            "- search history <query>",
+            "- read interaction <id>",
         }
 
         self.assertEqual(plan.steps, ())

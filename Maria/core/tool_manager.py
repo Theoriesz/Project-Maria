@@ -15,6 +15,7 @@ from core.memory import Memory
 BUILT_IN_TOOL_MODULES = (
     "tools.calculator",
     "tools.filesystem",
+    "tools.history",
     "tools.memory",
     "tools.notes",
     "tools.system",
@@ -28,6 +29,7 @@ class ToolExecutionResult:
     success: bool
     message: str
     data: Any = None
+    recorded_message: str | None = None
 
 
 class Tool(Protocol):

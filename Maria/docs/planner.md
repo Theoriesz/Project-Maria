@@ -85,6 +85,67 @@ The truly bare `create note` command (no operand text at all) is unaffected
 by this grammar and keeps the planner's existing generic unsupported-command
 response.
 
+## Interaction History Grammar
+
+Interaction-history commands use strict command syntax. Command keywords are
+case-insensitive, while the search query keeps its original casing and
+internal spacing after surrounding whitespace is removed.
+
+The exact command `history` creates this step:
+
+```text
+PlanStep(
+    tool_name="history",
+    action="list",
+    arguments={},
+)
+```
+
+`search history <query>` creates this step:
+
+```text
+PlanStep(
+    tool_name="history",
+    action="search",
+    arguments={"query": query},
+)
+```
+
+`read interaction <id>` creates this step:
+
+```text
+PlanStep(
+    tool_name="history",
+    action="read",
+    arguments={"id": interaction_id},
+)
+```
+
+`id` must be one or more ASCII digits (`0`-`9`) with a resulting value of at
+least 1; leading zeroes are accepted (`007` parses to `7`). Unicode digit
+lookalikes, signs, decimals, embedded whitespace, and any other non-digit
+character are rejected. A bare or whitespace-only `search history` returns:
+
+```text
+Use: search history <query>
+```
+
+A bare or whitespace-only `read interaction` returns:
+
+```text
+Use: read interaction <id>
+```
+
+An invalid `read interaction` ID returns:
+
+```text
+Interaction id must be a positive whole number.
+```
+
+Near-prefix and plural variants such as `histories`, `history list`,
+`search historyfoo`, and `read interactions <id>` remain unsupported and
+receive the planner's existing generic unsupported-command response.
+
 ## Plan Shape
 
 A plan contains:

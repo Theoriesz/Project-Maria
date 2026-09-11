@@ -2,10 +2,12 @@
 
 ## Status
 
-- **v0.1.2** is the current released baseline. Every capability described below is
+- **v0.1.2** is the current released baseline.
+- Stage 1 (interaction-history browsing) is implemented in the current
+  `Unreleased` development state for v0.2.0. Stages 2 through 4 remain
   **planned, not implemented**.
 - `APP_VERSION` (`core/constants.py`) and the shipped `config/config.toml` version
-  remain `0.1.2` throughout every v0.2.0 feature branch.
+  remain `0.1.2` throughout v0.2.0 feature development.
 - `0.2.0` is assigned only during the separate `release/v0.2.0` preparation stage
   (Stage 6), after every feature branch below has merged.
 
