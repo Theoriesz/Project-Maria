@@ -292,6 +292,20 @@ class MemoryToolTests(unittest.TestCase):
                 "Unable to list memories.",
                 "Memory listing failed: Unable to list memories.",
             ),
+            (
+                "update",
+                "update_memory",
+                {"id": 1, "fact": "A fact"},
+                "Unable to update memory.",
+                "Memory update failed: Unable to update memory.",
+            ),
+            (
+                "forget",
+                "forget_memory",
+                {"id": 1},
+                "Unable to forget memory.",
+                "Memory forget failed: Unable to forget memory.",
+            ),
         )
 
         for action, method_name, arguments, error_text, expected_message in cases:
@@ -326,6 +340,18 @@ class MemoryToolTests(unittest.TestCase):
                 "list_memories",
                 {},
                 f"Memory listing failed: {busy_text}",
+            ),
+            (
+                "update",
+                "update_memory",
+                {"id": 1, "fact": "A fact"},
+                f"Memory update failed: {busy_text}",
+            ),
+            (
+                "forget",
+                "forget_memory",
+                {"id": 1},
+                f"Memory forget failed: {busy_text}",
             ),
         )
 
@@ -367,11 +393,213 @@ class MemoryToolTests(unittest.TestCase):
         self.assertEqual(stored[0]["id"], first.data["id"])
 
     def test_unknown_action_is_rejected(self) -> None:
-        result = self.tool.execute("forget", {"id": 1})
+        result = self.tool.execute("purge", {"id": 1})
 
         self.assertFalse(result.success)
-        self.assertEqual(result.message, "Unsupported memory action: forget")
+        self.assertEqual(result.message, "Unsupported memory action: purge")
         self.assertIsNone(result.data)
+
+    def test_tool_identity_supported_actions_and_factory_contract(self) -> None:
+        built = memory_tool_module.build_tool(memory=self.memory)
+
+        self.assertIsInstance(built, MemoryTool)
+        self.assertEqual(built.name, "memory")
+        self.assertEqual(
+            built.description,
+            "Stores, searches, lists, updates, and forgets explicit memories.",
+        )
+        self.assertEqual(
+            built.actions,
+            frozenset({"store", "search", "list", "update", "forget"}),
+        )
+        self.assertIs(built.memory, self.memory)
+
+    def test_update_success_message_and_data(self) -> None:
+        stored = self.tool.execute("store", {"fact": "My editor is VS Code"})
+        memory_id = stored.data["id"]
+
+        result = self.tool.execute(
+            "update",
+            {"id": memory_id, "fact": "  My editor is Neovim  "},
+        )
+
+        self.assertTrue(result.success)
+        self.assertEqual(result.message, f"Updated memory {memory_id}.")
+        self.assertEqual(result.data, {"id": memory_id})
+        self.assertIsNone(result.recorded_message)
+        self.assertEqual(
+            self.memory.get_memory(memory_id)["fact"], "My editor is Neovim"
+        )
+
+    def test_forget_success_message_and_data(self) -> None:
+        stored = self.tool.execute("store", {"fact": "My editor is VS Code"})
+        memory_id = stored.data["id"]
+
+        result = self.tool.execute("forget", {"id": memory_id})
+
+        self.assertTrue(result.success)
+        self.assertEqual(result.message, f"Forgot memory {memory_id}.")
+        self.assertEqual(result.data, {"id": memory_id})
+        self.assertIsNone(result.recorded_message)
+        self.assertIsNone(self.memory.get_memory(memory_id))
+
+    def test_mutation_not_found_messages(self) -> None:
+        for action, arguments in (
+            ("update", {"id": 404, "fact": "Replacement fact"}),
+            ("forget", {"id": 404}),
+        ):
+            with self.subTest(action=action):
+                result = self.tool.execute(action, arguments)
+
+                self.assertFalse(result.success)
+                self.assertEqual(result.message, "Memory not found: 404.")
+                self.assertIsNone(result.data)
+                self.assertIsNone(result.recorded_message)
+
+    def test_update_conflict_message_names_only_numeric_ids(self) -> None:
+        target = self.tool.execute("store", {"fact": "My editor is VS Code"})
+        other = self.tool.execute("store", {"fact": "Straße in Berlin"})
+        target_id = target.data["id"]
+        other_id = other.data["id"]
+
+        result = self.tool.execute(
+            "update",
+            {"id": target_id, "fact": "STRASSE IN BERLIN"},
+        )
+
+        self.assertFalse(result.success)
+        self.assertEqual(
+            result.message,
+            f"Memory {target_id} conflicts with existing memory {other_id}.",
+        )
+        self.assertIsNone(result.data)
+        self.assertIsNone(result.recorded_message)
+        self.assertNotIn("STRASSE", result.message)
+        self.assertNotIn("Straße", result.message)
+        self.assertEqual(
+            self.memory.get_memory(target_id)["fact"], "My editor is VS Code"
+        )
+        self.assertEqual(
+            self.memory.get_memory(other_id)["fact"], "Straße in Berlin"
+        )
+
+    def test_mutation_ids_must_be_positive_integers_and_never_reach_memory(
+        self,
+    ) -> None:
+        cases = (
+            ("update", "update_memory", {"fact": "Replacement fact"}),
+            ("forget", "forget_memory", {}),
+        )
+        invalid_ids = (0, -1, "1", 1.0, True, False, None)
+
+        for action, method_name, extra_arguments in cases:
+            for invalid_id in invalid_ids:
+                with self.subTest(action=action, invalid_id=invalid_id):
+                    with patch.object(self.memory, method_name) as memory_method:
+                        result = self.tool.execute(
+                            action,
+                            {"id": invalid_id, **extra_arguments},
+                        )
+                    self.assertFalse(result.success)
+                    self.assertEqual(
+                        result.message,
+                        "Memory id must be a positive whole number.",
+                    )
+                    self.assertIsNone(result.data)
+                    memory_method.assert_not_called()
+
+            with self.subTest(action=action, invalid_id="missing"):
+                with patch.object(self.memory, method_name) as memory_method:
+                    result = self.tool.execute(action, dict(extra_arguments))
+                self.assertFalse(result.success)
+                self.assertEqual(
+                    result.message,
+                    "Memory id must be a positive whole number.",
+                )
+                memory_method.assert_not_called()
+
+    def test_update_fact_must_be_a_non_blank_string_and_never_reaches_memory(
+        self,
+    ) -> None:
+        stored = self.tool.execute("store", {"fact": "Original fact"})
+        memory_id = stored.data["id"]
+
+        for new_fact in (None, 5, True, [], object(), "", "   "):
+            with self.subTest(new_fact=new_fact):
+                with patch.object(self.memory, "update_memory") as memory_method:
+                    result = self.tool.execute(
+                        "update",
+                        {"id": memory_id, "fact": new_fact},
+                    )
+                self.assertFalse(result.success)
+                self.assertEqual(result.message, "New memory fact is required.")
+                self.assertIsNone(result.data)
+                memory_method.assert_not_called()
+
+        with self.subTest(new_fact="missing"):
+            with patch.object(self.memory, "update_memory") as memory_method:
+                result = self.tool.execute("update", {"id": memory_id})
+            self.assertFalse(result.success)
+            self.assertEqual(result.message, "New memory fact is required.")
+            memory_method.assert_not_called()
+
+        self.assertEqual(self.memory.get_memory(memory_id)["fact"], "Original fact")
+
+    def test_rejected_update_facts_are_never_coerced_into_persisted_text(
+        self,
+    ) -> None:
+        stored = self.tool.execute("store", {"fact": "Original fact"})
+        memory_id = stored.data["id"]
+
+        for new_fact in (None, 5, True, []):
+            with self.subTest(new_fact=new_fact):
+                result = self.tool.execute(
+                    "update",
+                    {"id": memory_id, "fact": new_fact},
+                )
+                self.assertFalse(result.success)
+                self.assertNotIn(str(new_fact), result.message)
+
+        self.assertEqual(self.memory.get_memory(memory_id)["fact"], "Original fact")
+
+    def test_mutation_results_and_logs_exclude_fact_content(self) -> None:
+        logger = _quiet_logger("memory-tool-log-privacy")
+        tool = MemoryTool(memory=self.memory, logger=logger)
+        target, _ = self.memory.store_memory("secret stored fact")
+        other, _ = self.memory.store_memory("secret other fact")
+
+        with patch.object(logger, "info") as info_mock, patch.object(
+            logger, "warning"
+        ) as warning_mock:
+            updated = tool.execute(
+                "update", {"id": target, "fact": "secret new fact"}
+            )
+            conflicted = tool.execute(
+                "update", {"id": target, "fact": "SECRET OTHER FACT"}
+            )
+            forgotten = tool.execute("forget", {"id": target})
+            missing = tool.execute("forget", {"id": target})
+
+        self.assertTrue(updated.success)
+        self.assertFalse(conflicted.success)
+        self.assertTrue(forgotten.success)
+        self.assertFalse(missing.success)
+        self.assertEqual(conflicted.message, f"Memory {target} conflicts with existing memory {other}.")
+
+        logged = [
+            " ".join(str(argument) for argument in call.args)
+            for call in list(info_mock.call_args_list) + list(warning_mock.call_args_list)
+        ]
+        texts = logged + [
+            result.message for result in (updated, conflicted, forgotten, missing)
+        ] + [
+            str(result.data) for result in (updated, conflicted, forgotten, missing)
+        ]
+        for text in texts:
+            self.assertNotIn("secret stored fact", text)
+            self.assertNotIn("secret other fact", text)
+            self.assertNotIn("secret new fact", text)
+            self.assertNotIn("SECRET OTHER FACT", text)
 
     def test_memory_tool_contains_no_direct_sql(self) -> None:
         source = inspect.getsource(memory_tool_module)

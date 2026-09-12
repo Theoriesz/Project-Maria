@@ -17,6 +17,8 @@ MANDATORY_CONFIRMATION_ACTIONS = frozenset(
         "notes.retitle",
         "notes.edit",
         "notes.delete",
+        "memory.update",
+        "memory.forget",
     }
 )
 

@@ -56,6 +56,42 @@
   revision history, and no guarantee of secure erasure from SQLite file
   pages, backups, or external copies. No schema or version change was
   introduced.
+- Added explicit-memory lifecycle management: `update memory <id>: <new fact>`
+  and `forget memory <id>`, backed by two new `MemoryTool` actions (`update`,
+  `forget`) and two new `Memory` methods (`update_memory`, `forget_memory`).
+  Each command accepts only a single positive ASCII-decimal ID — never fact
+  text — and affects at most one row; `update memory` splits its operand on the
+  first colon only, so later colons stay literal inside the new fact. Both
+  require mandatory explicit confirmation; `memory.update` and `memory.forget`
+  are new entries in `MANDATORY_CONFIRMATION_ACTIONS` alongside
+  `filesystem.rename`, `filesystem.move`, `history.delete`, `notes.retitle`,
+  `notes.edit`, and `notes.delete`, bringing that baseline to eight actions,
+  with no preview of stored content before confirmation. `remember`, `recall`,
+  and `memories` are unchanged. A successful update rewrites only `fact` and
+  `normalized_fact` and preserves `created_at`; no `memories.updated_at` column
+  was added, so an edited memory keeps its place in newest-first results
+  instead of moving to the top. A new fact equal to the stored one, or
+  differing from it only by casing, still counts as a successful update.
+  Because `normalized_fact` remains unique over `str.casefold()`, an update
+  whose casefolded fact already belongs to a different memory returns the
+  controlled, content-free result `Memory <id> conflicts with existing memory
+  <other id>.` rather than a raw constraint error; the conflict is classified
+  by SQLite's exact extended `SQLITE_CONSTRAINT_UNIQUE` result code, so other
+  constraint failures keep their existing static message, and neither memory is
+  changed, merged, or removed. Neither mutation reads its target row first.
+  Each mutation commits independently, and Maria then separately attempts to
+  record a short, content-free response (`Updated memory <id>.` or `Forgot
+  memory <id>.`); if that later recording fails, the mutation remains committed
+  with no audit row guaranteed. Because the original command is stored as the
+  request half of interaction history, an update command retains its new fact
+  there, and an earlier `remember`, `recall`, or `memories` response may
+  already have copied a fact into its own interaction row; forgetting the
+  memory afterwards does not rewrite or remove those independent rows. There is
+  no mutation by fact text, no fuzzy or contextual selection, no bulk,
+  wildcard, clear-all, or automatic deletion, no cascade into interaction
+  history or notes, no renumbering of remaining memory IDs, no undo or memory
+  revision history, and no guarantee of secure erasure from SQLite file pages,
+  backups, or external copies. No schema or version change was introduced.
 
 ## 0.1.2 - 2026-09-09
 

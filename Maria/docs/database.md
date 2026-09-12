@@ -138,6 +138,55 @@ The unique `normalized_fact` constraint makes case-insensitive exact duplicates
 idempotent. Storing a duplicate returns the existing ID and keeps the original
 display casing and creation timestamp; it does not add or update a row.
 
+`update memory <id>: <new fact>` and `forget memory <id>` each change at most
+one row by primary-key ID, after mandatory explicit confirmation and with no
+preview of stored content beforehand. Update runs a single parameterized
+`UPDATE memories SET fact = ?, normalized_fact = ? WHERE id = ?`, writing the
+stripped fact and its `casefold()` form together so display text and search
+text can never drift apart. It does not read the row first. `created_at` is
+always preserved and no `updated_at` column was added, so — unlike a retitled
+or edited note — an updated memory keeps its existing position in the
+`created_at DESC, id DESC` ordering used by `memories` and `recall` rather than
+moving to the top. Writing a value identical to the stored one still counts as
+a successful update, because success is determined by the row matching `WHERE
+id = ?` rather than by the value changing. A change that affects only letter
+casing rewrites the displayed `fact` while leaving `normalized_fact` identical,
+so it updates successfully and never conflicts with itself.
+
+Unlike note titles, memory facts stay unique. If the new fact's `casefold()`
+form already belongs to a *different* row, SQLite's unique constraint fires and
+Maria reports the controlled result `Memory <id> conflicts with existing memory
+<other id>.` instead of a raw constraint error. The violation is recognised by
+SQLite's exact extended `SQLITE_CONSTRAINT_UNIQUE` result code rather than by
+exception text, so the table's `CHECK` constraints — which share the same
+primary result code — are never mistaken for uniqueness conflicts. The
+conflicting row is then identified through one parameterized lookup on
+`normalized_fact`. Neither row is changed, merged, or deleted, and only numeric
+IDs are reported. Because `casefold()` is full Unicode folding, visually
+different facts can collide: storing `straße` and then updating another memory
+to `STRASSE` is a conflict, since both fold to `strasse`.
+
+`forget memory <id>` removes at most one row through a single parameterized
+`DELETE FROM memories WHERE id = ?` statement, under the same confirmation rule
+and without reading the row first. The forgotten fact is never read, logged, or
+returned. It does not cascade to `interactions` or `notes` and does not
+renumber remaining rows' IDs. For Maria's implicit-ID inserts, SQLite
+AUTOINCREMENT does not automatically reuse an ID from a previously committed
+row, even after the table has been emptied. Both mutations commit
+independently first; Maria then separately attempts to record a short,
+content-free audit interaction (`Updated memory <id>.` or `Forgot memory
+<id>.`) as its own transaction. If that later recording fails, the mutation
+remains committed and no audit row is guaranteed. Because the original command
+is stored as the request half of an interaction, an update command retains its
+new fact in the `interactions` table, and an earlier `remember`, `recall`, or
+`memories` response may already have copied a fact there; updating or
+forgetting the memory afterwards does not rewrite or remove those independent
+rows, which can be removed separately with `delete interaction <id>`. There is
+no memory mutation by fact text, no fuzzy or contextual selection, no bulk,
+wildcard, range, or automatic deletion, no undo or revision history, and no
+guarantee of secure erasure from SQLite file pages, backups, database copies,
+or external storage.
+
 ## Interaction Retrieval
 
 `history` requests the newest interactions via `get_recent_interactions()`.
@@ -208,8 +257,9 @@ requested, and it does not delete, expire, or prune any row — it only affects
 how the tool decides whether to mention that older rows were left out.
 
 Literal substring retrieval scans the stored normalized text and is intended
-for a small personal database. No update, deletion, or `forget` operation exists
-for memories in v0.1.
+for a small personal database. In the current Unreleased development state,
+`update memory <id>: <new fact>` and `forget memory <id>` change or remove one
+memory by numeric ID; both are described under the `memories` table above.
 
 ## Data Considerations
 
@@ -224,12 +274,14 @@ automatically remove matching text from existing interaction rows. All three
 tables share one database file; external removal or replacement affects all
 three datasets.
 
-In the current Unreleased development state, `delete interaction <id>` and
-`delete note <id>` each target at most one row by ID and remove it when
-found, and `retitle note <id>` and `edit note <id>` each change one note
-field; Maria still exposes no API or CLI operation to prune or bulk-delete
-interaction history, bulk-delete or clear notes, or
-delete or forget explicit memories. It also provides
+In the current Unreleased development state, `delete interaction <id>`,
+`delete note <id>`, and `forget memory <id>` each target at most one row by ID
+and remove it when found, and `retitle note <id>`, `edit note <id>`, and
+`update memory <id>` each change one stored field; Maria still exposes no API
+or CLI operation to prune or bulk-delete interaction history, bulk-delete or
+clear notes, or bulk-delete or clear explicit memories. Removing one record
+never cascades into another table, so forgetting a memory leaves any copy of
+its text that already exists in `interactions` untouched. It also provides
 no application-level database encryption. Protection depends on access to the
 machine, user account, and database file and on any storage encryption in use;
 local storage alone is not a confidentiality guarantee. The v0.1 persistence

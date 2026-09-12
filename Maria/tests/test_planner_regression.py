@@ -798,6 +798,8 @@ class PlannerRegressionTests(unittest.TestCase):
             "- remember <fact>",
             "- recall <query>",
             "- memories",
+            "- update memory <id>: <new fact>",
+            "- forget memory <id>",
             "- system",
             "- time",
             "- history",
@@ -818,9 +820,85 @@ class PlannerRegressionTests(unittest.TestCase):
             "- retitle note <id>: <new title>",
             "- edit note <id>: <new body>",
             "- delete note <id>",
+            "- update memory <id>: <new fact>",
+            "- forget memory <id>",
         ):
             with self.subTest(command=command_line):
                 self.assertEqual(response.splitlines().count(command_line), 1)
+
+    def test_memory_lifecycle_grammar_does_not_shadow_existing_commands(
+        self,
+    ) -> None:
+        cases: tuple[tuple[str, PlanStep], ...] = (
+            ("memories", PlanStep("memory", "list", {})),
+            ("MEMORIES", PlanStep("memory", "list", {})),
+            (
+                "remember My editor is VS Code",
+                PlanStep("memory", "store", {"fact": "My editor is VS Code"}),
+            ),
+            ("recall editor", PlanStep("memory", "search", {"query": "editor"})),
+            ("notes", PlanStep("notes", "list", {})),
+            ("delete note 1", PlanStep("notes", "delete", {"id": 1})),
+            (
+                "retitle note 1: New title",
+                PlanStep("notes", "retitle", {"id": 1, "title": "New title"}),
+            ),
+            (
+                "edit note 1: New body",
+                PlanStep("notes", "edit", {"id": 1, "body": "New body"}),
+            ),
+            ("history", PlanStep("history", "list", {})),
+            (
+                "search history editor",
+                PlanStep("history", "search", {"query": "editor"}),
+            ),
+            ("read interaction 1", PlanStep("history", "read", {"id": 1})),
+            ("delete interaction 1", PlanStep("history", "delete", {"id": 1})),
+            (
+                "move source.txt to docs/source.txt",
+                PlanStep(
+                    "filesystem",
+                    "move",
+                    {"source": "source.txt", "destination": "docs/source.txt"},
+                ),
+            ),
+            ("system", PlanStep("system", "overview", {})),
+            ("time", PlanStep("system", "current_time", {})),
+        )
+
+        for request, expected_step in cases:
+            with self.subTest(request=request):
+                self._assert_single_step(request, expected_step)
+
+    def test_memory_bulk_and_near_prefix_aliases_never_become_executable(
+        self,
+    ) -> None:
+        requests = (
+            "update memories 1: Fact",
+            "forget memories 1",
+            "update memory1: Fact",
+            "forget memory1",
+            "updatememory 1: Fact",
+            "forgetmemory 1",
+            "delete memory 1",
+            "delete memories",
+            "remove memory 1",
+            "clear memories",
+            "clear memory 1",
+            "purge memory 1",
+            "purge memories",
+            "forget all memories",
+            "forget every memory",
+            "forget memories",
+            "update all memories: Fact",
+            "update memory: Fact",
+            "forget memory my editor is VS Code",
+            "update memory my editor is VS Code: Fact",
+        )
+
+        for request in requests:
+            with self.subTest(request=request):
+                self.assertEqual(self.planner.create_plan(request).steps, ())
 
     def _assert_single_step(self, request: str, expected_step: PlanStep) -> None:
         """Assert the complete public plan for one deterministic command."""

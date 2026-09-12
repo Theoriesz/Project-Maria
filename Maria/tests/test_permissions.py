@@ -97,6 +97,47 @@ class PermissionManagerTests(unittest.TestCase):
                     ),
                 )
 
+    def test_empty_construction_requires_confirmation_for_memory_lifecycle(
+        self,
+    ) -> None:
+        manager = self._manager()
+
+        for action in ("update", "forget"):
+            with self.subTest(action=action):
+                self.assertEqual(
+                    manager.check("memory", action),
+                    PermissionResult(
+                        PermissionDecision.REQUIRES_CONFIRMATION,
+                        f"memory.{action} requires explicit confirmation.",
+                    ),
+                )
+
+    def test_memory_storage_and_retrieval_actions_default_to_allowed(self) -> None:
+        manager = self._manager()
+
+        for action in ("store", "search", "list"):
+            with self.subTest(action=action):
+                self.assertEqual(
+                    manager.check("memory", action),
+                    PermissionResult(
+                        PermissionDecision.ALLOWED,
+                        f"memory.{action} is allowed.",
+                    ),
+                )
+
+    def test_configured_denial_wins_over_mandatory_memory_lifecycle_confirmation(
+        self,
+    ) -> None:
+        for action in ("update", "forget"):
+            with self.subTest(action=action):
+                manager = self._manager(denied_actions={f"memory.{action}"})
+
+                self.assertIn(f"memory.{action}", manager.confirmation_required)
+                self.assertEqual(
+                    manager.check("memory", action).decision,
+                    PermissionDecision.DENIED,
+                )
+
     def test_configured_denial_wins_over_mandatory_note_lifecycle_confirmation(
         self,
     ) -> None:
@@ -275,9 +316,12 @@ class PermissionManagerTests(unittest.TestCase):
                     "notes.retitle",
                     "notes.edit",
                     "notes.delete",
+                    "memory.update",
+                    "memory.forget",
                 }
             ),
         )
+        self.assertEqual(len(MANDATORY_CONFIRMATION_ACTIONS), 8)
         self.assertEqual(
             MANDATORY_DENIED_ACTIONS,
             frozenset({"filesystem.delete", "filesystem.write"}),

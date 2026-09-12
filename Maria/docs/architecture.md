@@ -31,8 +31,8 @@ CLI
 -> SQLite
 ```
 
-The `MemoryTool` is a thin adapter for the `store`, `search`, and `list`
-actions. `ToolManager` registers `tools.memory` through the standard tool
+The `MemoryTool` is a thin adapter for the `store`, `search`, `list`, `update`,
+and `forget` actions. `ToolManager` registers `tools.memory` through the standard tool
 factory contract alongside the calculator, notes, filesystem, and system
 tools. Memory actions therefore pass through the normal permission and result
 handling flow.
@@ -167,10 +167,12 @@ malformed present arrays stop configuration loading instead of weakening it.
 When an action is both denied and confirmation-required, denial wins.
 
 In the current Unreleased development state, the mandatory confirmation
-baseline is six actions: `filesystem.rename`, `filesystem.move`,
-`history.delete`, `notes.retitle`, `notes.edit`, and `notes.delete`.
+baseline is eight actions: `filesystem.rename`, `filesystem.move`,
+`history.delete`, `notes.retitle`, `notes.edit`, `notes.delete`,
+`memory.update`, and `memory.forget`.
 `history.list`, `history.search`, `history.read`, `notes.create`,
-`notes.list`, and `notes.read` remain allowed by default. These entries live
+`notes.list`, `notes.read`, `memory.store`, `memory.search`, and `memory.list`
+remain allowed by default. These entries live
 in `MANDATORY_CONFIRMATION_ACTIONS` in `core/permissions.py` rather than in
 `config/config.toml`, so configuration can add restrictions on top of them but
 can never remove them.
@@ -195,11 +197,31 @@ Maria keeps three kinds of persistent data separate:
   mutations cascade into interaction history or explicit memories.
 - **Explicit memories** are deliberately stored facts. They are created only
   through the strict `remember <fact>` command or the public `Memory` API,
-  searched through `recall <query>`, and listed through `memories`.
+  searched through `recall <query>`, and listed through `memories`. A memory's
+  fact may be replaced, and a memory may be forgotten, through two separate
+  confirmation-gated commands addressed by numeric ID. An update preserves
+  `created_at` and adds no `updated_at`, so an edited memory keeps its place in
+  newest-first results rather than moving to the top — deliberately unlike an
+  edited note. Fact uniqueness stays casefold-based, so an update whose
+  casefolded fact already belongs to a different memory is refused with a
+  controlled, content-free conflict result instead of changing either row.
+  Neither mutation cascades into interaction history or notes.
 
 On the completed paths described above, memory commands and their responses
 also appear in interaction history when recording succeeds. A stored fact can
 therefore exist both as an explicit memory and as part of an interaction.
+Because Brain records the cleaned request verbatim, an `update memory <id>:
+<new fact>` command retains its new fact in `interactions.user_input` even
+though the displayed and recorded response is only `Updated memory <id>.`;
+`recorded_message` can shorten the response half, never the request half.
+Forgetting or later updating that memory does not rewrite or remove those
+independent interaction rows.
+
+Each persistent mutation commits in its own transaction, and Maria then makes a
+separate attempt to record the command and its short response. The two are
+never combined into one transaction: if the later recording fails, the mutation
+remains committed, the successful response is unchanged, and no audit row is
+guaranteed. There is no compensating rollback, retry, or replay.
 
 ## Boundaries
 
@@ -221,5 +243,8 @@ tool set without rewriting the foundation.
 
 Explicit memory remains intentionally small and strict. Maria does not infer
 facts from conversation, learn in the background, or provide embeddings,
-semantic search, fuzzy matching, ranking, update, deletion, or a `forget`
-command in v0.1.
+semantic search, fuzzy matching, or ranking. In the current Unreleased
+development state a memory's fact can be replaced and a memory can be forgotten
+by numeric ID only, through `update memory <id>: <new fact>` and `forget memory
+<id>`; there is no selection by fact text, no bulk or clear-all deletion, and
+no undo or revision history.

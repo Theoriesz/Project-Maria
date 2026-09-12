@@ -26,11 +26,19 @@ def _split_visible_rows(
 
 
 class MemoryTool:
-    """Store and retrieve explicit memories through the memory layer."""
+    """Store, retrieve, update, and forget explicit memories through the memory layer."""
 
     name = "memory"
-    description = "Stores, searches, and lists explicit memories."
-    actions = frozenset({"store", "search", "list"})
+    description = "Stores, searches, lists, updates, and forgets explicit memories."
+    actions = frozenset(
+        {
+            "store",
+            "search",
+            "list",
+            "update",
+            "forget",
+        }
+    )
 
     def __init__(self, memory: Memory, logger: Logger | None = None) -> None:
         self.memory = memory
@@ -48,6 +56,10 @@ class MemoryTool:
             return self._search(arguments)
         if action == "list":
             return self._list(arguments)
+        if action == "update":
+            return self._update(arguments)
+        if action == "forget":
+            return self._forget(arguments)
         return ToolExecutionResult(False, f"Unsupported memory action: {action}")
 
     def _store(self, arguments: dict[str, Any]) -> ToolExecutionResult:
@@ -143,6 +155,78 @@ class MemoryTool:
         if has_more:
             message = f"{message}\n{_MORE_MEMORIES_SUFFIX}"
         return ToolExecutionResult(True, message, visible_memories)
+
+    def _update(self, arguments: dict[str, Any]) -> ToolExecutionResult:
+        """Replace one memory's fact by id."""
+        memory_id = arguments.get("id")
+        if (
+            not isinstance(memory_id, int)
+            or isinstance(memory_id, bool)
+            or memory_id < 1
+        ):
+            return ToolExecutionResult(
+                False,
+                "Memory id must be a positive whole number.",
+            )
+
+        new_fact = arguments.get("fact")
+        if not isinstance(new_fact, str) or not new_fact.strip():
+            return ToolExecutionResult(False, "New memory fact is required.")
+
+        try:
+            updated, conflicting_id = self.memory.update_memory(
+                memory_id,
+                new_fact.strip(),
+            )
+        except (RuntimeError, ValueError) as exc:
+            self.logger.warning("Memory update failed: %s", exc)
+            return ToolExecutionResult(False, f"Memory update failed: {exc}")
+
+        if updated:
+            self.logger.info("Updated memory %s through memory tool.", memory_id)
+            return ToolExecutionResult(
+                True,
+                f"Updated memory {memory_id}.",
+                {"id": memory_id},
+            )
+
+        if conflicting_id is not None:
+            return ToolExecutionResult(
+                False,
+                f"Memory {memory_id} conflicts with existing memory "
+                f"{conflicting_id}.",
+            )
+
+        return ToolExecutionResult(False, f"Memory not found: {memory_id}.")
+
+    def _forget(self, arguments: dict[str, Any]) -> ToolExecutionResult:
+        """Forget one memory by id."""
+        memory_id = arguments.get("id")
+        if (
+            not isinstance(memory_id, int)
+            or isinstance(memory_id, bool)
+            or memory_id < 1
+        ):
+            return ToolExecutionResult(
+                False,
+                "Memory id must be a positive whole number.",
+            )
+
+        try:
+            forgotten = self.memory.forget_memory(memory_id)
+        except (RuntimeError, ValueError) as exc:
+            self.logger.warning("Memory forget failed: %s", exc)
+            return ToolExecutionResult(False, f"Memory forget failed: {exc}")
+
+        if not forgotten:
+            return ToolExecutionResult(False, f"Memory not found: {memory_id}.")
+
+        self.logger.info("Forgot memory %s through memory tool.", memory_id)
+        return ToolExecutionResult(
+            True,
+            f"Forgot memory {memory_id}.",
+            {"id": memory_id},
+        )
 
 
 def build_tool(memory: Memory, **_: Any) -> MemoryTool:

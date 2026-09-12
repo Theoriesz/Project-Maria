@@ -79,6 +79,45 @@ class Planner:
         if lowered == "memories":
             return self._single_step(text, "memory", "list", {})
 
+        if lowered == "update memory":
+            return self._no_action(text, "Use: update memory <id>: <new fact>")
+
+        if lowered.startswith("update memory "):
+            parsed_mutation = _parse_id_and_colon_operand(
+                text[len("update memory ") :].strip()
+            )
+            if parsed_mutation is None or not parsed_mutation[1]:
+                return self._no_action(
+                    text,
+                    "Use: update memory <id>: <new fact>",
+                )
+            id_text, new_fact = parsed_mutation
+            memory_id = _parse_positive_ascii_id(id_text)
+            if memory_id is None:
+                return self._no_action(
+                    text,
+                    "Memory id must be a positive whole number.",
+                )
+            return self._single_step(
+                text,
+                "memory",
+                "update",
+                {"id": memory_id, "fact": new_fact},
+            )
+
+        if lowered == "forget memory":
+            return self._no_action(text, "Use: forget memory <id>")
+
+        if lowered.startswith("forget memory "):
+            operand = text[len("forget memory ") :].strip()
+            memory_id = _parse_positive_ascii_id(operand)
+            if memory_id is None:
+                return self._no_action(
+                    text,
+                    "Memory id must be a positive whole number.",
+                )
+            return self._single_step(text, "memory", "forget", {"id": memory_id})
+
         if lowered.startswith(("list ", "ls ")):
             path = _remove_first_word(text)
             return self._single_step(text, "filesystem", "list", {"path": path})
@@ -349,6 +388,8 @@ def _help_text() -> str:
         "- remember <fact>\n"
         "- recall <query>\n"
         "- memories\n"
+        "- update memory <id>: <new fact>\n"
+        "- forget memory <id>\n"
         "- system\n"
         "- time\n"
         "- history\n"

@@ -64,6 +64,87 @@ The planner does not infer commands from recent interaction context. Requests
 such as `please remember ...`, `what do you remember about ...`, and
 `memories extra` remain unsupported.
 
+## Memory Lifecycle Grammar
+
+Memory lifecycle commands use strict command syntax. Command keywords are
+case-insensitive, while operand casing and internal spacing are preserved and
+only outer whitespace is stripped.
+
+`update memory <id>: <new fact>` creates this step:
+
+```text
+PlanStep(
+    tool_name="memory",
+    action="update",
+    arguments={"id": memory_id, "fact": new_fact},
+)
+```
+
+`forget memory <id>` creates this step:
+
+```text
+PlanStep(
+    tool_name="memory",
+    action="forget",
+    arguments={"id": memory_id},
+)
+```
+
+Both take a positive numeric ID only, never fact text, and reuse `read
+interaction`'s exact `id` grammar and validation, unmodified: `id` must be one
+or more ASCII digits (`0`-`9`) with a resulting value of at least 1, and
+leading zeroes are accepted (`007` parses to `7`). Unicode digit lookalikes
+(including full-width `１２`, Arabic-Indic `١٢`, and superscript `²`), signs,
+decimals, embedded whitespace, and any other non-digit character are rejected.
+There is no fact-text lookup, recent-context inference, or fuzzy matching for
+these mutations.
+
+`update memory` splits the operand on the first colon only, the same way
+`create note` and `edit note` do, so later colons stay literal inside the new
+fact. `update memory 005: New: fact` therefore sets the fact to `New: fact` for
+memory `5`.
+
+A bare command, a missing colon, or an empty or whitespace-only new fact
+returns the matching usage response:
+
+```text
+Use: update memory <id>: <new fact>
+Use: forget memory <id>
+```
+
+The emptiness check runs before ID parsing, so an invalid ID combined with
+empty content (for example `update memory abc:`) returns the usage response
+rather than the invalid-ID response. Empty content is deliberately rejected
+before any confirmation prompt, because a blank fact can never be stored and
+there is no way to clear a memory's text. The planner never returns `New memory
+fact is required.`; that exact message belongs to direct `MemoryTool` and
+`Memory` validation.
+
+An invalid ID returns:
+
+```text
+Memory id must be a positive whole number.
+```
+
+Because the operand after each fixed prefix is parsed as one value, an embedded
+extra token (for example `forget memory 1 extra` or `update memory 5 extra:
+Fact`) is an invalid ID, not a separate unsupported command. A blank ID with
+non-empty content, such as `update memory : Fact`, is likewise an invalid ID.
+`memory.update` and `memory.forget` both require mandatory explicit
+confirmation before they execute; see `docs/architecture.md`'s Permission
+Policy section.
+
+Only a literal ASCII space separates each prefix from its operand, so `update
+memory\t5: Fact` is unsupported while extra spaces are tolerated. This matches
+the note lifecycle grammar and differs from `remember` and `recall`, which
+accept any whitespace separator.
+
+Near-prefix, plural, and bulk variants such as `update memories <id>`, `forget
+memories <id>`, `forget memory1`, `delete memory <id>`, `clear memories`, and
+`purge memory <id>` remain unsupported and receive the planner's existing
+generic unsupported-command response. The exact command `memories` continues to
+list stored facts.
+
 ## Note Creation Grammar
 
 `create note <title>: <body>` requires an explicit colon separator between

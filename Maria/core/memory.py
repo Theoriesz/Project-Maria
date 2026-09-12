@@ -306,6 +306,102 @@ class Memory:
             self.logger.exception("Failed to list memories.")
             raise RuntimeError("Unable to list memories.") from exc
 
+    def update_memory(
+        self,
+        memory_id: int,
+        new_fact: str,
+    ) -> tuple[bool, int | None]:
+        """Replace one memory's fact, keeping its created_at.
+
+        Returns (True, None) when the row was updated, (False, None) when no
+        row matched memory_id, and (False, conflicting_id) when another
+        memory already stores the same casefolded fact. Raises ValueError for
+        a non-positive-integer id or a blank fact, since this persistent
+        mutation is validated independently of its callers. created_at is
+        never refreshed and no updated_at exists, so an updated memory keeps
+        its place in newest-first results; a fact matching the stored one, or
+        differing from it only by casing, still counts as a successful update.
+        """
+        if (
+            not isinstance(memory_id, int)
+            or isinstance(memory_id, bool)
+            or memory_id < 1
+        ):
+            raise ValueError("Memory id must be a positive whole number.")
+        if not isinstance(new_fact, str) or not new_fact.strip():
+            raise ValueError("New memory fact is required.")
+
+        clean_fact = new_fact.strip()
+        normalized_fact = clean_fact.casefold()
+        updated = False
+        conflicting_id: int | None = None
+        try:
+            with self._connection() as connection:
+                try:
+                    cursor = connection.execute(
+                        """
+                        UPDATE memories
+                        SET fact = ?, normalized_fact = ?
+                        WHERE id = ?
+                        """,
+                        (clean_fact, normalized_fact, memory_id),
+                    )
+                    updated = cursor.rowcount == 1
+                except sqlite3.IntegrityError as exc:
+                    if not _is_unique_violation(exc):
+                        raise
+                    row = connection.execute(
+                        """
+                        SELECT id
+                        FROM memories
+                        WHERE normalized_fact = ?
+                        """,
+                        (normalized_fact,),
+                    ).fetchone()
+                    if row is None:
+                        raise sqlite3.IntegrityError(
+                            "Unable to resolve conflicting memory."
+                        )
+                    conflicting_id = int(row["id"])
+            if updated:
+                self.logger.info("Updated memory %s.", memory_id)
+            return updated, conflicting_id
+        except sqlite3.Error as exc:
+            self.logger.exception("Failed to update memory.")
+            raise RuntimeError("Unable to update memory.") from exc
+
+    def forget_memory(self, memory_id: int) -> bool:
+        """Delete one explicit memory by its database id.
+
+        Returns True if a row was deleted, False if no row matched memory_id.
+        Raises ValueError for a non-positive-integer id, since this is a
+        destructive operation validated independently of its callers. The
+        forgotten fact is never read, logged, or returned.
+        """
+        if (
+            not isinstance(memory_id, int)
+            or isinstance(memory_id, bool)
+            or memory_id < 1
+        ):
+            raise ValueError("Memory id must be a positive whole number.")
+
+        try:
+            with self._connection() as connection:
+                cursor = connection.execute(
+                    """
+                    DELETE FROM memories
+                    WHERE id = ?
+                    """,
+                    (memory_id,),
+                )
+                forgotten = cursor.rowcount == 1
+            if forgotten:
+                self.logger.info("Forgot memory %s.", memory_id)
+            return forgotten
+        except sqlite3.Error as exc:
+            self.logger.exception("Failed to forget memory.")
+            raise RuntimeError("Unable to forget memory.") from exc
+
     def create_note(self, title: str, body: str) -> int:
         """Create a note and return its database id."""
         clean_title = title.strip()
@@ -527,6 +623,14 @@ def _is_busy_or_locked(exc: sqlite3.Error) -> bool:
         return False
     primary_code = error_code & _SQLITE_PRIMARY_RESULT_CODE_MASK
     return primary_code in _BUSY_OR_LOCKED_PRIMARY_CODES
+
+
+def _is_unique_violation(exc: sqlite3.Error) -> bool:
+    """Return whether exc is SQLite's extended UNIQUE constraint code."""
+    error_code = getattr(exc, "sqlite_errorcode", None)
+    if not isinstance(error_code, int):
+        return False
+    return error_code == sqlite3.SQLITE_CONSTRAINT_UNIQUE
 
 
 def _utc_timestamp() -> str:

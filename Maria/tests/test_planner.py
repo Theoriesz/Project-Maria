@@ -198,6 +198,8 @@ class PlannerMemoryTests(unittest.TestCase):
             "- remember <fact>",
             "- recall <query>",
             "- memories",
+            "- update memory <id>: <new fact>",
+            "- forget memory <id>",
             "- system",
             "- time",
             "- history",
@@ -215,9 +217,181 @@ class PlannerMemoryTests(unittest.TestCase):
             "- retitle note <id>: <new title>",
             "- edit note <id>: <new body>",
             "- delete note <id>",
+            "- update memory <id>: <new fact>",
+            "- forget memory <id>",
         ):
             with self.subTest(command=command_line):
                 self.assertEqual(lines.count(command_line), 1)
+
+    def test_update_memory_maps_to_update_step(self) -> None:
+        plan = self.planner.create_plan("update memory 5: My editor is Neovim")
+
+        self.assertEqual(
+            plan,
+            Plan(
+                original_request="update memory 5: My editor is Neovim",
+                steps=(
+                    PlanStep(
+                        tool_name="memory",
+                        action="update",
+                        arguments={"id": 5, "fact": "My editor is Neovim"},
+                    ),
+                ),
+            ),
+        )
+
+    def test_forget_memory_maps_to_forget_step(self) -> None:
+        plan = self.planner.create_plan("forget memory 5")
+
+        self.assertEqual(
+            plan,
+            Plan(
+                original_request="forget memory 5",
+                steps=(
+                    PlanStep(
+                        tool_name="memory",
+                        action="forget",
+                        arguments={"id": 5},
+                    ),
+                ),
+            ),
+        )
+
+    def test_memory_lifecycle_keywords_are_case_insensitive(self) -> None:
+        cases = (
+            (
+                "UPDATE MEMORY 5: New Fact",
+                PlanStep("memory", "update", {"id": 5, "fact": "New Fact"}),
+            ),
+            (
+                "Forget Memory 5",
+                PlanStep("memory", "forget", {"id": 5}),
+            ),
+        )
+
+        for request, expected_step in cases:
+            with self.subTest(request=request):
+                plan = self.planner.create_plan(request)
+                self.assertEqual(plan.original_request, request)
+                self.assertEqual(plan.steps, (expected_step,))
+
+    def test_memory_lifecycle_accepts_leading_zeroes(self) -> None:
+        cases = (
+            (
+                "update memory 005: New fact",
+                PlanStep("memory", "update", {"id": 5, "fact": "New fact"}),
+            ),
+            ("forget memory 007", PlanStep("memory", "forget", {"id": 7})),
+        )
+
+        for request, expected_step in cases:
+            with self.subTest(request=request):
+                self.assertEqual(
+                    self.planner.create_plan(request).steps, (expected_step,)
+                )
+
+    def test_update_memory_splits_on_the_first_colon_only(self) -> None:
+        plan = self.planner.create_plan("update memory 005: New: fact")
+
+        self.assertEqual(
+            plan.steps,
+            (PlanStep("memory", "update", {"id": 5, "fact": "New: fact"}),),
+        )
+
+    def test_update_memory_preserves_casing_and_internal_spacing(self) -> None:
+        plan = self.planner.create_plan("update memory 5:   My   Mixed   Fact   ")
+
+        self.assertEqual(
+            plan.original_request, "update memory 5:   My   Mixed   Fact"
+        )
+        self.assertEqual(
+            plan.steps,
+            (PlanStep("memory", "update", {"id": 5, "fact": "My   Mixed   Fact"}),),
+        )
+
+    def test_memory_lifecycle_bare_and_incomplete_commands_return_usage(self) -> None:
+        cases = (
+            ("update memory", "Use: update memory <id>: <new fact>"),
+            ("update memory   ", "Use: update memory <id>: <new fact>"),
+            ("UPDATE MEMORY", "Use: update memory <id>: <new fact>"),
+            ("update memory 5", "Use: update memory <id>: <new fact>"),
+            ("update memory 5:", "Use: update memory <id>: <new fact>"),
+            ("update memory 5:    ", "Use: update memory <id>: <new fact>"),
+            ("update memory abc:", "Use: update memory <id>: <new fact>"),
+            ("forget memory", "Use: forget memory <id>"),
+            ("forget memory   ", "Use: forget memory <id>"),
+            ("FORGET MEMORY", "Use: forget memory <id>"),
+        )
+
+        for request, expected_response in cases:
+            with self.subTest(request=request):
+                plan = self.planner.create_plan(request)
+                self.assertEqual(plan.steps, ())
+                self.assertEqual(plan.response_if_no_action, expected_response)
+
+    def test_memory_lifecycle_rejects_invalid_ids(self) -> None:
+        invalid_ids = (
+            "0",
+            "-1",
+            "+1",
+            "1.5",
+            "abc",
+            "5 extra",
+            "²",
+            "１２",
+            "١٢",
+        )
+
+        for invalid_id in invalid_ids:
+            for request in (
+                f"update memory {invalid_id}: Fact",
+                f"forget memory {invalid_id}",
+            ):
+                with self.subTest(request=request):
+                    plan = self.planner.create_plan(request)
+                    self.assertEqual(plan.steps, ())
+                    self.assertEqual(
+                        plan.response_if_no_action,
+                        "Memory id must be a positive whole number.",
+                    )
+
+    def test_update_memory_blank_id_with_content_is_an_invalid_id(self) -> None:
+        plan = self.planner.create_plan("update memory : Fact")
+
+        self.assertEqual(plan.steps, ())
+        self.assertEqual(
+            plan.response_if_no_action,
+            "Memory id must be a positive whole number.",
+        )
+
+    def test_memory_lifecycle_never_reports_the_direct_fact_validation_message(
+        self,
+    ) -> None:
+        for request in ("update memory 5:", "update memory 5:   "):
+            with self.subTest(request=request):
+                self.assertNotEqual(
+                    self.planner.create_plan(request).response_if_no_action,
+                    "New memory fact is required.",
+                )
+
+    def test_memory_lifecycle_near_prefix_variants_remain_unsupported(self) -> None:
+        requests = (
+            "update memories 1: Fact",
+            "forget memories 1",
+            "update memory1: Fact",
+            "forget memory1",
+            "delete memory 1",
+            "clear memories",
+            "purge memory 1",
+            "updating memory 1: Fact",
+            "forgetting memory 1",
+            "please forget memory 1",
+            "update memory\t5: Fact",
+        )
+
+        for request in requests:
+            with self.subTest(request=request):
+                self._assert_unsupported(request)
 
     def _assert_unsupported(self, request: str) -> None:
         """Assert that a request receives the unchanged fallback."""
