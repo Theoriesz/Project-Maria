@@ -46,6 +46,9 @@ move source.txt to docs/source.txt
 create note Idea: Keep the foundation simple.
 notes
 read note 1
+retitle note 1: Clearer idea
+edit note 1: Keep the foundation simple and reviewable.
+delete note 1
 remember My editor is VS Code
 recall editor
 memories
@@ -57,10 +60,16 @@ read interaction 1
 delete interaction 1
 ```
 
-File rename and move operations, and `delete interaction <id>`, require
-explicit confirmation. `delete interaction <id>` targets at most one
-interaction row by ID and removes it when found; it never cascades to notes
-or memories. Filesystem
+File rename and move operations, `delete interaction <id>`, and the three note
+lifecycle commands `retitle note <id>: <new title>`, `edit note <id>: <new
+body>`, and `delete note <id>` require explicit confirmation. `delete
+interaction <id>` targets at most one interaction row by ID and removes it
+when found; it never cascades to notes or memories. Each note lifecycle
+command likewise targets at most one note by positive whole-number ID only,
+never by title, and never cascades into interaction history or explicit
+memories.
+Retitling and editing are deliberately separate commands, so neither can
+overwrite the other's field. Filesystem
 delete functionality remains intentionally not implemented in version 0.1.
 
 ## Persistent Memory
@@ -106,7 +115,8 @@ behavior described below, so a fact can appear in both places.
 Maria v0.1 stores most non-empty requests it processes and their final response
 text as persistent interaction history in its configured SQLite database,
 located inside the project directory by default. This can retain file contents
-returned by `read file`, note titles and bodies, note-creation requests,
+returned by `read file`, note titles and bodies, note creation, retitle, and
+edit requests,
 calculator expressions and results, explicit memory facts and their
 recall/list output, filesystem paths, system information, and failure or denial
 messages. Asking Maria to display a sensitive file or note can therefore copy
@@ -132,12 +142,35 @@ interaction <id>.` as a new interaction-history row; when that later
 recording succeeds, deleting one old row and adding that audit row may leave
 the total interaction-row count unchanged, and if it fails, the deletion
 remains committed with no audit row guaranteed. There is still no CLI
-command to clear, bulk-delete, or prune interaction history, no note-delete
-command, and no memory-forget command. Retrieval limits affect only how many
+command to clear, bulk-delete, or prune interaction history, and no
+memory-forget command. Retrieval limits affect only how many
 rows are read; they do not
 remove stored rows, and restarting Maria does not clear them. Protection
 depends on access to the machine, user account, and database file and on any
 storage encryption in use.
+
+`retitle note <id>: <new title>`, `edit note <id>: <new body>`, and `delete
+note <id>` each target at most one note row and change or remove it when
+found, after mandatory explicit
+confirmation, with no content preview before confirmation. Retitle replaces
+only the title, edit replaces only the body, and both preserve `created_at`
+while refreshing `updated_at`; delete removes the matching row. An ID that
+matches no note changes or removes nothing and returns a not-found result.
+None of
+them cascade into interaction history or explicit memories, renumber remaining
+note IDs, or offer bulk, wildcard, clear-all, or automatic deletion, and there
+is no undo, recovery, or note revision history. Each mutation commits
+independently, and Maria then separately attempts to record a short,
+content-free response (`Retitled note <id>.`, `Edited note <id>.`, or `Deleted
+note <id>.`); if that later recording fails, the mutation remains committed
+with no audit row guaranteed. The command text itself is still recorded as the
+request half of interaction history, so a retitle command retains its new
+title and an edit command retains its new body there, and a prior `read note`
+may already have copied that note's content into interaction history.
+Afterwards changing or deleting the note does not rewrite or erase those
+independent interaction rows; they can be removed separately with `delete
+interaction <id>`. As elsewhere, Maria promises no secure erasure from SQLite
+file pages, database or filesystem backups, Git history, or external copies.
 
 The shipped v0.1 runtime has no built-in networking or cloud integration and
 does not itself transmit this history. Configured network-mounted or

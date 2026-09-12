@@ -20,7 +20,8 @@ Returns a `Plan` containing zero or more `PlanStep` objects.
 
 The memory layer owns all SQLite access. Other modules should call methods such
 as `record_interaction`, `get_recent_interactions`, `create_note`, `list_notes`,
-and `get_note` instead of writing SQL directly.
+`get_note`, `retitle_note`, `edit_note`, and `delete_note` instead of writing
+SQL directly.
 
 Every connection uses an explicit 5.0-second SQLite busy timeout
 (`DEFAULT_DATABASE_BUSY_TIMEOUT_SECONDS`), which governs SQLite's built-in
@@ -131,6 +132,49 @@ returns an empty list. SQLite failures raise
 Search and list default to 20 results. Direct API limits are clamped to a
 minimum of 1 and a maximum of 100.
 
+### Notes
+
+`Memory.retitle_note(note_id: int, new_title: str) -> bool`
+
+Validates both arguments directly, before generating a timestamp or opening a
+connection: raises `ValueError("Note id must be a positive whole number.")`
+when `note_id` is not an `int`, is a `bool`, or is less than 1, and
+`ValueError("New note title is required.")` when `new_title` is not a `str` or
+is blank after stripping. Non-string values are rejected rather than coerced.
+For valid arguments, executes one parameterized `UPDATE notes SET title = ?,
+updated_at = ? WHERE id = ?` statement without first reading the row, writing
+only the stripped title and a single current UTC timestamp. `body` and
+`created_at` are untouched. Returns `True` when exactly one row was updated or
+`False` when no row matched. A title identical to the stored one still returns
+`True` and still refreshes `updated_at`, because the row matched; duplicate
+titles across notes remain allowed. `updated_at` receives the current
+timestamp with no guarantee that it is strictly later than the previous value.
+SQLite failures raise `RuntimeError("Unable to retitle note.")`, and
+busy/locked contention raises `RuntimeError("Database is busy. Try again
+shortly.")`.
+
+`Memory.edit_note(note_id: int, new_body: str) -> bool`
+
+Behaves identically to `retitle_note`, except that it validates `new_body`
+with `ValueError("New note body is required.")`, executes `UPDATE notes SET
+body = ?, updated_at = ? WHERE id = ?`, leaves `title` and `created_at`
+untouched, and raises `RuntimeError("Unable to edit note.")` on SQLite
+failure.
+
+`Memory.delete_note(note_id: int) -> bool`
+
+Validates `note_id` the same way, before opening a connection. For a valid ID,
+executes one parameterized `DELETE FROM notes WHERE id = ?` statement without
+first reading the row, and returns `True` when exactly one row was deleted or
+`False` when no row matched. Deleted title and body text is never read,
+logged, or returned. Deletion does not cascade to `interactions` or
+`memories` and does not renumber remaining note IDs. SQLite failures raise
+`RuntimeError("Unable to delete note.")`.
+
+All three log only the numeric note ID on success, after their transaction
+commits, and log nothing extra for a benign not-found result. Note titles and
+bodies never appear in log messages.
+
 ## Tool Execution Result
 
 `ToolExecutionResult(success: bool, message: str, data: Any = None, recorded_message: str | None = None)`
@@ -196,6 +240,42 @@ path; `history.list`, `history.search`, and `history.read` are allowed by
 default, while `history.delete` always requires explicit confirmation. The
 tool contains no SQL; `core/memory.py` owns all database operations.
 
+## Notes Tool
+
+`NotesTool.execute(action: str, arguments: dict[str, Any]) -> ToolExecutionResult`
+
+The notes tool supports `create`, `list`, `read`, `retitle`, `edit`, and
+`delete`. `create`, `list`, and `read` are unchanged.
+
+`retitle`, `edit`, and `delete` each read an `id` argument and validate it the
+same way as the history tool (an actual `int`, not a `bool`, at least `1`),
+returning `"Note id must be a positive whole number."` for an invalid direct
+value without calling `Memory`. `retitle` additionally reads a `title`
+argument and `edit` a `body` argument, each of which must be an actual `str`
+that is non-blank after stripping; otherwise they return `"New note title is
+required."` or `"New note body is required."`, again without calling `Memory`.
+Values are never coerced with `str(...)`, so `None`, numbers, booleans, and
+arbitrary objects can never be persisted as note text. Only the stripped value
+is passed to `Memory`.
+
+A missing row returns `"Note not found: <id>."`. Success returns `"Retitled
+note <id>."`, `"Edited note <id>."`, or `"Deleted note <id>."` with
+`data={"id": <id>}` — never the note's title or body — and leaves
+`recorded_message` as `None`, since those messages are already short and
+content-free. An ordinary `Memory` failure is wrapped as `"Note retitle
+failed: Unable to retitle note."`, `"Note edit failed: Unable to edit
+note."`, or `"Note deletion failed: Unable to delete note."`; busy/locked
+contention is wrapped the same way, for example `"Note deletion failed:
+Database is busy. Try again shortly."`.
+
+The tool receives the shared `Memory` instance through dependency injection.
+It is registered as `tools.notes` through Tool Manager's standard
+`build_tool(...)` factory contract and travels through the normal permission
+path; `notes.create`, `notes.list`, and `notes.read` are allowed by default,
+while `notes.retitle`, `notes.edit`, and `notes.delete` always require
+explicit confirmation. The tool contains no SQL; `core/memory.py` owns all
+database operations.
+
 ## Tool Manager
 
 `ToolManager.execute_tool(tool_name, action, arguments) -> ToolExecutionResult`
@@ -218,7 +298,8 @@ one array are rejected, while syntactically valid identifiers for future tools
 are retained. Malformed permission values raise `ValueError`.
 
 Missing permission arrays and explicitly empty arrays use the mandatory secure
-baseline: `filesystem.rename`, `filesystem.move`, and `history.delete` require
+baseline: `filesystem.rename`, `filesystem.move`, `history.delete`,
+`notes.retitle`, `notes.edit`, and `notes.delete` require
 confirmation, while `filesystem.delete` and `filesystem.write` are denied.
 Configuration can add restrictions but cannot remove this baseline.
 `PermissionManager` applies the same mandatory policy when constructed

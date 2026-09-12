@@ -192,6 +192,9 @@ class PlannerMemoryTests(unittest.TestCase):
             "- create note <title>: <body>",
             "- notes",
             "- read note <id or exact title>",
+            "- retitle note <id>: <new title>",
+            "- edit note <id>: <new body>",
+            "- delete note <id>",
             "- remember <fact>",
             "- recall <query>",
             "- memories",
@@ -208,6 +211,13 @@ class PlannerMemoryTests(unittest.TestCase):
         self.assertEqual(lines[0], "Supported v0.1 commands:")
         self.assertEqual(set(lines[1:]), expected_commands)
         self.assertEqual(len(lines[1:]), len(expected_commands))
+        for command_line in (
+            "- retitle note <id>: <new title>",
+            "- edit note <id>: <new body>",
+            "- delete note <id>",
+        ):
+            with self.subTest(command=command_line):
+                self.assertEqual(lines.count(command_line), 1)
 
     def _assert_unsupported(self, request: str) -> None:
         """Assert that a request receives the unchanged fallback."""

@@ -69,6 +69,47 @@ class PermissionManagerTests(unittest.TestCase):
             PermissionDecision.DENIED,
         )
 
+    def test_empty_construction_requires_confirmation_for_note_lifecycle(
+        self,
+    ) -> None:
+        manager = self._manager()
+
+        for action in ("retitle", "edit", "delete"):
+            with self.subTest(action=action):
+                self.assertEqual(
+                    manager.check("notes", action),
+                    PermissionResult(
+                        PermissionDecision.REQUIRES_CONFIRMATION,
+                        f"notes.{action} requires explicit confirmation.",
+                    ),
+                )
+
+    def test_note_creation_and_reading_actions_default_to_allowed(self) -> None:
+        manager = self._manager()
+
+        for action in ("create", "list", "read"):
+            with self.subTest(action=action):
+                self.assertEqual(
+                    manager.check("notes", action),
+                    PermissionResult(
+                        PermissionDecision.ALLOWED,
+                        f"notes.{action} is allowed.",
+                    ),
+                )
+
+    def test_configured_denial_wins_over_mandatory_note_lifecycle_confirmation(
+        self,
+    ) -> None:
+        for action in ("retitle", "edit", "delete"):
+            with self.subTest(action=action):
+                manager = self._manager(denied_actions={f"notes.{action}"})
+
+                self.assertIn(f"notes.{action}", manager.confirmation_required)
+                self.assertEqual(
+                    manager.check("notes", action).decision,
+                    PermissionDecision.DENIED,
+                )
+
     def test_ordinary_unconfigured_action_remains_allowed(self) -> None:
         result = self._manager().check("notes", "list")
 
@@ -227,7 +268,14 @@ class PermissionManagerTests(unittest.TestCase):
         self.assertEqual(
             MANDATORY_CONFIRMATION_ACTIONS,
             frozenset(
-                {"filesystem.rename", "filesystem.move", "history.delete"}
+                {
+                    "filesystem.rename",
+                    "filesystem.move",
+                    "history.delete",
+                    "notes.retitle",
+                    "notes.edit",
+                    "notes.delete",
+                }
             ),
         )
         self.assertEqual(
@@ -244,6 +292,29 @@ class PermissionManagerTests(unittest.TestCase):
             manager.denied_actions,
             MANDATORY_DENIED_ACTIONS | {"memory.store"},
         )
+
+    def test_mandatory_policy_sets_stay_immutable_across_construction(self) -> None:
+        original_confirmation = set(MANDATORY_CONFIRMATION_ACTIONS)
+        original_denied = set(MANDATORY_DENIED_ACTIONS)
+
+        self._manager(
+            confirmation_required={"calendar.create"},
+            denied_actions={"calendar.remove"},
+        )
+
+        for name, mandatory_actions, expected in (
+            (
+                "confirmation",
+                MANDATORY_CONFIRMATION_ACTIONS,
+                original_confirmation,
+            ),
+            ("denied", MANDATORY_DENIED_ACTIONS, original_denied),
+        ):
+            with self.subTest(name=name):
+                self.assertIsInstance(mandatory_actions, frozenset)
+                self.assertEqual(set(mandatory_actions), expected)
+                self.assertFalse(hasattr(mandatory_actions, "add"))
+                self.assertFalse(hasattr(mandatory_actions, "discard"))
 
     def test_decisions_use_expected_log_levels(self) -> None:
         cases = (
@@ -335,6 +406,58 @@ class PermissionManagerTests(unittest.TestCase):
                     manager.check(tool_name, action).decision,
                     expected,
                 )
+
+    def test_configuration_cannot_remove_mandatory_confirmation_actions(self) -> None:
+        cases = (
+            ("missing_permissions_section", "[app]\nname = \"Maria\"\n"),
+            ("empty_permissions_section", "[permissions]\n"),
+            (
+                "empty_permission_arrays",
+                "[permissions]\n"
+                "require_confirmation = []\n"
+                "deny = []\n",
+            ),
+            (
+                "minimal_unrelated_permissions",
+                "[permissions]\n"
+                "require_confirmation = [\"calendar.create\"]\n"
+                "deny = [\"memory.store\"]\n",
+            ),
+        )
+
+        for description, config_text in cases:
+            with self.subTest(description=description):
+                with TemporaryDirectory() as temporary_directory:
+                    config_path = Path(temporary_directory) / "config.toml"
+                    config_path.write_text(config_text, encoding="utf-8")
+                    config = load_config(config_path)
+
+                manager = PermissionManager(
+                    config.confirmation_required,
+                    config.denied_actions,
+                    logger=Mock(spec=logging.Logger),
+                )
+
+                self.assertTrue(
+                    MANDATORY_CONFIRMATION_ACTIONS.issubset(
+                        config.confirmation_required
+                    )
+                )
+                self.assertTrue(
+                    MANDATORY_CONFIRMATION_ACTIONS.issubset(
+                        manager.confirmation_required
+                    )
+                )
+                for action_id in sorted(MANDATORY_CONFIRMATION_ACTIONS):
+                    tool_name, action = action_id.split(".")
+                    with self.subTest(action_id=action_id):
+                        self.assertEqual(
+                            manager.check(tool_name, action),
+                            PermissionResult(
+                                PermissionDecision.REQUIRES_CONFIRMATION,
+                                f"{action_id} requires explicit confirmation.",
+                            ),
+                        )
 
     @staticmethod
     def _manager(

@@ -85,6 +85,93 @@ The truly bare `create note` command (no operand text at all) is unaffected
 by this grammar and keeps the planner's existing generic unsupported-command
 response.
 
+## Note Lifecycle Grammar
+
+Note lifecycle commands use strict command syntax. Command keywords are
+case-insensitive, while operand casing and internal spacing are preserved and
+only outer whitespace is stripped.
+
+`retitle note <id>: <new title>` creates this step:
+
+```text
+PlanStep(
+    tool_name="notes",
+    action="retitle",
+    arguments={"id": note_id, "title": new_title},
+)
+```
+
+`edit note <id>: <new body>` creates this step:
+
+```text
+PlanStep(
+    tool_name="notes",
+    action="edit",
+    arguments={"id": note_id, "body": new_body},
+)
+```
+
+`delete note <id>` creates this step:
+
+```text
+PlanStep(
+    tool_name="notes",
+    action="delete",
+    arguments={"id": note_id},
+)
+```
+
+All three take a positive numeric ID only, never a title, and reuse `read
+interaction`'s exact `id` grammar and validation, unmodified: `id` must be one
+or more ASCII digits (`0`-`9`) with a resulting value of at least 1, and
+leading zeroes are accepted (`007` parses to `7`). Unicode digit lookalikes,
+signs, decimals, embedded whitespace, and any other non-digit character are
+rejected. There is no title lookup, recent-context inference, or fuzzy matching
+for these mutations.
+
+`retitle note` and `edit note` split the operand on the first colon only, the
+same way `create note` does, so later colons stay literal inside the new title
+or body. `retitle note 005: New: Title` therefore sets the title to `New:
+Title` for note `5`.
+
+A bare command, a missing colon, or an empty or whitespace-only new title or
+body returns the matching usage response:
+
+```text
+Use: retitle note <id>: <new title>
+Use: edit note <id>: <new body>
+Use: delete note <id>
+```
+
+Empty content is deliberately rejected before any confirmation prompt, because
+a blank title or body can never be stored; there is no implicit `Untitled`
+fallback for these mutations and no way to clear a note's body.
+
+An invalid ID returns:
+
+```text
+Note id must be a positive whole number.
+```
+
+Because the operand after each fixed prefix is parsed as one value, an embedded
+extra token (for example `delete note 1 extra` or `retitle note 5 extra:
+Title`) is an invalid ID, not a separate unsupported command. A blank ID with
+non-empty content, such as `retitle note : Title`, is likewise an invalid ID.
+`notes.retitle`, `notes.edit`, and `notes.delete` all require mandatory
+explicit confirmation before they execute; see `docs/architecture.md`'s
+Permission Policy section.
+
+Near-prefix, plural, and bulk variants such as `retitle notes <id>`, `edit
+notes <id>`, `delete notes <id>`, `delete note1`, `clear notes`, and `purge
+note <id>` remain unsupported and receive the planner's existing generic
+unsupported-command response.
+
+`rename note` is not a note lifecycle command. Text beginning with `rename `
+is matched earlier by the existing filesystem grammar, so `rename note 1 to
+title` produces a `filesystem.rename` step from its `<source> to
+<destination>` form and never routes to the notes tool. Retitling is therefore
+spelled `retitle`, which avoids that collision.
+
 ## Interaction History Grammar
 
 Interaction-history commands use strict command syntax. Command keywords are

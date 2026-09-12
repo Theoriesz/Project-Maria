@@ -37,8 +37,12 @@ class NotesToolTests(unittest.TestCase):
 
         self.assertEqual(self.tool.name, "notes")
         self.assertEqual(
+            self.tool.description,
+            "Creates, lists, reads, retitles, edits, and deletes notes.",
+        )
+        self.assertEqual(
             self.tool.actions,
-            frozenset({"create", "list", "read"}),
+            frozenset({"create", "list", "read", "retitle", "edit", "delete"}),
         )
         self.assertIsInstance(factory_tool, NotesTool)
         self.assertIs(factory_tool.memory, self.memory)
@@ -270,7 +274,7 @@ class NotesToolTests(unittest.TestCase):
 
     def test_blank_read_target_and_unknown_action_are_rejected(self) -> None:
         blank = self.tool.execute("read", {"target": " \t "})
-        unknown = self.tool.execute("delete", {"target": "1"})
+        unknown = self.tool.execute("archive", {"target": "1"})
 
         self.assertEqual(
             blank,
@@ -278,7 +282,7 @@ class NotesToolTests(unittest.TestCase):
         )
         self.assertEqual(
             unknown,
-            ToolExecutionResult(False, "Unsupported notes action: delete"),
+            ToolExecutionResult(False, "Unsupported notes action: archive"),
         )
 
     def test_invalid_list_limit_is_a_controlled_failure(self) -> None:
@@ -289,6 +293,188 @@ class NotesToolTests(unittest.TestCase):
                     result,
                     ToolExecutionResult(False, "Notes limit must be a number."),
                 )
+
+    def test_retitle_replaces_the_title_and_returns_only_the_id(self) -> None:
+        note_id = self.memory.create_note("Original Title", "Untouched body")
+
+        result = self.tool.execute(
+            "retitle",
+            {"id": note_id, "title": "  Renamed Title  "},
+        )
+
+        self.assertEqual(
+            result,
+            ToolExecutionResult(
+                True,
+                f"Retitled note {note_id}.",
+                {"id": note_id},
+            ),
+        )
+        self.assertIsNone(result.recorded_message)
+        stored = self.memory.get_note(note_id=note_id)
+        self.assertEqual(stored["title"], "Renamed Title")
+        self.assertEqual(stored["body"], "Untouched body")
+
+    def test_edit_replaces_the_body_and_returns_only_the_id(self) -> None:
+        note_id = self.memory.create_note("Untouched Title", "Original body")
+
+        result = self.tool.execute(
+            "edit",
+            {"id": note_id, "body": "\n  Replacement body.  \t"},
+        )
+
+        self.assertEqual(
+            result,
+            ToolExecutionResult(
+                True,
+                f"Edited note {note_id}.",
+                {"id": note_id},
+            ),
+        )
+        self.assertIsNone(result.recorded_message)
+        stored = self.memory.get_note(note_id=note_id)
+        self.assertEqual(stored["body"], "Replacement body.")
+        self.assertEqual(stored["title"], "Untouched Title")
+
+    def test_delete_removes_the_note_and_returns_only_the_id(self) -> None:
+        note_id = self.memory.create_note("Disposable", "Disposable body")
+        survivor_id = self.memory.create_note("Survivor", "Survivor body")
+
+        result = self.tool.execute("delete", {"id": note_id})
+
+        self.assertEqual(
+            result,
+            ToolExecutionResult(
+                True,
+                f"Deleted note {note_id}.",
+                {"id": note_id},
+            ),
+        )
+        self.assertIsNone(result.recorded_message)
+        self.assertIsNone(self.memory.get_note(note_id=note_id))
+        self.assertIsNotNone(self.memory.get_note(note_id=survivor_id))
+
+    def test_mutations_on_a_missing_note_use_the_not_found_result(self) -> None:
+        cases = (
+            ("retitle", {"id": 99999, "title": "New Title"}),
+            ("edit", {"id": 99999, "body": "New body"}),
+            ("delete", {"id": 99999}),
+        )
+
+        for action, arguments in cases:
+            with self.subTest(action=action):
+                result = self.tool.execute(action, arguments)
+                self.assertEqual(
+                    result,
+                    ToolExecutionResult(False, "Note not found: 99999."),
+                )
+                self.assertIsNone(result.recorded_message)
+
+    def test_mutation_ids_must_be_positive_integers_and_never_reach_memory(
+        self,
+    ) -> None:
+        mutations = (
+            ("retitle", "retitle_note", {"title": "New Title"}),
+            ("edit", "edit_note", {"body": "New body"}),
+            ("delete", "delete_note", {}),
+        )
+        invalid_ids = (0, -1, "1", 1.0, True, False, None)
+        expected = ToolExecutionResult(
+            False,
+            "Note id must be a positive whole number.",
+        )
+
+        for action, method_name, content in mutations:
+            for note_id in invalid_ids:
+                with self.subTest(action=action, note_id=repr(note_id)):
+                    with patch.object(self.memory, method_name) as memory_method:
+                        result = self.tool.execute(
+                            action,
+                            {"id": note_id, **content},
+                        )
+                    self.assertEqual(result, expected)
+                    memory_method.assert_not_called()
+            with self.subTest(action=action, note_id="missing"):
+                with patch.object(self.memory, method_name) as memory_method:
+                    result = self.tool.execute(action, dict(content))
+                self.assertEqual(result, expected)
+                memory_method.assert_not_called()
+
+    def test_mutation_content_must_be_a_non_blank_string_and_never_reaches_memory(
+        self,
+    ) -> None:
+        note_id = self.memory.create_note("Original Title", "Original body")
+        mutations = (
+            ("retitle", "retitle_note", "title", "New note title is required."),
+            ("edit", "edit_note", "body", "New note body is required."),
+        )
+        invalid_values = (None, 5, True, [], object(), "", "   ")
+
+        for action, method_name, key, expected_message in mutations:
+            expected = ToolExecutionResult(False, expected_message)
+            for value in invalid_values:
+                with self.subTest(action=action, value=repr(value)):
+                    with patch.object(self.memory, method_name) as memory_method:
+                        result = self.tool.execute(
+                            action,
+                            {"id": note_id, key: value},
+                        )
+                    self.assertEqual(result, expected)
+                    memory_method.assert_not_called()
+            with self.subTest(action=action, value="missing"):
+                with patch.object(self.memory, method_name) as memory_method:
+                    result = self.tool.execute(action, {"id": note_id})
+                self.assertEqual(result, expected)
+                memory_method.assert_not_called()
+
+    def test_rejected_mutation_content_is_never_coerced_into_persisted_text(
+        self,
+    ) -> None:
+        note_id = self.memory.create_note("Original Title", "Original body")
+
+        retitled = self.tool.execute("retitle", {"id": note_id, "title": 5})
+        edited = self.tool.execute("edit", {"id": note_id, "body": True})
+
+        self.assertEqual(
+            retitled,
+            ToolExecutionResult(False, "New note title is required."),
+        )
+        self.assertEqual(
+            edited,
+            ToolExecutionResult(False, "New note body is required."),
+        )
+        stored = self.memory.get_note(note_id=note_id)
+        self.assertEqual(stored["title"], "Original Title")
+        self.assertEqual(stored["body"], "Original body")
+
+    def test_successful_mutation_results_and_logs_exclude_title_and_body(
+        self,
+    ) -> None:
+        distinctive_title = "PRIVATE-NOTE-TITLE-2b41c0d9-complete"
+        distinctive_body = "PRIVATE-NOTE-BODY-9c72e51a-complete"
+        note_id = self.memory.create_note("Original", "Original body")
+        self.logger.reset_mock()
+
+        retitled = self.tool.execute(
+            "retitle",
+            {"id": note_id, "title": distinctive_title},
+        )
+        edited = self.tool.execute(
+            "edit",
+            {"id": note_id, "body": distinctive_body},
+        )
+        deleted = self.tool.execute("delete", {"id": note_id})
+
+        self.assertTrue(retitled.success)
+        self.assertTrue(edited.success)
+        self.assertTrue(deleted.success)
+        logged_calls = " ".join(str(entry) for entry in self.logger.method_calls)
+        for secret in (distinctive_title, distinctive_body):
+            with self.subTest(secret=secret):
+                self.assertNotIn(secret, logged_calls)
+                for result in (retitled, edited, deleted):
+                    self.assertNotIn(secret, result.message)
+                    self.assertNotIn(secret, str(result.data))
 
     def test_expected_value_and_runtime_errors_become_controlled_results(self) -> None:
         cases = (
@@ -327,6 +513,41 @@ class NotesToolTests(unittest.TestCase):
                 {"target": "Title"},
                 "Note read failed: database unavailable",
             ),
+            (
+                "retitle",
+                "retitle_note",
+                ValueError("New note title is required."),
+                {"id": 1, "title": "Title"},
+                "Note retitle failed: New note title is required.",
+            ),
+            (
+                "retitle",
+                "retitle_note",
+                RuntimeError("Unable to retitle note."),
+                {"id": 1, "title": "Title"},
+                "Note retitle failed: Unable to retitle note.",
+            ),
+            (
+                "edit",
+                "edit_note",
+                ValueError("New note body is required."),
+                {"id": 1, "body": "Body"},
+                "Note edit failed: New note body is required.",
+            ),
+            (
+                "edit",
+                "edit_note",
+                RuntimeError("Unable to edit note."),
+                {"id": 1, "body": "Body"},
+                "Note edit failed: Unable to edit note.",
+            ),
+            (
+                "delete",
+                "delete_note",
+                RuntimeError("Unable to delete note."),
+                {"id": 1},
+                "Note deletion failed: Unable to delete note.",
+            ),
         )
 
         for action, method_name, error, arguments, expected_message in cases:
@@ -358,6 +579,24 @@ class NotesToolTests(unittest.TestCase):
                 "get_note",
                 {"target": "Title"},
                 f"Note read failed: {busy_text}",
+            ),
+            (
+                "retitle",
+                "retitle_note",
+                {"id": 1, "title": "Title"},
+                f"Note retitle failed: {busy_text}",
+            ),
+            (
+                "edit",
+                "edit_note",
+                {"id": 1, "body": "Body"},
+                f"Note edit failed: {busy_text}",
+            ),
+            (
+                "delete",
+                "delete_note",
+                {"id": 1},
+                f"Note deletion failed: {busy_text}",
             ),
         )
 

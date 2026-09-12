@@ -154,6 +154,222 @@ class PlannerRegressionTests(unittest.TestCase):
                     PlanStep("notes", "read", arguments),
                 )
 
+    def test_retitle_note_maps_to_exact_step(self) -> None:
+        self._assert_single_step(
+            "retitle note 5: New Title",
+            PlanStep("notes", "retitle", {"id": 5, "title": "New Title"}),
+        )
+
+    def test_edit_note_maps_to_exact_step(self) -> None:
+        self._assert_single_step(
+            "edit note 5: New body",
+            PlanStep("notes", "edit", {"id": 5, "body": "New body"}),
+        )
+
+    def test_delete_note_maps_to_exact_step(self) -> None:
+        self._assert_single_step(
+            "delete note 5",
+            PlanStep("notes", "delete", {"id": 5}),
+        )
+
+    def test_note_lifecycle_commands_accept_leading_zeroes(self) -> None:
+        cases = (
+            (
+                "retitle note 007: New Title",
+                PlanStep("notes", "retitle", {"id": 7, "title": "New Title"}),
+            ),
+            (
+                "edit note 007: New body",
+                PlanStep("notes", "edit", {"id": 7, "body": "New body"}),
+            ),
+            ("delete note 007", PlanStep("notes", "delete", {"id": 7})),
+        )
+
+        for request, expected_step in cases:
+            with self.subTest(request=request):
+                self._assert_single_step(request, expected_step)
+
+    def test_note_lifecycle_keywords_are_case_insensitive(self) -> None:
+        cases = (
+            (
+                "RETITLE NOTE 9: Shout",
+                PlanStep("notes", "retitle", {"id": 9, "title": "Shout"}),
+            ),
+            (
+                "EDIT NOTE 9: Shout",
+                PlanStep("notes", "edit", {"id": 9, "body": "Shout"}),
+            ),
+            ("DELETE NOTE 9", PlanStep("notes", "delete", {"id": 9})),
+        )
+
+        for request, expected_step in cases:
+            with self.subTest(request=request):
+                self.assertEqual(
+                    self.planner.create_plan(request).steps,
+                    (expected_step,),
+                )
+
+    def test_note_lifecycle_splits_only_on_the_first_colon(self) -> None:
+        cases = (
+            (
+                "retitle note 005: New: Title",
+                PlanStep("notes", "retitle", {"id": 5, "title": "New: Title"}),
+            ),
+            (
+                "edit note 5: Body: with: colons",
+                PlanStep(
+                    "notes",
+                    "edit",
+                    {"id": 5, "body": "Body: with: colons"},
+                ),
+            ),
+        )
+
+        for request, expected_step in cases:
+            with self.subTest(request=request):
+                self._assert_single_step(request, expected_step)
+
+    def test_note_lifecycle_operands_preserve_casing_and_internal_spacing(
+        self,
+    ) -> None:
+        retitled = self.planner.create_plan("retitle note 5:   Spaced   Out   ")
+        edited = self.planner.create_plan("edit note 5:   MiXeD   Body   ")
+
+        self.assertEqual(retitled.original_request, "retitle note 5:   Spaced   Out")
+        self.assertEqual(
+            retitled.steps[0].arguments,
+            {"id": 5, "title": "Spaced   Out"},
+        )
+        self.assertEqual(edited.original_request, "edit note 5:   MiXeD   Body")
+        self.assertEqual(
+            edited.steps[0].arguments,
+            {"id": 5, "body": "MiXeD   Body"},
+        )
+
+    def test_bare_note_lifecycle_command_variants_return_exact_usage_response(
+        self,
+    ) -> None:
+        cases = (
+            ("retitle note", "Use: retitle note <id>: <new title>"),
+            ("retitle note   ", "Use: retitle note <id>: <new title>"),
+            ("RETITLE NOTE", "Use: retitle note <id>: <new title>"),
+            ("retitle note 5", "Use: retitle note <id>: <new title>"),
+            ("edit note", "Use: edit note <id>: <new body>"),
+            ("edit note   ", "Use: edit note <id>: <new body>"),
+            ("EDIT NOTE", "Use: edit note <id>: <new body>"),
+            ("edit note 5", "Use: edit note <id>: <new body>"),
+            ("delete note", "Use: delete note <id>"),
+            ("delete note   ", "Use: delete note <id>"),
+            ("DELETE NOTE", "Use: delete note <id>"),
+        )
+
+        for request, expected_response in cases:
+            with self.subTest(request=request):
+                plan = self.planner.create_plan(request)
+                self.assertEqual(plan.steps, ())
+                self.assertEqual(plan.response_if_no_action, expected_response)
+
+    def test_empty_new_note_content_returns_usage_rather_than_invalid_id(
+        self,
+    ) -> None:
+        # A well-formed id with no content is a usage error, not an id error:
+        # the emptiness check runs before the id is parsed.
+        cases = (
+            ("retitle note 5:", "Use: retitle note <id>: <new title>"),
+            ("retitle note 5:    ", "Use: retitle note <id>: <new title>"),
+            ("edit note 5:", "Use: edit note <id>: <new body>"),
+            ("edit note 5:    ", "Use: edit note <id>: <new body>"),
+        )
+
+        for request, expected_response in cases:
+            with self.subTest(request=request):
+                plan = self.planner.create_plan(request)
+                self.assertEqual(plan.steps, ())
+                self.assertEqual(plan.response_if_no_action, expected_response)
+
+    def test_invalid_note_id_returns_exact_invalid_id_response(self) -> None:
+        # The Unicode digit cases matter because str.isdigit() accepts them and
+        # int() converts the decimal ones; only the ASCII guard rejects them.
+        # The id part is parsed as one value, so an embedded extra token
+        # (e.g. "5 extra") is an invalid id, not a separate unsupported command.
+        invalid_ids = (
+            "0",
+            "-1",
+            "+1",
+            "1.5",
+            "abc",
+            "1 extra",
+            "１２",
+            "١٢",
+        )
+        templates = (
+            "retitle note {note_id}: Title",
+            "edit note {note_id}: Body",
+            "delete note {note_id}",
+        )
+
+        for template in templates:
+            for invalid_id in invalid_ids:
+                request = template.format(note_id=invalid_id)
+                with self.subTest(request=request):
+                    plan = self.planner.create_plan(request)
+                    self.assertEqual(plan.steps, ())
+                    self.assertEqual(
+                        plan.response_if_no_action,
+                        "Note id must be a positive whole number.",
+                    )
+
+    def test_blank_note_id_with_content_returns_invalid_id_response(self) -> None:
+        # Unlike "create note : body", a blank id is never defaulted; content
+        # is present, so this is an id error rather than a usage error.
+        cases = (
+            "retitle note : Title",
+            "edit note : Body",
+        )
+
+        for request in cases:
+            with self.subTest(request=request):
+                plan = self.planner.create_plan(request)
+                self.assertEqual(plan.steps, ())
+                self.assertEqual(
+                    plan.response_if_no_action,
+                    "Note id must be a positive whole number.",
+                )
+
+    def test_note_lifecycle_near_prefix_and_plural_variants_remain_unsupported(
+        self,
+    ) -> None:
+        requests = (
+            "retitle notes 1: T",
+            "edit notes 1: B",
+            "delete notes 1",
+            "retitle note1: T",
+            "edit note1: B",
+            "delete note1",
+            "retitling note 1: T",
+            "editing note 1: B",
+            "deleting note 1",
+            "clear notes",
+            "clear note 1",
+            "purge note 1",
+        )
+
+        for request in requests:
+            with self.subTest(request=request):
+                self._assert_unsupported(request)
+
+    def test_rename_note_still_maps_to_the_filesystem_rename_step(self) -> None:
+        # The pre-existing filesystem grammar owns "rename ...", so a path that
+        # merely reads like a note must never be routed to the notes tool.
+        self._assert_single_step(
+            "rename note 1 to title",
+            PlanStep(
+                "filesystem",
+                "rename",
+                {"source": "note 1", "destination": "title"},
+            ),
+        )
+
     def test_history_maps_to_exact_step(self) -> None:
         self._assert_single_step("history", PlanStep("history", "list", {}))
 
@@ -576,6 +792,9 @@ class PlannerRegressionTests(unittest.TestCase):
             "- create note <title>: <body>",
             "- notes",
             "- read note <id or exact title>",
+            "- retitle note <id>: <new title>",
+            "- edit note <id>: <new body>",
+            "- delete note <id>",
             "- remember <fact>",
             "- recall <query>",
             "- memories",
@@ -595,6 +814,13 @@ class PlannerRegressionTests(unittest.TestCase):
             response.splitlines().count("- delete interaction <id>"),
             1,
         )
+        for command_line in (
+            "- retitle note <id>: <new title>",
+            "- edit note <id>: <new body>",
+            "- delete note <id>",
+        ):
+            with self.subTest(command=command_line):
+                self.assertEqual(response.splitlines().count(command_line), 1)
 
     def _assert_single_step(self, request: str, expected_step: PlanStep) -> None:
         """Assert the complete public plan for one deterministic command."""

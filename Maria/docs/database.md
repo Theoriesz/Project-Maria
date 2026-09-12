@@ -78,6 +78,41 @@ included in the displayed message or returned tool data, which both remain
 capped at 20. If the extra row is present, the tool appends one line stating
 that more notes exist. This does not delete, expire, or prune any row.
 
+`retitle note <id>: <new title>` and `edit note <id>: <new body>` each target
+at most one row by primary-key ID, after mandatory explicit confirmation and
+with no preview of stored content beforehand. Retitle runs a single
+parameterized `UPDATE notes SET title = ?, updated_at = ? WHERE id = ?` and
+edit runs a single parameterized `UPDATE notes SET body = ?, updated_at = ?
+WHERE id = ?`, so each writes exactly one content column and neither can
+overwrite the other's field. Neither reads the row first. `created_at` is
+always preserved, and `updated_at` receives the current UTC timestamp
+generated once per call; that timestamp is not guaranteed to be strictly
+later than the previous value, and ordering ties are broken by descending
+`id` as usual. Writing a value identical to the stored one still counts as a
+successful update and still refreshes `updated_at`, because success is
+determined by the row matching `WHERE id = ?` rather than by the value
+changing. Duplicate titles across notes remain allowed, since `title` is a
+non-unique index rather than a constraint.
+
+`delete note <id>` removes at most one row through a single parameterized
+`DELETE FROM notes WHERE id = ?` statement, under the same confirmation rule
+and without reading the row first. It does not cascade to `interactions` or
+`memories` and does not renumber remaining rows' IDs. For Maria's implicit-ID
+inserts, SQLite AUTOINCREMENT does not automatically reuse an ID from a
+previously committed row, even after the table has been emptied. Each of the
+three mutations commits independently first; Maria then
+separately attempts to record a short, content-free audit interaction
+(`Retitled note <id>.`, `Edited note <id>.`, or `Deleted note <id>.`) as its
+own transaction. If that later recording fails, the mutation remains
+committed and no audit row is guaranteed. Because the original command is
+stored as the request half of an interaction, a retitle or edit command
+retains its new title or body in the `interactions` table, and a prior `read
+note` may already have copied that note's content there; changing or deleting
+the note afterwards does not rewrite or remove those independent rows. There
+is no bulk, wildcard, range, or automatic note deletion, no undo or revision
+history, and no guarantee of secure erasure from SQLite file pages, backups,
+database copies, or external storage.
+
 ### memories
 
 Stores facts that the user deliberately saves as explicit memories.
@@ -189,10 +224,11 @@ automatically remove matching text from existing interaction rows. All three
 tables share one database file; external removal or replacement affects all
 three datasets.
 
-In the current Unreleased development state, `delete interaction <id>`
-targets at most one interaction row by ID and removes it when found; Maria
-still exposes no API or CLI operation to prune or bulk-delete interaction
-history, delete notes, or
+In the current Unreleased development state, `delete interaction <id>` and
+`delete note <id>` each target at most one row by ID and remove it when
+found, and `retitle note <id>` and `edit note <id>` each change one note
+field; Maria still exposes no API or CLI operation to prune or bulk-delete
+interaction history, bulk-delete or clear notes, or
 delete or forget explicit memories. It also provides
 no application-level database encryption. Protection depends on access to the
 machine, user account, and database file and on any storage encryption in use;

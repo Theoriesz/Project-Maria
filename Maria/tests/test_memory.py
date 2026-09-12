@@ -794,6 +794,449 @@ class MemoryTests(unittest.TestCase):
             self.assertNotIn("secret request", call_text)
             self.assertNotIn("secret response", call_text)
 
+    def test_retitle_note_replaces_title_and_keeps_body_and_created_at(self) -> None:
+        self.memory.initialize()
+        created_at = "2026-01-01T00:00:00+00:00"
+        retitled_at = "2026-02-01T00:00:00+00:00"
+        with patch("core.memory._utc_timestamp", return_value=created_at):
+            note_id = self.memory.create_note("Original title", "Original body")
+
+        with patch("core.memory._utc_timestamp", return_value=retitled_at):
+            retitled = self.memory.retitle_note(note_id, "  Replacement title  ")
+
+        self.assertTrue(retitled)
+        self.assertEqual(
+            self.memory.get_note(note_id=note_id),
+            {
+                "id": note_id,
+                "title": "Replacement title",
+                "body": "Original body",
+                "created_at": created_at,
+                "updated_at": retitled_at,
+            },
+        )
+
+    def test_edit_note_replaces_body_and_keeps_title_and_created_at(self) -> None:
+        self.memory.initialize()
+        created_at = "2026-01-01T00:00:00+00:00"
+        edited_at = "2026-02-01T00:00:00+00:00"
+        with patch("core.memory._utc_timestamp", return_value=created_at):
+            note_id = self.memory.create_note("Original title", "Original body")
+
+        with patch("core.memory._utc_timestamp", return_value=edited_at):
+            edited = self.memory.edit_note(note_id, "  Replacement body  ")
+
+        self.assertTrue(edited)
+        self.assertEqual(
+            self.memory.get_note(note_id=note_id),
+            {
+                "id": note_id,
+                "title": "Original title",
+                "body": "Replacement body",
+                "created_at": created_at,
+                "updated_at": edited_at,
+            },
+        )
+
+    def test_retitle_note_accepts_a_title_another_note_already_uses(self) -> None:
+        self.memory.initialize()
+        first_id = self.memory.create_note("Shared title", "First body")
+        second_id = self.memory.create_note("Second title", "Second body")
+
+        retitled = self.memory.retitle_note(second_id, "Shared title")
+
+        first = self.memory.get_note(note_id=first_id)
+        second = self.memory.get_note(note_id=second_id)
+        self.assertTrue(retitled)
+        self.assertEqual(first["title"], "Shared title")
+        self.assertEqual(first["body"], "First body")
+        self.assertEqual(second["title"], "Shared title")
+        self.assertEqual(second["body"], "Second body")
+
+    def test_note_updates_to_unchanged_values_still_report_success(self) -> None:
+        self.memory.initialize()
+        note_id = self.memory.create_note("Same title", "Same body")
+
+        retitled = self.memory.retitle_note(note_id, "Same title")
+        edited = self.memory.edit_note(note_id, "Same body")
+
+        self.assertTrue(retitled)
+        self.assertTrue(edited)
+        self.assertEqual(
+            self.memory.get_note(note_id=note_id)["title"], "Same title"
+        )
+        self.assertEqual(self.memory.get_note(note_id=note_id)["body"], "Same body")
+
+    def test_unchanged_note_updates_with_stored_timestamp_still_report_success(
+        self,
+    ) -> None:
+        """Matching every stored column still updates a row, proving rowcount."""
+        self.memory.initialize()
+        note_id = self.memory.create_note("Same title", "Same body")
+        stored_updated_at = self.memory.get_note(note_id=note_id)["updated_at"]
+
+        with patch("core.memory._utc_timestamp", return_value=stored_updated_at):
+            retitled = self.memory.retitle_note(note_id, "Same title")
+            edited = self.memory.edit_note(note_id, "Same body")
+
+        self.assertTrue(retitled)
+        self.assertTrue(edited)
+        self.assertEqual(
+            self.memory.get_note(note_id=note_id)["updated_at"],
+            stored_updated_at,
+        )
+
+    def test_note_updates_call_the_clock_once_and_store_that_timestamp(self) -> None:
+        self.memory.initialize()
+        note_id = self.memory.create_note("Original title", "Original body")
+        retitled_at = "2026-03-01T00:00:00+00:00"
+        edited_at = "2026-04-01T00:00:00+00:00"
+
+        with patch(
+            "core.memory._utc_timestamp",
+            return_value=retitled_at,
+        ) as retitle_clock:
+            self.memory.retitle_note(note_id, "Replacement title")
+
+        retitle_updated_at = self.memory.get_note(note_id=note_id)["updated_at"]
+
+        with patch(
+            "core.memory._utc_timestamp",
+            return_value=edited_at,
+        ) as edit_clock:
+            self.memory.edit_note(note_id, "Replacement body")
+
+        edit_updated_at = self.memory.get_note(note_id=note_id)["updated_at"]
+
+        self.assertEqual(retitle_clock.call_count, 1)
+        self.assertEqual(retitle_updated_at, retitled_at)
+        self.assertEqual(edit_clock.call_count, 1)
+        self.assertEqual(edit_updated_at, edited_at)
+
+    def test_note_mutations_return_false_for_missing_id(self) -> None:
+        self.memory.initialize()
+
+        self.assertFalse(self.memory.retitle_note(999, "Replacement title"))
+        self.assertFalse(self.memory.edit_note(999, "Replacement body"))
+        self.assertFalse(self.memory.delete_note(999))
+
+    def test_note_mutations_reject_invalid_direct_ids_without_connecting(
+        self,
+    ) -> None:
+        self.memory.initialize()
+        invalid_ids = (0, -1, "1", 1.0, True, False, None)
+        mutations = (
+            ("retitle_note", ("Replacement title",)),
+            ("edit_note", ("Replacement body",)),
+            ("delete_note", ()),
+        )
+
+        for method_name, extra_arguments in mutations:
+            mutate = getattr(self.memory, method_name)
+            for invalid_id in invalid_ids:
+                with self.subTest(method=method_name, invalid_id=invalid_id):
+                    with patch.object(self.memory, "_connect") as connect_mock, patch(
+                        "core.memory._utc_timestamp"
+                    ) as timestamp_mock:
+                        with self.assertRaisesRegex(
+                            ValueError,
+                            r"^Note id must be a positive whole number\.$",
+                        ):
+                            mutate(invalid_id, *extra_arguments)
+                        connect_mock.assert_not_called()
+                        timestamp_mock.assert_not_called()
+
+    def test_retitle_note_rejects_invalid_titles_without_connecting(self) -> None:
+        self.memory.initialize()
+        note_id = self.memory.create_note("Original title", "Original body")
+
+        for new_title in (None, 5, True, [], object(), "", "   "):
+            with self.subTest(new_title=new_title):
+                with patch.object(self.memory, "_connect") as connect_mock, patch(
+                    "core.memory._utc_timestamp"
+                ) as timestamp_mock:
+                    with self.assertRaisesRegex(
+                        ValueError,
+                        r"^New note title is required\.$",
+                    ):
+                        self.memory.retitle_note(note_id, new_title)
+                    connect_mock.assert_not_called()
+                    timestamp_mock.assert_not_called()
+
+        self.assertEqual(
+            self.memory.get_note(note_id=note_id)["title"], "Original title"
+        )
+
+    def test_edit_note_rejects_invalid_bodies_without_connecting(self) -> None:
+        self.memory.initialize()
+        note_id = self.memory.create_note("Original title", "Original body")
+
+        for new_body in (None, 5, True, [], object(), "", "   "):
+            with self.subTest(new_body=new_body):
+                with patch.object(self.memory, "_connect") as connect_mock, patch(
+                    "core.memory._utc_timestamp"
+                ) as timestamp_mock:
+                    with self.assertRaisesRegex(
+                        ValueError,
+                        r"^New note body is required\.$",
+                    ):
+                        self.memory.edit_note(note_id, new_body)
+                    connect_mock.assert_not_called()
+                    timestamp_mock.assert_not_called()
+
+        self.assertEqual(
+            self.memory.get_note(note_id=note_id)["body"], "Original body"
+        )
+
+    def test_retitle_note_binds_values_as_parameters_and_commits(self) -> None:
+        self.memory.initialize()
+        note_id = self.memory.create_note("Original title", "Original body")
+        timestamp = "2026-05-01T00:00:00+00:00"
+
+        mock_cursor = MagicMock()
+        mock_cursor.rowcount = 1
+        mock_connection = MagicMock(spec=sqlite3.Connection)
+        mock_connection.execute.return_value = mock_cursor
+
+        with patch.object(self.memory, "_connect", return_value=mock_connection):
+            with patch("core.memory._utc_timestamp", return_value=timestamp):
+                retitled = self.memory.retitle_note(note_id, "  Replacement title  ")
+
+        self.assertTrue(retitled)
+        query, params = mock_connection.execute.call_args.args
+        self.assertNotIn(str(note_id), query)
+        self.assertNotIn("Replacement title", query)
+        self.assertEqual(params, ("Replacement title", timestamp, note_id))
+        self.assertIn("UPDATE notes", query)
+        self.assertIn("SET title = ?", query)
+        self.assertIn("WHERE id = ?", query)
+        mock_connection.commit.assert_called_once()
+        mock_connection.rollback.assert_not_called()
+        mock_connection.close.assert_called_once()
+
+    def test_edit_note_binds_values_as_parameters_and_commits(self) -> None:
+        self.memory.initialize()
+        note_id = self.memory.create_note("Original title", "Original body")
+        timestamp = "2026-05-01T00:00:00+00:00"
+
+        mock_cursor = MagicMock()
+        mock_cursor.rowcount = 1
+        mock_connection = MagicMock(spec=sqlite3.Connection)
+        mock_connection.execute.return_value = mock_cursor
+
+        with patch.object(self.memory, "_connect", return_value=mock_connection):
+            with patch("core.memory._utc_timestamp", return_value=timestamp):
+                edited = self.memory.edit_note(note_id, "  Replacement body  ")
+
+        self.assertTrue(edited)
+        query, params = mock_connection.execute.call_args.args
+        self.assertNotIn(str(note_id), query)
+        self.assertNotIn("Replacement body", query)
+        self.assertEqual(params, ("Replacement body", timestamp, note_id))
+        self.assertIn("UPDATE notes", query)
+        self.assertIn("SET body = ?", query)
+        self.assertIn("WHERE id = ?", query)
+        mock_connection.commit.assert_called_once()
+        mock_connection.rollback.assert_not_called()
+        mock_connection.close.assert_called_once()
+
+    def test_delete_note_binds_id_as_a_parameter_and_commits(self) -> None:
+        self.memory.initialize()
+        note_id = self.memory.create_note("Original title", "Original body")
+
+        mock_cursor = MagicMock()
+        mock_cursor.rowcount = 1
+        mock_connection = MagicMock(spec=sqlite3.Connection)
+        mock_connection.execute.return_value = mock_cursor
+
+        with patch.object(self.memory, "_connect", return_value=mock_connection):
+            deleted = self.memory.delete_note(note_id)
+
+        self.assertTrue(deleted)
+        query, params = mock_connection.execute.call_args.args
+        self.assertNotIn(str(note_id), query)
+        self.assertEqual(params, (note_id,))
+        self.assertIn("DELETE FROM notes", query)
+        self.assertIn("WHERE id = ?", query)
+        mock_connection.commit.assert_called_once()
+        mock_connection.rollback.assert_not_called()
+        mock_connection.close.assert_called_once()
+
+    def test_retitle_note_ordinary_failure_rolls_back_and_closes(self) -> None:
+        self.memory.initialize()
+        io_error = sqlite3.OperationalError("disk I/O error")
+        io_error.sqlite_errorcode = 10  # SQLITE_IOERR: unrelated to busy/locked.
+
+        mock_connection = MagicMock(spec=sqlite3.Connection)
+        mock_connection.execute.side_effect = io_error
+
+        with patch.object(self.memory, "_connect", return_value=mock_connection):
+            with self.assertRaisesRegex(
+                RuntimeError,
+                r"^Unable to retitle note\.$",
+            ) as raised:
+                self.memory.retitle_note(1, "Replacement title")
+
+        self.assertIs(raised.exception.__cause__, io_error)
+        mock_connection.rollback.assert_called_once()
+        mock_connection.close.assert_called_once()
+
+    def test_edit_note_ordinary_failure_rolls_back_and_closes(self) -> None:
+        self.memory.initialize()
+        io_error = sqlite3.OperationalError("disk I/O error")
+        io_error.sqlite_errorcode = 10  # SQLITE_IOERR: unrelated to busy/locked.
+
+        mock_connection = MagicMock(spec=sqlite3.Connection)
+        mock_connection.execute.side_effect = io_error
+
+        with patch.object(self.memory, "_connect", return_value=mock_connection):
+            with self.assertRaisesRegex(
+                RuntimeError,
+                r"^Unable to edit note\.$",
+            ) as raised:
+                self.memory.edit_note(1, "Replacement body")
+
+        self.assertIs(raised.exception.__cause__, io_error)
+        mock_connection.rollback.assert_called_once()
+        mock_connection.close.assert_called_once()
+
+    def test_delete_note_ordinary_failure_rolls_back_and_closes(self) -> None:
+        self.memory.initialize()
+        io_error = sqlite3.OperationalError("disk I/O error")
+        io_error.sqlite_errorcode = 10  # SQLITE_IOERR: unrelated to busy/locked.
+
+        mock_connection = MagicMock(spec=sqlite3.Connection)
+        mock_connection.execute.side_effect = io_error
+
+        with patch.object(self.memory, "_connect", return_value=mock_connection):
+            with self.assertRaisesRegex(
+                RuntimeError,
+                r"^Unable to delete note\.$",
+            ) as raised:
+                self.memory.delete_note(1)
+
+        self.assertIs(raised.exception.__cause__, io_error)
+        mock_connection.rollback.assert_called_once()
+        mock_connection.close.assert_called_once()
+
+    def test_retitle_note_busy_error_becomes_fixed_message(self) -> None:
+        self.memory.initialize()
+        busy_exc = sqlite3.OperationalError("database is locked")
+        busy_exc.sqlite_errorcode = sqlite3.SQLITE_BUSY
+
+        mock_connection = MagicMock(spec=sqlite3.Connection)
+        mock_connection.execute.side_effect = busy_exc
+
+        with patch.object(self.memory, "_connect", return_value=mock_connection):
+            with self.assertRaisesRegex(
+                RuntimeError,
+                r"^Database is busy\. Try again shortly\.$",
+            ) as raised:
+                self.memory.retitle_note(1, "Replacement title")
+
+        self.assertIs(raised.exception.__cause__, busy_exc)
+        mock_connection.rollback.assert_called_once()
+        mock_connection.close.assert_called_once()
+
+    def test_edit_note_busy_error_becomes_fixed_message(self) -> None:
+        self.memory.initialize()
+        busy_exc = sqlite3.OperationalError("database is locked")
+        busy_exc.sqlite_errorcode = sqlite3.SQLITE_BUSY
+
+        mock_connection = MagicMock(spec=sqlite3.Connection)
+        mock_connection.execute.side_effect = busy_exc
+
+        with patch.object(self.memory, "_connect", return_value=mock_connection):
+            with self.assertRaisesRegex(
+                RuntimeError,
+                r"^Database is busy\. Try again shortly\.$",
+            ) as raised:
+                self.memory.edit_note(1, "Replacement body")
+
+        self.assertIs(raised.exception.__cause__, busy_exc)
+        mock_connection.rollback.assert_called_once()
+        mock_connection.close.assert_called_once()
+
+    def test_delete_note_busy_error_becomes_fixed_message(self) -> None:
+        self.memory.initialize()
+        locked_exc = sqlite3.OperationalError("database is locked")
+        locked_exc.sqlite_errorcode = sqlite3.SQLITE_LOCKED
+
+        mock_connection = MagicMock(spec=sqlite3.Connection)
+        mock_connection.execute.side_effect = locked_exc
+
+        with patch.object(self.memory, "_connect", return_value=mock_connection):
+            with self.assertRaisesRegex(
+                RuntimeError,
+                r"^Database is busy\. Try again shortly\.$",
+            ) as raised:
+                self.memory.delete_note(1)
+
+        self.assertIs(raised.exception.__cause__, locked_exc)
+        mock_connection.rollback.assert_called_once()
+        mock_connection.close.assert_called_once()
+
+    def test_delete_note_removes_target_and_leaves_others(self) -> None:
+        self.memory.initialize()
+        keep_id = self.memory.create_note("Keep", "Keep body")
+        delete_id = self.memory.create_note("Delete", "Delete body")
+
+        deleted = self.memory.delete_note(delete_id)
+
+        self.assertTrue(deleted)
+        self.assertIsNone(self.memory.get_note(note_id=delete_id))
+        self.assertIsNotNone(self.memory.get_note(note_id=keep_id))
+
+    def test_delete_note_does_not_affect_interactions_or_memories(self) -> None:
+        self.memory.initialize()
+        note_id = self.memory.create_note("Editor", "VS Code")
+        interaction_id = self.memory.record_interaction("system", "details")
+        memory_id, _ = self.memory.store_memory("My editor is VS Code")
+
+        self.assertTrue(self.memory.delete_note(note_id))
+
+        self.assertIsNotNone(self.memory.get_interaction(interaction_id))
+        self.assertIsNotNone(self.memory.get_memory(memory_id))
+
+    def test_delete_note_does_not_renumber_or_reuse_ids(self) -> None:
+        self.memory.initialize()
+        first_id = self.memory.create_note("First", "First body")
+
+        self.assertTrue(self.memory.delete_note(first_id))
+        second_id = self.memory.create_note("Second", "Second body")
+
+        self.assertGreater(second_id, first_id)
+        self.assertNotEqual(second_id, first_id)
+
+    def test_note_mutation_logs_contain_no_title_or_body_content(self) -> None:
+        mock_logger = Mock(spec=logging.Logger)
+        memory = Memory(self.database_path, logger=mock_logger)
+        memory.initialize()
+        note_id = memory.create_note("secret title", "secret body")
+        mock_logger.reset_mock()
+
+        retitled = memory.retitle_note(note_id, "secret new title")
+        edited = memory.edit_note(note_id, "secret new body")
+        deleted = memory.delete_note(note_id)
+        missing_retitle = memory.retitle_note(note_id, "secret missing title")
+        missing_edit = memory.edit_note(note_id, "secret missing body")
+        missing_delete = memory.delete_note(note_id)
+
+        self.assertTrue(retitled)
+        self.assertTrue(edited)
+        self.assertTrue(deleted)
+        self.assertFalse(missing_retitle)
+        self.assertFalse(missing_edit)
+        self.assertFalse(missing_delete)
+        for logger_call in mock_logger.method_calls:
+            call_text = " ".join(str(arg) for arg in logger_call.args)
+            self.assertNotIn("secret title", call_text)
+            self.assertNotIn("secret body", call_text)
+            self.assertNotIn("secret new title", call_text)
+            self.assertNotIn("secret new body", call_text)
+            self.assertNotIn("secret missing title", call_text)
+            self.assertNotIn("secret missing body", call_text)
+
 
 class BusyLockedClassificationTests(unittest.TestCase):
     """Exercise _is_busy_or_locked's numeric primary-result-code matching."""
