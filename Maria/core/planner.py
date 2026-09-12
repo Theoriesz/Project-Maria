@@ -158,6 +158,21 @@ class Planner:
                 )
             return self._single_step(text, "history", "read", {"id": interaction_id})
 
+        if lowered == "delete interaction":
+            return self._no_action(text, "Use: delete interaction <id>")
+
+        if lowered.startswith("delete interaction "):
+            operand = text[len("delete interaction ") :].strip()
+            if not operand:
+                return self._no_action(text, "Use: delete interaction <id>")
+            interaction_id = _parse_positive_ascii_id(operand)
+            if interaction_id is None:
+                return self._no_action(
+                    text,
+                    "Interaction id must be a positive whole number.",
+                )
+            return self._single_step(text, "history", "delete", {"id": interaction_id})
+
         if lowered in {"system", "system info", "status", "sys", "sys info"}:
             return self._single_step(text, "system", "overview", {})
 
@@ -259,5 +274,6 @@ def _help_text() -> str:
         "- time\n"
         "- history\n"
         "- search history <query>\n"
-        "- read interaction <id>"
+        "- read interaction <id>\n"
+        "- delete interaction <id>"
     )

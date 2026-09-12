@@ -536,6 +536,10 @@ class MariaBrainTests(unittest.TestCase):
             source,
             r"(?:action|step\.action)\s*==\s*['\"]read['\"]",
         )
+        self.assertNotRegex(
+            source,
+            r"(?:action|step\.action)\s*==\s*['\"]delete['\"]",
+        )
 
 
 def _single_step_plan(

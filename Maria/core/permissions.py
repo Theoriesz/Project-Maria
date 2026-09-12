@@ -13,6 +13,7 @@ MANDATORY_CONFIRMATION_ACTIONS = frozenset(
     {
         "filesystem.rename",
         "filesystem.move",
+        "history.delete",
     }
 )
 

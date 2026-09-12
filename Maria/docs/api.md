@@ -60,8 +60,10 @@ limits are clamped to a minimum of 1 and maximum of 50. SQLite failures raise
 `RuntimeError("Unable to fetch recent interactions.")`.
 
 "Recent" limits the query result and does not delete, expire, or prune older
-rows. Maria exposes no interaction-history delete or prune API method or CLI
-command. Brain requests up to three rows for context; retrieval failure falls
+rows. `Memory.delete_interaction`, documented below, targets at most one row
+by ID and removes it when found; Maria still exposes no prune or bulk-delete
+API method or CLI command.
+Brain requests up to three rows for context; retrieval failure falls
 back to empty context, while recording failure is logged without replacing
 the user response.
 
@@ -83,6 +85,17 @@ are literal characters, not wildcards. Results contain `id`, `user_input`,
 `id` descending; no match returns an empty list. Requested integer limits are
 clamped to the same 1-through-50 range as `get_recent_interactions`. SQLite
 failures raise `RuntimeError("Unable to search interactions.")`.
+
+`Memory.delete_interaction(interaction_id: int) -> bool`
+
+Validates `interaction_id` directly, before opening a connection: raises
+`ValueError("Interaction id must be a positive whole number.")` when it is
+not an `int`, is a `bool`, or is less than 1. For a valid ID, executes
+one parameterized `DELETE FROM interactions WHERE id = ?` statement without
+first reading the row, and returns `True` when exactly one row was deleted or
+`False` when no row matched. Deleted content is never read, logged, or
+returned. SQLite failures raise `RuntimeError("Unable to delete
+interaction.")`.
 
 ### Explicit Memories
 
@@ -153,13 +166,12 @@ does not execute SQL.
 
 `HistoryTool.execute(action: str, arguments: dict[str, Any]) -> ToolExecutionResult`
 
-The history tool supports `list`, `search`, and `read`; `delete` does not
-exist in the current Unreleased development state. `list` and `search`
-return at most the newest 20 rows, using the same limit-plus-one probing
-pattern as notes and memories; their `data` is a redacted list of `{"id",
-"user_input", "created_at"}` dictionaries that excludes `response`, even
-when `search` matched inside a row's `response` text. `read` returns the
-complete interaction row (including `response`) as `data`, since its
+The history tool supports `list`, `search`, `read`, and `delete`. `list` and
+`search` return at most the newest 20 rows, using the same limit-plus-one
+probing pattern as notes and memories; their `data` is a redacted list of
+`{"id", "user_input", "created_at"}` dictionaries that excludes `response`,
+even when `search` matched inside a row's `response` text. `read` returns
+the complete interaction row (including `response`) as `data`, since its
 `message` already displays the full stored request and response.
 Non-printable characters in a `list`/`search` display row are replaced with
 a single space; the underlying stored data and `read`'s full display are
@@ -167,12 +179,22 @@ unaffected. `read` sets `recorded_message` to a fixed
 `Displayed interaction <id>.` string so redisplaying old content does not
 duplicate it into a new interaction row.
 
+`delete` validates its `id` argument the same way as `read` (an actual
+`int`, not a `bool`, at least `1`), returning `"Interaction id must be a
+positive whole number."` for an invalid direct value without calling
+`Memory`. A missing row returns `"Interaction not found: <id>."`. A
+successful deletion returns `"Deleted interaction <id>."` with
+`data={"id": <id>}` — never the deleted request or response text — and
+leaves `recorded_message` as `None`, since that message is already short
+and content-free. An ordinary `Memory` failure is wrapped as `"History
+deletion failed: Unable to delete interaction."`.
+
 The tool receives the shared `Memory` instance through dependency injection.
 It is registered as `tools.history` through Tool Manager's standard
 `build_tool(...)` factory contract and travels through the normal permission
-path; `history.list`, `history.search`, and `history.read` are all allowed
-by default. The tool contains no SQL; `core/memory.py` owns all database
-operations.
+path; `history.list`, `history.search`, and `history.read` are allowed by
+default, while `history.delete` always requires explicit confirmation. The
+tool contains no SQL; `core/memory.py` owns all database operations.
 
 ## Tool Manager
 
@@ -196,8 +218,8 @@ one array are rejected, while syntactically valid identifiers for future tools
 are retained. Malformed permission values raise `ValueError`.
 
 Missing permission arrays and explicitly empty arrays use the mandatory secure
-baseline: `filesystem.rename` and `filesystem.move` require confirmation, while
-`filesystem.delete` and `filesystem.write` are denied. Configuration can add
-restrictions but cannot remove this baseline. `PermissionManager` applies the
-same mandatory policy when constructed directly, and denial wins if an action
-also requires confirmation.
+baseline: `filesystem.rename`, `filesystem.move`, and `history.delete` require
+confirmation, while `filesystem.delete` and `filesystem.write` are denied.
+Configuration can add restrictions but cannot remove this baseline.
+`PermissionManager` applies the same mandatory policy when constructed
+directly, and denial wins if an action also requires confirmation.

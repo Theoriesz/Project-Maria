@@ -50,10 +50,12 @@ normal recording path.
 
 Successful writes are committed to the configured SQLite file and remain
 available across normal restarts until the database is removed or altered
-externally. Maria provides no automatic retention period, pruning, archival,
-or interaction-history deletion feature. `history`, `search history <query>`,
-and `read interaction <id>` list, search, and read existing rows; there is
-still no CLI command to clear or delete interaction history. Calling data
+externally. Maria provides no automatic retention period, pruning, or
+archival. `history`, `search history <query>`, and `read interaction <id>`
+list, search, and read existing rows without modifying them; `delete
+interaction <id>` targets at most one row by ID and removes it when found,
+after mandatory confirmation. There is still no CLI command to clear,
+bulk-delete, or automatically prune interaction history. Calling data
 "recent" does not imply that older rows expire.
 
 ### notes
@@ -132,6 +134,23 @@ redisplayed, so repeatedly reading old rows does not duplicate their content
 into new interaction rows. `list`, `search`, and `read` are all read-only:
 none of them delete, clear, or prune any interaction row.
 
+`delete interaction <id>` targets at most one row by primary-key ID and
+removes it when found, through a single parameterized `DELETE FROM
+interactions WHERE id = ?` statement, after mandatory explicit confirmation
+and with no preview of stored content beforehand. It does not read the row
+first, does not cascade to `notes` or `memories`, and does not renumber
+remaining rows' IDs. For Maria's implicit-ID inserts, SQLite AUTOINCREMENT
+does not automatically reuse an ID from a previously committed row, even
+after the table has been emptied. The deletion commits independently first;
+Maria then separately attempts to record a short, content-free audit
+interaction (`Deleted interaction <id>.`) as its own transaction. When that
+later recording succeeds, the total interaction row count may remain
+unchanged even though the selected historical content is gone; if it fails,
+the deletion remains committed and no audit row is guaranteed. There is no
+bulk, wildcard, range, or automatic deletion, and no guarantee of secure
+erasure from SQLite file pages, backups, database copies, or external
+storage.
+
 ## Memory Retrieval
 
 `recall <query>` strips and case-folds the query, then uses SQLite `instr()` to
@@ -170,8 +189,11 @@ automatically remove matching text from existing interaction rows. All three
 tables share one database file; external removal or replacement affects all
 three datasets.
 
-Maria v0.1 exposes no API or CLI operation to delete or prune interaction
-history, delete notes, or delete or forget explicit memories. It also provides
+In the current Unreleased development state, `delete interaction <id>`
+targets at most one interaction row by ID and removes it when found; Maria
+still exposes no API or CLI operation to prune or bulk-delete interaction
+history, delete notes, or
+delete or forget explicit memories. It also provides
 no application-level database encryption. Protection depends on access to the
 machine, user account, and database file and on any storage encryption in use;
 local storage alone is not a confidentiality guarantee. The v0.1 persistence

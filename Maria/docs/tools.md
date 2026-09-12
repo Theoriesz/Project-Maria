@@ -6,7 +6,8 @@ Tools are small modules that expose controlled capabilities to Maria.
 
 - `calculator`: basic arithmetic
 - `filesystem`: read, list, rename, and move inside the configured safe root
-- `history`: list, search, and read SQLite-backed interaction-history rows
+- `history`: list, search, read, and delete SQLite-backed interaction-history
+  rows
 - `memory`: store, search, and list explicit SQLite-backed memories
 - `notes`: create, list, and read SQLite-backed notes
 - `system`: read-only OS, CPU, RAM, disk, and time information
@@ -98,15 +99,14 @@ change is also prospective only: existing interaction-history rows are not rewri
 
 ## History Tool
 
-The history tool supports exactly three actions:
+The history tool supports exactly four actions:
 
 - `list`: list the newest interaction-history rows
 - `search`: find interactions by literal, case-insensitive substring across
   the stored request and response
 - `read`: display one interaction's complete stored request, response, and
   timestamp
-
-`delete` does not exist in the current Unreleased development state.
+- `delete`: target at most one interaction row by ID and remove it when found
 
 `list` and `search` output one row per line as `<id>: <user_input>`, newest
 first, using the same newest-20-with-more-exists convention as notes and
@@ -150,12 +150,26 @@ historical content again, `read` sets `ToolExecutionResult.recorded_message`
 to a fixed `Displayed interaction <id>.` string, so Brain persists that short
 summary instead of the redisplayed content.
 
+`delete` validates its `id` argument the same way as `read` (an actual
+`int`, not a `bool`, at least `1`), returning `Interaction id must be a
+positive whole number.` for an invalid direct value without calling
+`Memory`. It never reads or previews the row first. A missing ID returns
+`Interaction not found: <id>.`. A successful deletion returns `Deleted
+interaction <id>.` with `data={"id": <id>}` — never the deleted request or
+response text — and leaves `recorded_message` unset (`None`), since that
+message is already short and content-free, unlike `read`'s full-content
+display. An ordinary `Memory` failure is wrapped as `History deletion
+failed: Unable to delete interaction.`; a busy/locked failure is wrapped the
+same way, as `History deletion failed: Database is busy. Try again
+shortly.`. `delete` never cascades to `notes` or `memories` and never
+performs bulk, wildcard, or range deletion.
+
 The tool receives the shared `Memory` instance through dependency injection.
 It is registered as `tools.history` through Tool Manager's standard
 `build_tool(...)` factory contract and travels through the normal permission
-path; `history.list`, `history.search`, and `history.read` are all allowed by
-default. The tool contains no SQL; `core/memory.py` owns all database
-operations.
+path; `history.list`, `history.search`, and `history.read` are allowed by
+default, while `history.delete` always requires explicit confirmation. The
+tool contains no SQL; `core/memory.py` owns all database operations.
 
 ## Notes Tool
 
@@ -259,6 +273,8 @@ Tool actions should return `ToolExecutionResult`.
 ## Safety Rules
 
 Tools should validate inputs and handle errors gracefully. File-modifying
-actions must be checked by `permissions.py` before execution. Delete behavior is
-not part of version 0.1. The memory tool provides no update, delete, or forget
-action.
+actions must be checked by `permissions.py` before execution. Filesystem
+delete behavior is still not part of version 0.1. Interaction-history
+deletion (`history.delete`) is checked by `permissions.py` and always
+requires explicit confirmation before a row is removed. The memory tool
+provides no update, delete, or forget action.

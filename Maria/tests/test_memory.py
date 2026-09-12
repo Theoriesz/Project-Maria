@@ -646,6 +646,154 @@ class MemoryTests(unittest.TestCase):
 
         self.assertIsInstance(raised.exception.__cause__, sqlite3.OperationalError)
 
+    def test_delete_interaction_removes_target_and_leaves_others(self) -> None:
+        self.memory.initialize()
+        keep_id = self.memory.record_interaction("keep", "keep response")
+        delete_id = self.memory.record_interaction("delete", "delete response")
+
+        deleted = self.memory.delete_interaction(delete_id)
+
+        self.assertTrue(deleted)
+        self.assertIsNone(self.memory.get_interaction(delete_id))
+        self.assertIsNotNone(self.memory.get_interaction(keep_id))
+
+    def test_delete_interaction_returns_false_for_missing_id(self) -> None:
+        self.memory.initialize()
+
+        self.assertFalse(self.memory.delete_interaction(999))
+
+    def test_delete_interaction_does_not_renumber_or_reuse_ids(self) -> None:
+        self.memory.initialize()
+        first_id = self.memory.record_interaction("first", "first response")
+
+        self.assertTrue(self.memory.delete_interaction(first_id))
+        second_id = self.memory.record_interaction("second", "second response")
+
+        self.assertGreater(second_id, first_id)
+        self.assertNotEqual(second_id, first_id)
+
+    def test_delete_interaction_does_not_affect_notes_or_memories(self) -> None:
+        self.memory.initialize()
+        interaction_id = self.memory.record_interaction("system", "details")
+        note_id = self.memory.create_note("Editor", "VS Code")
+        memory_id, _ = self.memory.store_memory("My editor is VS Code")
+
+        self.assertTrue(self.memory.delete_interaction(interaction_id))
+
+        self.assertIsNotNone(self.memory.get_note(note_id=note_id))
+        self.assertIsNotNone(self.memory.get_memory(memory_id))
+
+    def test_delete_interaction_rejects_invalid_direct_ids_without_connecting(
+        self,
+    ) -> None:
+        self.memory.initialize()
+        invalid_ids = (0, -1, "1", 1.0, True, False, None)
+
+        for invalid_id in invalid_ids:
+            with self.subTest(invalid_id=invalid_id):
+                with patch.object(self.memory, "_connect") as connect_mock:
+                    with self.assertRaisesRegex(
+                        ValueError,
+                        r"^Interaction id must be a positive whole number\.$",
+                    ):
+                        self.memory.delete_interaction(invalid_id)
+                    connect_mock.assert_not_called()
+
+    def test_delete_interaction_binds_id_as_a_parameter_and_commits(self) -> None:
+        self.memory.initialize()
+        interaction_id = self.memory.record_interaction("system", "details")
+
+        mock_cursor = MagicMock()
+        mock_cursor.rowcount = 1
+        mock_connection = MagicMock(spec=sqlite3.Connection)
+        mock_connection.execute.return_value = mock_cursor
+
+        with patch.object(self.memory, "_connect", return_value=mock_connection):
+            deleted = self.memory.delete_interaction(interaction_id)
+
+        self.assertTrue(deleted)
+        query, params = mock_connection.execute.call_args.args
+        self.assertNotIn(str(interaction_id), query)
+        self.assertEqual(params, (interaction_id,))
+        self.assertIn("DELETE FROM interactions", query)
+        self.assertIn("WHERE id = ?", query)
+        mock_connection.commit.assert_called_once()
+        mock_connection.rollback.assert_not_called()
+        mock_connection.close.assert_called_once()
+
+    def test_delete_interaction_wraps_database_errors(self) -> None:
+        self.memory.initialize()
+        interaction_id = self.memory.record_interaction("system", "details")
+
+        with patch.object(
+            self.memory,
+            "_connect",
+            side_effect=sqlite3.OperationalError("database unavailable"),
+        ):
+            with self.assertRaisesRegex(
+                RuntimeError,
+                r"^Unable to delete interaction\.$",
+            ) as raised:
+                self.memory.delete_interaction(interaction_id)
+
+        self.assertIsInstance(raised.exception.__cause__, sqlite3.OperationalError)
+
+    def test_delete_interaction_ordinary_failure_rolls_back_and_closes(self) -> None:
+        self.memory.initialize()
+        io_error = sqlite3.OperationalError("disk I/O error")
+        io_error.sqlite_errorcode = 10  # SQLITE_IOERR: unrelated to busy/locked.
+
+        mock_connection = MagicMock(spec=sqlite3.Connection)
+        mock_connection.execute.side_effect = io_error
+
+        with patch.object(self.memory, "_connect", return_value=mock_connection):
+            with self.assertRaisesRegex(
+                RuntimeError,
+                r"^Unable to delete interaction\.$",
+            ):
+                self.memory.delete_interaction(1)
+
+        mock_connection.rollback.assert_called_once()
+        mock_connection.close.assert_called_once()
+
+    def test_delete_interaction_busy_error_becomes_fixed_message(self) -> None:
+        self.memory.initialize()
+        busy_exc = sqlite3.OperationalError("database is locked")
+        busy_exc.sqlite_errorcode = sqlite3.SQLITE_BUSY
+
+        mock_connection = MagicMock(spec=sqlite3.Connection)
+        mock_connection.execute.side_effect = busy_exc
+
+        with patch.object(self.memory, "_connect", return_value=mock_connection):
+            with self.assertRaisesRegex(
+                RuntimeError,
+                r"^Database is busy\. Try again shortly\.$",
+            ) as raised:
+                self.memory.delete_interaction(1)
+
+        self.assertIs(raised.exception.__cause__, busy_exc)
+        mock_connection.rollback.assert_called_once()
+        mock_connection.close.assert_called_once()
+
+    def test_delete_interaction_logs_contain_no_request_or_response_content(
+        self,
+    ) -> None:
+        mock_logger = Mock(spec=logging.Logger)
+        memory = Memory(self.database_path, logger=mock_logger)
+        memory.initialize()
+        interaction_id = memory.record_interaction("secret request", "secret response")
+        mock_logger.reset_mock()
+
+        deleted = memory.delete_interaction(interaction_id)
+        missing = memory.delete_interaction(interaction_id)
+
+        self.assertTrue(deleted)
+        self.assertFalse(missing)
+        for logger_call in mock_logger.method_calls:
+            call_text = " ".join(str(arg) for arg in logger_call.args)
+            self.assertNotIn("secret request", call_text)
+            self.assertNotIn("secret response", call_text)
+
 
 class BusyLockedClassificationTests(unittest.TestCase):
     """Exercise _is_busy_or_locked's numeric primary-result-code matching."""

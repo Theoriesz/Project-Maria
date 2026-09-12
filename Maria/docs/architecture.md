@@ -77,9 +77,20 @@ action.
 In the current Unreleased development state, `history.read` is the only
 result that supplies a non-`None` `recorded_message`, so that redisplaying
 old interaction content does not duplicate it into a new interaction row.
-Every other current tool result leaves the field as `None` and therefore
-retains the existing message-as-recorded behavior; `read file`, `read note`,
+Every other current tool result, including `history.delete`, leaves the
+field as `None` and therefore retains the existing message-as-recorded
+behavior; `history.delete`'s displayed message is already a short,
+content-free summary, so no override is needed. `read file`, `read note`,
 and `recall` are unmodified and still record their full displayed content.
+
+`history.delete`'s row deletion and the subsequent audit-recording `INSERT`
+are separate transactions, following the same boundary as every other
+recordable path: `Memory.delete_interaction()` commits independently of the
+later `Memory.record_interaction()` call. If the deletion commits but the
+following recording call raises `RuntimeError`, that error is logged and the
+already-computed successful deletion response is still returned unchanged;
+the deletion is not rolled back and no compensating write is attempted, so an
+audit row is not guaranteed in that case.
 
 Some paths return before this boundary. Blank CLI input is not processed, and
 blank input passed directly to `process()` returns before logging, context
@@ -138,6 +149,11 @@ configuration may add restrictions but cannot remove these mandatory
 protections. Missing permission arrays retain the secure baseline, and
 malformed present arrays stop configuration loading instead of weakening it.
 When an action is both denied and confirmation-required, denial wins.
+
+In the current Unreleased development state, `history.delete` also always
+requires confirmation, alongside `filesystem.rename` and `filesystem.move`.
+`history.list`, `history.search`, and `history.read` remain allowed by
+default.
 
 Direct tool invocation bypasses planning and permission checks and therefore
 remains an internal trusted-code boundary.
