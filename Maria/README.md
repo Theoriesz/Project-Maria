@@ -52,6 +52,8 @@ delete note 1
 remember My editor is VS Code
 recall editor
 memories
+update memory 1: My editor is Neovim
+forget memory 1
 system
 time
 history
@@ -60,14 +62,17 @@ read interaction 1
 delete interaction 1
 ```
 
-File rename and move operations, `delete interaction <id>`, and the three note
+File rename and move operations, `delete interaction <id>`, the three note
 lifecycle commands `retitle note <id>: <new title>`, `edit note <id>: <new
-body>`, and `delete note <id>` require explicit confirmation. `delete
-interaction <id>` targets at most one interaction row by ID and removes it
-when found; it never cascades to notes or memories. Each note lifecycle
-command likewise targets at most one note by positive whole-number ID only,
-never by title, and never cascades into interaction history or explicit
-memories.
+body>`, and `delete note <id>`, and the two memory lifecycle commands `update
+memory <id>: <new fact>` and `forget memory <id>` require explicit
+confirmation. `delete interaction <id>` targets at most one interaction row by
+ID and removes it when found; it never cascades to notes or memories. Each note
+lifecycle command likewise targets at most one note by positive whole-number ID
+only, never by title, and never cascades into interaction history or explicit
+memories. Each memory lifecycle command targets at most one memory by positive
+whole-number ID only, never by fact text, and never cascades into interaction
+history or notes.
 Retitling and editing are deliberately separate commands, so neither can
 overwrite the other's field. Filesystem
 delete functionality remains intentionally not implemented in version 0.1.
@@ -80,11 +85,36 @@ after the application restarts. The supported syntax is strict:
 - `remember <fact>` stores one fact.
 - `recall <query>` performs a literal, case-insensitive substring search.
 - `memories` lists the newest stored facts.
+- `update memory <id>: <new fact>` replaces one stored fact.
+- `forget memory <id>` removes one stored fact.
 
 Command keywords are case-insensitive, and surrounding whitespace is removed
 from facts and queries without changing their display casing. `remember` and
 `recall` must start the request directly, while `memories` must be the complete
-command. Conversational forms such as `please remember ...` are not supported.
+command. `update memory` and `forget memory` must likewise start the request
+directly.
+
+`update memory` and `forget memory` identify a memory only by its positive
+whole-number ID, never by fact text, and each affects at most one memory. Both
+require explicit confirmation. `update memory` splits its operand on the first
+colon only, so a new fact may itself contain colons. An update replaces the
+stored fact while preserving the memory's original creation time; because Maria
+records no separate update time, an edited memory keeps its place in
+newest-first output instead of moving to the top. A new fact identical to the
+stored one, or differing only by letter casing, is still a successful update —
+a casing-only change rewrites how the fact is displayed.
+
+Stored facts stay unique after Unicode case folding, so updating one memory to
+a fact another memory already holds is refused with a message naming only the
+two numeric IDs, and neither memory is changed, merged, or removed. Folding can
+make visually different text collide: `straße` and `STRASSE` count as the same
+fact.
+
+There is no way to update or forget a memory by its text, no fuzzy or
+contextual selection, no bulk, wildcard, or clear-all deletion, no automatic
+pruning, and no undo, recovery, or memory revision history. Neither command
+cascades into interaction history or notes, and remaining memory IDs are never
+renumbered. Conversational forms such as `please remember ...` are not supported.
 
 ```text
 remember My editor is VS Code
@@ -117,8 +147,9 @@ text as persistent interaction history in its configured SQLite database,
 located inside the project directory by default. This can retain file contents
 returned by `read file`, note titles and bodies, note creation, retitle, and
 edit requests,
-calculator expressions and results, explicit memory facts and their
-recall/list output, filesystem paths, system information, and failure or denial
+calculator expressions and results, explicit memory facts from both `remember`
+and `update memory` requests and from their recall/list output, filesystem
+paths, system information, and failure or denial
 messages. Asking Maria to display a sensitive file or note can therefore copy
 that returned content into interaction history.
 
@@ -142,8 +173,8 @@ interaction <id>.` as a new interaction-history row; when that later
 recording succeeds, deleting one old row and adding that audit row may leave
 the total interaction-row count unchanged, and if it fails, the deletion
 remains committed with no audit row guaranteed. There is still no CLI
-command to clear, bulk-delete, or prune interaction history, and no
-memory-forget command. Retrieval limits affect only how many
+command to clear, bulk-delete, or prune interaction history. Retrieval limits
+affect only how many
 rows are read; they do not
 remove stored rows, and restarting Maria does not clear them. Protection
 depends on access to the machine, user account, and database file and on any
@@ -169,6 +200,24 @@ title and an edit command retains its new body there, and a prior `read note`
 may already have copied that note's content into interaction history.
 Afterwards changing or deleting the note does not rewrite or erase those
 independent interaction rows; they can be removed separately with `delete
+interaction <id>`. As elsewhere, Maria promises no secure erasure from SQLite
+file pages, database or filesystem backups, Git history, or external copies.
+
+`update memory <id>: <new fact>` and `forget memory <id>` each target at most
+one explicit memory and change or remove it when found, after mandatory
+explicit confirmation, with no content preview beforehand. An ID that matches
+no memory changes or removes nothing and returns a not-found result. Neither
+cascades into interaction history or notes, renumbers remaining memory IDs, or
+offers bulk, wildcard, clear-all, or automatic deletion, and there is no undo,
+recovery, or memory revision history. Each mutation commits independently, and
+Maria then separately attempts to record a short, content-free response
+(`Updated memory <id>.` or `Forgot memory <id>.`); if that later recording
+fails, the mutation remains committed with no audit row guaranteed. The command
+text itself is still recorded as the request half of interaction history, so an
+update command retains its new fact there, and an earlier `remember`, `recall`,
+or `memories` response may already have copied that fact into interaction
+history. Forgetting or afterwards changing the memory does not rewrite or erase
+those independent interaction rows; they can be removed separately with `delete
 interaction <id>`. As elsewhere, Maria promises no secure erasure from SQLite
 file pages, database or filesystem backups, Git history, or external copies.
 

@@ -3,10 +3,10 @@
 ## Status
 
 - **v0.1.2** is the current released baseline.
-- Stages 1, 2, and 3 (interaction-history browsing, single-interaction
-  deletion, and note lifecycle management) are implemented in the current
-  `Unreleased` development state for v0.2.0. Stage 4 remains **planned, not
-  implemented**.
+- Stages 1, 2, 3, and 4 (interaction-history browsing, single-interaction
+  deletion, note lifecycle management, and explicit-memory lifecycle
+  management) are implemented in the current `Unreleased` development state for
+  v0.2.0.
 - `APP_VERSION` (`core/constants.py`) and the shipped `config/config.toml` version
   remain `0.1.2` throughout v0.2.0 feature development.
 - `0.2.0` is assigned only during the separate `release/v0.2.0` preparation stage

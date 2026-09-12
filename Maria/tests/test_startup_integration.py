@@ -252,6 +252,20 @@ class StartupIntegrationTests(unittest.TestCase):
                     PermissionDecision.ALLOWED,
                 )
 
+        for action in ("update", "forget"):
+            with self.subTest(action=f"memory.{action}"):
+                self.assertEqual(
+                    self.brain.permissions.check("memory", action).decision,
+                    PermissionDecision.REQUIRES_CONFIRMATION,
+                )
+
+        for action in ("store", "search", "list"):
+            with self.subTest(action=f"memory.{action}"):
+                self.assertEqual(
+                    self.brain.permissions.check("memory", action).decision,
+                    PermissionDecision.ALLOWED,
+                )
+
     def test_delete_interaction_removes_the_row_and_records_a_content_free_audit_summary(
         self,
     ) -> None:
@@ -561,6 +575,199 @@ class StartupIntegrationTests(unittest.TestCase):
         self.assertIsNone(self._fetch_note(3))
         self.assertEqual(self._row_id_snapshot()["notes"], [1, 2])
 
+    def test_update_memory_requires_confirmation_and_then_changes_only_the_fact(
+        self,
+    ) -> None:
+        self.brain.process("remember My editor is EXC-UPDATE-TOKEN")
+        self.brain.process("remember An untouched EXC-KEEP-TOKEN fact")
+        self.brain.process("create note Untouched Note: Untouched body")
+
+        target_before = self._fetch_memory(1)
+        other_before = self._fetch_memory(2)
+        snapshot_before = self._row_id_snapshot()
+
+        memory_tool = self.brain.tool_manager._tools["memory"]
+        with patch.object(
+            memory_tool,
+            "execute",
+            wraps=memory_tool.execute,
+        ) as memory_execute:
+            unconfirmed = self.brain.process(
+                "update memory 1: My editor is EXC-REPLACEMENT-TOKEN"
+            )
+
+        memory_execute.assert_not_called()
+        self.assertTrue(unconfirmed.needs_confirmation)
+        self.assertEqual(
+            unconfirmed.text,
+            "Confirmation required: memory.update requires explicit confirmation.",
+        )
+        self.assertEqual(self._fetch_memory(1), target_before)
+        self.assertEqual(self._row_id_snapshot(), snapshot_before)
+
+        confirmed = self.brain.process(
+            "update memory 1: My editor is EXC-REPLACEMENT-TOKEN",
+            confirmed=True,
+        )
+
+        self.assertFalse(confirmed.needs_confirmation)
+        self.assertEqual(confirmed.text, "Updated memory 1.")
+
+        target_after = self._fetch_memory(1)
+        self.assertEqual(target_after["fact"], "My editor is EXC-REPLACEMENT-TOKEN")
+        self.assertEqual(
+            target_after["normalized_fact"],
+            "My editor is EXC-REPLACEMENT-TOKEN".casefold(),
+        )
+        self.assertEqual(target_after["created_at"], target_before["created_at"])
+        self.assertEqual(self._fetch_memory(2), other_before)
+
+        snapshot_after = self._row_id_snapshot()
+        self.assertEqual(snapshot_after["memories"], snapshot_before["memories"])
+        self.assertEqual(snapshot_after["notes"], snapshot_before["notes"])
+        self.assertEqual(
+            snapshot_after["interactions"],
+            snapshot_before["interactions"] + snapshot_after["interactions"][-1:],
+        )
+
+        self.assertEqual(
+            [row["id"] for row in self.brain.memory.list_memories()], [2, 1]
+        )
+
+        newest_input, newest_response = self._newest_interaction()
+        self.assertEqual(
+            newest_input, "update memory 1: My editor is EXC-REPLACEMENT-TOKEN"
+        )
+        self.assertEqual(newest_response, "Updated memory 1.")
+        self.assertIn("EXC-REPLACEMENT-TOKEN", newest_input)
+        self.assertNotIn("EXC-REPLACEMENT-TOKEN", newest_response)
+
+    def test_update_memory_conflict_reports_ids_and_changes_no_row(self) -> None:
+        self.brain.process("remember My editor is EXC-CONFLICT-ONE")
+        self.brain.process("remember My editor is EXC-CONFLICT-TWO")
+
+        target_before = self._fetch_memory(1)
+        other_before = self._fetch_memory(2)
+
+        self.assertTrue(
+            self.brain.process(
+                "update memory 1: MY EDITOR IS EXC-CONFLICT-TWO"
+            ).needs_confirmation
+        )
+        confirmed = self.brain.process(
+            "update memory 1: MY EDITOR IS EXC-CONFLICT-TWO",
+            confirmed=True,
+        )
+
+        self.assertFalse(confirmed.needs_confirmation)
+        self.assertEqual(
+            confirmed.text, "Memory 1 conflicts with existing memory 2."
+        )
+        self.assertNotIn("EXC-CONFLICT-TWO", confirmed.text)
+        self.assertEqual(self._fetch_memory(1), target_before)
+        self.assertEqual(self._fetch_memory(2), other_before)
+
+    def test_forget_memory_requires_confirmation_and_then_removes_only_the_target(
+        self,
+    ) -> None:
+        self.brain.process("remember My editor is EXC-FORGET-TOKEN")
+        self.brain.process("remember An untouched EXC-KEEP-TOKEN fact")
+        self.brain.process("create note Untouched Note: Untouched body")
+
+        target_before = self._fetch_memory(1)
+        other_before = self._fetch_memory(2)
+        snapshot_before = self._row_id_snapshot()
+
+        memory_tool = self.brain.tool_manager._tools["memory"]
+        with patch.object(
+            memory_tool,
+            "execute",
+            wraps=memory_tool.execute,
+        ) as memory_execute:
+            unconfirmed = self.brain.process("forget memory 1")
+
+        memory_execute.assert_not_called()
+        self.assertTrue(unconfirmed.needs_confirmation)
+        self.assertEqual(
+            unconfirmed.text,
+            "Confirmation required: memory.forget requires explicit confirmation.",
+        )
+        self.assertEqual(self._fetch_memory(1), target_before)
+        self.assertEqual(self._row_id_snapshot(), snapshot_before)
+
+        confirmed = self.brain.process("forget memory 1", confirmed=True)
+
+        self.assertFalse(confirmed.needs_confirmation)
+        self.assertEqual(confirmed.text, "Forgot memory 1.")
+
+        self.assertIsNone(self._fetch_memory(1))
+        self.assertEqual(self._fetch_memory(2), other_before)
+
+        snapshot_after = self._row_id_snapshot()
+        self.assertEqual(snapshot_after["memories"], [2])
+        self.assertEqual(snapshot_after["notes"], snapshot_before["notes"])
+        self.assertEqual(
+            snapshot_after["interactions"],
+            snapshot_before["interactions"] + snapshot_after["interactions"][-1:],
+        )
+
+        newest_input, newest_response = self._newest_interaction()
+        self.assertEqual(newest_input, "forget memory 1")
+        self.assertEqual(newest_response, "Forgot memory 1.")
+        self.assertNotIn("EXC-FORGET-TOKEN", newest_response)
+
+    def test_forgotten_memory_content_remains_in_earlier_interaction_rows(
+        self,
+    ) -> None:
+        self.brain.process("remember My editor is EXC-RETAINED-TOKEN")
+        self.brain.process("recall EXC-RETAINED-TOKEN")
+
+        self.assertTrue(self.brain.process("forget memory 1").needs_confirmation)
+        confirmed = self.brain.process("forget memory 1", confirmed=True)
+
+        self.assertEqual(confirmed.text, "Forgot memory 1.")
+        self.assertIsNone(self._fetch_memory(1))
+
+        connection = sqlite3.connect(self.database_path)
+        try:
+            retained = connection.execute(
+                "SELECT COUNT(*) FROM interactions "
+                "WHERE instr(user_input, ?) > 0 OR instr(response, ?) > 0",
+                ("EXC-RETAINED-TOKEN", "EXC-RETAINED-TOKEN"),
+            ).fetchone()[0]
+        finally:
+            connection.close()
+
+        self.assertGreaterEqual(retained, 2)
+
+    def test_memory_mutation_recording_failure_does_not_undo_the_mutation(
+        self,
+    ) -> None:
+        self.brain.process("remember An EXC-UPDATE-TARGET fact")
+        self.brain.process("remember An EXC-FORGET-TARGET fact")
+
+        for command in ("update memory 1: A replaced fact", "forget memory 2"):
+            with self.subTest(command=command, confirmed=False):
+                self.assertTrue(self.brain.process(command).needs_confirmation)
+
+        with patch.object(
+            self.brain.memory,
+            "record_interaction",
+            side_effect=RuntimeError("temporary interaction write failure"),
+        ):
+            for command, expected_text in (
+                ("update memory 1: A replaced fact", "Updated memory 1."),
+                ("forget memory 2", "Forgot memory 2."),
+            ):
+                with self.subTest(command=command, confirmed=True):
+                    confirmed = self.brain.process(command, confirmed=True)
+                    self.assertFalse(confirmed.needs_confirmation)
+                    self.assertEqual(confirmed.text, expected_text)
+
+        self.assertEqual(self._fetch_memory(1)["fact"], "A replaced fact")
+        self.assertIsNone(self._fetch_memory(2))
+        self.assertEqual(self._row_id_snapshot()["memories"], [1])
+
     def test_all_runtime_paths_and_file_handlers_are_temporary(self) -> None:
         self.assertTrue(self.config.database_path.is_relative_to(self.temporary_root))
         self.assertTrue(self.config.log_dir.is_relative_to(self.temporary_root))
@@ -603,6 +810,19 @@ class StartupIntegrationTests(unittest.TestCase):
             row = connection.execute(
                 "SELECT title, body, created_at, updated_at FROM notes WHERE id = ?",
                 (note_id,),
+            ).fetchone()
+        finally:
+            connection.close()
+        return None if row is None else dict(row)
+
+    def _fetch_memory(self, memory_id: int) -> dict[str, str] | None:
+        """Return one temporary-database memory row, or None when it is gone."""
+        connection = sqlite3.connect(self.database_path)
+        connection.row_factory = sqlite3.Row
+        try:
+            row = connection.execute(
+                "SELECT fact, normalized_fact, created_at FROM memories WHERE id = ?",
+                (memory_id,),
             ).fetchone()
         finally:
             connection.close()

@@ -1238,6 +1238,515 @@ class MemoryTests(unittest.TestCase):
             self.assertNotIn("secret missing body", call_text)
 
 
+    def _stored_memory_row(self, memory_id: int) -> tuple[str, str, str]:
+        """Read one memory's raw columns straight from the temporary database."""
+        with closing(sqlite3.connect(self.database_path)) as connection:
+            row = connection.execute(
+                "SELECT fact, normalized_fact, created_at FROM memories WHERE id = ?",
+                (memory_id,),
+            ).fetchone()
+        self.assertIsNotNone(row)
+        return row
+
+    def test_update_memory_replaces_fact_and_normalized_fact(self) -> None:
+        self.memory.initialize()
+        memory_id, _ = self.memory.store_memory("My editor is VS Code")
+        original_created_at = self._stored_memory_row(memory_id)[2]
+
+        updated, conflicting_id = self.memory.update_memory(
+            memory_id, "My editor is Neovim"
+        )
+
+        self.assertTrue(updated)
+        self.assertIsNone(conflicting_id)
+        fact, normalized_fact, created_at = self._stored_memory_row(memory_id)
+        self.assertEqual(fact, "My editor is Neovim")
+        self.assertEqual(normalized_fact, "my editor is neovim")
+        self.assertEqual(created_at, original_created_at)
+
+    def test_update_memory_keeps_created_at_and_newest_first_ordering(self) -> None:
+        self.memory.initialize()
+        oldest_id, _ = self.memory.store_memory("Oldest fact")
+        time.sleep(0.01)
+        newest_id, _ = self.memory.store_memory("Newest fact")
+        original_created_at = self._stored_memory_row(oldest_id)[2]
+
+        self.assertEqual(
+            self.memory.update_memory(oldest_id, "Edited oldest fact"),
+            (True, None),
+        )
+
+        self.assertEqual(self._stored_memory_row(oldest_id)[2], original_created_at)
+        self.assertEqual(
+            [row["id"] for row in self.memory.list_memories()],
+            [newest_id, oldest_id],
+        )
+        self.assertEqual(
+            [row["id"] for row in self.memory.search_memories("fact")],
+            [newest_id, oldest_id],
+        )
+
+    def test_update_memory_to_the_identical_fact_reports_success(self) -> None:
+        self.memory.initialize()
+        memory_id, _ = self.memory.store_memory("My editor is VS Code")
+        original_created_at = self._stored_memory_row(memory_id)[2]
+
+        self.assertEqual(
+            self.memory.update_memory(memory_id, "My editor is VS Code"),
+            (True, None),
+        )
+
+        fact, normalized_fact, created_at = self._stored_memory_row(memory_id)
+        self.assertEqual(fact, "My editor is VS Code")
+        self.assertEqual(normalized_fact, "my editor is vs code")
+        self.assertEqual(created_at, original_created_at)
+
+    def test_update_memory_casing_only_change_reports_success(self) -> None:
+        self.memory.initialize()
+        memory_id, _ = self.memory.store_memory("My editor is VS Code")
+
+        self.assertEqual(
+            self.memory.update_memory(memory_id, "MY EDITOR IS VS CODE"),
+            (True, None),
+        )
+
+        fact, normalized_fact, _ = self._stored_memory_row(memory_id)
+        self.assertEqual(fact, "MY EDITOR IS VS CODE")
+        self.assertEqual(normalized_fact, "my editor is vs code")
+
+    def test_update_memory_strips_surrounding_whitespace(self) -> None:
+        self.memory.initialize()
+        memory_id, _ = self.memory.store_memory("Original fact")
+
+        self.assertEqual(
+            self.memory.update_memory(memory_id, "   My   edited   fact   "),
+            (True, None),
+        )
+
+        fact, normalized_fact, _ = self._stored_memory_row(memory_id)
+        self.assertEqual(fact, "My   edited   fact")
+        self.assertEqual(normalized_fact, "my   edited   fact")
+
+    def test_update_memory_conflict_returns_conflicting_id_and_changes_nothing(
+        self,
+    ) -> None:
+        self.memory.initialize()
+        target_id, _ = self.memory.store_memory("My editor is VS Code")
+        other_id, _ = self.memory.store_memory("Straße in Berlin")
+
+        updated, conflicting_id = self.memory.update_memory(
+            target_id, "  STRASSE IN BERLIN  "
+        )
+
+        self.assertFalse(updated)
+        self.assertEqual(conflicting_id, other_id)
+        self.assertEqual(
+            self._stored_memory_row(target_id)[:2],
+            ("My editor is VS Code", "my editor is vs code"),
+        )
+        self.assertEqual(
+            self._stored_memory_row(other_id)[:2],
+            ("Straße in Berlin", "straße in berlin".casefold()),
+        )
+
+    def test_update_memory_returns_not_found_for_missing_id(self) -> None:
+        self.memory.initialize()
+        memory_id, _ = self.memory.store_memory("Only fact")
+
+        self.assertEqual(
+            self.memory.update_memory(memory_id + 1000, "Replacement fact"),
+            (False, None),
+        )
+        self.assertEqual(self._stored_memory_row(memory_id)[0], "Only fact")
+
+    def test_memory_mutations_reject_invalid_direct_ids_without_connecting(
+        self,
+    ) -> None:
+        self.memory.initialize()
+        invalid_ids = (0, -1, "1", 1.0, True, False, None)
+        mutations = (
+            ("update_memory", ("Replacement fact",)),
+            ("forget_memory", ()),
+        )
+
+        for method_name, extra_arguments in mutations:
+            mutate = getattr(self.memory, method_name)
+            for invalid_id in invalid_ids:
+                with self.subTest(method=method_name, invalid_id=invalid_id):
+                    with patch.object(self.memory, "_connect") as connect_mock, patch(
+                        "core.memory._utc_timestamp"
+                    ) as timestamp_mock:
+                        with self.assertRaisesRegex(
+                            ValueError,
+                            r"^Memory id must be a positive whole number\.$",
+                        ):
+                            mutate(invalid_id, *extra_arguments)
+                        connect_mock.assert_not_called()
+                        timestamp_mock.assert_not_called()
+
+    def test_update_memory_rejects_invalid_facts_without_connecting(self) -> None:
+        self.memory.initialize()
+        memory_id, _ = self.memory.store_memory("Original fact")
+
+        for new_fact in (None, 5, True, [], object(), "", "   "):
+            with self.subTest(new_fact=new_fact):
+                with patch.object(self.memory, "_connect") as connect_mock, patch(
+                    "core.memory._utc_timestamp"
+                ) as timestamp_mock:
+                    with self.assertRaisesRegex(
+                        ValueError,
+                        r"^New memory fact is required\.$",
+                    ):
+                        self.memory.update_memory(memory_id, new_fact)
+                    connect_mock.assert_not_called()
+                    timestamp_mock.assert_not_called()
+
+        self.assertEqual(self._stored_memory_row(memory_id)[0], "Original fact")
+
+    def test_update_memory_binds_values_as_parameters_and_commits(self) -> None:
+        self.memory.initialize()
+        memory_id, _ = self.memory.store_memory("Original fact")
+
+        mock_cursor = MagicMock()
+        mock_cursor.rowcount = 1
+        mock_connection = MagicMock(spec=sqlite3.Connection)
+        mock_connection.execute.return_value = mock_cursor
+
+        with patch.object(self.memory, "_connect", return_value=mock_connection):
+            result = self.memory.update_memory(memory_id, "  My Edited Fact  ")
+
+        self.assertEqual(result, (True, None))
+        mock_connection.execute.assert_called_once()
+        query, params = mock_connection.execute.call_args.args
+        self.assertIn("UPDATE memories", query)
+        self.assertIn("SET fact = ?, normalized_fact = ?", query)
+        self.assertIn("WHERE id = ?", query)
+        self.assertNotIn("SELECT", query)
+        self.assertNotIn("My Edited Fact", query)
+        self.assertNotIn(str(memory_id), query)
+        self.assertEqual(params, ("My Edited Fact", "my edited fact", memory_id))
+        mock_connection.commit.assert_called_once()
+        mock_connection.rollback.assert_not_called()
+        mock_connection.close.assert_called_once()
+
+    def test_update_memory_missing_row_runs_only_the_update_statement(self) -> None:
+        self.memory.initialize()
+
+        mock_cursor = MagicMock()
+        mock_cursor.rowcount = 0
+        mock_connection = MagicMock(spec=sqlite3.Connection)
+        mock_connection.execute.return_value = mock_cursor
+
+        with patch.object(self.memory, "_connect", return_value=mock_connection):
+            result = self.memory.update_memory(7, "Replacement fact")
+
+        self.assertEqual(result, (False, None))
+        mock_connection.execute.assert_called_once()
+        mock_connection.commit.assert_called_once()
+        mock_connection.close.assert_called_once()
+
+    def test_update_memory_conflict_identifies_the_row_by_normalized_fact(
+        self,
+    ) -> None:
+        self.memory.initialize()
+        unique_exc = sqlite3.IntegrityError(
+            "UNIQUE constraint failed: memories.normalized_fact"
+        )
+        unique_exc.sqlite_errorcode = sqlite3.SQLITE_CONSTRAINT_UNIQUE
+        lookup_cursor = MagicMock()
+        lookup_cursor.fetchone.return_value = {"id": 9}
+        mock_connection = MagicMock(spec=sqlite3.Connection)
+        mock_connection.execute.side_effect = [unique_exc, lookup_cursor]
+
+        with patch.object(self.memory, "_connect", return_value=mock_connection):
+            result = self.memory.update_memory(4, "Duplicate Fact")
+
+        self.assertEqual(result, (False, 9))
+        lookup_query, lookup_params = mock_connection.execute.call_args.args
+        self.assertIn("SELECT id", lookup_query)
+        self.assertIn("WHERE normalized_fact = ?", lookup_query)
+        self.assertEqual(lookup_params, ("duplicate fact",))
+        mock_cursor_calls = mock_connection.execute.call_count
+        self.assertEqual(mock_cursor_calls, 2)
+        mock_connection.commit.assert_called_once()
+        mock_connection.close.assert_called_once()
+
+    def test_update_memory_unresolvable_conflict_becomes_ordinary_failure(
+        self,
+    ) -> None:
+        self.memory.initialize()
+        unique_exc = sqlite3.IntegrityError(
+            "UNIQUE constraint failed: memories.normalized_fact"
+        )
+        unique_exc.sqlite_errorcode = sqlite3.SQLITE_CONSTRAINT_UNIQUE
+        lookup_cursor = MagicMock()
+        lookup_cursor.fetchone.return_value = None
+        mock_connection = MagicMock(spec=sqlite3.Connection)
+        mock_connection.execute.side_effect = [unique_exc, lookup_cursor]
+
+        with patch.object(self.memory, "_connect", return_value=mock_connection):
+            with self.assertRaisesRegex(
+                RuntimeError,
+                r"^Unable to update memory\.$",
+            ) as raised:
+                self.memory.update_memory(4, "Duplicate Fact")
+
+        self.assertNotIn(
+            "Unable to resolve conflicting memory.", str(raised.exception)
+        )
+        mock_connection.rollback.assert_called_once()
+        mock_connection.close.assert_called_once()
+
+    def test_update_memory_non_unique_constraint_is_not_a_conflict(self) -> None:
+        self.memory.initialize()
+        check_exc = sqlite3.IntegrityError("CHECK constraint failed")
+        check_exc.sqlite_errorcode = sqlite3.SQLITE_CONSTRAINT_CHECK
+
+        mock_connection = MagicMock(spec=sqlite3.Connection)
+        mock_connection.execute.side_effect = check_exc
+
+        with patch.object(self.memory, "_connect", return_value=mock_connection):
+            with self.assertRaisesRegex(
+                RuntimeError,
+                r"^Unable to update memory\.$",
+            ) as raised:
+                self.memory.update_memory(1, "Replacement fact")
+
+        self.assertIs(raised.exception.__cause__, check_exc)
+        mock_connection.execute.assert_called_once()
+        mock_connection.rollback.assert_called_once()
+        mock_connection.close.assert_called_once()
+
+    def test_update_memory_ordinary_failure_rolls_back_and_closes(self) -> None:
+        self.memory.initialize()
+        io_error = sqlite3.OperationalError("disk I/O error")
+        io_error.sqlite_errorcode = 10  # SQLITE_IOERR: unrelated to busy/locked.
+
+        mock_connection = MagicMock(spec=sqlite3.Connection)
+        mock_connection.execute.side_effect = io_error
+
+        with patch.object(self.memory, "_connect", return_value=mock_connection):
+            with self.assertRaisesRegex(
+                RuntimeError,
+                r"^Unable to update memory\.$",
+            ) as raised:
+                self.memory.update_memory(1, "Replacement fact")
+
+        self.assertIs(raised.exception.__cause__, io_error)
+        mock_connection.rollback.assert_called_once()
+        mock_connection.close.assert_called_once()
+
+    def test_update_memory_busy_error_becomes_fixed_message(self) -> None:
+        self.memory.initialize()
+        busy_exc = sqlite3.OperationalError("database is locked")
+        busy_exc.sqlite_errorcode = sqlite3.SQLITE_BUSY
+
+        mock_connection = MagicMock(spec=sqlite3.Connection)
+        mock_connection.execute.side_effect = busy_exc
+
+        with patch.object(self.memory, "_connect", return_value=mock_connection):
+            with self.assertRaisesRegex(
+                RuntimeError,
+                r"^Database is busy\. Try again shortly\.$",
+            ) as raised:
+                self.memory.update_memory(1, "Replacement fact")
+
+        self.assertIs(raised.exception.__cause__, busy_exc)
+        mock_connection.rollback.assert_called_once()
+        mock_connection.close.assert_called_once()
+
+    def test_forget_memory_removes_target_and_leaves_others(self) -> None:
+        self.memory.initialize()
+        keep_id, _ = self.memory.store_memory("Keep this fact")
+        forget_id, _ = self.memory.store_memory("Forget this fact")
+
+        self.assertTrue(self.memory.forget_memory(forget_id))
+
+        self.assertIsNone(self.memory.get_memory(forget_id))
+        self.assertIsNotNone(self.memory.get_memory(keep_id))
+
+    def test_forget_memory_returns_false_for_missing_id(self) -> None:
+        self.memory.initialize()
+        memory_id, _ = self.memory.store_memory("Only fact")
+
+        self.assertTrue(self.memory.forget_memory(memory_id))
+        self.assertFalse(self.memory.forget_memory(memory_id))
+
+    def test_forget_memory_does_not_affect_notes_or_interactions(self) -> None:
+        self.memory.initialize()
+        memory_id, _ = self.memory.store_memory("My editor is VS Code")
+        note_id = self.memory.create_note("Editor", "VS Code")
+        interaction_id = self.memory.record_interaction("system", "details")
+
+        self.assertTrue(self.memory.forget_memory(memory_id))
+
+        self.assertIsNotNone(self.memory.get_note(note_id=note_id))
+        self.assertIsNotNone(self.memory.get_interaction(interaction_id))
+
+    def test_forget_memory_does_not_renumber_or_reuse_ids(self) -> None:
+        self.memory.initialize()
+        first_id, _ = self.memory.store_memory("First fact")
+
+        self.assertTrue(self.memory.forget_memory(first_id))
+        second_id, _ = self.memory.store_memory("Second fact")
+
+        self.assertGreater(second_id, first_id)
+        self.assertNotEqual(second_id, first_id)
+
+    def test_forget_memory_binds_id_as_a_parameter_and_commits(self) -> None:
+        self.memory.initialize()
+        memory_id, _ = self.memory.store_memory("Original fact")
+
+        mock_cursor = MagicMock()
+        mock_cursor.rowcount = 1
+        mock_connection = MagicMock(spec=sqlite3.Connection)
+        mock_connection.execute.return_value = mock_cursor
+
+        with patch.object(self.memory, "_connect", return_value=mock_connection):
+            forgotten = self.memory.forget_memory(memory_id)
+
+        self.assertTrue(forgotten)
+        mock_connection.execute.assert_called_once()
+        query, params = mock_connection.execute.call_args.args
+        self.assertIn("DELETE FROM memories", query)
+        self.assertIn("WHERE id = ?", query)
+        self.assertNotIn("SELECT", query)
+        self.assertNotIn(str(memory_id), query)
+        self.assertEqual(params, (memory_id,))
+        mock_connection.commit.assert_called_once()
+        mock_connection.rollback.assert_not_called()
+        mock_connection.close.assert_called_once()
+
+    def test_forget_memory_ordinary_failure_rolls_back_and_closes(self) -> None:
+        self.memory.initialize()
+        io_error = sqlite3.OperationalError("disk I/O error")
+        io_error.sqlite_errorcode = 10  # SQLITE_IOERR: unrelated to busy/locked.
+
+        mock_connection = MagicMock(spec=sqlite3.Connection)
+        mock_connection.execute.side_effect = io_error
+
+        with patch.object(self.memory, "_connect", return_value=mock_connection):
+            with self.assertRaisesRegex(
+                RuntimeError,
+                r"^Unable to forget memory\.$",
+            ) as raised:
+                self.memory.forget_memory(1)
+
+        self.assertIs(raised.exception.__cause__, io_error)
+        mock_connection.rollback.assert_called_once()
+        mock_connection.close.assert_called_once()
+
+    def test_forget_memory_busy_error_becomes_fixed_message(self) -> None:
+        self.memory.initialize()
+        locked_exc = sqlite3.OperationalError("database is locked")
+        locked_exc.sqlite_errorcode = sqlite3.SQLITE_LOCKED
+
+        mock_connection = MagicMock(spec=sqlite3.Connection)
+        mock_connection.execute.side_effect = locked_exc
+
+        with patch.object(self.memory, "_connect", return_value=mock_connection):
+            with self.assertRaisesRegex(
+                RuntimeError,
+                r"^Database is busy\. Try again shortly\.$",
+            ) as raised:
+                self.memory.forget_memory(1)
+
+        self.assertIs(raised.exception.__cause__, locked_exc)
+        mock_connection.rollback.assert_called_once()
+        mock_connection.close.assert_called_once()
+
+    def test_memory_mutation_logs_contain_no_fact_content(self) -> None:
+        mock_logger = Mock(spec=logging.Logger)
+        memory = Memory(self.database_path, logger=mock_logger)
+        memory.initialize()
+        memory_id, _ = memory.store_memory("secret stored fact")
+        other_id, _ = memory.store_memory("secret other fact")
+        mock_logger.reset_mock()
+
+        updated = memory.update_memory(memory_id, "secret new fact")
+        conflicted = memory.update_memory(memory_id, "SECRET OTHER FACT")
+        forgotten = memory.forget_memory(memory_id)
+        missing_update = memory.update_memory(memory_id, "secret missing fact")
+        missing_forget = memory.forget_memory(memory_id)
+
+        self.assertEqual(updated, (True, None))
+        self.assertEqual(conflicted, (False, other_id))
+        self.assertTrue(forgotten)
+        self.assertEqual(missing_update, (False, None))
+        self.assertFalse(missing_forget)
+        for logger_call in mock_logger.method_calls:
+            call_text = " ".join(str(arg) for arg in logger_call.args)
+            self.assertNotIn("secret stored fact", call_text)
+            self.assertNotIn("secret other fact", call_text)
+            self.assertNotIn("secret new fact", call_text)
+            self.assertNotIn("secret missing fact", call_text)
+
+
+class UniqueViolationClassificationTests(unittest.TestCase):
+    """Exercise _is_unique_violation's exact extended-result-code matching."""
+
+    def test_classifies_extended_unique_constraint_code(self) -> None:
+        exc = sqlite3.IntegrityError("synthetic unique violation")
+        exc.sqlite_errorcode = sqlite3.SQLITE_CONSTRAINT_UNIQUE
+
+        self.assertTrue(memory_module._is_unique_violation(exc))
+
+    def test_rejects_primary_constraint_code(self) -> None:
+        exc = sqlite3.IntegrityError("synthetic constraint violation")
+        exc.sqlite_errorcode = sqlite3.SQLITE_CONSTRAINT
+
+        self.assertFalse(memory_module._is_unique_violation(exc))
+
+    def test_rejects_check_constraint_code(self) -> None:
+        exc = sqlite3.IntegrityError("synthetic check violation")
+        exc.sqlite_errorcode = sqlite3.SQLITE_CONSTRAINT_CHECK
+
+        self.assertFalse(memory_module._is_unique_violation(exc))
+
+    def test_rejects_primary_key_constraint_code(self) -> None:
+        exc = sqlite3.IntegrityError("synthetic primary key violation")
+        exc.sqlite_errorcode = sqlite3.SQLITE_CONSTRAINT_PRIMARYKEY
+
+        self.assertFalse(memory_module._is_unique_violation(exc))
+
+    def test_rejects_missing_sqlite_errorcode(self) -> None:
+        self.assertFalse(
+            memory_module._is_unique_violation(sqlite3.Error("no error code"))
+        )
+
+    def test_rejects_none_error_code(self) -> None:
+        exc = sqlite3.IntegrityError("synthetic")
+        exc.sqlite_errorcode = None
+
+        self.assertFalse(memory_module._is_unique_violation(exc))
+
+    def test_rejects_non_integer_error_code(self) -> None:
+        exc = sqlite3.IntegrityError("synthetic")
+        exc.sqlite_errorcode = str(sqlite3.SQLITE_CONSTRAINT_UNIQUE)
+
+        self.assertFalse(memory_module._is_unique_violation(exc))
+
+    def test_rejects_boolean_error_code(self) -> None:
+        exc = sqlite3.IntegrityError("synthetic")
+        exc.sqlite_errorcode = True
+
+        self.assertFalse(memory_module._is_unique_violation(exc))
+
+    def test_does_not_mask_extended_code_to_its_primary_byte(self) -> None:
+        exc = sqlite3.IntegrityError("synthetic")
+        exc.sqlite_errorcode = sqlite3.SQLITE_CONSTRAINT_UNIQUE & 0xFF
+
+        self.assertFalse(memory_module._is_unique_violation(exc))
+
+    def test_ignores_exception_text(self) -> None:
+        exc = sqlite3.IntegrityError(
+            "UNIQUE constraint failed: memories.normalized_fact"
+        )
+        exc.sqlite_errorcode = sqlite3.SQLITE_CONSTRAINT_CHECK
+
+        self.assertFalse(memory_module._is_unique_violation(exc))
+
+
 class BusyLockedClassificationTests(unittest.TestCase):
     """Exercise _is_busy_or_locked's numeric primary-result-code matching."""
 

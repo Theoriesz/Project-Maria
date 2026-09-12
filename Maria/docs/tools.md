@@ -8,7 +8,8 @@ Tools are small modules that expose controlled capabilities to Maria.
 - `filesystem`: read, list, rename, and move inside the configured safe root
 - `history`: list, search, read, and delete SQLite-backed interaction-history
   rows
-- `memory`: store, search, and list explicit SQLite-backed memories
+- `memory`: store, search, list, update, and forget explicit SQLite-backed
+  memories
 - `notes`: create, list, read, retitle, edit, and delete SQLite-backed notes
 - `system`: read-only OS, CPU, RAM, disk, and time information
 
@@ -224,11 +225,13 @@ contains no SQL; `core/memory.py` owns all database operations.
 
 ## Memory Tool
 
-The memory tool supports exactly three actions:
+The memory tool supports exactly five actions:
 
 - `store`: store a deliberate fact
 - `search`: find facts by literal, case-insensitive substring
 - `list`: list the newest stored facts
+- `update`: replace one memory's fact by numeric ID
+- `forget`: remove one memory by numeric ID
 
 Successful store messages use one of these forms:
 
@@ -257,10 +260,47 @@ No matching memories found.
 No memories found.
 ```
 
+`update` and `forget` each read an `id` argument and validate it directly (an
+actual `int`, not a `bool`, at least `1`), returning `Memory id must be a
+positive whole number.` for an invalid direct value without calling `Memory`.
+`update` additionally reads a `fact` argument, which must be an actual `str`
+that is non-blank after stripping; otherwise it returns `New memory fact is
+required.`, again without calling `Memory`. That value is never coerced with
+`str(...)`, so `None`, numbers, booleans, and arbitrary objects can never be
+persisted as memory text, and only the stripped value reaches `Memory`. The
+older `store` action keeps its own existing coercion behavior and is unchanged.
+
+A missing row returns `Memory not found: <id>.`. Success returns `Updated
+memory <id>.` or `Forgot memory <id>.` with `data={"id": <id>}` — never the old
+or new fact — and leaves `recorded_message` unset (`None`), since those messages
+are already short and content-free. `update` writes only `fact` and
+`normalized_fact` and preserves `created_at`; because no `updated_at` exists, an
+updated memory keeps its place in newest-first output. A fact identical to the
+stored one, or differing only by casing, still counts as a successful update.
+
+Because memory facts stay unique over `casefold()`, an update whose new fact
+already belongs to a different memory returns the controlled failure `Memory
+<id> conflicts with existing memory <other id>.` — numeric IDs only, never
+either memory's text — and changes, merges, and removes nothing. Unsuccessful
+results, including this one, carry no `data`. An ordinary `Memory` failure is
+wrapped as `Memory update failed: Unable to update memory.` or `Memory forget
+failed: Unable to forget memory.`; a busy/locked failure is wrapped the same
+way, for example `Memory forget failed: Database is busy. Try again shortly.`.
+Neither action cascades to `interactions` or `notes`, renumbers remaining
+memory IDs, or performs bulk, wildcard, or range mutation.
+
+Successful mutations log only the numeric memory ID and fixed wording, such as
+`Forgot memory <id> through memory tool.`; benign not-found and conflict
+outcomes are not logged. Memory fact text and `normalized_fact` never appear in
+operational log messages, mutation result data, or mutation response text.
+
 The tool receives the shared `Memory` instance through dependency injection.
 It is registered as `tools.memory` through Tool Manager's standard
 `build_tool(...)` factory contract and travels through the normal permission
-path. The tool contains no SQL; `core/memory.py` owns all database operations.
+path; `memory.store`, `memory.search`, and `memory.list` are allowed by
+default, while `memory.update` and `memory.forget` always require explicit
+confirmation. The tool contains no SQL; `core/memory.py` owns all database
+operations.
 
 ## System Tool
 
@@ -316,5 +356,8 @@ deletion (`history.delete`) is checked by `permissions.py` and always
 requires explicit confirmation before a row is removed. Note retitling,
 editing, and deletion (`notes.retitle`, `notes.edit`, `notes.delete`) are
 checked by `permissions.py` the same way and always require explicit
-confirmation before a note row is changed or removed. The memory tool
-provides no update, delete, or forget action.
+confirmation before a note row is changed or removed. Explicit-memory updating
+and forgetting (`memory.update`, `memory.forget`) are checked the same way and
+always require explicit confirmation before a memory row is changed or removed;
+the memory tool provides no bulk or clear-all action, and no way to select a
+memory by its fact text.
