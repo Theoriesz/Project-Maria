@@ -14,6 +14,9 @@ MANDATORY_CONFIRMATION_ACTIONS = frozenset(
         "filesystem.rename",
         "filesystem.move",
         "history.delete",
+        "notes.retitle",
+        "notes.edit",
+        "notes.delete",
     }
 )
 

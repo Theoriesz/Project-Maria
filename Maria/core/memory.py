@@ -383,6 +383,114 @@ class Memory:
             self.logger.exception("Failed to read note.")
             raise RuntimeError("Unable to read note.") from exc
 
+    def retitle_note(self, note_id: int, new_title: str) -> bool:
+        """Replace one note's title, keeping its body and created_at.
+
+        Returns True if a row was updated, False if no row matched note_id.
+        Raises ValueError for a non-positive-integer id or a blank title,
+        since this persistent mutation is validated independently of its
+        callers. updated_at receives the current UTC timestamp even when
+        new_title already matches the stored title.
+        """
+        if (
+            not isinstance(note_id, int)
+            or isinstance(note_id, bool)
+            or note_id < 1
+        ):
+            raise ValueError("Note id must be a positive whole number.")
+        if not isinstance(new_title, str) or not new_title.strip():
+            raise ValueError("New note title is required.")
+
+        clean_title = new_title.strip()
+        timestamp = _utc_timestamp()
+        try:
+            with self._connection() as connection:
+                cursor = connection.execute(
+                    """
+                    UPDATE notes
+                    SET title = ?, updated_at = ?
+                    WHERE id = ?
+                    """,
+                    (clean_title, timestamp, note_id),
+                )
+                retitled = cursor.rowcount == 1
+            if retitled:
+                self.logger.info("Retitled note %s.", note_id)
+            return retitled
+        except sqlite3.Error as exc:
+            self.logger.exception("Failed to retitle note.")
+            raise RuntimeError("Unable to retitle note.") from exc
+
+    def edit_note(self, note_id: int, new_body: str) -> bool:
+        """Replace one note's body, keeping its title and created_at.
+
+        Returns True if a row was updated, False if no row matched note_id.
+        Raises ValueError for a non-positive-integer id or a blank body,
+        since this persistent mutation is validated independently of its
+        callers. updated_at receives the current UTC timestamp even when
+        new_body already matches the stored body.
+        """
+        if (
+            not isinstance(note_id, int)
+            or isinstance(note_id, bool)
+            or note_id < 1
+        ):
+            raise ValueError("Note id must be a positive whole number.")
+        if not isinstance(new_body, str) or not new_body.strip():
+            raise ValueError("New note body is required.")
+
+        clean_body = new_body.strip()
+        timestamp = _utc_timestamp()
+        try:
+            with self._connection() as connection:
+                cursor = connection.execute(
+                    """
+                    UPDATE notes
+                    SET body = ?, updated_at = ?
+                    WHERE id = ?
+                    """,
+                    (clean_body, timestamp, note_id),
+                )
+                edited = cursor.rowcount == 1
+            if edited:
+                self.logger.info("Edited note %s.", note_id)
+            return edited
+        except sqlite3.Error as exc:
+            self.logger.exception("Failed to edit note.")
+            raise RuntimeError("Unable to edit note.") from exc
+
+    def delete_note(self, note_id: int) -> bool:
+        """Delete one note by its database id.
+
+        Returns True if a row was deleted, False if no row matched note_id.
+        Raises ValueError for a non-positive-integer id, since this is a
+        destructive operation validated independently of its callers. The
+        deleted title and body are never read, logged, or returned.
+        """
+        if (
+            not isinstance(note_id, int)
+            or isinstance(note_id, bool)
+            or note_id < 1
+        ):
+            raise ValueError("Note id must be a positive whole number.")
+
+        try:
+            with self._connection() as connection:
+                cursor = connection.execute(
+                    """
+                    DELETE FROM notes
+                    WHERE id = ?
+                    """,
+                    (note_id,),
+                )
+                deleted = cursor.rowcount == 1
+            if deleted:
+                self.logger.info("Deleted note %s.", note_id)
+            return deleted
+        except sqlite3.Error as exc:
+            self.logger.exception("Failed to delete note.")
+            raise RuntimeError("Unable to delete note.") from exc
+
     @contextmanager
     def _connection(self) -> Iterator[sqlite3.Connection]:
         """Open a SQLite connection and close it after use."""

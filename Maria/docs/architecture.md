@@ -77,10 +77,11 @@ action.
 In the current Unreleased development state, `history.read` is the only
 result that supplies a non-`None` `recorded_message`, so that redisplaying
 old interaction content does not duplicate it into a new interaction row.
-Every other current tool result, including `history.delete`, leaves the
+Every other current tool result, including `history.delete`,
+`notes.retitle`, `notes.edit`, and `notes.delete`, leaves the
 field as `None` and therefore retains the existing message-as-recorded
-behavior; `history.delete`'s displayed message is already a short,
-content-free summary, so no override is needed. `read file`, `read note`,
+behavior; those displayed messages are already short,
+content-free summaries, so no override is needed. `read file`, `read note`,
 and `recall` are unmodified and still record their full displayed content.
 
 `history.delete`'s row deletion and the subsequent audit-recording `INSERT`
@@ -91,6 +92,21 @@ following recording call raises `RuntimeError`, that error is logged and the
 already-computed successful deletion response is still returned unchanged;
 the deletion is not rolled back and no compensating write is attempted, so an
 audit row is not guaranteed in that case.
+
+`notes.retitle`, `notes.edit`, and `notes.delete` follow that identical
+boundary: `Memory.retitle_note()`, `Memory.edit_note()`, and
+`Memory.delete_note()` each commit in their own transaction, independently of
+the later `Memory.record_interaction()` call. A recording failure after a
+committed note mutation is logged, does not roll the mutation back, does not
+replace the successful response, and triggers no compensating write or retry.
+
+Because Brain records the original cleaned request as the `user_input` half of
+an interaction, a `retitle note` command retains its new title and an `edit
+note` command retains its new body in interaction history even though the
+recorded response is content-free. `recorded_message` can only change the
+response half of a recorded interaction, never the request half, so later
+editing or deleting the note does not rewrite or remove those independent
+interaction rows.
 
 Some paths return before this boundary. Blank CLI input is not processed, and
 blank input passed directly to `process()` returns before logging, context
@@ -150,10 +166,14 @@ protections. Missing permission arrays retain the secure baseline, and
 malformed present arrays stop configuration loading instead of weakening it.
 When an action is both denied and confirmation-required, denial wins.
 
-In the current Unreleased development state, `history.delete` also always
-requires confirmation, alongside `filesystem.rename` and `filesystem.move`.
-`history.list`, `history.search`, and `history.read` remain allowed by
-default.
+In the current Unreleased development state, the mandatory confirmation
+baseline is six actions: `filesystem.rename`, `filesystem.move`,
+`history.delete`, `notes.retitle`, `notes.edit`, and `notes.delete`.
+`history.list`, `history.search`, `history.read`, `notes.create`,
+`notes.list`, and `notes.read` remain allowed by default. These entries live
+in `MANDATORY_CONFIRMATION_ACTIONS` in `core/permissions.py` rather than in
+`config/config.toml`, so configuration can add restrictions on top of them but
+can never remove them.
 
 Direct tool invocation bypasses planning and permission checks and therefore
 remains an internal trusted-code boundary.
@@ -168,7 +188,11 @@ Maria keeps three kinds of persistent data separate:
   discards that context. Interaction rows are never converted automatically
   into explicit memories.
 - **Notes** are structured title-and-body records deliberately created by the
-  user. The notes tool uses the shared `Memory` persistence interface.
+  user. The notes tool uses the shared `Memory` persistence interface. A note's
+  title and body are edited through two separate confirmation-gated commands,
+  so neither can overwrite the other; both preserve `created_at` and refresh
+  `updated_at`. A note may also be deleted by numeric ID. None of those
+  mutations cascade into interaction history or explicit memories.
 - **Explicit memories** are deliberately stored facts. They are created only
   through the strict `remember <fact>` command or the public `Memory` API,
   searched through `recall <query>`, and listed through `memories`.

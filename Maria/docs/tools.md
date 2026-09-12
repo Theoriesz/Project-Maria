@@ -9,7 +9,7 @@ Tools are small modules that expose controlled capabilities to Maria.
 - `history`: list, search, read, and delete SQLite-backed interaction-history
   rows
 - `memory`: store, search, and list explicit SQLite-backed memories
-- `notes`: create, list, and read SQLite-backed notes
+- `notes`: create, list, read, retitle, edit, and delete SQLite-backed notes
 - `system`: read-only OS, CPU, RAM, disk, and time information
 
 ## Calculator Tool
@@ -173,7 +173,8 @@ tool contains no SQL; `core/memory.py` owns all database operations.
 
 ## Notes Tool
 
-The notes tool supports `create`, `list`, and `read`. `list` returns notes newest
+The notes tool supports `create`, `list`, `read`, `retitle`, `edit`, and
+`delete`. `list` returns notes newest
 first (by `updated_at`, then descending `id`) and shows at most the newest 20 by
 default. When exactly 20 or fewer notes exist, the output is unchanged. When more
 than 20 notes exist, only the newest 20 are shown and one line is appended:
@@ -184,6 +185,42 @@ Showing the newest 20 notes. More notes exist.
 
 An explicit non-default `limit` argument passed to the tool is honored as before
 and never produces this suffix. Empty results remain `No notes found.`.
+
+`retitle`, `edit`, and `delete` each validate an `id` argument the same way as
+the history tool (an actual `int`, not a `bool`, at least `1`), returning `Note
+id must be a positive whole number.` for an invalid direct value without
+calling `Memory`. `retitle` additionally requires a `title` argument and `edit`
+a `body` argument that is an actual `str` and non-blank after stripping;
+anything else returns `New note title is required.` or `New note body is
+required.` without calling `Memory`. Non-string values are rejected rather than
+coerced, so `None`, numbers, booleans, and arbitrary objects can never become
+persisted note text. Only the stripped value reaches `Memory`.
+
+None of the three read or preview the row first. A missing ID returns `Note not
+found: <id>.`. Success returns `Retitled note <id>.`, `Edited note <id>.`, or
+`Deleted note <id>.` with `data={"id": <id>}` — never the note's title or body —
+and leaves `recorded_message` unset (`None`), since those messages are already
+short and content-free. `retitle` writes only the title, `edit` writes only the
+body, and both refresh `updated_at` with the current UTC timestamp while
+preserving `created_at`; a value identical to the stored one still counts as a
+successful update and still refreshes `updated_at`. Duplicate note titles remain
+allowed. An ordinary `Memory` failure is wrapped as `Note retitle failed: Unable
+to retitle note.`, `Note edit failed: Unable to edit note.`, or `Note deletion
+failed: Unable to delete note.`; a busy/locked failure is wrapped the same way,
+for example `Note deletion failed: Database is busy. Try again shortly.`. None
+of the three cascade to `interactions` or `memories`, renumber remaining note
+IDs, or perform bulk, wildcard, or range mutation.
+
+Successful operations log only the numeric note ID and fixed wording, such as
+`Deleted note <id> through notes tool.`; note titles and bodies never appear in
+operational log messages, result data, or mutation response text.
+
+The tool receives the shared `Memory` instance through dependency injection. It
+is registered as `tools.notes` through Tool Manager's standard `build_tool(...)`
+factory contract and travels through the normal permission path; `notes.create`,
+`notes.list`, and `notes.read` are allowed by default, while `notes.retitle`,
+`notes.edit`, and `notes.delete` always require explicit confirmation. The tool
+contains no SQL; `core/memory.py` owns all database operations.
 
 ## Memory Tool
 
@@ -276,5 +313,8 @@ Tools should validate inputs and handle errors gracefully. File-modifying
 actions must be checked by `permissions.py` before execution. Filesystem
 delete behavior is still not part of version 0.1. Interaction-history
 deletion (`history.delete`) is checked by `permissions.py` and always
-requires explicit confirmation before a row is removed. The memory tool
+requires explicit confirmation before a row is removed. Note retitling,
+editing, and deletion (`notes.retitle`, `notes.edit`, `notes.delete`) are
+checked by `permissions.py` the same way and always require explicit
+confirmation before a note row is changed or removed. The memory tool
 provides no update, delete, or forget action.

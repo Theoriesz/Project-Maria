@@ -30,6 +30,32 @@
   renumbering of remaining IDs, and no guarantee of secure erasure from
   SQLite file pages, backups, or external copies. No schema or version
   change was introduced.
+- Added note lifecycle management: `retitle note <id>: <new title>`,
+  `edit note <id>: <new body>`, and `delete note <id>`, backed by three new
+  `NotesTool` actions (`retitle`, `edit`, `delete`) and three new `Memory`
+  methods (`retitle_note`, `edit_note`, `delete_note`). Title editing and
+  body editing are deliberately separate commands, so neither can overwrite
+  the other's field, and each command accepts only a single positive
+  ASCII-decimal ID — never a title — and affects at most one row. All three
+  require mandatory explicit confirmation; `notes.retitle`, `notes.edit`, and
+  `notes.delete` are new entries in `MANDATORY_CONFIRMATION_ACTIONS`
+  alongside `filesystem.rename`, `filesystem.move`, and `history.delete`,
+  with no preview of stored content before confirmation. A successful retitle
+  or edit preserves `created_at` and refreshes `updated_at` with the current
+  UTC timestamp, even when the new value matches the stored one; duplicate
+  note titles remain allowed. Each mutation commits independently, and Maria
+  then separately attempts to record a short, content-free response (`Retitled
+  note <id>.`, `Edited note <id>.`, or `Deleted note <id>.`); if that later
+  recording fails, the mutation remains committed with no audit row
+  guaranteed. Because the original command is stored as the request half of
+  interaction history, a retitle retains its new title and an edit retains
+  its new body there, and later changing or deleting the note does not
+  rewrite those independent interaction rows. There is no bulk, wildcard,
+  clear-all, or automatic deletion, no cascade into interaction history or
+  explicit memories, no renumbering of remaining note IDs, no undo or note
+  revision history, and no guarantee of secure erasure from SQLite file
+  pages, backups, or external copies. No schema or version change was
+  introduced.
 
 ## 0.1.2 - 2026-09-09
 

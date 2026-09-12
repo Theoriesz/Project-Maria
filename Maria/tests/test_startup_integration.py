@@ -232,9 +232,23 @@ class StartupIntegrationTests(unittest.TestCase):
         )
 
         for action in ("list", "search", "read"):
-            with self.subTest(action=action):
+            with self.subTest(action=f"history.{action}"):
                 self.assertEqual(
                     self.brain.permissions.check("history", action).decision,
+                    PermissionDecision.ALLOWED,
+                )
+
+        for action in ("retitle", "edit", "delete"):
+            with self.subTest(action=f"notes.{action}"):
+                self.assertEqual(
+                    self.brain.permissions.check("notes", action).decision,
+                    PermissionDecision.REQUIRES_CONFIRMATION,
+                )
+
+        for action in ("create", "list", "read"):
+            with self.subTest(action=f"notes.{action}"):
+                self.assertEqual(
+                    self.brain.permissions.check("notes", action).decision,
                     PermissionDecision.ALLOWED,
                 )
 
@@ -350,6 +364,203 @@ class StartupIntegrationTests(unittest.TestCase):
 
         self.assertIsNone(deleted_row)
 
+    def test_retitle_note_requires_confirmation_and_then_changes_only_the_title(
+        self,
+    ) -> None:
+        self.brain.process("create note Release Check: Original body text")
+        self.brain.process("create note Untouched Note: Untouched body")
+        self.brain.process("remember a distinctive marker EXC-RETITLE-TOKEN")
+
+        target_before = self._fetch_note(1)
+        other_before = self._fetch_note(2)
+        snapshot_before = self._row_id_snapshot()
+
+        notes_tool = self.brain.tool_manager._tools["notes"]
+        with patch.object(
+            notes_tool,
+            "execute",
+            wraps=notes_tool.execute,
+        ) as notes_execute:
+            unconfirmed = self.brain.process("retitle note 1: Renamed Release Check")
+
+        notes_execute.assert_not_called()
+        self.assertTrue(unconfirmed.needs_confirmation)
+        self.assertEqual(
+            unconfirmed.text,
+            "Confirmation required: notes.retitle requires explicit confirmation.",
+        )
+        self.assertEqual(self._fetch_note(1), target_before)
+        self.assertEqual(self._row_id_snapshot(), snapshot_before)
+
+        confirmed = self.brain.process(
+            "retitle note 1: Renamed Release Check",
+            confirmed=True,
+        )
+
+        self.assertFalse(confirmed.needs_confirmation)
+        self.assertEqual(confirmed.text, "Retitled note 1.")
+
+        target_after = self._fetch_note(1)
+        self.assertEqual(target_after["title"], "Renamed Release Check")
+        self.assertEqual(target_after["body"], target_before["body"])
+        self.assertEqual(target_after["created_at"], target_before["created_at"])
+        self.assertNotEqual(target_after["updated_at"], target_before["updated_at"])
+        self.assertEqual(self._fetch_note(2), other_before)
+
+        snapshot_after = self._row_id_snapshot()
+        self.assertEqual(snapshot_after["notes"], snapshot_before["notes"])
+        self.assertEqual(snapshot_after["memories"], snapshot_before["memories"])
+        self.assertEqual(
+            snapshot_after["interactions"],
+            snapshot_before["interactions"] + snapshot_after["interactions"][-1:],
+        )
+
+        newest_input, newest_response = self._newest_interaction()
+        self.assertEqual(newest_input, "retitle note 1: Renamed Release Check")
+        self.assertEqual(newest_response, "Retitled note 1.")
+        self.assertIn("Renamed Release Check", newest_input)
+        self.assertNotIn("Renamed Release Check", newest_response)
+
+    def test_edit_note_requires_confirmation_and_then_changes_only_the_body(
+        self,
+    ) -> None:
+        self.brain.process("create note Release Check: Original body text")
+        self.brain.process("create note Untouched Note: Untouched body")
+        self.brain.process("remember a distinctive marker EXC-EDIT-TOKEN")
+
+        target_before = self._fetch_note(1)
+        other_before = self._fetch_note(2)
+        snapshot_before = self._row_id_snapshot()
+
+        notes_tool = self.brain.tool_manager._tools["notes"]
+        with patch.object(
+            notes_tool,
+            "execute",
+            wraps=notes_tool.execute,
+        ) as notes_execute:
+            unconfirmed = self.brain.process("edit note 1: Replacement body text")
+
+        notes_execute.assert_not_called()
+        self.assertTrue(unconfirmed.needs_confirmation)
+        self.assertEqual(
+            unconfirmed.text,
+            "Confirmation required: notes.edit requires explicit confirmation.",
+        )
+        self.assertEqual(self._fetch_note(1), target_before)
+        self.assertEqual(self._row_id_snapshot(), snapshot_before)
+
+        confirmed = self.brain.process(
+            "edit note 1: Replacement body text",
+            confirmed=True,
+        )
+
+        self.assertFalse(confirmed.needs_confirmation)
+        self.assertEqual(confirmed.text, "Edited note 1.")
+
+        target_after = self._fetch_note(1)
+        self.assertEqual(target_after["body"], "Replacement body text")
+        self.assertEqual(target_after["title"], target_before["title"])
+        self.assertEqual(target_after["created_at"], target_before["created_at"])
+        self.assertNotEqual(target_after["updated_at"], target_before["updated_at"])
+        self.assertEqual(self._fetch_note(2), other_before)
+
+        snapshot_after = self._row_id_snapshot()
+        self.assertEqual(snapshot_after["notes"], snapshot_before["notes"])
+        self.assertEqual(snapshot_after["memories"], snapshot_before["memories"])
+        self.assertEqual(
+            snapshot_after["interactions"],
+            snapshot_before["interactions"] + snapshot_after["interactions"][-1:],
+        )
+
+        newest_input, newest_response = self._newest_interaction()
+        self.assertEqual(newest_input, "edit note 1: Replacement body text")
+        self.assertEqual(newest_response, "Edited note 1.")
+        self.assertIn("Replacement body text", newest_input)
+        self.assertNotIn("Replacement body text", newest_response)
+
+    def test_delete_note_requires_confirmation_and_then_removes_only_that_note(
+        self,
+    ) -> None:
+        self.brain.process("create note Release Check: Original body text")
+        self.brain.process("create note Untouched Note: Untouched body")
+        self.brain.process("remember a distinctive marker EXC-NOTE-DELETE-TOKEN")
+
+        target_before = self._fetch_note(1)
+        other_before = self._fetch_note(2)
+        snapshot_before = self._row_id_snapshot()
+
+        notes_tool = self.brain.tool_manager._tools["notes"]
+        with patch.object(
+            notes_tool,
+            "execute",
+            wraps=notes_tool.execute,
+        ) as notes_execute:
+            unconfirmed = self.brain.process("delete note 1")
+
+        notes_execute.assert_not_called()
+        self.assertTrue(unconfirmed.needs_confirmation)
+        self.assertEqual(
+            unconfirmed.text,
+            "Confirmation required: notes.delete requires explicit confirmation.",
+        )
+        self.assertEqual(self._fetch_note(1), target_before)
+        self.assertEqual(self._row_id_snapshot(), snapshot_before)
+
+        confirmed = self.brain.process("delete note 1", confirmed=True)
+
+        self.assertFalse(confirmed.needs_confirmation)
+        self.assertEqual(confirmed.text, "Deleted note 1.")
+
+        self.assertIsNone(self._fetch_note(1))
+        self.assertEqual(self._fetch_note(2), other_before)
+
+        snapshot_after = self._row_id_snapshot()
+        self.assertEqual(snapshot_after["notes"], [2])
+        self.assertEqual(snapshot_after["memories"], snapshot_before["memories"])
+        self.assertEqual(
+            snapshot_after["interactions"],
+            snapshot_before["interactions"] + snapshot_after["interactions"][-1:],
+        )
+
+        newest_input, newest_response = self._newest_interaction()
+        self.assertEqual(newest_input, "delete note 1")
+        self.assertEqual(newest_response, "Deleted note 1.")
+        self.assertNotIn("Original body text", newest_response)
+        self.assertNotIn("Release Check", newest_response)
+
+    def test_note_mutation_recording_failure_does_not_undo_the_mutation(self) -> None:
+        self.brain.process("create note Retitle Target: Original body text")
+        self.brain.process("create note Edit Target: Original body text")
+        self.brain.process("create note Delete Target: Original body text")
+
+        for command in (
+            "retitle note 1: Renamed",
+            "edit note 2: Replaced",
+            "delete note 3",
+        ):
+            with self.subTest(command=command, confirmed=False):
+                self.assertTrue(self.brain.process(command).needs_confirmation)
+
+        with patch.object(
+            self.brain.memory,
+            "record_interaction",
+            side_effect=RuntimeError("temporary interaction write failure"),
+        ):
+            for command, expected_text in (
+                ("retitle note 1: Renamed", "Retitled note 1."),
+                ("edit note 2: Replaced", "Edited note 2."),
+                ("delete note 3", "Deleted note 3."),
+            ):
+                with self.subTest(command=command, confirmed=True):
+                    confirmed = self.brain.process(command, confirmed=True)
+                    self.assertFalse(confirmed.needs_confirmation)
+                    self.assertEqual(confirmed.text, expected_text)
+
+        self.assertEqual(self._fetch_note(1)["title"], "Renamed")
+        self.assertEqual(self._fetch_note(2)["body"], "Replaced")
+        self.assertIsNone(self._fetch_note(3))
+        self.assertEqual(self._row_id_snapshot()["notes"], [1, 2])
+
     def test_all_runtime_paths_and_file_handlers_are_temporary(self) -> None:
         self.assertTrue(self.config.database_path.is_relative_to(self.temporary_root))
         self.assertTrue(self.config.log_dir.is_relative_to(self.temporary_root))
@@ -383,6 +594,46 @@ class StartupIntegrationTests(unittest.TestCase):
             self.assertNotIn(handler, self._maria_logger.handlers)
             self.assertIsNone(handler.stream)
         self.assertTrue(self.log_dir.is_dir())
+
+    def _fetch_note(self, note_id: int) -> dict[str, str] | None:
+        """Return one temporary-database note row, or None when it is gone."""
+        connection = sqlite3.connect(self.database_path)
+        connection.row_factory = sqlite3.Row
+        try:
+            row = connection.execute(
+                "SELECT title, body, created_at, updated_at FROM notes WHERE id = ?",
+                (note_id,),
+            ).fetchone()
+        finally:
+            connection.close()
+        return None if row is None else dict(row)
+
+    def _row_id_snapshot(self) -> dict[str, list[int]]:
+        """Return the ids stored in every persistence table, oldest first."""
+        connection = sqlite3.connect(self.database_path)
+        try:
+            return {
+                table: [
+                    int(row[0])
+                    for row in connection.execute(
+                        f"SELECT id FROM {table} ORDER BY id"
+                    ).fetchall()
+                ]
+                for table in ("notes", "memories", "interactions")
+            }
+        finally:
+            connection.close()
+
+    def _newest_interaction(self) -> tuple[str, str]:
+        """Return the newest interaction row as (user_input, response)."""
+        connection = sqlite3.connect(self.database_path)
+        try:
+            user_input, response = connection.execute(
+                "SELECT user_input, response FROM interactions ORDER BY id DESC LIMIT 1"
+            ).fetchone()
+        finally:
+            connection.close()
+        return str(user_input), str(response)
 
     def _restore_maria_logging(self) -> None:
         """Close temporary handlers and restore the process-global logger."""

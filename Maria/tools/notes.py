@@ -15,11 +15,20 @@ _MORE_NOTES_SUFFIX = "Showing the newest 20 notes. More notes exist."
 
 
 class NotesTool:
-    """Create and retrieve notes through the memory layer."""
+    """Create, retrieve, update, and delete notes through the memory layer."""
 
     name = "notes"
-    description = "Creates, lists, and reads notes."
-    actions = frozenset({"create", "list", "read"})
+    description = "Creates, lists, reads, retitles, edits, and deletes notes."
+    actions = frozenset(
+        {
+            "create",
+            "list",
+            "read",
+            "retitle",
+            "edit",
+            "delete",
+        }
+    )
 
     def __init__(self, memory: Memory, logger: Logger | None = None) -> None:
         self.memory = memory
@@ -37,6 +46,12 @@ class NotesTool:
             return self._list(arguments)
         if action == "read":
             return self._read(arguments)
+        if action == "retitle":
+            return self._retitle(arguments)
+        if action == "edit":
+            return self._edit(arguments)
+        if action == "delete":
+            return self._delete(arguments)
         return ToolExecutionResult(False, f"Unsupported notes action: {action}")
 
     def _create(self, arguments: dict[str, Any]) -> ToolExecutionResult:
@@ -106,6 +121,101 @@ class NotesTool:
 
         message = f"{note['title']}\n{note['body']}"
         return ToolExecutionResult(True, message, note)
+
+    def _retitle(self, arguments: dict[str, Any]) -> ToolExecutionResult:
+        """Retitle one note by id."""
+        note_id = arguments.get("id")
+        if (
+            not isinstance(note_id, int)
+            or isinstance(note_id, bool)
+            or note_id < 1
+        ):
+            return ToolExecutionResult(
+                False,
+                "Note id must be a positive whole number.",
+            )
+
+        new_title = arguments.get("title")
+        if not isinstance(new_title, str) or not new_title.strip():
+            return ToolExecutionResult(False, "New note title is required.")
+
+        try:
+            retitled = self.memory.retitle_note(note_id, new_title.strip())
+        except (RuntimeError, ValueError) as exc:
+            self.logger.warning("Note retitle failed: %s", exc)
+            return ToolExecutionResult(False, f"Note retitle failed: {exc}")
+
+        if not retitled:
+            return ToolExecutionResult(False, f"Note not found: {note_id}.")
+
+        self.logger.info("Retitled note %s through notes tool.", note_id)
+        return ToolExecutionResult(
+            True,
+            f"Retitled note {note_id}.",
+            {"id": note_id},
+        )
+
+    def _edit(self, arguments: dict[str, Any]) -> ToolExecutionResult:
+        """Edit one note's body by id."""
+        note_id = arguments.get("id")
+        if (
+            not isinstance(note_id, int)
+            or isinstance(note_id, bool)
+            or note_id < 1
+        ):
+            return ToolExecutionResult(
+                False,
+                "Note id must be a positive whole number.",
+            )
+
+        new_body = arguments.get("body")
+        if not isinstance(new_body, str) or not new_body.strip():
+            return ToolExecutionResult(False, "New note body is required.")
+
+        try:
+            edited = self.memory.edit_note(note_id, new_body.strip())
+        except (RuntimeError, ValueError) as exc:
+            self.logger.warning("Note edit failed: %s", exc)
+            return ToolExecutionResult(False, f"Note edit failed: {exc}")
+
+        if not edited:
+            return ToolExecutionResult(False, f"Note not found: {note_id}.")
+
+        self.logger.info("Edited note %s through notes tool.", note_id)
+        return ToolExecutionResult(
+            True,
+            f"Edited note {note_id}.",
+            {"id": note_id},
+        )
+
+    def _delete(self, arguments: dict[str, Any]) -> ToolExecutionResult:
+        """Delete one note by id."""
+        note_id = arguments.get("id")
+        if (
+            not isinstance(note_id, int)
+            or isinstance(note_id, bool)
+            or note_id < 1
+        ):
+            return ToolExecutionResult(
+                False,
+                "Note id must be a positive whole number.",
+            )
+
+        try:
+            deleted = self.memory.delete_note(note_id)
+        except RuntimeError as exc:
+            self.logger.warning("Note deletion failed: %s", exc)
+            return ToolExecutionResult(False, f"Note deletion failed: {exc}")
+
+        if not deleted:
+            return ToolExecutionResult(False, f"Note not found: {note_id}.")
+
+        self.logger.info("Deleted note %s through notes tool.", note_id)
+        return ToolExecutionResult(
+            True,
+            f"Deleted note {note_id}.",
+            {"id": note_id},
+        )
 
 
 def build_tool(memory: Memory, **_: Any) -> NotesTool:
