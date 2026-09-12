@@ -20,7 +20,7 @@ rather than assume. **All application code lives in `Maria/`.**
 |---|---|
 | `Maria/main.py` | CLI entry point |
 | `Maria/core/` | `brain`, `planner`, `memory`, `permissions`, `tool_manager`, `logger`, `config`, `constants` |
-| `Maria/tools/` | `calculator`, `filesystem`, `memory`, `notes`, `system` |
+| `Maria/tools/` | `calculator`, `filesystem`, `history`, `memory`, `notes`, `system` |
 | `Maria/tests/` | standard-library `unittest` suite |
 | `Maria/docs/` | `architecture`, `api`, `database`, `planner`, `tools`, `coding_style`, `roadmap`, `vision` |
 | `Maria/config/config.toml` | TOML configuration |
@@ -48,7 +48,9 @@ use temporary resources instead.
 `Maria/core/permissions.py` defines two mandatory frozensets:
 
 - `MANDATORY_DENIED_ACTIONS` — `filesystem.delete` and `filesystem.write`
-- `MANDATORY_CONFIRMATION_ACTIONS` — `filesystem.rename` and `filesystem.move`
+- `MANDATORY_CONFIRMATION_ACTIONS` — `filesystem.rename`, `filesystem.move`,
+  `history.delete`, `notes.retitle`, `notes.edit`, `notes.delete`,
+  `memory.update`, and `memory.forget`
 
 `PermissionManager.__init__` and `Maria/core/config.py` union these into whatever
 configuration supplies, so **configuration can extend the mandatory baseline but can never
@@ -72,12 +74,22 @@ Configuration *validation* is the part that fails closed. The decision function 
 
 ## Persistence
 
-Interaction history (cleaned requests plus full response text), notes, and explicit
-memories are three separate SQLite record types. Maria records most requests and their
-complete responses, and provides no forget, prune, or delete path. Be careful not to leak
-sensitive content into any of them when adding features. See `Maria/docs/architecture.md`
-("Persistence Models"), `Maria/docs/database.md`, and the "Data Retention and Privacy"
-section of `Maria/README.md`.
+Interaction history (cleaned requests plus recorded response text), notes, and explicit
+memories are three separate SQLite record types. Maria normally records most requests
+together with the result message it displayed. `ToolExecutionResult.recorded_message`,
+when set, replaces only the response half of that record; when Brain records an
+interaction, the cleaned `user_input` is preserved unchanged. `history.read` is the only
+current action that sets this field, using a fixed content-free summary. Brain applies
+the field generically, with no history-specific branch.
+
+Six lifecycle actions can update or remove an existing stored record: `history.delete`,
+`notes.retitle`, `notes.edit`, `notes.delete`, `memory.update`, and `memory.forget`.
+Each requires explicit confirmation and targets at most one row selected by id. There is
+no bulk, wildcard, clear-all, or date-range deletion; no automatic retention or pruning;
+no cascade between the three record types; no undo or revision history; and no guarantee
+of secure erasure. Be careful not to leak sensitive content into any of them when adding
+features. See `Maria/docs/architecture.md` ("Persistence Models"), `Maria/docs/database.md`,
+and the "Data Retention and Privacy" section of `Maria/README.md`.
 
 ## Philosophy (in priority order)
 
@@ -115,16 +127,19 @@ boundary.
 - `Maria/core/planner.py` — turns user input into structured `Plan` and `PlanStep` objects,
   and owns the no-action response copy and the help text.
 - `Maria/core/memory.py` — the **only production application module** that may import
-  `sqlite3` or execute SQL. Guard tests enforce this; keep it true. (Tests may connect to a
-  temporary test database directly when necessary — never to the live database.)
+  `sqlite3` or execute SQL, and the only one that does. Guard tests cover this boundary in
+  several existing modules; keep it true. (Tests may connect to a temporary test database
+  directly when necessary — never to the live database.)
 - `Maria/core/permissions.py` — decides `ALLOWED` / `REQUIRES_CONFIRMATION` / `DENIED`.
 - `Maria/core/tool_manager.py` — discovers, loads, and dispatches tools.
 - `Maria/core/logger.py` — application logging only.
 - `Maria/core/config.py` — loads and validates `Maria/config/config.toml`.
-- `Maria/core/constants.py` — shared identity and canonical paths (`APP_NAME`,
-  `APP_VERSION`, `PROJECT_ROOT`, `CONFIG_PATH`, `DATABASE_PATH`, `LOG_DIR`,
-  `DEFAULT_LOG_FILE`, `SYSTEM_PROMPT_PATH`, `DEFAULT_TEXT_READ_LIMIT_BYTES`). Reuse these
-  rather than hardcoding a path.
+- `Maria/core/constants.py` — shared identity, canonical paths, and default limits
+  (`APP_NAME`, `APP_VERSION`, `PROJECT_ROOT`, `CONFIG_PATH`, `DATABASE_PATH`,
+  `LOG_DIR`, `DEFAULT_LOG_FILE`, `SYSTEM_PROMPT_PATH`, `DEFAULT_TEXT_READ_LIMIT_BYTES`,
+  and `DEFAULT_DATABASE_BUSY_TIMEOUT_SECONDS`, the SQLite busy-timeout constant
+  `Memory._connect` passes to `sqlite3.connect()`). Reuse these rather than hardcoding a
+  path.
 - `Maria/tools/*.py` — one tool per file, thin adapters, no direct SQLite access; use the
   injected `Memory` object.
 
