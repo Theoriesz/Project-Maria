@@ -10,7 +10,7 @@ from core.planner import Plan, Planner, PlanStep
 
 
 UNSUPPORTED_RESPONSE = (
-    "I do not have an executable v0.1 plan for that yet. "
+    "I do not have an executable plan for that yet. "
     "Type 'help' to see supported commands."
 )
 
@@ -210,7 +210,7 @@ class PlannerMemoryTests(unittest.TestCase):
 
         self.assertEqual(plan.steps, ())
         lines = plan.response_if_no_action.splitlines()
-        self.assertEqual(lines[0], "Supported v0.1 commands:")
+        self.assertEqual(lines[0], "Supported commands:")
         self.assertEqual(set(lines[1:]), expected_commands)
         self.assertEqual(len(lines[1:]), len(expected_commands))
         for command_line in (

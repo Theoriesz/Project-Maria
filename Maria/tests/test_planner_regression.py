@@ -9,7 +9,7 @@ from core.planner import Plan, Planner, PlanStep
 
 
 UNSUPPORTED_RESPONSE = (
-    "I do not have an executable v0.1 plan for that yet. "
+    "I do not have an executable plan for that yet. "
     "Type 'help' to see supported commands."
 )
 

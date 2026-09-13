@@ -128,7 +128,7 @@ class FilesystemToolTests(unittest.TestCase):
         self.assertEqual(len(accepted.message), DEFAULT_TEXT_READ_LIMIT_BYTES)
         self.assertEqual(
             rejected,
-            ToolExecutionResult(False, "File is too large for v0.1 reading."),
+            ToolExecutionResult(False, "File exceeds Maria's text-read limit."),
         )
 
     def test_list_is_case_insensitively_sorted_with_existing_type_labels(self) -> None:

@@ -61,7 +61,7 @@ def run_cli(
         return _EXIT_STARTUP_FAILURE
 
     print(f"{APP_NAME} v{APP_VERSION}")
-    print("Type 'help' for supported v0.1 commands. Type 'exit' to quit.")
+    print("Type 'help' for supported commands. Type 'exit' to quit.")
 
     while True:
         try:
