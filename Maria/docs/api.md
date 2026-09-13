@@ -1,6 +1,6 @@
 # Internal API
 
-Maria v0.1 exposes internal Python interfaces between modules. These are not
+Maria exposes internal Python interfaces between modules. These are not
 public network APIs.
 
 ## Brain
@@ -18,10 +18,9 @@ Returns a `Plan` containing zero or more `PlanStep` objects.
 
 ## Memory
 
-The memory layer owns all SQLite access. Other modules should call methods such
-as `record_interaction`, `get_recent_interactions`, `create_note`, `list_notes`,
-`get_note`, `retitle_note`, `edit_note`, `delete_note`, `update_memory`, and
-`forget_memory` instead of writing SQL directly.
+The memory layer owns all SQLite access. Other modules must use the public
+`Memory` methods documented below rather than importing `sqlite3` or executing
+SQL directly.
 
 Every connection uses an explicit 5.0-second SQLite busy timeout
 (`DEFAULT_DATABASE_BUSY_TIMEOUT_SECONDS`), which governs SQLite's built-in
@@ -247,9 +246,9 @@ honored and persisted as an empty string rather than falling back to
 `message`. Brain applies this generically and never branches on a tool's name
 or action.
 
-In the current Unreleased development state, `history.read` is the only
-result that supplies a non-`None` `recorded_message`. Every other current
-tool result leaves the field as `None` and therefore retains the existing
+In the current implementation, `history.read` is the only result that
+supplies a non-`None` `recorded_message`. Every other current tool result
+leaves the field as `None` and therefore retains the existing
 message-as-recorded behavior.
 
 ## Memory Tool

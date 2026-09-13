@@ -2,7 +2,7 @@
 
 Maria is a modular personal AI assistant foundation written in Python.
 
-Version 0.1 focuses on architecture, safety, and maintainability. It is not a
+Maria focuses on architecture, safety, and maintainability. It is not a
 prototype of the final assistant and does not include advanced AI features.
 
 ## Requirements
@@ -74,8 +74,8 @@ memories. Each memory lifecycle command targets at most one memory by positive
 whole-number ID only, never by fact text, and never cascades into interaction
 history or notes.
 Retitling and editing are deliberately separate commands, so neither can
-overwrite the other's field. Filesystem
-delete functionality remains intentionally not implemented in version 0.1.
+overwrite the other's field. Filesystem delete functionality remains
+intentionally unimplemented.
 
 ## Persistent Memory
 
@@ -142,7 +142,7 @@ behavior described below, so a fact can appear in both places.
 
 ## Data Retention and Privacy
 
-Maria v0.1 stores most non-empty requests it processes and their final response
+Maria stores most non-empty requests it processes and their final response
 text as persistent interaction history in its configured SQLite database,
 located inside the project directory by default. This can retain file contents
 returned by `read file`, note titles and bodies, note creation, retitle, and
@@ -221,7 +221,7 @@ those independent interaction rows; they can be removed separately with `delete
 interaction <id>`. As elsewhere, Maria promises no secure erasure from SQLite
 file pages, database or filesystem backups, Git history, or external copies.
 
-The shipped v0.1 runtime has no built-in networking or cloud integration and
+Maria's shipped runtime has no built-in networking or cloud integration and
 does not itself transmit this history. Configured network-mounted or
 synchronized paths and operating-system backup or sync services remain outside
 Maria's boundary.
@@ -243,8 +243,9 @@ python -m unittest discover -s tests -v
 
 Tests use temporary databases, log directories, and filesystem roots, so
 production runtime files are not required. The suite covers the CLI,
-configuration, permissions, calculator, memory, Logger, Tool Manager, notes,
-filesystem, system information, Brain, Planner, and clean startup wiring.
+configuration, permissions, calculator, memory, Logger, Tool Manager,
+notes, interaction history, filesystem, system information, Brain,
+Planner, and clean startup wiring.
 
 ## Project Layout
 
@@ -259,5 +260,5 @@ filesystem, system information, Brain, Planner, and clean startup wiring.
 
 ## Scope
 
-Maria v0.1 intentionally excludes internet search, browser automation, voice,
+Maria intentionally excludes internet search, browser automation, voice,
 text-to-speech, autonomous agents, multi-user support, and plugin marketplaces.

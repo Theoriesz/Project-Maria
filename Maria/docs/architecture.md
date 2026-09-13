@@ -1,6 +1,6 @@
 # Architecture
 
-Maria v0.1 is organized around a small set of modules with clear ownership.
+Maria is organized around a small set of modules with clear ownership.
 
 ## Core Flow
 
@@ -32,9 +32,9 @@ CLI
 ```
 
 The `MemoryTool` is a thin adapter for the `store`, `search`, `list`, `update`,
-and `forget` actions. `ToolManager` registers `tools.memory` through the standard tool
-factory contract alongside the calculator, notes, filesystem, and system
-tools. Memory actions therefore pass through the normal permission and result
+and `forget` actions. It is registered as `tools.memory` through Tool Manager's
+standard `build_tool(...)` factory contract alongside the other built-in tools.
+Memory actions therefore pass through the normal permission and result
 handling flow.
 
 ## Interaction Recording Boundary
@@ -74,7 +74,7 @@ than falling back to `message`. Brain applies this generically, reading only
 `.message` and `.recorded_message`, with no branch on a tool's name or
 action.
 
-In the current Unreleased development state, `history.read` is the only
+In the current implementation, `history.read` is the only
 result that supplies a non-`None` `recorded_message`, so that redisplaying
 old interaction content does not duplicate it into a new interaction row.
 Every other current tool result, including `history.delete`,
@@ -125,7 +125,7 @@ interaction write is attempted.
 
 For each non-empty `process()` call, Brain attempts to retrieve up to three
 recent interaction rows and supplies them to Planner as context. A retrieval
-`RuntimeError` is logged and produces empty context instead. The v0.1 Planner
+`RuntimeError` is logged and produces empty context instead. The Planner
 currently accepts and discards that context, so retained history does not alter
 plans. The retrieval limit controls query results; it is not a retention or
 deletion policy.
@@ -158,7 +158,7 @@ confirmation to an immutable plan remains deferred.
 
 ## Permission Policy
 
-All planned actions pass through `PermissionManager`. In v0.1,
+All planned actions pass through `PermissionManager`.
 `filesystem.rename` and `filesystem.move` always require confirmation, while
 `filesystem.delete` and `filesystem.write` are always denied. TOML
 configuration may add restrictions but cannot remove these mandatory
@@ -166,8 +166,8 @@ protections. Missing permission arrays retain the secure baseline, and
 malformed present arrays stop configuration loading instead of weakening it.
 When an action is both denied and confirmation-required, denial wins.
 
-In the current Unreleased development state, the mandatory confirmation
-baseline is eight actions: `filesystem.rename`, `filesystem.move`,
+In the current implementation, the mandatory confirmation baseline is
+eight actions: `filesystem.rename`, `filesystem.move`,
 `history.delete`, `notes.retitle`, `notes.edit`, `notes.delete`,
 `memory.update`, and `memory.forget`.
 `history.list`, `history.search`, `history.read`, `notes.create`,
@@ -186,7 +186,7 @@ Maria keeps three kinds of persistent data separate:
 
 - **Interaction history** records cleaned requests and final Maria responses
   on the completed paths described above. The brain retrieves recent rows and
-  supplies them to the planner as context, although the strict v0.1 planner
+  supplies them to the planner as context, although the strict planner
   discards that context. Interaction rows are never converted automatically
   into explicit memories.
 - **Notes** are structured title-and-body records deliberately created by the
@@ -234,7 +234,7 @@ it receives the shared `Memory` object and calls its public persistence methods.
 The existing calculator, notes, filesystem, and system tool implementations are
 unchanged by explicit memory support.
 
-## Version 0.1 Scope
+## Scope
 
 This foundation intentionally excludes autonomous agents, voice, browser
 automation, internet search, and user interfaces beyond the command line. Future
@@ -243,8 +243,7 @@ tool set without rewriting the foundation.
 
 Explicit memory remains intentionally small and strict. Maria does not infer
 facts from conversation, learn in the background, or provide embeddings,
-semantic search, fuzzy matching, or ranking. In the current Unreleased
-development state a memory's fact can be replaced and a memory can be forgotten
-by numeric ID only, through `update memory <id>: <new fact>` and `forget memory
-<id>`; there is no selection by fact text, no bulk or clear-all deletion, and
-no undo or revision history.
+semantic search, fuzzy matching, or ranking. A memory's fact can be replaced
+and a memory can be forgotten by numeric ID only, through `update memory <id>:
+<new fact>` and `forget memory <id>`; there is no selection by fact text, no
+bulk or clear-all deletion, and no undo or revision history.

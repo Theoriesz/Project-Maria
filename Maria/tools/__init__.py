@@ -1,1 +1,1 @@
-"""Built-in tools for Maria v0.1."""
+"""Built-in tools for Maria."""

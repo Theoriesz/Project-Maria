@@ -2,15 +2,20 @@
 
 ## Status
 
-- **v0.1.2** is the current released baseline.
-- Stages 1, 2, 3, and 4 (interaction-history browsing, single-interaction
+- Stages 1 through 4 — interaction-history browsing, single-interaction
   deletion, note lifecycle management, and explicit-memory lifecycle
-  management) are implemented in the current `Unreleased` development state for
-  v0.2.0.
-- `APP_VERSION` (`core/constants.py`) and the shipped `config/config.toml` version
-  remain `0.1.2` throughout v0.2.0 feature development.
-- `0.2.0` is assigned only during the separate `release/v0.2.0` preparation stage
-  (Stage 6), after every feature branch below has merged.
+  management — are implemented and merged into `main`.
+- Stage 5, the read-only cross-feature and release-planning audit, is
+  complete. Its focused corrections and final documentation
+  synchronization are complete before release preparation begins.
+- Stage 6, release preparation, is the final stage. It is the only stage
+  that assigns `0.2.0`, and it runs on the `release/v0.2.0` branch.
+- `APP_VERSION` (`core/constants.py`) and the shipped `config/config.toml`
+  version stay at `0.1.2` until Stage 6 changes them. No feature or
+  documentation branch changes either value.
+- The `v0.2.0` annotated tag and its GitHub Release are created only after
+  the release-preparation PR is merged and the resulting `main` merge
+  commit is independently verified.
 
 ## v0.2.0 — Personal Data Control
 

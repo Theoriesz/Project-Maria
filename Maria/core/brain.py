@@ -28,7 +28,7 @@ class BrainResponse:
 
 
 class MariaBrain:
-    """Coordinate Maria's v0.1 request handling workflow."""
+    """Coordinate Maria's request handling workflow."""
 
     def __init__(
         self,

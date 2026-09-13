@@ -1,8 +1,8 @@
-"""Request planning for Maria v0.1.
+"""Request planning for Maria.
 
-The v0.1 planner is intentionally conservative. It maps explicit user
+The planner is intentionally conservative. It maps explicit user
 commands to a small set of supported tool actions and returns no plan when the
-request is outside the foundation scope.
+request is outside Maria's supported command set.
 """
 
 from __future__ import annotations
@@ -43,7 +43,7 @@ class Planner:
         user_input: str,
         context: dict[str, Any] | None = None,
     ) -> Plan:
-        """Create a plan for a supported v0.1 request."""
+        """Create a plan for a supported request."""
         del context
 
         text = user_input.strip()
