@@ -14,7 +14,7 @@ from core.brain import BrainResponse
 
 
 MAIN_PATH = Path(__file__).resolve().parents[1] / "main.py"
-BANNER = "Maria v0.1.2"
+BANNER = "Maria v0.2.0"
 HELP_HINT = "Type 'help' for supported commands. Type 'exit' to quit."
 CONFIRMATION_PROMPT = (
     "Confirm action? Type 'y' or 'yes' to continue, or 'n' or 'no' to cancel: "
