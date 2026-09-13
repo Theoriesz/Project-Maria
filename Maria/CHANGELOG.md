@@ -2,6 +2,8 @@
 
 ## Unreleased
 
+## 0.2.0 - 2026-09-13
+
 - Added read-only interaction-history browsing: `history`, `search history
   <query>`, and `read interaction <id>`, backed by a new `HistoryTool`
   (`list`, `search`, `read` actions) and two new `Memory` methods
@@ -92,6 +94,10 @@
   history or notes, no renumbering of remaining memory IDs, no undo or memory
   revision history, and no guarantee of secure erasure from SQLite file pages,
   backups, or external copies. No schema or version change was introduced.
+- Made active command guidance version-neutral: CLI startup and help text,
+  unsupported-command responses, and the oversized-file response no longer
+  label the command set as v0.1; command grammar, filesystem limits,
+  permissions, versions, and operational behavior are unchanged.
 
 ## 0.1.2 - 2026-09-09
 
