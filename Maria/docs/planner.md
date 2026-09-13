@@ -2,7 +2,7 @@
 
 The planner converts explicit user requests into executable plans.
 
-## Version 0.1 Behavior
+## Planner Behavior
 
 The planner is command-oriented. It does not attempt general reasoning,
 autonomous decomposition, or long-running task execution.
@@ -13,6 +13,7 @@ Supported command families:
 - Safe filesystem commands
 - Notes commands
 - Explicit persistent-memory commands
+- Interaction-history commands
 - Read-only system information commands
 
 ## Memory Command Grammar

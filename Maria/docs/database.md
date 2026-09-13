@@ -1,6 +1,6 @@
 # Database
 
-Maria v0.1 uses SQLite through `core/memory.py`.
+Maria uses SQLite through `core/memory.py`.
 
 ## File
 
@@ -64,7 +64,7 @@ Stores simple notes created by the notes tool.
 
 | Column | Type | Purpose |
 | --- | --- | --- |
-| id | INTEGER | Autoincrementing primary key |
+| id | INTEGER PRIMARY KEY AUTOINCREMENT | Stable note identifier |
 | title | TEXT NOT NULL | Note title |
 | body | TEXT NOT NULL | Note body |
 | created_at | TEXT NOT NULL | UTC ISO 8601 timestamp |
@@ -91,8 +91,8 @@ later than the previous value, and ordering ties are broken by descending
 `id` as usual. Writing a value identical to the stored one still counts as a
 successful update and still refreshes `updated_at`, because success is
 determined by the row matching `WHERE id = ?` rather than by the value
-changing. Duplicate titles across notes remain allowed, since `title` is a
-non-unique index rather than a constraint.
+changing. Duplicate titles across notes remain allowed, since the
+`idx_notes_title` index is non-unique rather than a unique constraint.
 
 `delete note <id>` removes at most one row through a single parameterized
 `DELETE FROM notes WHERE id = ?` statement, under the same confirmation rule
@@ -257,9 +257,9 @@ requested, and it does not delete, expire, or prune any row — it only affects
 how the tool decides whether to mention that older rows were left out.
 
 Literal substring retrieval scans the stored normalized text and is intended
-for a small personal database. In the current Unreleased development state,
-`update memory <id>: <new fact>` and `forget memory <id>` change or remove one
-memory by numeric ID; both are described under the `memories` table above.
+for a small personal database. `update memory <id>: <new fact>` and `forget
+memory <id>` change or remove one memory by numeric ID; both are described
+under the `memories` table above.
 
 ## Data Considerations
 
@@ -274,7 +274,7 @@ automatically remove matching text from existing interaction rows. All three
 tables share one database file; external removal or replacement affects all
 three datasets.
 
-In the current Unreleased development state, `delete interaction <id>`,
+In the current implementation, `delete interaction <id>`,
 `delete note <id>`, and `forget memory <id>` each target at most one row by ID
 and remove it when found, and `retitle note <id>`, `edit note <id>`, and
 `update memory <id>` each change one stored field; Maria still exposes no API
@@ -284,7 +284,7 @@ never cascades into another table, so forgetting a memory leaves any copy of
 its text that already exists in `interactions` untouched. It also provides
 no application-level database encryption. Protection depends on access to the
 machine, user account, and database file and on any storage encryption in use;
-local storage alone is not a confidentiality guarantee. The v0.1 persistence
+local storage alone is not a confidentiality guarantee. Maria's persistence
 layer contains no network-transmission path, and the shipped runtime does not
 itself upload this history. Configured network-mounted or synchronized storage
 and operating-system backup or sync services remain outside Maria's boundary.

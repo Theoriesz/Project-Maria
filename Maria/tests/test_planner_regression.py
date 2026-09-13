@@ -15,7 +15,7 @@ UNSUPPORTED_RESPONSE = (
 
 
 class PlannerRegressionTests(unittest.TestCase):
-    """Verify the strict v0.1 mappings outside the focused memory suite."""
+    """Verify strict command mappings outside the focused memory suite."""
 
     def setUp(self) -> None:
         logger = logging.Logger("tests.planner_regression")

@@ -14,7 +14,7 @@ Maria's code should be written for long-term readability.
 
 ## Dependencies
 
-Version 0.1 uses only the Python standard library. Add dependencies only when
+Maria uses only the Python standard library. Add dependencies only when
 they solve a real maintenance problem and are approved for the project scope.
 
 ## Logging

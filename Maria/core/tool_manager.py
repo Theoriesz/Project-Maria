@@ -62,7 +62,7 @@ class ToolManager:
         self._tools: dict[str, Tool] = {}
 
     def discover_tools(self) -> tuple[str, ...]:
-        """Return import paths for built-in v0.1 tools."""
+        """Return import paths for built-in tools."""
         return BUILT_IN_TOOL_MODULES
 
     def load_tools(self) -> None:

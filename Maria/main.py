@@ -1,4 +1,4 @@
-"""Command line entry point for Maria v0.1."""
+"""Command line entry point for Maria."""
 
 from __future__ import annotations
 
@@ -46,7 +46,7 @@ def print_response(response: BrainResponse) -> None:
 def run_cli(
     brain_factory: Callable[[], MariaBrain] | None = None,
 ) -> int:
-    """Run Maria's minimal v0.1 command line interface."""
+    """Run Maria's minimal command line interface."""
     factory = MariaBrain.from_defaults if brain_factory is None else brain_factory
 
     try:

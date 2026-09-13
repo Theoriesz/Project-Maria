@@ -19,7 +19,7 @@ Maria should be built as a long-term software product.
 - Log important actions.
 - Require confirmation before potentially destructive operations.
 - Avoid unnecessary third-party dependencies.
-- Do not add out-of-scope features to version 0.1.
+- Do not add out-of-scope features.
 
 ## User Control
 
