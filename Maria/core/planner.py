@@ -282,7 +282,7 @@ class Planner:
 
         return self._no_action(
             text,
-            "I do not have an executable v0.1 plan for that yet. "
+            "I do not have an executable plan for that yet. "
             "Type 'help' to see supported commands.",
         )
 
@@ -373,7 +373,7 @@ def _parse_positive_ascii_id(value: str) -> int | None:
 def _help_text() -> str:
     """Return the supported command list."""
     return (
-        "Supported v0.1 commands:\n"
+        "Supported commands:\n"
         "- calculate <expression>\n"
         "- list <path>\n"
         "- read file <path>\n"

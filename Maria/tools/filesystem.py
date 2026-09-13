@@ -93,7 +93,10 @@ class FilesystemTool:
                     f"Not a file: {self._display_path(path)}",
                 )
             if path.stat().st_size > DEFAULT_TEXT_READ_LIMIT_BYTES:
-                return ToolExecutionResult(False, "File is too large for v0.1 reading.")
+                return ToolExecutionResult(
+                    False,
+                    "File exceeds Maria's text-read limit.",
+                )
 
             text = path.read_text(encoding="utf-8", errors="replace")
             self.logger.info("Read file: %s", path)
