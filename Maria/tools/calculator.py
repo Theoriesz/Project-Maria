@@ -5,6 +5,7 @@ from __future__ import annotations
 import ast
 import math
 import operator
+from collections.abc import Mapping
 from logging import Logger
 from typing import Any, Callable
 
@@ -53,7 +54,7 @@ class CalculatorTool:
     def execute(
         self,
         action: str,
-        arguments: dict[str, Any],
+        arguments: Mapping[str, Any],
     ) -> ToolExecutionResult:
         """Execute a calculator action."""
         if action != "calculate":

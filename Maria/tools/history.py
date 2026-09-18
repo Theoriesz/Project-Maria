@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+from collections.abc import Mapping
 from logging import Logger
 from typing import Any
 
@@ -47,7 +48,7 @@ class HistoryTool:
         self.memory = memory
         self.logger = logger or get_logger(__name__)
 
-    def execute(self, action: str, arguments: dict[str, Any]) -> ToolExecutionResult:
+    def execute(self, action: str, arguments: Mapping[str, Any]) -> ToolExecutionResult:
         """Execute a history action."""
         if action == "list":
             return self._list(arguments)
@@ -59,7 +60,7 @@ class HistoryTool:
             return self._delete(arguments)
         return ToolExecutionResult(False, f"Unsupported history action: {action}")
 
-    def _list(self, arguments: dict[str, Any]) -> ToolExecutionResult:
+    def _list(self, arguments: Mapping[str, Any]) -> ToolExecutionResult:
         """List interactions newest first."""
         del arguments
         try:
@@ -80,7 +81,7 @@ class HistoryTool:
             message = f"{message}\n{_MORE_INTERACTIONS_SUFFIX}"
         return ToolExecutionResult(True, message, [_row_summary(row) for row in visible])
 
-    def _search(self, arguments: dict[str, Any]) -> ToolExecutionResult:
+    def _search(self, arguments: Mapping[str, Any]) -> ToolExecutionResult:
         """Search interactions by literal, case-insensitive substring."""
         query = str(arguments.get("query", "")).strip()
         if not query:
@@ -104,7 +105,7 @@ class HistoryTool:
             message = f"{message}\n{_MORE_MATCHES_SUFFIX}"
         return ToolExecutionResult(True, message, [_row_summary(row) for row in visible])
 
-    def _read(self, arguments: dict[str, Any]) -> ToolExecutionResult:
+    def _read(self, arguments: Mapping[str, Any]) -> ToolExecutionResult:
         """Read one interaction by id."""
         interaction_id = arguments.get("id")
         if (
@@ -141,7 +142,7 @@ class HistoryTool:
             recorded_message=f"Displayed interaction {interaction_id}.",
         )
 
-    def _delete(self, arguments: dict[str, Any]) -> ToolExecutionResult:
+    def _delete(self, arguments: Mapping[str, Any]) -> ToolExecutionResult:
         """Delete one interaction by id."""
         interaction_id = arguments.get("id")
         if (

@@ -7,20 +7,114 @@ request is outside Maria's supported command set.
 
 from __future__ import annotations
 
+import hashlib
+import json
+from collections.abc import Iterator, Mapping
 from dataclasses import dataclass
 from logging import Logger
+from types import MappingProxyType
 from typing import Any
 
 from core.logger import get_logger
 
 
+SUPPORTED_ARGUMENT_VALUE_TYPES = (str, int)
+
+
+class PlanArguments(Mapping[str, Any]):
+    """An immutable, hashable, read-only mapping of plan-step arguments.
+
+    Keys are strings and values are strings or integers, which is exactly
+    the domain the deterministic planner emits. Both supported value types
+    are themselves immutable, so a validated snapshot is deeply immutable
+    without any recursive copying: there is no nested container to reach
+    through. Any other key or value type is rejected at construction
+    instead of being coerced, so an unsupported argument fails loudly
+    rather than becoming an unhashable or mutable member of a plan. The
+    input itself must be a Mapping: no other container, and no missing
+    value, is quietly treated as empty arguments. Pass an empty mapping to
+    build an argumentless step.
+
+    The validated snapshot is stored as a read-only MappingProxyType and
+    the dictionary behind it is never retained anywhere else, so there is
+    no reachable mutable storage: content cannot be changed through this
+    object at all, and the hash computed once at construction can never
+    go stale.
+    """
+
+    __slots__ = ("_values", "_hash")
+
+    def __init__(self, values: Mapping[str, Any]) -> None:
+        if not isinstance(values, Mapping):
+            raise TypeError("Plan arguments must be a mapping.")
+        snapshot: dict[str, Any] = {}
+        for key, value in values.items():
+            if type(key) is not str:
+                raise TypeError(
+                    "Plan argument keys must be str, got "
+                    f"{type(key).__name__}."
+                )
+            if type(value) not in SUPPORTED_ARGUMENT_VALUE_TYPES:
+                raise TypeError(
+                    f"Unsupported plan argument value type for {key!r}: "
+                    f"{type(value).__name__}."
+                )
+            snapshot[key] = value
+        object.__setattr__(self, "_values", MappingProxyType(snapshot))
+        object.__setattr__(self, "_hash", hash(frozenset(snapshot.items())))
+
+    def __getitem__(self, key: str) -> Any:
+        """Return the value stored for a key."""
+        return self._values[key]
+
+    def __iter__(self) -> Iterator[str]:
+        """Iterate over argument names."""
+        return iter(self._values)
+
+    def __len__(self) -> int:
+        """Return how many arguments the step carries."""
+        return len(self._values)
+
+    def __hash__(self) -> int:
+        """Return a structural hash that ignores key insertion order."""
+        return self._hash
+
+    def __repr__(self) -> str:
+        """Return a representation matching the underlying mapping."""
+        return f"{type(self).__name__}({dict(self._values)!r})"
+
+    def __setattr__(self, name: str, value: Any) -> None:
+        """Refuse attribute assignment, as a frozen dataclass does."""
+        raise AttributeError(f"{type(self).__name__} is immutable.")
+
+    def __delattr__(self, name: str) -> None:
+        """Refuse attribute deletion, as a frozen dataclass does."""
+        raise AttributeError(f"{type(self).__name__} is immutable.")
+
+
 @dataclass(frozen=True)
 class PlanStep:
-    """One executable step in a Maria plan."""
+    """One executable step in a Maria plan.
+
+    The declared argument type is the mapping a caller may supply. On
+    construction it is normalized into an immutable PlanArguments snapshot,
+    so later mutation of the supplied mapping cannot alter the step, and no
+    accessor hands back the caller's original object.
+    """
 
     tool_name: str
     action: str
-    arguments: dict[str, Any]
+    arguments: Mapping[str, Any]
+
+    def __post_init__(self) -> None:
+        """Replace the supplied arguments with an exact immutable snapshot.
+
+        The snapshot is always rebuilt, never reused because the supplied
+        object already looks like a PlanArguments. A subclass can satisfy
+        that check while backing its Mapping behavior with mutable state,
+        so reusing it would let a caller change a constructed step.
+        """
+        object.__setattr__(self, "arguments", PlanArguments(self.arguments))
 
 
 @dataclass(frozen=True)
@@ -30,6 +124,48 @@ class Plan:
     original_request: str
     steps: tuple[PlanStep, ...]
     response_if_no_action: str | None = None
+
+    @property
+    def fingerprint(self) -> str:
+        """Return a stable lowercase SHA-256 digest of this plan.
+
+        The digest covers the plan's complete logical content and is
+        deterministic across processes, so a plan shown to the owner can
+        later be matched against the plan about to run. Only the digest is
+        exposed: the content it covers can include note bodies, memory
+        facts, and file paths, so the serialized form stays private and is
+        never logged.
+        """
+        return hashlib.sha256(self._canonical_content()).hexdigest()
+
+    def _canonical_content(self) -> bytes:
+        """Serialize the plan's logical content canonically as UTF-8 bytes.
+
+        JSON keeps the supported argument types distinguishable, because a
+        string value never serializes like an integer one. Mapping keys are
+        sorted and separators are fixed so that structurally equal plans
+        produce identical bytes whatever order their arguments were built
+        in, while step order is preserved because steps stay a list.
+        Escaping stays ASCII-only so that the payload always encodes.
+        """
+        payload = {
+            "original_request": self.original_request,
+            "response_if_no_action": self.response_if_no_action,
+            "steps": [
+                {
+                    "tool_name": step.tool_name,
+                    "action": step.action,
+                    "arguments": dict(step.arguments),
+                }
+                for step in self.steps
+            ],
+        }
+        return json.dumps(
+            payload,
+            sort_keys=True,
+            ensure_ascii=True,
+            separators=(",", ":"),
+        ).encode("utf-8")
 
 
 class Planner:
@@ -291,7 +427,7 @@ class Planner:
         original_request: str,
         tool_name: str,
         action: str,
-        arguments: dict[str, Any],
+        arguments: Mapping[str, Any],
     ) -> Plan:
         """Create a one-step plan."""
         return Plan(

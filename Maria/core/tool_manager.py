@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import importlib
+from collections.abc import Mapping
 from dataclasses import dataclass
 from logging import Logger
 from typing import Any, Protocol
@@ -42,7 +43,7 @@ class Tool(Protocol):
     def execute(
         self,
         action: str,
-        arguments: dict[str, Any],
+        arguments: Mapping[str, Any],
     ) -> ToolExecutionResult:
         """Execute a supported action."""
 
@@ -81,7 +82,7 @@ class ToolManager:
         self,
         tool_name: str,
         action: str,
-        arguments: dict[str, Any],
+        arguments: Mapping[str, Any],
     ) -> ToolExecutionResult:
         """Execute an action on a loaded tool."""
         tool = self._tools.get(tool_name)

@@ -16,6 +16,37 @@ interaction-history recording.
 
 Returns a `Plan` containing zero or more `PlanStep` objects.
 
+`Plan` and `PlanStep` are immutable value objects, and both are hashable, so a
+plan can be compared, stored in a set, or used as a dictionary key. Step order
+is significant; argument insertion order is not.
+
+`PlanStep.arguments` is a read-only `Mapping[str, Any]`. A supplied mapping is
+copied into an immutable `PlanArguments` snapshot on construction, so mutating
+the original mapping afterwards cannot change the step, and no accessor returns
+the caller's object. Key lookup, `get`, `in`, `len`, iteration, `keys`,
+`items`, `values`, and equality against a plain dictionary all work as usual;
+every mutating operation raises.
+
+The supported argument domain is `str` keys with `str` or `int` values, which
+is exactly what the deterministic planner emits. Both supported value types are
+themselves immutable, so a snapshot is deeply immutable without recursive
+copying. Any other key or value type, including `bool`, `float`, `None`, and
+any nested container, raises `TypeError` at construction naming the key and the
+rejected type, never the value.
+
+`Plan.fingerprint -> str`
+
+Returns a stable lowercase SHA-256 hexadecimal digest of the plan's complete
+logical content: `original_request`, every step in order with its `tool_name`,
+`action`, and complete arguments, and `response_if_no_action`. The digest comes
+from a canonical JSON serialization with sorted mapping keys, fixed separators,
+and ASCII escaping, encoded as UTF-8, so it is deterministic across processes
+and independent of Python's randomized hashing. Structurally equal plans share
+one fingerprint, argument insertion order cannot change it, step order and any
+single differing character do change it, and string and integer values stay
+distinguishable. Only the digest is exposed: the serialized content can include
+note bodies, memory facts, and file paths, so it is never returned or logged.
+
 ## Memory
 
 The memory layer owns all SQLite access. Other modules must use the public
@@ -253,7 +284,7 @@ message-as-recorded behavior.
 
 ## Memory Tool
 
-`MemoryTool.execute(action: str, arguments: dict[str, Any]) -> ToolExecutionResult`
+`MemoryTool.execute(action: str, arguments: Mapping[str, Any]) -> ToolExecutionResult`
 
 The memory tool supports `store`, `search`, `list`, `update`, and `forget`.
 Successful stores return data shaped as
@@ -293,7 +324,7 @@ does not execute SQL.
 
 ## History Tool
 
-`HistoryTool.execute(action: str, arguments: dict[str, Any]) -> ToolExecutionResult`
+`HistoryTool.execute(action: str, arguments: Mapping[str, Any]) -> ToolExecutionResult`
 
 The history tool supports `list`, `search`, `read`, and `delete`. `list` and
 `search` return at most the newest 20 rows, using the same limit-plus-one
@@ -327,7 +358,7 @@ tool contains no SQL; `core/memory.py` owns all database operations.
 
 ## Notes Tool
 
-`NotesTool.execute(action: str, arguments: dict[str, Any]) -> ToolExecutionResult`
+`NotesTool.execute(action: str, arguments: Mapping[str, Any]) -> ToolExecutionResult`
 
 The notes tool supports `create`, `list`, `read`, `retitle`, `edit`, and
 `delete`. `create`, `list`, and `read` are unchanged.
@@ -366,6 +397,10 @@ database operations.
 `ToolManager.execute_tool(tool_name, action, arguments) -> ToolExecutionResult`
 
 Tools must expose `name`, `description`, `actions`, and an `execute` method.
+`arguments` is typed as a read-only `Mapping[str, Any]`, so a tool receives a
+plan's immutable arguments directly rather than a mutable copy. Tool Manager
+forwards the mapping unchanged and never rebuilds it, and no built-in tool
+mutates it.
 
 ## Permissions
 

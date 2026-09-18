@@ -355,7 +355,15 @@ A plan contains:
 - Zero or more steps
 - An optional response when no action should run
 
-Each step names a tool, an action, and JSON-compatible arguments.
+Each step names a tool, an action, and its arguments.
+
+`Plan` and `PlanStep` are immutable, hashable value objects. `PlanStep`
+arguments are a read-only mapping snapshotted at construction, whose keys are
+strings and whose values are strings or integers; any other key or value type
+is refused. `Plan.fingerprint` returns a stable SHA-256 digest of the plan's
+complete logical content, so structurally equal plans share one fingerprint
+while a differing step order or a single differing character does not. See
+`docs/api.md` for the full contract.
 
 ## Future Direction
 
