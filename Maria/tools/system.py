@@ -6,6 +6,7 @@ import ctypes
 import os
 import platform
 import shutil
+from collections.abc import Mapping
 from datetime import datetime
 from logging import Logger
 from pathlib import Path
@@ -28,7 +29,7 @@ class SystemTool:
     def execute(
         self,
         action: str,
-        arguments: dict[str, Any],
+        arguments: Mapping[str, Any],
     ) -> ToolExecutionResult:
         """Execute a system information action."""
         del arguments

@@ -149,10 +149,7 @@ class MariaBrainTests(unittest.TestCase):
     def test_allowed_step_delegates_arguments_unchanged_and_returns_output(
         self,
     ) -> None:
-        arguments = {
-            "expression": "2 + 2",
-            "metadata": {"request_id": "fixed-id"},
-        }
+        arguments = {"expression": "2 + 2", "precision": 2}
         plan = _single_step_plan("calculate 2 + 2", arguments=arguments)
         result = ToolExecutionResult(True, "4", {"value": 4})
         self.planner.create_plan.return_value = plan
@@ -168,7 +165,8 @@ class MariaBrainTests(unittest.TestCase):
             arguments,
         )
         forwarded_arguments = self.tool_manager.execute_tool.call_args.args[2]
-        self.assertIs(forwarded_arguments, arguments)
+        self.assertIs(forwarded_arguments, plan.steps[0].arguments)
+        self.assertEqual(forwarded_arguments, arguments)
         self.memory.record_interaction.assert_called_once_with(
             "calculate 2 + 2",
             "4",

@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import os
 import shutil
+from collections.abc import Mapping
 from logging import Logger
 from pathlib import Path
 from typing import Any
@@ -70,7 +71,7 @@ class FilesystemTool:
     def execute(
         self,
         action: str,
-        arguments: dict[str, Any],
+        arguments: Mapping[str, Any],
     ) -> ToolExecutionResult:
         """Execute a filesystem action."""
         if action == "read":
@@ -83,7 +84,7 @@ class FilesystemTool:
             return self._move(arguments)
         return ToolExecutionResult(False, f"Unsupported filesystem action: {action}")
 
-    def _read(self, arguments: dict[str, Any]) -> ToolExecutionResult:
+    def _read(self, arguments: Mapping[str, Any]) -> ToolExecutionResult:
         """Read a text file inside the safe root."""
         try:
             path = self._safe_path(str(arguments.get("path", "")))
@@ -108,7 +109,7 @@ class FilesystemTool:
                 f"File read failed: {_failure_reason(exc)}",
             )
 
-    def _list(self, arguments: dict[str, Any]) -> ToolExecutionResult:
+    def _list(self, arguments: Mapping[str, Any]) -> ToolExecutionResult:
         """List a directory inside the safe root."""
         try:
             path = self._safe_path(str(arguments.get("path", ".")))
@@ -137,7 +138,7 @@ class FilesystemTool:
                 f"Directory listing failed: {_failure_reason(exc)}",
             )
 
-    def _rename(self, arguments: dict[str, Any]) -> ToolExecutionResult:
+    def _rename(self, arguments: Mapping[str, Any]) -> ToolExecutionResult:
         """Rename a file or directory inside the safe root."""
         try:
             source = self._safe_path(str(arguments.get("source", "")))
@@ -168,7 +169,7 @@ class FilesystemTool:
                 f"Rename failed: {_failure_reason(exc)}",
             )
 
-    def _move(self, arguments: dict[str, Any]) -> ToolExecutionResult:
+    def _move(self, arguments: Mapping[str, Any]) -> ToolExecutionResult:
         """Move a file or directory inside the safe root."""
         try:
             source = self._safe_path(str(arguments.get("source", "")))

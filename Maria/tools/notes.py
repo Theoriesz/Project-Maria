@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+from collections.abc import Mapping
 from logging import Logger
 from typing import Any
 
@@ -37,7 +38,7 @@ class NotesTool:
     def execute(
         self,
         action: str,
-        arguments: dict[str, Any],
+        arguments: Mapping[str, Any],
     ) -> ToolExecutionResult:
         """Execute a notes action."""
         if action == "create":
@@ -54,7 +55,7 @@ class NotesTool:
             return self._delete(arguments)
         return ToolExecutionResult(False, f"Unsupported notes action: {action}")
 
-    def _create(self, arguments: dict[str, Any]) -> ToolExecutionResult:
+    def _create(self, arguments: Mapping[str, Any]) -> ToolExecutionResult:
         """Create a note."""
         title = str(arguments.get("title", "Untitled")).strip() or "Untitled"
         body = str(arguments.get("body", "")).strip()
@@ -74,7 +75,7 @@ class NotesTool:
             {"id": note_id, "title": title},
         )
 
-    def _list(self, arguments: dict[str, Any]) -> ToolExecutionResult:
+    def _list(self, arguments: Mapping[str, Any]) -> ToolExecutionResult:
         """List notes."""
         try:
             limit = int(arguments.get("limit", _DEFAULT_LIST_LIMIT))
@@ -101,7 +102,7 @@ class NotesTool:
             message = f"{message}\n{_MORE_NOTES_SUFFIX}"
         return ToolExecutionResult(True, message, visible_notes)
 
-    def _read(self, arguments: dict[str, Any]) -> ToolExecutionResult:
+    def _read(self, arguments: Mapping[str, Any]) -> ToolExecutionResult:
         """Read one note by id or exact title."""
         target = str(arguments.get("target", "")).strip()
         if not target:
@@ -122,7 +123,7 @@ class NotesTool:
         message = f"{note['title']}\n{note['body']}"
         return ToolExecutionResult(True, message, note)
 
-    def _retitle(self, arguments: dict[str, Any]) -> ToolExecutionResult:
+    def _retitle(self, arguments: Mapping[str, Any]) -> ToolExecutionResult:
         """Retitle one note by id."""
         note_id = arguments.get("id")
         if (
@@ -155,7 +156,7 @@ class NotesTool:
             {"id": note_id},
         )
 
-    def _edit(self, arguments: dict[str, Any]) -> ToolExecutionResult:
+    def _edit(self, arguments: Mapping[str, Any]) -> ToolExecutionResult:
         """Edit one note's body by id."""
         note_id = arguments.get("id")
         if (
@@ -188,7 +189,7 @@ class NotesTool:
             {"id": note_id},
         )
 
-    def _delete(self, arguments: dict[str, Any]) -> ToolExecutionResult:
+    def _delete(self, arguments: Mapping[str, Any]) -> ToolExecutionResult:
         """Delete one note by id."""
         note_id = arguments.get("id")
         if (

@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+from collections.abc import Mapping
 from logging import Logger
 from typing import Any
 
@@ -47,7 +48,7 @@ class MemoryTool:
     def execute(
         self,
         action: str,
-        arguments: dict[str, Any],
+        arguments: Mapping[str, Any],
     ) -> ToolExecutionResult:
         """Execute an explicit memory action."""
         if action == "store":
@@ -62,7 +63,7 @@ class MemoryTool:
             return self._forget(arguments)
         return ToolExecutionResult(False, f"Unsupported memory action: {action}")
 
-    def _store(self, arguments: dict[str, Any]) -> ToolExecutionResult:
+    def _store(self, arguments: Mapping[str, Any]) -> ToolExecutionResult:
         """Store one explicit memory."""
         fact = str(arguments.get("fact", "")).strip()
 
@@ -105,7 +106,7 @@ class MemoryTool:
             {"id": memory_id, "fact": stored_fact, "created": created},
         )
 
-    def _search(self, arguments: dict[str, Any]) -> ToolExecutionResult:
+    def _search(self, arguments: Mapping[str, Any]) -> ToolExecutionResult:
         """Search explicit memories."""
         query = str(arguments.get("query", "")).strip()
         try:
@@ -131,7 +132,7 @@ class MemoryTool:
             message = f"{message}\n{_MORE_MATCHES_SUFFIX}"
         return ToolExecutionResult(True, message, visible_memories)
 
-    def _list(self, arguments: dict[str, Any]) -> ToolExecutionResult:
+    def _list(self, arguments: Mapping[str, Any]) -> ToolExecutionResult:
         """List explicit memories."""
         try:
             limit = int(arguments.get("limit", _DEFAULT_LIST_LIMIT))
@@ -156,7 +157,7 @@ class MemoryTool:
             message = f"{message}\n{_MORE_MEMORIES_SUFFIX}"
         return ToolExecutionResult(True, message, visible_memories)
 
-    def _update(self, arguments: dict[str, Any]) -> ToolExecutionResult:
+    def _update(self, arguments: Mapping[str, Any]) -> ToolExecutionResult:
         """Replace one memory's fact by id."""
         memory_id = arguments.get("id")
         if (
@@ -199,7 +200,7 @@ class MemoryTool:
 
         return ToolExecutionResult(False, f"Memory not found: {memory_id}.")
 
-    def _forget(self, arguments: dict[str, Any]) -> ToolExecutionResult:
+    def _forget(self, arguments: Mapping[str, Any]) -> ToolExecutionResult:
         """Forget one memory by id."""
         memory_id = arguments.get("id")
         if (
