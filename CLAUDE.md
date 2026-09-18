@@ -4,10 +4,10 @@ You are acting as a Senior Python Software Engineer and Software Architect on **
 Maria**, a long-term, modular personal AI assistant. It is a real software product, not a
 prototype. Read the existing code before writing new code.
 
-`v0.1.0` is the immutable Foundation release baseline — do not assume it is still the
-current development version. Verify the actual repository state first: the active branch
-(`git branch --show-current`), the `## Unreleased` section of `Maria/CHANGELOG.md`, and
-`git status`.
+`v0.1.0` is the immutable Foundation release baseline and `v0.2.0` is the current public
+release — do not assume either matches the working tree. Verify the actual repository
+state first: the active branch (`git branch --show-current`), the `## Unreleased` section
+of `Maria/CHANGELOG.md`, and `git status`.
 
 ## Repository Layout
 
@@ -206,13 +206,35 @@ python -m unittest discover -s tests -v
 
 ## Git and Safety
 
-- The `v0.1.0` tag is immutable. Never retag, amend, force-push, or rewrite published
-  history.
-- It is an **annotated** tag, so `git rev-parse v0.1.0` returns the tag object rather than
-  the commit. Use `git rev-parse "v0.1.0^{commit}"` or `git rev-list -n 1 v0.1.0`.
+- The published tags are `v0.1.0`, `v0.1.1`, `v0.1.2`, and `v0.2.0`. All four are
+  immutable: never retag, move, delete, amend, recreate one against another commit,
+  force-push, or otherwise rewrite published history.
+- They are **annotated** tags, so `git rev-parse v0.1.0` returns the tag object rather
+  than the commit. Use `git rev-parse "v0.1.0^{commit}"` or `git rev-list -n 1 v0.1.0`.
 - Do not `add`, `commit`, `push`, or `tag` without explicit user permission.
 - This repository is public. Never commit secrets, credentials, personal email addresses,
   real names, or absolute machine paths.
+
+## Release and Version Policy
+
+The active effort is **Maria v1.0**; `Maria/docs/roadmap.md` defines its stages. Until it
+ships, the public release surface and the version literals are frozen:
+
+- `v0.2.0` remains the latest public release until `v1.0.0`.
+- Focused development branches and pull requests continue normally.
+- No intermediate public `0.x` release branch, annotated tag, or GitHub Release may be
+  created during the Maria v1.0 effort.
+- `APP_VERSION` in `Maria/core/constants.py` and the shipped `Maria/config/config.toml`
+  version both stay `0.2.0` through Stage V1-31. No feature, documentation, maintenance,
+  milestone, audit, or ordinary fix branch may change either value before Stage V1-32.
+- Only Stage V1-32, the owner-approved `release/v1.0.0` branch, may move `APP_VERSION`,
+  the shipped configuration version, and the corresponding hardcoded test expectations
+  from `0.2.0` to `1.0.0`.
+- `release/v1.0.0` may be created only after the Stage V1-31 completion audit passes.
+- The `v1.0.0` annotated tag may be created only after the release-preparation pull
+  request is merged and the resulting `main` merge commit is independently verified.
+- The GitHub Release may be created only after that annotated tag is pushed and
+  independently verified.
 
 ## Working Style
 
