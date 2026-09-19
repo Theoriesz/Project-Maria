@@ -83,7 +83,11 @@ class HistoryTool:
 
     def _search(self, arguments: Mapping[str, Any]) -> ToolExecutionResult:
         """Search interactions by literal, case-insensitive substring."""
-        query = str(arguments.get("query", "")).strip()
+        query = arguments.get("query", "")
+        if type(query) is not str:
+            return ToolExecutionResult(False, "Search query must be text.")
+
+        query = query.strip()
         if not query:
             return ToolExecutionResult(False, "Search query is required.")
 

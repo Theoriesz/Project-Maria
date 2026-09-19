@@ -33,7 +33,7 @@ from core.tool_manager import ToolExecutionResult, ToolManager
 ALLOWED = PermissionResult(PermissionDecision.ALLOWED, "the action is allowed.")
 DENIED = PermissionResult(
     PermissionDecision.DENIED,
-    "filesystem.write is denied by configuration.",
+    "filesystem.read is denied by configuration.",
 )
 DENIED_RENAME = PermissionResult(
     PermissionDecision.DENIED,
@@ -51,7 +51,7 @@ SINGLE_STEP_CONFIRMATION_TEXT = (
     "Confirmation required: filesystem.rename requires explicit confirmation."
 )
 RENAME_STEP = ("filesystem", "rename", {"source": "old.txt", "destination": "new.txt"})
-WRITE_STEP = ("filesystem", "write", {"path": "notes.txt", "content": "data"})
+READ_STEP = ("filesystem", "read", {"path": "notes.txt"})
 CALCULATE_STEP = ("calculator", "calculate", {"expression": "1 + 1"})
 TIME_STEP = ("system", "current_time", {})
 EDIT_STEP = ("notes", "edit", {"id": 4, "body": "sentinel-body-9f31ac"})
@@ -80,6 +80,7 @@ class ResolutionTestCase(unittest.TestCase):
         self.planner = Mock(spec=Planner)
         self.memory = Mock(spec=Memory)
         self.tool_manager = Mock(spec=ToolManager)
+        self.tool_manager.validate_action.return_value = None
         self.permissions = Mock(spec=PermissionManager)
         self.logger = Mock(spec=logging.Logger)
         self.events: list[str] = []
@@ -130,18 +131,18 @@ class DenialPrecedenceTests(ResolutionTestCase):
     """Verify a denial anywhere in a plan stops the whole plan."""
 
     def test_denial_at_a_later_step_executes_no_earlier_step(self) -> None:
-        plan = _plan("synthetic denial", CALCULATE_STEP, WRITE_STEP)
+        plan = _plan("synthetic denial", CALCULATE_STEP, READ_STEP)
         self.planner.create_plan.return_value = plan
-        self._resolve_as({"calculator.calculate": ALLOWED, "filesystem.write": DENIED})
+        self._resolve_as({"calculator.calculate": ALLOWED, "filesystem.read": DENIED})
 
         response = self.brain.process("synthetic denial")
 
-        expected = "Permission denied: filesystem.write is denied by configuration."
+        expected = "Permission denied: filesystem.read is denied by configuration."
         self.assertEqual(response, BrainResponse(expected, plan=plan))
         self.tool_manager.execute_tool.assert_not_called()
         self.assertEqual(
             self.events,
-            ["check:calculator.calculate", "check:filesystem.write"],
+            ["check:calculator.calculate", "check:filesystem.read"],
         )
         self.memory.record_interaction.assert_called_once_with(
             "synthetic denial",
@@ -149,13 +150,13 @@ class DenialPrecedenceTests(ResolutionTestCase):
         )
 
     def test_every_step_is_checked_before_the_first_possible_dispatch(self) -> None:
-        plan = _plan("synthetic denial", CALCULATE_STEP, TIME_STEP, WRITE_STEP)
+        plan = _plan("synthetic denial", CALCULATE_STEP, TIME_STEP, READ_STEP)
         self.planner.create_plan.return_value = plan
         self._resolve_as(
             {
                 "calculator.calculate": ALLOWED,
                 "system.current_time": ALLOWED,
-                "filesystem.write": DENIED,
+                "filesystem.read": DENIED,
             }
         )
 
@@ -166,21 +167,21 @@ class DenialPrecedenceTests(ResolutionTestCase):
             [
                 "check:calculator.calculate",
                 "check:system.current_time",
-                "check:filesystem.write",
+                "check:filesystem.read",
             ],
         )
         self.assertEqual(self._dispatched(), [])
 
     def test_confirmation_before_a_denial_is_denied_and_never_pends(self) -> None:
-        plan = _plan("synthetic blocked confirmation", RENAME_STEP, WRITE_STEP)
+        plan = _plan("synthetic blocked confirmation", RENAME_STEP, READ_STEP)
         self.planner.create_plan.return_value = plan
         self._resolve_as(
-            {"filesystem.rename": NEEDS_CONFIRMATION, "filesystem.write": DENIED}
+            {"filesystem.rename": NEEDS_CONFIRMATION, "filesystem.read": DENIED}
         )
 
         response = self.session.submit("synthetic blocked confirmation")
 
-        expected = "Permission denied: filesystem.write is denied by configuration."
+        expected = "Permission denied: filesystem.read is denied by configuration."
         self.assertFalse(response.needs_confirmation)
         self.assertEqual(response.text, expected)
         self.assertIsNone(self.session.pending_approval)
@@ -191,17 +192,17 @@ class DenialPrecedenceTests(ResolutionTestCase):
         )
 
     def test_the_first_denied_step_in_plan_order_supplies_the_reason(self) -> None:
-        plan = _plan("synthetic double denial", WRITE_STEP, RENAME_STEP)
+        plan = _plan("synthetic double denial", READ_STEP, RENAME_STEP)
         self.planner.create_plan.return_value = plan
         self._resolve_as(
-            {"filesystem.write": DENIED, "filesystem.rename": DENIED_RENAME}
+            {"filesystem.read": DENIED, "filesystem.rename": DENIED_RENAME}
         )
 
         response = self.brain.process("synthetic double denial")
 
         self.assertEqual(
             response.text,
-            "Permission denied: filesystem.write is denied by configuration.",
+            "Permission denied: filesystem.read is denied by configuration.",
         )
         self.tool_manager.execute_tool.assert_not_called()
 
@@ -302,23 +303,23 @@ class ConfirmationResolutionTests(ResolutionTestCase):
     def test_confirmation_time_denial_at_a_later_step_runs_no_earlier_step(
         self,
     ) -> None:
-        plan = _plan("synthetic revoked later step", RENAME_STEP, WRITE_STEP)
+        plan = _plan("synthetic revoked later step", RENAME_STEP, READ_STEP)
         self.planner.create_plan.return_value = plan
         self._resolve_as(
-            {"filesystem.rename": NEEDS_CONFIRMATION, "filesystem.write": ALLOWED}
+            {"filesystem.rename": NEEDS_CONFIRMATION, "filesystem.read": ALLOWED}
         )
 
         pending_response = self.session.submit("synthetic revoked later step")
         self.assertTrue(pending_response.needs_confirmation)
 
         self._resolve_as(
-            {"filesystem.rename": NEEDS_CONFIRMATION, "filesystem.write": DENIED}
+            {"filesystem.rename": NEEDS_CONFIRMATION, "filesystem.read": DENIED}
         )
         denial = self.session.confirm()
 
         self.assertEqual(
             denial.text,
-            "Permission denied: filesystem.write is denied by configuration.",
+            "Permission denied: filesystem.read is denied by configuration.",
         )
         self.assertEqual(self._dispatched(), [])
 
@@ -567,6 +568,7 @@ class RenderingLoggingPrivacyTests(unittest.TestCase):
         self.planner = Mock(spec=Planner)
         self.memory = Mock(spec=Memory)
         self.tool_manager = Mock(spec=ToolManager)
+        self.tool_manager.validate_action.return_value = None
         self.permissions = Mock(spec=PermissionManager)
         self.memory.get_recent_interactions.return_value = []
         self.tool_manager.execute_tool.return_value = ToolExecutionResult(True, "done")

@@ -73,18 +73,35 @@ class NotesToolTests(unittest.TestCase):
             "Ready to ship.",
         )
 
-    def test_missing_or_blank_title_uses_untitled(self) -> None:
-        cases = ({"body": "Missing title"}, {"title": " \t ", "body": "Blank"})
+    def test_absent_title_uses_untitled(self) -> None:
+        result = self.tool.execute("create", {"body": "Missing title"})
 
-        for arguments in cases:
-            with self.subTest(arguments=arguments):
-                result = self.tool.execute("create", arguments)
-                self.assertTrue(result.success)
-                self.assertEqual(result.data["title"], "Untitled")
-                self.assertEqual(
-                    self.memory.get_note(note_id=result.data["id"])["title"],
-                    "Untitled",
+        self.assertTrue(result.success)
+        self.assertEqual(result.data["title"], "Untitled")
+        self.assertEqual(
+            self.memory.get_note(note_id=result.data["id"])["title"],
+            "Untitled",
+        )
+
+    def test_provided_blank_title_is_a_controlled_failure(self) -> None:
+        """A supplied blank title is malformed rather than repaired.
+
+        Before per-action argument contracts this silently became
+        ``Untitled``. V1-06 removes that repair: only a genuinely absent
+        title takes the tool-owned default.
+        """
+        for blank in ("", " \t ", " \r\n "):
+            with self.subTest(blank=repr(blank)):
+                result = self.tool.execute(
+                    "create",
+                    {"title": blank, "body": "Blank"},
                 )
+
+                self.assertEqual(
+                    result,
+                    ToolExecutionResult(False, "Note title is required."),
+                )
+        self.assertEqual(self.memory.list_notes(limit=5), [])
 
     def test_missing_or_blank_body_is_a_controlled_failure(self) -> None:
         cases = ({"title": "Missing"}, {"title": "Blank", "body": " \t\r\n "})

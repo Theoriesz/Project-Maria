@@ -30,6 +30,7 @@ class MariaBrainTests(unittest.TestCase):
         self.planner = Mock(spec=Planner)
         self.memory = Mock(spec=Memory)
         self.tool_manager = Mock(spec=ToolManager)
+        self.tool_manager.validate_action.return_value = None
         self.permissions = Mock(spec=PermissionManager)
         self.logger = Mock(spec=logging.Logger)
 
@@ -149,7 +150,7 @@ class MariaBrainTests(unittest.TestCase):
     def test_allowed_step_delegates_arguments_unchanged_and_returns_output(
         self,
     ) -> None:
-        arguments = {"expression": "2 + 2", "precision": 2}
+        arguments = {"expression": "2 + 2"}
         plan = _single_step_plan("calculate 2 + 2", arguments=arguments)
         result = ToolExecutionResult(True, "4", {"value": 4})
         self.planner.create_plan.return_value = plan
@@ -257,28 +258,28 @@ class MariaBrainTests(unittest.TestCase):
 
     def test_denied_step_prevents_dispatch_and_records_denial(self) -> None:
         plan = _single_step_plan(
-            "write file",
+            "read file file.txt",
             tool_name="filesystem",
-            action="write",
-            arguments={"path": "file.txt", "content": "data"},
+            action="read",
+            arguments={"path": "file.txt"},
         )
         permission = PermissionResult(
             PermissionDecision.DENIED,
-            "filesystem.write is denied by configuration.",
+            "filesystem.read is denied by configuration.",
         )
         self.planner.create_plan.return_value = plan
         self.permissions.check.return_value = permission
 
-        response = self.brain.process("write file")
+        response = self.brain.process("read file file.txt")
 
         expected = (
-            "Permission denied: filesystem.write is denied by configuration."
+            "Permission denied: filesystem.read is denied by configuration."
         )
         self.assertEqual(response, BrainResponse(expected, plan=plan))
-        self.permissions.check.assert_called_once_with("filesystem", "write")
+        self.permissions.check.assert_called_once_with("filesystem", "read")
         self.tool_manager.execute_tool.assert_not_called()
         self.memory.record_interaction.assert_called_once_with(
-            "write file",
+            "read file file.txt",
             expected,
         )
 
@@ -372,7 +373,10 @@ class MariaBrainTests(unittest.TestCase):
         self,
     ) -> None:
         error = RuntimeError("temporary interaction write failure")
-        plan = _single_step_plan("calculate 3 * 3")
+        plan = _single_step_plan(
+            "calculate 3 * 3",
+            arguments={"expression": "3 * 3"},
+        )
         self.planner.create_plan.return_value = plan
         self.tool_manager.execute_tool.return_value = ToolExecutionResult(
             True,
@@ -450,12 +454,11 @@ class MariaBrainTests(unittest.TestCase):
 
     def test_recorded_message_is_applied_per_step_in_multi_step_plans(self) -> None:
         first_arguments = {"expression": "1 + 1"}
-        second_arguments: dict[str, Any] = {}
         plan = Plan(
             original_request="synthetic multi step",
             steps=(
                 PlanStep("calculator", "calculate", first_arguments),
-                PlanStep("history", "read", second_arguments),
+                PlanStep("history", "read", {"id": 9}),
             ),
         )
         self.planner.create_plan.return_value = plan

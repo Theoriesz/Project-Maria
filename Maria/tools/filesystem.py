@@ -16,6 +16,7 @@ from core.tool_manager import ToolExecutionResult
 
 
 PATH_REQUIRED_MESSAGE = "Path is required."
+PATH_NOT_TEXT_MESSAGE = "Path must be text."
 PATH_OUTSIDE_ROOT_MESSAGE = "Path is outside Maria's configured safe root."
 UNCONTAINED_DISPLAY = "<path outside safe root>"
 UNSPECIFIED_FAILURE_REASON = "The operating system reported an unspecified error."
@@ -36,7 +37,7 @@ def _failure_reason(exc: OSError | ValueError) -> str:
     """Describe a filesystem failure without exposing host paths.
 
     An ``OSError`` reason is derived from its numeric ``errno``. Only Maria's
-    two fixed controlled ``ValueError`` messages are preserved, and every other
+    three fixed controlled ``ValueError`` messages are preserved, and every other
     failure uses the generic fallback. Exception-supplied text is read solely
     as a whitelist comparison key, so raw exception text and path fields such
     as ``strerror``, ``filename``, ``filename2``, and ``args`` are never
@@ -48,9 +49,29 @@ def _failure_reason(exc: OSError | ValueError) -> str:
     message = str(exc)
     if message == PATH_REQUIRED_MESSAGE:
         return PATH_REQUIRED_MESSAGE
+    if message == PATH_NOT_TEXT_MESSAGE:
+        return PATH_NOT_TEXT_MESSAGE
     if message == PATH_OUTSIDE_ROOT_MESSAGE:
         return PATH_OUTSIDE_ROOT_MESSAGE
     return UNSPECIFIED_FAILURE_REASON
+
+
+def _path_argument(
+    arguments: Mapping[str, Any],
+    name: str,
+    default: str = "",
+) -> str:
+    """Return a path argument without converting a non-text value.
+
+    A value of any other type is refused rather than rendered into a path,
+    so a malformed direct call can no longer be turned into a real
+    filesystem target. An absent argument still falls back to the caller's
+    existing default.
+    """
+    value = arguments.get(name, default)
+    if type(value) is not str:
+        raise ValueError(PATH_NOT_TEXT_MESSAGE)
+    return value
 
 
 class FilesystemTool:
@@ -87,7 +108,7 @@ class FilesystemTool:
     def _read(self, arguments: Mapping[str, Any]) -> ToolExecutionResult:
         """Read a text file inside the safe root."""
         try:
-            path = self._safe_path(str(arguments.get("path", "")))
+            path = self._safe_path(_path_argument(arguments, "path"))
             if not path.is_file():
                 return ToolExecutionResult(
                     False,
@@ -112,7 +133,7 @@ class FilesystemTool:
     def _list(self, arguments: Mapping[str, Any]) -> ToolExecutionResult:
         """List a directory inside the safe root."""
         try:
-            path = self._safe_path(str(arguments.get("path", ".")))
+            path = self._safe_path(_path_argument(arguments, "path", "."))
             if not path.is_dir():
                 return ToolExecutionResult(
                     False,
@@ -141,8 +162,8 @@ class FilesystemTool:
     def _rename(self, arguments: Mapping[str, Any]) -> ToolExecutionResult:
         """Rename a file or directory inside the safe root."""
         try:
-            source = self._safe_path(str(arguments.get("source", "")))
-            destination = self._safe_path(str(arguments.get("destination", "")))
+            source = self._safe_path(_path_argument(arguments, "source"))
+            destination = self._safe_path(_path_argument(arguments, "destination"))
             if not source.exists():
                 return ToolExecutionResult(
                     False,
@@ -172,8 +193,8 @@ class FilesystemTool:
     def _move(self, arguments: Mapping[str, Any]) -> ToolExecutionResult:
         """Move a file or directory inside the safe root."""
         try:
-            source = self._safe_path(str(arguments.get("source", "")))
-            destination = self._safe_path(str(arguments.get("destination", "")))
+            source = self._safe_path(_path_argument(arguments, "source"))
+            destination = self._safe_path(_path_argument(arguments, "destination"))
             if not source.exists():
                 return ToolExecutionResult(
                     False,

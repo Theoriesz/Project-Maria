@@ -6,6 +6,7 @@ from collections.abc import Mapping
 from logging import Logger
 from typing import Any
 
+from core.action_contracts import MAXIMUM_LIST_LIMIT, MINIMUM_LIST_LIMIT
 from core.logger import get_logger
 from core.memory import Memory
 from core.tool_manager import ToolExecutionResult
@@ -14,6 +15,13 @@ from core.tool_manager import ToolExecutionResult
 _DEFAULT_LIST_LIMIT = 20
 _MORE_MEMORIES_SUFFIX = "Showing the newest 20 memories. More memories exist."
 _MORE_MATCHES_SUFFIX = "Showing the newest 20 matches. More matching memories exist."
+_LIST_LIMIT_RANGE_MESSAGE = (
+    f"Memories limit must be between {MINIMUM_LIST_LIMIT} and {MAXIMUM_LIST_LIMIT}."
+)
+_SEARCH_LIMIT_RANGE_MESSAGE = (
+    "Memory search limit must be between "
+    f"{MINIMUM_LIST_LIMIT} and {MAXIMUM_LIST_LIMIT}."
+)
 
 
 def _split_visible_rows(
@@ -65,7 +73,11 @@ class MemoryTool:
 
     def _store(self, arguments: Mapping[str, Any]) -> ToolExecutionResult:
         """Store one explicit memory."""
-        fact = str(arguments.get("fact", "")).strip()
+        fact = arguments.get("fact", "")
+        if type(fact) is not str:
+            return ToolExecutionResult(False, "Memory fact must be text.")
+
+        fact = fact.strip()
 
         try:
             memory_id, created = self.memory.store_memory(fact)
@@ -108,11 +120,16 @@ class MemoryTool:
 
     def _search(self, arguments: Mapping[str, Any]) -> ToolExecutionResult:
         """Search explicit memories."""
-        query = str(arguments.get("query", "")).strip()
-        try:
-            limit = int(arguments.get("limit", _DEFAULT_LIST_LIMIT))
-        except (TypeError, ValueError):
+        query = arguments.get("query", "")
+        if type(query) is not str:
+            return ToolExecutionResult(False, "Memory search query must be text.")
+
+        query = query.strip()
+        limit = arguments.get("limit", _DEFAULT_LIST_LIMIT)
+        if type(limit) is not int:
             return ToolExecutionResult(False, "Memory search limit must be a number.")
+        if not MINIMUM_LIST_LIMIT <= limit <= MAXIMUM_LIST_LIMIT:
+            return ToolExecutionResult(False, _SEARCH_LIMIT_RANGE_MESSAGE)
 
         probe_default = limit == _DEFAULT_LIST_LIMIT
         query_limit = limit + 1 if probe_default else limit
@@ -134,10 +151,11 @@ class MemoryTool:
 
     def _list(self, arguments: Mapping[str, Any]) -> ToolExecutionResult:
         """List explicit memories."""
-        try:
-            limit = int(arguments.get("limit", _DEFAULT_LIST_LIMIT))
-        except (TypeError, ValueError):
+        limit = arguments.get("limit", _DEFAULT_LIST_LIMIT)
+        if type(limit) is not int:
             return ToolExecutionResult(False, "Memories limit must be a number.")
+        if not MINIMUM_LIST_LIMIT <= limit <= MAXIMUM_LIST_LIMIT:
+            return ToolExecutionResult(False, _LIST_LIMIT_RANGE_MESSAGE)
 
         probe_default = limit == _DEFAULT_LIST_LIMIT
         query_limit = limit + 1 if probe_default else limit

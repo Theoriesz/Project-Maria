@@ -11,6 +11,11 @@ from typing import Any
 from unittest.mock import Mock, call, patch
 
 import core.tool_manager as tool_manager_module
+from core.action_contracts import (
+    ActionContract,
+    ActionContractRegistry,
+    ArgumentContract,
+)
 from core.config import MariaConfig
 from core.memory import Memory
 from core.tool_manager import (
@@ -33,6 +38,15 @@ EXPECTED_TOOL_NAMES = frozenset(
 )
 
 
+def _stub_registry(
+    *arguments: ArgumentContract,
+    tool_name: str = "sample",
+    action: str = "run",
+) -> ActionContractRegistry:
+    """Declare one stub tool action so dispatch tests reach the stub."""
+    return ActionContractRegistry((ActionContract(tool_name, action, arguments),))
+
+
 class ToolManagerTests(unittest.TestCase):
     """Verify tool discovery, loading, and controlled dispatch."""
 
@@ -51,7 +65,15 @@ class ToolManagerTests(unittest.TestCase):
         self.assertEqual(BUILT_IN_TOOL_MODULES, EXPECTED_MODULES)
 
     def test_load_imports_all_modules_and_passes_factory_keywords(self) -> None:
-        manager = ToolManager(self.config, self.memory, self.manager_logger)
+        manager = ToolManager(
+            self.config,
+            self.memory,
+            self.manager_logger,
+            contracts=ActionContractRegistry(
+                ActionContract(module_name.removeprefix("tools."), "run")
+                for module_name in EXPECTED_MODULES
+            ),
+        )
         modules: dict[str, SimpleNamespace] = {}
         factories: dict[str, Mock] = {}
         child_loggers = {
@@ -111,26 +133,57 @@ class ToolManagerTests(unittest.TestCase):
                     result,
                     ToolExecutionResult(
                         False,
-                        f"Unsupported action for {tool_name}: not_an_action",
+                        f"Unsupported action: {tool_name}.not_an_action "
+                        "is not a supported action.",
                     ),
                 )
         self.assertEqual(
             manager.execute_tool("not_shipped", "not_an_action", {}),
-            ToolExecutionResult(False, "Tool not loaded: not_shipped"),
+            ToolExecutionResult(
+                False,
+                "Unsupported action: not_shipped is not a supported tool.",
+            ),
         )
 
-    def test_unknown_tool_returns_controlled_unsuccessful_result(self) -> None:
+    def test_unknown_tool_is_refused_by_the_action_contract(self) -> None:
         manager = ToolManager(self.config, self.memory, self.manager_logger)
 
         result = manager.execute_tool("missing", "run", {"value": 1})
 
-        self.assertEqual(result, ToolExecutionResult(False, "Tool not loaded: missing"))
-        self.manager_logger.error.assert_called_once_with(
-            "Tool not loaded: %s",
+        self.assertEqual(
+            result,
+            ToolExecutionResult(
+                False,
+                "Unsupported action: missing is not a supported tool.",
+            ),
+        )
+        self.manager_logger.warning.assert_called_once_with(
+            "Rejected action by contract: %s %s.%s field=%s",
+            "unknown_tool",
             "missing",
+            None,
+            None,
         )
 
-    def test_unknown_action_returns_controlled_unsuccessful_result(self) -> None:
+    def test_declared_but_unloaded_tool_still_reports_it_is_not_loaded(self) -> None:
+        manager = ToolManager(self.config, self.memory, self.manager_logger)
+
+        result = manager.execute_tool(
+            "calculator",
+            "calculate",
+            {"expression": "1 + 1"},
+        )
+
+        self.assertEqual(
+            result,
+            ToolExecutionResult(False, "Tool not loaded: calculator"),
+        )
+        self.manager_logger.error.assert_called_once_with(
+            "Tool not loaded: %s",
+            "calculator",
+        )
+
+    def test_unknown_action_is_refused_by_the_action_contract(self) -> None:
         tool = _StubTool("sample")
         manager = self._load_single_tool(tool)
 
@@ -138,22 +191,51 @@ class ToolManagerTests(unittest.TestCase):
 
         self.assertEqual(
             result,
-            ToolExecutionResult(False, "Unsupported action for sample: missing"),
+            ToolExecutionResult(
+                False,
+                "Unsupported action: sample.missing is not a supported action.",
+            ),
+        )
+        self.manager_logger.warning.assert_called_once_with(
+            "Rejected action by contract: %s %s.%s field=%s",
+            "unknown_action",
+            "sample",
+            "missing",
+            None,
+        )
+
+    def test_declared_action_absent_from_the_loaded_tool_is_still_refused(
+        self,
+    ) -> None:
+        tool = _StubTool("sample")
+        manager = self._load_single_tool(
+            tool,
+            contracts=_stub_registry(action="other"),
+        )
+
+        result = manager.execute_tool("sample", "other", {})
+
+        self.assertEqual(
+            result,
+            ToolExecutionResult(False, "Unsupported action for sample: other"),
         )
         self.manager_logger.warning.assert_called_once_with(
             "Unsupported action requested: %s.%s",
             "sample",
-            "missing",
+            "other",
         )
 
     def test_arguments_are_forwarded_unchanged(self) -> None:
         expected = ToolExecutionResult(True, "completed", {"answer": 42})
         tool = _StubTool("sample", result=expected)
-        manager = self._load_single_tool(tool)
-        arguments: dict[str, Any] = {
-            "nested": {"items": [1, 2, 3]},
-            "marker": object(),
-        }
+        manager = self._load_single_tool(
+            tool,
+            contracts=_stub_registry(
+                ArgumentContract("text", str, required=True, allow_blank=True, minimum_length=None, maximum_length=None),
+                ArgumentContract("count", int, required=True),
+            ),
+        )
+        arguments: dict[str, Any] = {"text": "value", "count": 3}
 
         actual = manager.execute_tool("sample", "run", arguments)
 
@@ -238,17 +320,33 @@ class ToolManagerTests(unittest.TestCase):
                     result,
                     ToolExecutionResult(
                         False,
-                        f"Unsupported action for {tool_name}: not_an_action",
+                        f"Unsupported action: {tool_name}.not_an_action "
+                        "is not a supported action.",
                     ),
                 )
         self.assertEqual(
             manager.execute_tool("not_shipped", "not_an_action", {}),
-            ToolExecutionResult(False, "Tool not loaded: not_shipped"),
+            ToolExecutionResult(
+                False,
+                "Unsupported action: not_shipped is not a supported tool.",
+            ),
         )
 
     def test_successful_dispatch_logging_omits_sensitive_arguments(self) -> None:
         tool = _StubTool("sample")
-        manager = self._load_single_tool(tool)
+        manager = self._load_single_tool(
+            tool,
+            contracts=_stub_registry(
+                ArgumentContract(
+                    "secret",
+                    str,
+                    required=True,
+                    allow_blank=True,
+                    minimum_length=None,
+                    maximum_length=None,
+                )
+            ),
+        )
         sensitive_value = "sensitive-value-9d5fc1f6f4"
 
         result = manager.execute_tool(
@@ -261,9 +359,18 @@ class ToolManagerTests(unittest.TestCase):
         logged_calls = " ".join(str(entry) for entry in self.manager_logger.method_calls)
         self.assertNotIn(sensitive_value, logged_calls)
 
-    def _load_single_tool(self, tool: _StubTool) -> ToolManager:
+    def _load_single_tool(
+        self,
+        tool: _StubTool,
+        contracts: ActionContractRegistry | None = None,
+    ) -> ToolManager:
         """Load one stub through the public loading flow."""
-        manager = ToolManager(self.config, self.memory, self.manager_logger)
+        manager = ToolManager(
+            self.config,
+            self.memory,
+            self.manager_logger,
+            contracts=_stub_registry() if contracts is None else contracts,
+        )
         module = SimpleNamespace(build_tool=Mock(return_value=tool))
         with (
             patch.object(manager, "discover_tools", return_value=("tools.stub",)),
