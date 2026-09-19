@@ -12,6 +12,7 @@ from unittest.mock import patch
 from core.brain import MariaBrain
 from core.config import MariaConfig
 from core.permissions import PermissionDecision
+from core.session import MariaSession
 
 
 class StartupIntegrationTests(unittest.TestCase):
@@ -56,6 +57,7 @@ class StartupIntegrationTests(unittest.TestCase):
 
         load_config.assert_called_once_with()
         self._temporary_handlers = tuple(self._maria_logger.handlers)
+        self.session = MariaSession(self.brain)
 
     def test_clean_start_creates_database_log_and_expected_schema(self) -> None:
         self.assertTrue(self.database_parent_was_missing)
@@ -286,7 +288,7 @@ class StartupIntegrationTests(unittest.TestCase):
         finally:
             connection.close()
 
-        unconfirmed = self.brain.process(f"delete interaction {target_id}")
+        unconfirmed = self.session.submit(f"delete interaction {target_id}")
 
         self.assertTrue(unconfirmed.needs_confirmation)
         self.assertEqual(
@@ -308,10 +310,7 @@ class StartupIntegrationTests(unittest.TestCase):
         self.assertIsNotNone(still_present)
         self.assertEqual(row_count_after_unconfirmed, row_count_before)
 
-        confirmed = self.brain.process(
-            f"delete interaction {target_id}",
-            confirmed=True,
-        )
+        confirmed = self.session.confirm()
 
         self.assertEqual(confirmed.text, f"Deleted interaction {target_id}.")
         self.assertFalse(confirmed.needs_confirmation)
@@ -353,17 +352,14 @@ class StartupIntegrationTests(unittest.TestCase):
         finally:
             connection.close()
 
-        self.brain.process(f"delete interaction {target_id}")
+        self.session.submit(f"delete interaction {target_id}")
 
         with patch.object(
             self.brain.memory,
             "record_interaction",
             side_effect=RuntimeError("temporary interaction write failure"),
         ):
-            confirmed = self.brain.process(
-                f"delete interaction {target_id}",
-                confirmed=True,
-            )
+            confirmed = self.session.confirm()
 
         self.assertEqual(confirmed.text, f"Deleted interaction {target_id}.")
         self.assertFalse(confirmed.needs_confirmation)
@@ -395,7 +391,7 @@ class StartupIntegrationTests(unittest.TestCase):
             "execute",
             wraps=notes_tool.execute,
         ) as notes_execute:
-            unconfirmed = self.brain.process("retitle note 1: Renamed Release Check")
+            unconfirmed = self.session.submit("retitle note 1: Renamed Release Check")
 
         notes_execute.assert_not_called()
         self.assertTrue(unconfirmed.needs_confirmation)
@@ -406,10 +402,7 @@ class StartupIntegrationTests(unittest.TestCase):
         self.assertEqual(self._fetch_note(1), target_before)
         self.assertEqual(self._row_id_snapshot(), snapshot_before)
 
-        confirmed = self.brain.process(
-            "retitle note 1: Renamed Release Check",
-            confirmed=True,
-        )
+        confirmed = self.session.confirm()
 
         self.assertFalse(confirmed.needs_confirmation)
         self.assertEqual(confirmed.text, "Retitled note 1.")
@@ -452,7 +445,7 @@ class StartupIntegrationTests(unittest.TestCase):
             "execute",
             wraps=notes_tool.execute,
         ) as notes_execute:
-            unconfirmed = self.brain.process("edit note 1: Replacement body text")
+            unconfirmed = self.session.submit("edit note 1: Replacement body text")
 
         notes_execute.assert_not_called()
         self.assertTrue(unconfirmed.needs_confirmation)
@@ -463,10 +456,7 @@ class StartupIntegrationTests(unittest.TestCase):
         self.assertEqual(self._fetch_note(1), target_before)
         self.assertEqual(self._row_id_snapshot(), snapshot_before)
 
-        confirmed = self.brain.process(
-            "edit note 1: Replacement body text",
-            confirmed=True,
-        )
+        confirmed = self.session.confirm()
 
         self.assertFalse(confirmed.needs_confirmation)
         self.assertEqual(confirmed.text, "Edited note 1.")
@@ -509,7 +499,7 @@ class StartupIntegrationTests(unittest.TestCase):
             "execute",
             wraps=notes_tool.execute,
         ) as notes_execute:
-            unconfirmed = self.brain.process("delete note 1")
+            unconfirmed = self.session.submit("delete note 1")
 
         notes_execute.assert_not_called()
         self.assertTrue(unconfirmed.needs_confirmation)
@@ -520,7 +510,7 @@ class StartupIntegrationTests(unittest.TestCase):
         self.assertEqual(self._fetch_note(1), target_before)
         self.assertEqual(self._row_id_snapshot(), snapshot_before)
 
-        confirmed = self.brain.process("delete note 1", confirmed=True)
+        confirmed = self.session.confirm()
 
         self.assertFalse(confirmed.needs_confirmation)
         self.assertEqual(confirmed.text, "Deleted note 1.")
@@ -553,7 +543,7 @@ class StartupIntegrationTests(unittest.TestCase):
             "delete note 3",
         ):
             with self.subTest(command=command, confirmed=False):
-                self.assertTrue(self.brain.process(command).needs_confirmation)
+                self.assertTrue(self.session.submit(command).needs_confirmation)
 
         with patch.object(
             self.brain.memory,
@@ -566,7 +556,9 @@ class StartupIntegrationTests(unittest.TestCase):
                 ("delete note 3", "Deleted note 3."),
             ):
                 with self.subTest(command=command, confirmed=True):
-                    confirmed = self.brain.process(command, confirmed=True)
+                    pending = self.session.submit(command)
+                    self.assertTrue(pending.needs_confirmation)
+                    confirmed = self.session.confirm()
                     self.assertFalse(confirmed.needs_confirmation)
                     self.assertEqual(confirmed.text, expected_text)
 
@@ -592,7 +584,7 @@ class StartupIntegrationTests(unittest.TestCase):
             "execute",
             wraps=memory_tool.execute,
         ) as memory_execute:
-            unconfirmed = self.brain.process(
+            unconfirmed = self.session.submit(
                 "update memory 1: My editor is EXC-REPLACEMENT-TOKEN"
             )
 
@@ -605,10 +597,7 @@ class StartupIntegrationTests(unittest.TestCase):
         self.assertEqual(self._fetch_memory(1), target_before)
         self.assertEqual(self._row_id_snapshot(), snapshot_before)
 
-        confirmed = self.brain.process(
-            "update memory 1: My editor is EXC-REPLACEMENT-TOKEN",
-            confirmed=True,
-        )
+        confirmed = self.session.confirm()
 
         self.assertFalse(confirmed.needs_confirmation)
         self.assertEqual(confirmed.text, "Updated memory 1.")
@@ -650,14 +639,11 @@ class StartupIntegrationTests(unittest.TestCase):
         other_before = self._fetch_memory(2)
 
         self.assertTrue(
-            self.brain.process(
+            self.session.submit(
                 "update memory 1: MY EDITOR IS EXC-CONFLICT-TWO"
             ).needs_confirmation
         )
-        confirmed = self.brain.process(
-            "update memory 1: MY EDITOR IS EXC-CONFLICT-TWO",
-            confirmed=True,
-        )
+        confirmed = self.session.confirm()
 
         self.assertFalse(confirmed.needs_confirmation)
         self.assertEqual(
@@ -684,7 +670,7 @@ class StartupIntegrationTests(unittest.TestCase):
             "execute",
             wraps=memory_tool.execute,
         ) as memory_execute:
-            unconfirmed = self.brain.process("forget memory 1")
+            unconfirmed = self.session.submit("forget memory 1")
 
         memory_execute.assert_not_called()
         self.assertTrue(unconfirmed.needs_confirmation)
@@ -695,7 +681,7 @@ class StartupIntegrationTests(unittest.TestCase):
         self.assertEqual(self._fetch_memory(1), target_before)
         self.assertEqual(self._row_id_snapshot(), snapshot_before)
 
-        confirmed = self.brain.process("forget memory 1", confirmed=True)
+        confirmed = self.session.confirm()
 
         self.assertFalse(confirmed.needs_confirmation)
         self.assertEqual(confirmed.text, "Forgot memory 1.")
@@ -722,8 +708,8 @@ class StartupIntegrationTests(unittest.TestCase):
         self.brain.process("remember My editor is EXC-RETAINED-TOKEN")
         self.brain.process("recall EXC-RETAINED-TOKEN")
 
-        self.assertTrue(self.brain.process("forget memory 1").needs_confirmation)
-        confirmed = self.brain.process("forget memory 1", confirmed=True)
+        self.assertTrue(self.session.submit("forget memory 1").needs_confirmation)
+        confirmed = self.session.confirm()
 
         self.assertEqual(confirmed.text, "Forgot memory 1.")
         self.assertIsNone(self._fetch_memory(1))
@@ -748,7 +734,7 @@ class StartupIntegrationTests(unittest.TestCase):
 
         for command in ("update memory 1: A replaced fact", "forget memory 2"):
             with self.subTest(command=command, confirmed=False):
-                self.assertTrue(self.brain.process(command).needs_confirmation)
+                self.assertTrue(self.session.submit(command).needs_confirmation)
 
         with patch.object(
             self.brain.memory,
@@ -760,7 +746,9 @@ class StartupIntegrationTests(unittest.TestCase):
                 ("forget memory 2", "Forgot memory 2."),
             ):
                 with self.subTest(command=command, confirmed=True):
-                    confirmed = self.brain.process(command, confirmed=True)
+                    pending = self.session.submit(command)
+                    self.assertTrue(pending.needs_confirmation)
+                    confirmed = self.session.confirm()
                     self.assertFalse(confirmed.needs_confirmation)
                     self.assertEqual(confirmed.text, expected_text)
 

@@ -2,6 +2,27 @@
 
 ## Unreleased
 
+- Bound confirmation to the exact plan the owner approved. Confirming a
+  sensitive action now executes the plan that was presented for approval
+  instead of re-sending the original request text, so Maria no longer
+  plans that request a second time after confirmation and can no longer
+  execute a different action than the one it announced. The confirmation
+  lifecycle moved out of the command line into a shared in-memory session
+  contract that any present or future interface can drive without a
+  terminal: it holds at most one pending plan together with the
+  fingerprint captured when that plan was shown, consumes an approval
+  exactly once so it cannot be replayed, and discards the pending plan as
+  soon as another request arrives. A pending plan that was invalidated,
+  already used, cancelled, or no longer matches its captured fingerprint
+  executes nothing and returns one fixed refusal that repeats no request,
+  argument, path, or stored content. The pending plan is process memory
+  only and is never written to the database, a file, or configuration.
+  Confirmation prompt wording, the accepted `y`/`yes` and `n`/`no`
+  answers, cancellation behavior, CLI output, and exit codes are
+  unchanged. Configuring logging a second time is now honoured by
+  replacing Maria's file handler instead of being silently ignored. No
+  schema, permission, or version change was introduced.
+
 ## 0.2.0 - 2026-09-13
 
 - Added read-only interaction-history browsing: `history`, `search history
