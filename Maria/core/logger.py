@@ -3,12 +3,22 @@
 from __future__ import annotations
 
 import logging
+from logging.handlers import RotatingFileHandler
 from pathlib import Path
 
 from core.constants import LOG_DIR
 
 
 LOG_FORMAT = "%(asctime)s | %(levelname)s | %(name)s | %(message)s"
+
+# Bounded growth for the managed log. An operational log that never
+# stops growing becomes a privacy problem of its own at conversational
+# volume, so the active file is capped and a fixed number of previous
+# files is kept. The policy is internal on purpose: it is declared here
+# rather than exposed through configuration, a CLI option, or an
+# environment variable, so no caller can widen or disable it.
+LOG_MAX_BYTES = 1 * 1024 * 1024
+LOG_BACKUP_COUNT = 3
 
 # Marks the handlers this module creates, so reconfiguration replaces only
 # its own and never touches a handler an embedder attached. Ownership is
@@ -34,10 +44,20 @@ def configure_logging(
     The replacement happens only once the new handler exists, so a failure
     to create the directory or open the file propagates with the previous
     configuration still intact.
+
+    The managed handler rotates rather than growing without limit: the
+    active file is capped at ``LOG_MAX_BYTES`` and at most
+    ``LOG_BACKUP_COUNT`` previous files are kept, so the log directory
+    holds a bounded amount of history whatever the volume of use.
     """
     log_dir.mkdir(parents=True, exist_ok=True)
     log_file = log_dir / "maria.log"
-    file_handler = logging.FileHandler(log_file, encoding="utf-8")
+    file_handler = RotatingFileHandler(
+        log_file,
+        maxBytes=LOG_MAX_BYTES,
+        backupCount=LOG_BACKUP_COUNT,
+        encoding="utf-8",
+    )
     file_handler.setFormatter(logging.Formatter(LOG_FORMAT))
     setattr(file_handler, _MANAGED_ATTRIBUTE, True)
 

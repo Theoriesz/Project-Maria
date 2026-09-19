@@ -593,6 +593,26 @@ so a `Plan` fingerprint is unchanged by validation. A path field's `root_class`
 is classification metadata: the registry resolves no path and touches no
 filesystem.
 
+## Shared Failures
+
+`Failure(kind: FailureKind)`
+
+An immutable typed failure carrying a kind and nothing else. `FailureKind`
+is a closed set and currently has one member, `TOOL_EXECUTION_FAILED`.
+`.code` returns that kind's stable identifier, `tool_execution_failed`,
+which is what an operational log record may name. `.message` returns the
+fixed owner-visible sentence for the kind, `Tool execution failed.`. The
+kind is checked by exact type, so a plain string equal to a member's value
+raises `ValueError` rather than reaching the message table.
+
+The value object has no field for a request, a response, an arguments
+mapping, an exception, its text, a path, an endpoint, a credential, or a
+header, and a message interpolates nothing, so neither a caller's value nor
+an underlying failure's text can travel with it. Constructing one logs
+nothing and touches no file. `ContractFailure` in `core/action_contracts.py`
+is separate and unchanged: it is the action-contract vocabulary rather than
+this shared spine.
+
 ## Tool Manager
 
 `ToolManager.execute_tool(tool_name, action, arguments) -> ToolExecutionResult`
@@ -621,6 +641,17 @@ Reports the first violation for one call without executing anything.
 Returns a read-only snapshot of every loaded tool action, used to check the
 declared registry against the tools actually loaded. The registry is never
 populated from this snapshot.
+
+An unexpected exception raised by a tool is contained at this boundary
+rather than crashing Maria, and neither the exception nor its text reaches
+the owner or the log. The result is an unsuccessful `ToolExecutionResult`
+carrying the shared failure's fixed `Tool execution failed.` message, no
+`data`, and no `recorded_message`, while the log records the validated tool
+name, the validated action name, and the typed failure code only. The
+exception is never bound to a name, so no traceback, `str()`, or `repr()`
+of it can be formatted into either. Contract refusals, the not-loaded and
+unsupported-action messages, and every tool's own controlled errors are
+unaffected and keep their existing specific text.
 
 ## Permissions
 

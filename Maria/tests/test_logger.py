@@ -5,11 +5,14 @@ from __future__ import annotations
 import logging
 import tempfile
 import unittest
+from logging.handlers import RotatingFileHandler
 from pathlib import Path
 from unittest.mock import patch
 
 import core.logger as logger_module
+import tests.log_assertions as log_assertions
 from core.logger import configure_logging, get_logger
+from tests.log_assertions import assert_log_omits
 
 
 class LoggerTests(unittest.TestCase):
@@ -93,6 +96,72 @@ class LoggerTests(unittest.TestCase):
 
         log_text = (self.log_dir / "maria.log").read_text(encoding="utf-8")
         self.assertIn(" | WARNING | maria.regression | child-message-sentinel", log_text)
+
+    def test_managed_handler_applies_the_bounded_growth_policy(self) -> None:
+        logger = configure_logging(self.log_dir)
+
+        handler = _managed_handlers(logger)[0]
+        self.assertIsInstance(handler, RotatingFileHandler)
+        self.assertEqual(handler.maxBytes, 1 * 1024 * 1024)
+        self.assertEqual(handler.backupCount, 3)
+
+    def test_declared_bounded_growth_policy_is_the_shipped_one(self) -> None:
+        self.assertEqual(logger_module.LOG_MAX_BYTES, 1048576)
+        self.assertEqual(logger_module.LOG_BACKUP_COUNT, 3)
+
+    def test_sustained_writing_rotates_within_the_backup_inventory(self) -> None:
+        with (
+            patch.object(logger_module, "LOG_MAX_BYTES", 256),
+            patch.object(logger_module, "LOG_BACKUP_COUNT", 3),
+        ):
+            logger = configure_logging(self.log_dir)
+            handler = _managed_handlers(logger)[0]
+            self.assertEqual(handler.maxBytes, 256)
+            self.assertEqual(handler.backupCount, 3)
+
+            highest_file_count = 0
+            for index in range(200):
+                logger.info("rotation-filler-%03d", index)
+                highest_file_count = max(
+                    highest_file_count,
+                    len(list(self.log_dir.iterdir())),
+                )
+            _flush_handlers(logger)
+
+        # One active file plus at most three backups, at every point during
+        # the run rather than only once it finished.
+        self.assertEqual(highest_file_count, 4)
+        self.assertEqual(
+            sorted(path.name for path in self.log_dir.iterdir()),
+            ["maria.log", "maria.log.1", "maria.log.2", "maria.log.3"],
+        )
+        self.assertFalse((self.log_dir / "maria.log.4").exists())
+
+    def test_rotation_keeps_utf8_the_existing_format_and_child_messages(
+        self,
+    ) -> None:
+        message = "Unicode survives rotation: Mar\u00eda \u2603 \u6f22\u5b57"
+
+        with patch.object(logger_module, "LOG_MAX_BYTES", 256):
+            logger = configure_logging(self.log_dir)
+            for index in range(200):
+                logger.info("rotation-filler-%03d", index)
+            get_logger("tools.regression").warning(message)
+            _flush_handlers(logger)
+
+        active = (self.log_dir / "maria.log").read_text(encoding="utf-8")
+        backup = (self.log_dir / "maria.log.1").read_text(encoding="utf-8")
+
+        # A rollover happens before the record that triggered it is written,
+        # so the newest record is in the active file rather than a backup.
+        matching_line = next(
+            line for line in active.splitlines() if message in line
+        )
+        self.assertRegex(matching_line, r"^\d{4}-\d{2}-\d{2} \d{2}:\d{2}:\d{2}")
+        self.assertTrue(
+            matching_line.endswith(f" | WARNING | maria.regression | {message}")
+        )
+        self.assertIn("rotation-filler-", backup)
 
     def test_repeated_configuration_does_not_duplicate_handlers_or_message(self) -> None:
         first_logger = configure_logging(self.log_dir)
@@ -238,7 +307,7 @@ class LoggerTests(unittest.TestCase):
         second_dir = Path(self.temporary_directory.name) / "failed" / "logs"
 
         with patch(
-            "core.logger.logging.FileHandler",
+            "core.logger.RotatingFileHandler",
             side_effect=OSError("handler construction failed"),
         ):
             with self.assertRaisesRegex(OSError, "handler construction failed"):
@@ -268,7 +337,7 @@ class LoggerTests(unittest.TestCase):
 
     def test_file_handler_construction_failure_propagates(self) -> None:
         with patch(
-            "core.logger.logging.FileHandler",
+            "core.logger.RotatingFileHandler",
             side_effect=OSError("handler construction failed"),
         ):
             with self.assertRaisesRegex(OSError, "handler construction failed"):
@@ -287,6 +356,114 @@ class LoggerTests(unittest.TestCase):
         self.assertIsNone(handler.stream)
         log_text = (self.log_dir / "maria.log").read_text(encoding="utf-8")
         self.assertIn("cleanup-marker", log_text)
+
+
+class LogAssertionHelperTests(unittest.TestCase):
+    """Verify the reusable sentinel helper refuses Maria's live log tree.
+
+    Maria's real ``LOG_DIR`` is never used as the live root here: it is
+    patched to a temporary directory, so every rejection probe below names a
+    path that exists only for the duration of the test.
+    """
+
+    def setUp(self) -> None:
+        self.temporary_directory = tempfile.TemporaryDirectory()
+        self.addCleanup(self.temporary_directory.cleanup)
+        root = Path(self.temporary_directory.name)
+
+        self.fake_live_root = root / "live" / "logs"
+        (self.fake_live_root / "nested").mkdir(parents=True)
+        for path in (
+            self.fake_live_root / "maria.log",
+            self.fake_live_root / "nested" / "maria.log",
+        ):
+            path.write_text("live-content-must-not-be-read\n", encoding="utf-8")
+
+        self.outside_dir = root / "temporary"
+        self.outside_dir.mkdir()
+        self.outside_log = self.outside_dir / "maria.log"
+        self.outside_log.write_text(
+            "2026-01-01 00:00:00,000 | INFO | maria | ordinary-line\n",
+            encoding="utf-8",
+        )
+
+        patcher = patch.object(
+            log_assertions,
+            "LOG_DIR",
+            self.fake_live_root,
+        )
+        patcher.start()
+        self.addCleanup(patcher.stop)
+
+    def test_every_path_inside_the_live_root_is_refused(self) -> None:
+        cases = {
+            "the live root itself": self.fake_live_root,
+            "a file directly inside it": self.fake_live_root / "maria.log",
+            "a nested descendant": self.fake_live_root / "nested" / "maria.log",
+            "a traversal back into it": (
+                self.fake_live_root / "nested" / ".." / "maria.log"
+            ),
+            "a traversal into a nested child": (
+                self.fake_live_root / "nested" / ".." / "nested" / "maria.log"
+            ),
+            "a traversal from outside it": (
+                self.outside_dir / ".." / "live" / "logs" / "maria.log"
+            ),
+        }
+
+        for label, target in cases.items():
+            with self.subTest(target=label):
+                with self.assertRaises(ValueError) as caught:
+                    assert_log_omits(self, target, ("absent-value",))
+
+                self.assertIn("live log directory", str(caught.exception))
+
+    def test_a_live_root_path_is_refused_before_anything_is_read(self) -> None:
+        with patch.object(Path, "read_text", autospec=True) as read_text:
+            with self.assertRaises(ValueError):
+                assert_log_omits(
+                    self,
+                    self.fake_live_root / "nested" / "maria.log",
+                    ("absent-value",),
+                )
+
+        read_text.assert_not_called()
+
+    def test_a_temporary_path_outside_the_live_root_is_read(self) -> None:
+        assert_log_omits(self, self.outside_log, ("absent-value",))
+        assert_log_omits(self, self.outside_log, ("absent-value", "also-absent"))
+
+    def test_a_blank_sentinel_is_refused(self) -> None:
+        for sentinel in ("", "   ", "\t\n"):
+            with self.subTest(sentinel=repr(sentinel)):
+                with self.assertRaises(ValueError) as caught:
+                    assert_log_omits(self, self.outside_log, (sentinel,))
+
+                self.assertIn("non-blank", str(caught.exception))
+
+    def test_supplying_no_sentinel_at_all_is_refused(self) -> None:
+        with self.assertRaises(ValueError):
+            assert_log_omits(self, self.outside_log, ())
+
+    def test_a_leak_names_the_sentinel_and_nothing_around_it(self) -> None:
+        leaked = "leaked-sentinel-6b2f0a9d41"
+        unrelated = "unrelated-log-content-cc71e4b8"
+        log_file = self.outside_dir / "leaky.log"
+        log_file.write_text(
+            f"... | INFO | maria | {unrelated}\n... | INFO | maria | {leaked}\n",
+            encoding="utf-8",
+        )
+
+        with self.assertRaises(AssertionError) as caught:
+            assert_log_omits(self, log_file, (leaked, "absent-value"))
+
+        report = str(caught.exception)
+        self.assertIn(leaked, report)
+        self.assertIn("leaky.log", report)
+        self.assertNotIn(unrelated, report)
+        self.assertNotIn("absent-value", report.split("Private values reached")[-1])
+        self.assertNotIn(str(log_file), report)
+        self.assertNotIn(str(self.outside_dir), report)
 
 
 def _file_handlers(logger: logging.Logger) -> list[logging.FileHandler]:

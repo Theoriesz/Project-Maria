@@ -14,6 +14,7 @@ from core.action_contracts import (
     ContractViolation,
 )
 from core.config import MariaConfig
+from core.failures import Failure, FailureKind
 from core.logger import get_logger
 from core.memory import Memory
 
@@ -125,6 +126,14 @@ class ToolManager:
         caller cannot reach a tool with arguments the central registry
         rejects. Brain validates a whole plan earlier for ordering reasons;
         this pass is the defensive one that no caller can skip.
+
+        An unexpected exception from a tool is contained here rather than
+        crashing Maria, and neither the exception nor its text reaches the
+        owner or the log. The result carries the shared typed failure's
+        fixed message, and the log records the validated action identity
+        and the failure code only. A tool that has a safe, specific
+        diagnostic still logs it itself, where it knows what its own
+        failure is allowed to say.
         """
         violation = self.validate_action(tool_name, action, arguments)
         if violation is not None:
@@ -152,6 +161,16 @@ class ToolManager:
         try:
             self.logger.info("Executing tool action: %s.%s", tool_name, action)
             return tool.execute(action, arguments)
-        except Exception as exc:  # noqa: BLE001 - tools must not crash the app.
-            self.logger.exception("Tool execution failed: %s.%s", tool_name, action)
-            return ToolExecutionResult(False, f"Tool execution failed: {exc}")
+        except Exception:  # noqa: BLE001 - tools must not crash the app.
+            # The exception is deliberately not bound, so no path here can
+            # format its text, its args, or its traceback into a response or
+            # a log record. Both names logged below already matched a
+            # declared contract entry above, so neither carries caller text.
+            failure = Failure(FailureKind.TOOL_EXECUTION_FAILED)
+            self.logger.error(
+                "Tool execution failed: %s.%s code=%s",
+                tool_name,
+                action,
+                failure.code,
+            )
+            return ToolExecutionResult(False, failure.message)
