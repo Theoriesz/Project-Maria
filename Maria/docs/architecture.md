@@ -152,7 +152,29 @@ flushed, detached, and closed, and one new handler for the requested directory
 replaces them, so a second call never duplicates a handler and never keeps
 writing to the previous directory. The replacement happens only once the new
 handler exists, so a failure to create the directory or open the file
-propagates with the previous configuration intact.
+propagates with the previous configuration intact. The managed handler
+rotates rather than growing without limit: the active `maria.log` is capped
+at 1 MiB and at most three previous files are kept, so the directory holds
+`maria.log` through `maria.log.3` and no more. That policy is internal and
+has no configuration field, CLI option, or environment variable.
+
+Maria carries no global redaction, scrubbing, or log-filtering layer, and
+deliberately so: an existing test asserts that the filesystem tool's
+operational log does retain the absolute root path and the filenames its
+owner-visible response omits, and a blanket filter would break that contract
+while giving false confidence everywhere else. The discipline is
+module-scoped instead: a module never hands a private value to the logger in
+the first place. `failures.py` supports that discipline. It declares a closed
+set of failure kinds and one immutable value object holding a kind and
+nothing else, with no field for a request, a response, an arguments mapping,
+an exception, its text, a path, an endpoint, a credential, or a header, and
+with a fixed owner-visible sentence per kind. `tool_manager.py` uses it at
+the one boundary that previously leaked: an unexpected exception from a tool
+now yields that fixed message and a log record naming the validated tool,
+the validated action, and the typed failure code, with the exception never
+bound to a name. Tools keep their own specific diagnostics, where each one
+knows what its own failure may safely say.
+
 `Memory.record_interaction()` separately writes request and response text to
 SQLite. A log message that omits full request or response content does not
 prevent that content from appearing in interaction history.

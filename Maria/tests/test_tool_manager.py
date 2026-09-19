@@ -17,12 +17,15 @@ from core.action_contracts import (
     ArgumentContract,
 )
 from core.config import MariaConfig
+from core.failures import FailureKind
+from core.logger import configure_logging
 from core.memory import Memory
 from core.tool_manager import (
     BUILT_IN_TOOL_MODULES,
     ToolExecutionResult,
     ToolManager,
 )
+from tests.log_assertions import assert_log_omits
 
 
 EXPECTED_MODULES = (
@@ -36,6 +39,15 @@ EXPECTED_MODULES = (
 EXPECTED_TOOL_NAMES = frozenset(
     {"calculator", "filesystem", "history", "memory", "notes", "system"}
 )
+
+# The one owner-visible sentence an unexpected tool exception produces,
+# written out here so the test asserts the contract rather than echoing
+# whatever the implementation currently returns.
+TOOL_EXECUTION_FAILED_MESSAGE = "Tool execution failed."
+
+# Distinctive values that must never leave the boundary that saw them.
+EXCEPTION_SENTINEL = "private-exception-detail-7f3b9c2d1e"
+ARGUMENT_SENTINEL = "private-argument-content-5a8e4b06c7"
 
 
 def _stub_registry(
@@ -253,16 +265,22 @@ class ToolManagerTests(unittest.TestCase):
 
         self.assertEqual(
             result,
-            ToolExecutionResult(
-                False,
-                "Tool execution failed: distinct failure detail",
-            ),
+            ToolExecutionResult(False, TOOL_EXECUTION_FAILED_MESSAGE),
         )
-        self.manager_logger.exception.assert_called_once_with(
-            "Tool execution failed: %s.%s",
+        self.assertNotIn("distinct failure detail", result.message)
+        self.manager_logger.error.assert_called_once_with(
+            "Tool execution failed: %s.%s code=%s",
             "sample",
             "run",
+            FailureKind.TOOL_EXECUTION_FAILED.value,
         )
+        # exception() would attach the traceback, and with it the very
+        # text the response no longer carries.
+        self.manager_logger.exception.assert_not_called()
+        logged_calls = " ".join(
+            str(entry) for entry in self.manager_logger.method_calls
+        )
+        self.assertNotIn("distinct failure detail", logged_calls)
 
     def test_missing_module_import_propagates_during_load(self) -> None:
         manager = ToolManager(self.config, self.memory, self.manager_logger)
@@ -390,6 +408,150 @@ class ToolManagerTests(unittest.TestCase):
         return manager
 
 
+class ToolManagerLogPrivacyTests(unittest.TestCase):
+    """Prove an unexpected tool exception reaches neither response nor log.
+
+    This exercises the production logging path rather than a mock: the real
+    ``configure_logging()`` installs the real handler, the manager takes the
+    real child logger it builds for itself, and the assertions read the file
+    that handler actually wrote. Everything stays under a temporary
+    directory, so Maria's live log is never opened.
+    """
+
+    def setUp(self) -> None:
+        self.temporary_directory = tempfile.TemporaryDirectory()
+        self.addCleanup(self.temporary_directory.cleanup)
+        self.root = Path(self.temporary_directory.name)
+        self.config = _temporary_config(self.root)
+        self.memory = Memory(
+            self.config.database_path,
+            logger=Mock(spec=logging.Logger),
+        )
+        self.log_dir = self.root / "logs"
+        self.log_file = self.log_dir / "maria.log"
+
+        self.maria_logger = logging.getLogger("maria")
+        self.original_handlers = tuple(self.maria_logger.handlers)
+        self.original_level = self.maria_logger.level
+        self.original_propagate = self.maria_logger.propagate
+        for handler in self.original_handlers:
+            self.maria_logger.removeHandler(handler)
+        self.addCleanup(self._restore_maria_logger)
+
+    def _restore_maria_logger(self) -> None:
+        """Close what this test configured and put the previous state back."""
+        for handler in list(self.maria_logger.handlers):
+            try:
+                handler.flush()
+            finally:
+                self.maria_logger.removeHandler(handler)
+                handler.close()
+        for handler in self.original_handlers:
+            self.maria_logger.addHandler(handler)
+        self.maria_logger.setLevel(self.original_level)
+        self.maria_logger.propagate = self.original_propagate
+
+    def _load_stub_through_the_real_logging_path(self, tool: _StubTool) -> ToolManager:
+        """Load one stub, letting the manager build its own real loggers."""
+        manager = ToolManager(
+            self.config,
+            self.memory,
+            contracts=_stub_registry(
+                ArgumentContract(
+                    "text",
+                    str,
+                    required=True,
+                    allow_blank=True,
+                    minimum_length=None,
+                    maximum_length=None,
+                )
+            ),
+        )
+        module = SimpleNamespace(build_tool=Mock(return_value=tool))
+        with (
+            patch.object(manager, "discover_tools", return_value=("tools.stub",)),
+            patch.object(
+                tool_manager_module.importlib,
+                "import_module",
+                return_value=module,
+            ),
+        ):
+            manager.load_tools()
+        return manager
+
+    def _flush(self) -> None:
+        """Flush the configured handler so the file holds every record."""
+        for handler in self.maria_logger.handlers:
+            handler.flush()
+
+    def test_unexpected_tool_exception_reaches_neither_response_nor_log(self) -> None:
+        configure_logging(self.log_dir)
+        tool = _StubTool("sample", exception=RuntimeError(EXCEPTION_SENTINEL))
+        manager = self._load_stub_through_the_real_logging_path(tool)
+        self._flush()
+        before = self.log_file.read_text(encoding="utf-8")
+
+        # Returning rather than raising is itself the proof that the stub's
+        # exception was contained and never escaped the manager.
+        result = manager.execute_tool("sample", "run", {"text": ARGUMENT_SENTINEL})
+
+        self._flush()
+        added = self.log_file.read_text(encoding="utf-8")[len(before):]
+
+        self.assertFalse(result.success)
+        self.assertEqual(result.message, TOOL_EXECUTION_FAILED_MESSAGE)
+        self.assertIsNone(result.recorded_message)
+        self.assertIsNone(result.data)
+        self.assertNotIn(EXCEPTION_SENTINEL, result.message)
+        self.assertNotIn(ARGUMENT_SENTINEL, result.message)
+        self.assertEqual(tool.call_count, 1)
+
+        assert_log_omits(
+            self,
+            self.log_file,
+            (
+                EXCEPTION_SENTINEL,
+                ARGUMENT_SENTINEL,
+                "RuntimeError",
+                "Traceback",
+                "_StubTool",
+                "object at 0x",
+            ),
+        )
+
+        # Enumerating every record the call produced proves the omission
+        # positively: there is no third line in which a request, a plan, an
+        # argument, or an object repr could have been recorded.
+        self.assertEqual(
+            [line.split(" | ", 1)[1] for line in added.splitlines()],
+            [
+                "INFO | maria.tool_manager | Executing tool action: sample.run",
+                "ERROR | maria.tool_manager | Tool execution failed: sample.run "
+                f"code={FailureKind.TOOL_EXECUTION_FAILED.value}",
+            ],
+        )
+
+    def test_a_successful_action_still_logs_only_its_safe_identity(self) -> None:
+        configure_logging(self.log_dir)
+        tool = _StubTool("sample")
+        manager = self._load_stub_through_the_real_logging_path(tool)
+        self._flush()
+        before = self.log_file.read_text(encoding="utf-8")
+
+        result = manager.execute_tool("sample", "run", {"text": ARGUMENT_SENTINEL})
+
+        self._flush()
+        added = self.log_file.read_text(encoding="utf-8")[len(before):]
+
+        self.assertTrue(result.success)
+        self.assertEqual(result.message, "ran sample")
+        assert_log_omits(self, self.log_file, (ARGUMENT_SENTINEL,))
+        self.assertEqual(
+            [line.split(" | ", 1)[1] for line in added.splitlines()],
+            ["INFO | maria.tool_manager | Executing tool action: sample.run"],
+        )
+
+
 class _StubTool:
     """Small deterministic tool used to exercise manager dispatch."""
 
@@ -406,6 +568,7 @@ class _StubTool:
         self.result = result or ToolExecutionResult(True, f"ran {name}")
         self.exception = exception
         self.received_arguments: dict[str, Any] | None = None
+        self.call_count = 0
 
     def execute(
         self,
@@ -413,6 +576,7 @@ class _StubTool:
         arguments: dict[str, Any],
     ) -> ToolExecutionResult:
         del action
+        self.call_count += 1
         self.received_arguments = arguments
         if self.exception is not None:
             raise self.exception

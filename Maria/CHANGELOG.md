@@ -96,6 +96,34 @@
   and every permission decision are unchanged; `core/permissions.py`, both
   mandatory sets, and its tests are untouched. No schema, permission, or
   version change was introduced.
+- Introduced shared typed failures with a privacy-safe logging discipline
+  and bounded the operational log's growth. A new `core/failures.py`
+  declares a closed set of failure kinds and one immutable value object
+  that carries a kind and nothing else: there is no field for a request, a
+  response, an arguments mapping, an exception, its text, a path, an
+  endpoint, a credential, or a header, and each kind's owner-visible
+  sentence is fixed rather than interpolated, so no boundary can attach a
+  private value by accident. `ToolManager` now uses it for an unexpected
+  exception raised by a tool, which changes one user-visible string:
+  `Tool execution failed: <raw exception text>` becomes `Tool execution
+  failed.`. The matching operational record changed with it, from a
+  formatted traceback to the validated tool name, the validated action
+  name, and the typed failure code alone; the exception is no longer even
+  bound to a name, so nothing on that path can format it into a response or
+  a log. Maria's managed log handler now rotates instead of growing without
+  limit, keeping at most a 1 MiB active `maria.log` plus three previous
+  files, with no configuration field, CLI option, or environment variable
+  to widen it; encoding, format, file name, level, propagation, and the
+  existing handler-ownership rules are unchanged. There is deliberately no
+  global redaction, scrubbing, or filtering layer, because the filesystem
+  tool's operational log is deliberately tested to retain the absolute root
+  path and filenames its sanitized response omits, and a blanket filter
+  would break that contract while giving false confidence elsewhere; the
+  discipline is instead that a module never hands a private value to the
+  logger. Every tool keeps its own controlled error messages and specific
+  diagnostics, and every other user-visible string, permission decision,
+  and recorded interaction row is unchanged. No schema, permission, or
+  version change was introduced.
 
 ## 0.2.0 - 2026-09-13
 
