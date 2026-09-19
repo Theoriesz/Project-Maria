@@ -22,6 +22,26 @@
   unchanged. Configuring logging a second time is now honoured by
   replacing Maria's file handler instead of being silently ignored. No
   schema, permission, or version change was introduced.
+- Resolved permission for every step of a plan before executing any part
+  of it. Maria previously decided one step's permission and ran that same
+  step before looking at the next, so a plan whose later step was denied
+  could already have executed an earlier one. Permission resolution is now
+  a complete first phase and dispatch a separate second phase: a denial
+  anywhere in a plan denies the whole plan and executes no tool at all, and
+  a plan that needs confirmation executes nothing before the owner approves
+  it, even when an earlier step would have been allowed on its own. A plan
+  that both needs confirmation and contains a denial is denied outright
+  rather than offered for approval. Confirming re-resolves the whole plan's
+  permissions before dispatching anything, so a decision that changed since
+  the plan was shown still applies and the consumed approval still cannot be
+  replayed. Approved steps then run in plan order and at most once each.
+  Stop-on-failure is unchanged and remains the documented semantics: the
+  first unsuccessful result stops the plan, and Maria neither rolls back nor
+  compensates for the steps that already succeeded. Every command Maria
+  currently understands still plans to at most one step, so single-step
+  responses, confirmation wording, recorded interaction rows, CLI output,
+  and every permission decision are unchanged. No schema, permission, or
+  version change was introduced.
 
 ## 0.2.0 - 2026-09-13
 

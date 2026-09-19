@@ -13,8 +13,12 @@ from logging import Logger
 from core.config import MariaConfig, load_config
 from core.logger import configure_logging, get_logger
 from core.memory import Memory
-from core.permissions import PermissionDecision, PermissionManager
-from core.planner import Plan, Planner
+from core.permissions import (
+    PermissionDecision,
+    PermissionManager,
+    PermissionResult,
+)
+from core.planner import Plan, Planner, PlanStep
 from core.tool_manager import ToolExecutionResult, ToolManager
 
 
@@ -25,6 +29,51 @@ class BrainResponse:
     text: str
     needs_confirmation: bool = False
     plan: Plan | None = None
+
+
+@dataclass(frozen=True)
+class _ResolvedStep:
+    """One plan step paired with the permission decision it resolved to.
+
+    Both fields are the original objects rather than copies, so a resolved
+    step never duplicates a step's immutable arguments into mutable storage
+    and never restates what PermissionManager decided.
+    """
+
+    step: PlanStep
+    permission: PermissionResult
+
+
+@dataclass(frozen=True)
+class _ResolvedPlan:
+    """A plan whose every step was resolved before any step was dispatched.
+
+    This is transient execution state. It is never persisted, never logged,
+    and never handed to another module: it exists only so Brain can finish
+    resolving permission for a complete plan before dispatching the first
+    tool. It reports which decisions came back without making any of them.
+    """
+
+    plan: Plan
+    steps: tuple[_ResolvedStep, ...]
+
+    @property
+    def first_denied_step(self) -> _ResolvedStep | None:
+        """Return the earliest denied step in plan order, or None."""
+        for resolved_step in self.steps:
+            if resolved_step.permission.decision == PermissionDecision.DENIED:
+                return resolved_step
+        return None
+
+    @property
+    def confirmation_required_steps(self) -> tuple[_ResolvedStep, ...]:
+        """Return every step awaiting explicit confirmation, in plan order."""
+        required = PermissionDecision.REQUIRES_CONFIRMATION
+        return tuple(
+            resolved_step
+            for resolved_step in self.steps
+            if resolved_step.permission.decision == required
+        )
 
 
 class MariaBrain:
@@ -103,50 +152,93 @@ class MariaBrain:
         """Run an already-approved plan without planning the request again.
 
         The caller has bound the owner's approval to this exact plan, so
-        Brain retrieves no context and invokes no planner. It resumes the
-        ordinary permission, dispatch, and recording flow for the steps it
-        is handed.
+        Brain retrieves no context and invokes no planner. It resolves the
+        plan's permissions again before dispatching anything, because an
+        approval authorises a plan rather than freezing the decisions that
+        were current when that plan was shown, then resumes the ordinary
+        dispatch and recording flow.
         """
         return self._run_plan(plan, confirmed=True)
 
     def _run_plan(self, plan: Plan, *, confirmed: bool) -> BrainResponse:
-        """Check, dispatch, and record one plan's steps generically."""
+        """Resolve a whole plan's permissions, then dispatch it generically.
+
+        Resolution is a complete first phase: every step's permission is
+        decided before any step is dispatched. A denial anywhere denies the
+        entire plan, and an outstanding confirmation anywhere holds the
+        entire plan, so neither outcome can arrive after a step already ran.
+        Dispatch begins only once resolution has cleared the whole plan.
+        """
         if not plan.steps:
             response = plan.response_if_no_action or "I do not know how to handle that yet."
             self._record_interaction(plan.original_request, response)
             return BrainResponse(response, plan=plan)
 
-        results: list[ToolExecutionResult] = []
+        resolved = self._resolve_plan(plan)
 
-        for step in plan.steps:
-            permission = self.permissions.check(step.tool_name, step.action)
+        denied_step = resolved.first_denied_step
+        if denied_step is not None:
+            self.logger.warning(
+                "Denied action: %s.%s",
+                denied_step.step.tool_name,
+                denied_step.step.action,
+            )
+            response = f"Permission denied: {denied_step.permission.reason}"
+            self._record_interaction(plan.original_request, response)
+            return BrainResponse(response, plan=plan)
 
-            if permission.decision == PermissionDecision.DENIED:
-                self.logger.warning(
-                    "Denied action: %s.%s",
-                    step.tool_name,
-                    step.action,
-                )
-                response = f"Permission denied: {permission.reason}"
-                self._record_interaction(plan.original_request, response)
-                return BrainResponse(response, plan=plan)
-
-            if (
-                permission.decision == PermissionDecision.REQUIRES_CONFIRMATION
-                and not confirmed
-            ):
+        awaiting_confirmation = resolved.confirmation_required_steps
+        if awaiting_confirmation and not confirmed:
+            for resolved_step in awaiting_confirmation:
                 self.logger.info(
                     "Confirmation required for action: %s.%s",
-                    step.tool_name,
-                    step.action,
+                    resolved_step.step.tool_name,
+                    resolved_step.step.action,
                 )
-                return BrainResponse(
-                    text=f"Confirmation required: {permission.reason}",
-                    needs_confirmation=True,
-                    plan=plan,
-                )
+            return BrainResponse(
+                text=self._format_confirmation_request(resolved),
+                needs_confirmation=True,
+                plan=plan,
+            )
 
-            if permission.decision == PermissionDecision.REQUIRES_CONFIRMATION:
+        return self._execute_resolved_plan(resolved)
+
+    def _resolve_plan(self, plan: Plan) -> _ResolvedPlan:
+        """Decide permission for every step before any step is dispatched.
+
+        Steps are inspected in plan order and each is paired with the result
+        PermissionManager returned for it. No tool runs during this pass, the
+        plan is neither rebuilt nor mutated, and the resolution is returned
+        rather than stored, so it cannot outlive the request producing it.
+        """
+        return _ResolvedPlan(
+            plan=plan,
+            steps=tuple(
+                _ResolvedStep(
+                    step,
+                    self.permissions.check(step.tool_name, step.action),
+                )
+                for step in plan.steps
+            ),
+        )
+
+    def _execute_resolved_plan(self, resolved: _ResolvedPlan) -> BrainResponse:
+        """Dispatch an already-resolved plan in order and record the outcome.
+
+        Every step reaching this point resolved to an allowed or an approved
+        decision, so dispatch performs no permission work of its own. Each
+        step runs at most once and receives the immutable arguments object
+        its PlanStep holds. The first unsuccessful result stops the plan
+        without undoing the steps that already succeeded.
+        """
+        results: list[ToolExecutionResult] = []
+
+        for resolved_step in resolved.steps:
+            step = resolved_step.step
+
+            if resolved_step.permission.decision == (
+                PermissionDecision.REQUIRES_CONFIRMATION
+            ):
                 self.logger.info(
                     "Confirmed action: %s.%s",
                     step.tool_name,
@@ -165,10 +257,10 @@ class MariaBrain:
 
         response = self._format_results(results)
         self._record_interaction(
-            plan.original_request,
+            resolved.plan.original_request,
             self._format_recorded_results(results),
         )
-        return BrainResponse(response, plan=plan)
+        return BrainResponse(response, plan=resolved.plan)
 
     def _record_interaction(self, user_input: str, response: str) -> None:
         """Store an interaction without allowing memory failures to crash Maria."""
@@ -176,6 +268,30 @@ class MariaBrain:
             self.memory.record_interaction(user_input, response)
         except RuntimeError as exc:
             self.logger.error("Unable to record interaction: %s", exc)
+
+    @staticmethod
+    def _format_confirmation_request(resolved: _ResolvedPlan) -> str:
+        """Render the confirmation request for a resolved plan.
+
+        A single-step plan keeps its existing wording exactly. A longer plan
+        is listed in plan order, naming each step's tool action and the
+        permission outcome it resolved to. Neither form repeats an argument
+        value, so no stored content and no host path can reach the owner's
+        interface, an interaction row, or a log through this text.
+        """
+        if len(resolved.steps) == 1:
+            return f"Confirmation required: {resolved.steps[0].permission.reason}"
+
+        lines = [
+            f"Confirmation required for {len(resolved.steps)} planned actions:"
+        ]
+        for position, resolved_step in enumerate(resolved.steps, start=1):
+            outcome = resolved_step.permission.decision.value.replace("_", " ")
+            lines.append(
+                f"{position}. {resolved_step.step.tool_name}."
+                f"{resolved_step.step.action}: {outcome}"
+            )
+        return "\n".join(lines)
 
     @staticmethod
     def _format_results(results: list[ToolExecutionResult]) -> str:

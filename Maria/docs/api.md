@@ -7,21 +7,79 @@ public network APIs.
 
 `MariaBrain.process(user_input: str) -> BrainResponse`
 
-Plans one request and coordinates it from input to plan, permission check, tool
-execution, and interaction-history recording. A step that requires confirmation
-returns before execution, carrying its `Plan` on the response.
+Plans one request and coordinates it from input to plan, whole-plan permission
+resolution, tool execution, and interaction-history recording. A plan holding a
+step that requires confirmation returns before execution, carrying its `Plan` on
+the response.
 
 `MariaBrain.execute_confirmed_plan(plan: Plan) -> BrainResponse`
 
 Runs a plan whose approval a caller has already bound, resuming the same
 permission, dispatch, and recording flow without retrieving context or invoking
-Planner again. There is no raw-text confirmation parameter: an approved request
-is never planned a second time.
+Planner again. It resolves the whole plan's permissions again before dispatching
+anything, so a decision that changed since the plan was shown still applies. That
+recheck is not replanning: it re-resolves the same immutable plan. There is no
+raw-text confirmation parameter: an approved request is never planned a second
+time.
 
 Both entry points share one internal helper, so zero-step, denied, allowed,
 successful, and failed-result behavior is identical on either path. The request
 half of a recorded interaction is the plan's `original_request`, which Planner
 sets to the cleaned input it was given.
+
+### Permission Resolution and Execution Phases
+
+A plan with at least one step runs in two separate phases, and no tool is
+dispatched while the first phase is incomplete.
+
+Phase one resolves the plan. Brain walks the steps in their original order and
+calls `PermissionManager.check(tool_name, action)` once for each, pairing every
+step with the `PermissionResult` that came back. It runs no tool, calls no
+planner, retrieves no context, and neither rebuilds the plan nor copies a step's
+arguments. The resolution is a private, frozen, in-memory value: it is never
+persisted, never logged, and never handed to another module, and it reports
+which decisions came back without making any of them.
+
+Phase two dispatches. It begins only once resolution has cleared the whole plan:
+
+- If any step resolved to `denied`, the entire plan is denied, no tool runs, and
+  no confirmation becomes pending. The earliest denied step in plan order
+  supplies the reason, and the denial is recorded through the normal path. A
+  plan whose first step needs confirmation and whose second is denied is denied
+  outright rather than offered for approval.
+- Otherwise, if any step resolved to `requires_confirmation` and the plan is not
+  yet approved, one confirmation-required response is returned carrying the exact
+  plan. Nothing executes and nothing is recorded. One approval covers that one
+  complete plan and no other.
+- Otherwise every step is dispatched in plan order, at most once each, receiving
+  the immutable arguments object its `PlanStep` holds rather than a copy.
+
+Stop-on-failure is unchanged: the first unsuccessful `ToolExecutionResult` stops
+the plan, later steps do not run, and Maria neither rolls back nor compensates
+for steps that already succeeded. There is no transaction, undo, or workflow
+persistence across steps. The displayed and recorded text covers exactly the
+prefix of steps that ran.
+
+`PermissionManager` is consumed unchanged. Brain coordinates several ordinary
+`check()` calls and never reinterprets an individual result, adds an argument,
+or asks for a bulk decision. Planner still emits at most one step for every
+command Maria currently understands, so these guarantees are about plans that a
+later stage may produce rather than about any command available today.
+
+A confirmation request for a single-step plan keeps its existing wording. A plan
+with more than one step is instead rendered as a deterministic, plan-ordered
+list naming each step's tool action and the permission outcome it resolved to:
+
+```text
+Confirmation required for 2 planned actions:
+1. calculator.calculate: allowed
+2. filesystem.rename: requires confirmation
+```
+
+Neither form repeats an argument value, so no stored content, and no absolute
+host path, can reach the owner's interface, an interaction row, or a log through
+it. The rendering carries no fingerprint and no canonical serialized plan
+content, and a pending confirmation is not recorded to interaction history.
 
 ## Session
 
