@@ -42,6 +42,60 @@
   responses, confirmation wording, recorded interaction rows, CLI output,
   and every permission decision are unchanged. No schema, permission, or
   version change was introduced.
+- Gave every built-in action one independent declarative argument contract,
+  enforced before any permission is evaluated. Registered action membership
+  was never argument validation: nothing declared which arguments an action
+  required, which were optional, what types they accepted, what bounds
+  applied, or which fields were paths, and several tools quietly converted a
+  malformed value with a bare string or integer conversion instead of
+  refusing it. A new `core/action_contracts.py` now declares all 22 built-in
+  tool actions by hand, independently of the loaded tool inventory, of
+  `PermissionManager`, and of the planner, and a two-way consistency test
+  proves the declared set and the loaded set match exactly. Validation runs
+  as a complete first phase over a whole plan, so an unknown tool, an unknown
+  action, or a malformed argument anywhere refuses the plan with zero
+  permission checks, zero tool calls, and no pending confirmation; confirming
+  an approved plan validates the same plan again before permissions are
+  re-resolved. Missing, extra, wrong-type, and out-of-range fields each
+  produce a distinct, content-safe refusal naming only the tool, action, and
+  field, never the submitted value, and duplicate contract declarations are
+  rejected rather than silently overwritten. Every field declares every bound
+  that applies to its type: an integer field its numeric minimum and maximum,
+  a text field whether blank content is accepted and its minimum and maximum
+  length, and an absent bound is declared as absent rather than left open. A
+  declaration whose metadata cannot apply to its type — a length bound on an
+  integer, a numeric bound on text, a negative or reversed length pair, a
+  missing blank policy — is rejected when the contract is built. Every text
+  field rejects blank or whitespace-only content, matching what each tool
+  already refused, and `calculator.calculate.expression` declares the
+  established 200-character maximum, measured on the stripped text exactly as
+  the calculator measures it. Nothing is coerced, parsed, truncated, clamped,
+  defaulted, or repaired, and `bool` is no longer accepted where an integer is
+  required. Path fields on `filesystem.read`,
+  `filesystem.list`, `filesystem.rename`, and `filesystem.move` declare the
+  configured safe-root class as classification metadata only; no path is
+  resolved and no filesystem access happens during validation. `ToolManager`
+  validates the same contracts at its own dispatch boundary, so a direct
+  caller cannot recover the old converting behavior, and the tools keep their
+  own checks as defence in depth. The deliberately tightened malformed paths
+  are the calculator expression; every filesystem path, source, and
+  destination; the history search query; the memory fact and search query;
+  the note title, body, and read target; and the memory, memory-search, and
+  notes listing limits, where a provided value must now be an actual integer
+  between 1 and 100 rather than being converted or clamped. A provided blank
+  `notes.create` title is no longer silently repaired to `Untitled`; only a
+  genuinely absent title still takes that tool-owned default, exactly as an
+  absent `filesystem.list` path still defaults to the safe root and an absent
+  listing limit still defaults to 20. The contract never inserts a default
+  into a plan's arguments, and `core/memory.py` is unchanged: its internal
+  limit clamp remains as defence in depth below the new gates rather than
+  being the acceptance policy. One user-visible consequence: `create note
+  <title>:` with an empty body now reports the contract refusal naming the
+  blank `body` field instead of the tool's `Note body is required.`. Every
+  other valid deterministic command, its output, its recorded interaction row,
+  and every permission decision are unchanged; `core/permissions.py`, both
+  mandatory sets, and its tests are untouched. No schema, permission, or
+  version change was introduced.
 
 ## 0.2.0 - 2026-09-13
 

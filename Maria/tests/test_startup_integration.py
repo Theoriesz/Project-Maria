@@ -99,7 +99,8 @@ class StartupIntegrationTests(unittest.TestCase):
                 self.assertFalse(probe.success)
                 self.assertEqual(
                     probe.message,
-                    f"Unsupported action for {tool_name}: startup_probe",
+                    f"Unsupported action: {tool_name}.startup_probe "
+                    "is not a supported action.",
                 )
 
         response = self.brain.process("calculate 6 * 7")

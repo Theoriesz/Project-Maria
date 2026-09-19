@@ -28,7 +28,7 @@ from core.tool_manager import ToolExecutionResult, ToolManager
 ALLOWED = PermissionResult(PermissionDecision.ALLOWED, "allowed")
 DENIED = PermissionResult(
     PermissionDecision.DENIED,
-    "filesystem.write is denied by configuration.",
+    "filesystem.read is denied by configuration.",
 )
 NEEDS_CONFIRMATION = PermissionResult(
     PermissionDecision.REQUIRES_CONFIRMATION,
@@ -67,6 +67,7 @@ class SessionTestCase(unittest.TestCase):
         self.planner = Mock(spec=Planner)
         self.memory = Mock(spec=Memory)
         self.tool_manager = Mock(spec=ToolManager)
+        self.tool_manager.validate_action.return_value = None
         self.permissions = Mock(spec=PermissionManager)
         self.brain_logger = Mock(spec=logging.Logger)
         self.session_logger = Mock(spec=logging.Logger)
@@ -410,19 +411,22 @@ class UnchangedBehaviorTests(SessionTestCase):
 
     def test_denied_request_keeps_its_response_and_recording(self) -> None:
         plan = Plan(
-            original_request="write file",
-            steps=(PlanStep("filesystem", "write", {"path": "file.txt"}),),
+            original_request="read file file.txt",
+            steps=(PlanStep("filesystem", "read", {"path": "file.txt"}),),
         )
         self.planner.create_plan.return_value = plan
         self.permissions.check.return_value = DENIED
 
-        response = self.session.submit("write file")
+        response = self.session.submit("read file file.txt")
 
-        expected = "Permission denied: filesystem.write is denied by configuration."
+        expected = "Permission denied: filesystem.read is denied by configuration."
         self.assertEqual(response, BrainResponse(expected, plan=plan))
         self.assertIsNone(self.session.pending_approval)
         self.tool_manager.execute_tool.assert_not_called()
-        self.memory.record_interaction.assert_called_once_with("write file", expected)
+        self.memory.record_interaction.assert_called_once_with(
+            "read file file.txt",
+            expected,
+        )
 
     def test_zero_step_request_keeps_its_response_and_recording(self) -> None:
         plan = Plan("help", (), "supported commands")
@@ -565,6 +569,7 @@ class SessionLoggingPrivacyTests(unittest.TestCase):
         self.planner = Mock(spec=Planner)
         self.memory = Mock(spec=Memory)
         self.tool_manager = Mock(spec=ToolManager)
+        self.tool_manager.validate_action.return_value = None
         self.permissions = Mock(spec=PermissionManager)
         self.memory.get_recent_interactions.return_value = []
         self.permissions.check.return_value = NEEDS_CONFIRMATION

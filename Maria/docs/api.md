@@ -15,22 +15,39 @@ the response.
 `MariaBrain.execute_confirmed_plan(plan: Plan) -> BrainResponse`
 
 Runs a plan whose approval a caller has already bound, resuming the same
-permission, dispatch, and recording flow without retrieving context or invoking
-Planner again. It resolves the whole plan's permissions again before dispatching
-anything, so a decision that changed since the plan was shown still applies. That
-recheck is not replanning: it re-resolves the same immutable plan. There is no
-raw-text confirmation parameter: an approved request is never planned a second
-time.
+contract, permission, dispatch, and recording flow without retrieving context or
+invoking Planner again. It validates the whole plan against the action contracts
+and resolves its permissions again before dispatching anything, so a contract or
+a decision that changed since the plan was shown still applies. That recheck is
+not replanning: it revalidates and re-resolves the same immutable plan, and a
+contract failure there dispatches nothing while the approval the session already
+consumed stays spent. There is no raw-text confirmation parameter: an approved
+request is never planned a second time.
 
 Both entry points share one internal helper, so zero-step, denied, allowed,
 successful, and failed-result behavior is identical on either path. The request
 half of a recorded interaction is the plan's `original_request`, which Planner
 sets to the cleaned input it was given.
 
-### Permission Resolution and Execution Phases
+### Contract Validation, Permission Resolution, and Execution Phases
 
-A plan with at least one step runs in two separate phases, and no tool is
-dispatched while the first phase is incomplete.
+A plan with at least one step runs in three separate phases, and no phase
+begins while an earlier one is incomplete.
+
+Phase zero validates the plan. Brain checks every step in plan order through
+`ToolManager.validate_action()` and stops at the first violation. Brain holds
+no registry of its own, so this phase and the defensive pass inside dispatch
+can only ever consult Tool Manager's one active registry. A violation
+anywhere refuses the whole plan before `PermissionManager` is consulted at all:
+`check()` is called zero times, no tool runs, no confirmation becomes pending,
+and the violation's fixed message is returned and recorded through the ordinary
+generic interaction path. Because the allowlist is positive, an identifier that
+is mandatorily denied but is not a registered tool action, such as
+`filesystem.write`, is refused here as an unknown action and never reaches the
+permission layer; a direct `PermissionManager.check("filesystem", "write")`
+still returns denied, and the two layers are defence in depth. The pass reads
+the original `PlanStep` objects and their immutable arguments, so the plan's
+fingerprint is unchanged by it.
 
 Phase one resolves the plan. Brain walks the steps in their original order and
 calls `PermissionManager.check(tool_name, action)` once for each, pairing every
@@ -40,7 +57,8 @@ arguments. The resolution is a private, frozen, in-memory value: it is never
 persisted, never logged, and never handed to another module, and it reports
 which decisions came back without making any of them.
 
-Phase two dispatches. It begins only once resolution has cleared the whole plan:
+Phase two dispatches. It begins only once validation and resolution have
+cleared the whole plan:
 
 - If any step resolved to `denied`, the entire plan is denied, no tool runs, and
   no confirmation becomes pending. The earliest denied step in plan order
@@ -62,7 +80,8 @@ prefix of steps that ran.
 
 `PermissionManager` is consumed unchanged. Brain coordinates several ordinary
 `check()` calls and never reinterprets an individual result, adds an argument,
-or asks for a bulk decision. Planner still emits at most one step for every
+or asks for a bulk decision, and `PermissionManager` remains unaware of
+arguments and contracts. Planner still emits at most one step for every
 command Maria currently understands, so these guarantees are about plans that a
 later stage may produce rather than about any command available today.
 
@@ -422,8 +441,9 @@ which must be an actual `str` that is non-blank after stripping; otherwise it
 returns `"New memory fact is required."`, again without calling `Memory`. That
 value is never coerced with `str(...)`, so `None`, numbers, booleans, and
 arbitrary objects can never be persisted as memory text, and only the stripped
-value is passed to `Memory`. The existing `store` action keeps its own
-longstanding coercion behavior.
+value is passed to `Memory`. The `store` action now rejects a non-`str` `fact`
+the same way, returning `"Memory fact must be text."` instead of converting
+it.
 
 A missing row returns `"Memory not found: <id>."`. A uniqueness conflict
 returns `"Memory <id> conflicts with existing memory <other id>."` — numeric
@@ -513,6 +533,66 @@ while `notes.retitle`, `notes.edit`, and `notes.delete` always require
 explicit confirmation. The tool contains no SQL; `core/memory.py` owns all
 database operations.
 
+## Action Contracts
+
+`ActionContractRegistry.validate(tool_name, action, arguments) -> ContractViolation | None`
+
+`core/action_contracts.py` declares `BUILT_IN_ACTION_CONTRACTS`, the immutable
+positive allowlist of all 22 built-in tool actions and their arguments. The
+table is written by hand and is independent of Tool Manager's runtime
+inventory, of `PermissionManager`, and of the planner; it is never generated
+from a tool's `actions` set, read from configuration, or persisted. Declaring
+the same tool action twice raises `ValueError` rather than silently keeping the
+last declaration, and the registry refuses attribute assignment and deletion
+after construction.
+
+`ActionContract` declares one exact tool action; `ArgumentContract` declares one
+field's `value_type` (exactly `str` or `int`), whether it is `required`, and
+every bound that applies to that type: `minimum` and `maximum` for an int field,
+`allow_blank`, `minimum_length`, and `maximum_length` for a str field, plus
+`root_class` when the field is a path. `None` for a bound declares that no bound
+exists rather than leaving it open, while `allow_blank` is mandatory on a str
+field so a blank policy can never be omitted. Construction raises `ValueError`
+for an unsupported declared type, a numeric bound on a str field, a length bound
+or blank policy on an int field, a root class on an int field, a missing blank
+policy on a str field, a negative length, and a `minimum_length` greater than a
+`maximum_length`.
+
+A present str value is measured on its stripped form: that is how every tool
+establishes blankness and exactly how `CalculatorTool` measures the
+200-character expression ceiling it applies after stripping. The stripped text
+is used for the comparison only and is never written back, so a valid argument
+reaches Tool Manager and the tool by exact object identity.
+
+`validate` returns `None` when a call is valid, or one frozen
+`ContractViolation` carrying only `kind`, `tool_name`, `action`, and `field`.
+An `arguments` container that is not a `Mapping`, or a mapping carrying any
+non-`str` key, is refused as `WRONG_TYPE` on the field name `arguments` rather
+than raising, and neither the container nor a key is converted. A tool, action,
+or field name is stored only when it reads as a short plain ASCII identifier;
+anything else is replaced on construction by the fixed label `unknown_tool`,
+`unknown_action`, or `unsupported_field`, so a path, a newline, or an oversized
+name can never reach a response, a recorded row, or a log.
+`ContractFailure` has six members: `UNKNOWN_TOOL`, `UNKNOWN_ACTION`,
+`MISSING_REQUIRED_ARGUMENT`, `EXTRA_ARGUMENT`, `WRONG_TYPE`, and
+`OUT_OF_RANGE`. `ContractViolation.message` renders one fixed template per kind
+naming the tool, action, and field only; it never contains the submitted value,
+its repr, an object address, or a host path.
+
+Validation rejects and never repairs: no coercion, parsing, truncation,
+clamping, default insertion, or case and whitespace normalization. Type
+identity is settled first and is exact, so `bool` is not accepted for an `int`
+field, a numeric string is not accepted for an `int` field, an `int` is not
+accepted for a `str` field, and an arbitrary object is refused without
+`str(value)` ever being called, so a side-effecting `__str__` is never reached.
+A field order of type, then blank policy, then length or numeric bounds means a
+malformed value never reaches a text operation. A blank, too-short, too-long,
+or out-of-range value all report `OUT_OF_RANGE`.
+The supplied mapping is read, never rebuilt or copied into a mutable mapping,
+so a `Plan` fingerprint is unchanged by validation. A path field's `root_class`
+is classification metadata: the registry resolves no path and touches no
+filesystem.
+
 ## Tool Manager
 
 `ToolManager.execute_tool(tool_name, action, arguments) -> ToolExecutionResult`
@@ -522,6 +602,25 @@ Tools must expose `name`, `description`, `actions`, and an `execute` method.
 plan's immutable arguments directly rather than a mutable copy. Tool Manager
 forwards the mapping unchanged and never rebuilds it, and no built-in tool
 mutates it.
+
+`execute_tool` validates the action contracts first and unconditionally, so a
+direct caller cannot reach a tool with an unsupported action or a malformed
+argument. A violation returns an unsuccessful `ToolExecutionResult` carrying
+the violation's fixed message, and no tool is invoked. The registry used is
+injected through the optional `contracts` constructor argument and defaults to
+`BUILT_IN_ACTION_CONTRACTS`. Brain validates a whole plan earlier through
+`validate_action()`, against that same active registry, so that ordering holds
+across a plan; this pass is the defensive one no caller can skip.
+
+`ToolManager.validate_action(tool_name, action, arguments) -> ContractViolation | None`
+
+Reports the first violation for one call without executing anything.
+
+`ToolManager.loaded_action_identifiers() -> frozenset[str]`
+
+Returns a read-only snapshot of every loaded tool action, used to check the
+declared registry against the tools actually loaded. The registry is never
+populated from this snapshot.
 
 ## Permissions
 

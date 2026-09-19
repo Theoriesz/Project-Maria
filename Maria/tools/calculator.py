@@ -21,6 +21,7 @@ MAX_EXPRESSION_LENGTH = 200
 MAX_ABSOLUTE_EXPONENT = 100
 MAX_INTEGER_BITS = 4096
 NUMERIC_LIMIT_MESSAGE = "Calculation exceeds supported numeric limits."
+EXPRESSION_NOT_TEXT_MESSAGE = "Expression must be text."
 UNSUPPORTED_NUMERIC_TYPE_MESSAGE = (
     "Only integer and floating-point values are supported."
 )
@@ -60,7 +61,12 @@ class CalculatorTool:
         if action != "calculate":
             return ToolExecutionResult(False, f"Unsupported calculator action: {action}")
 
-        expression = str(arguments.get("expression", "")).strip()
+        expression = arguments.get("expression", "")
+        if type(expression) is not str:
+            self.logger.warning("Rejected a non-text calculator expression.")
+            return ToolExecutionResult(False, EXPRESSION_NOT_TEXT_MESSAGE)
+
+        expression = expression.strip()
         if not expression:
             return ToolExecutionResult(False, "No expression provided.")
 

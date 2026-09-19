@@ -2,6 +2,46 @@
 
 Tools are small modules that expose controlled capabilities to Maria.
 
+## Declared Argument Contracts
+
+Every built-in tool action is declared once in `core/action_contracts.py`,
+which is the positive allowlist of the 22 supported tool actions and of the
+arguments each one accepts. A tool's `actions` set answers only whether an
+action is registered; the contract answers which arguments it takes, whether
+each is required, its exact type, any numeric bound, and, for a path field, the
+named root class it belongs to. The registry is hand-written and immutable, is
+never derived from the loaded tools, and a test proves the declared set and the
+loaded set match in both directions.
+
+Validation runs before `PermissionManager` for a planned request, and again
+inside `ToolManager.execute_tool()` for any direct call, so neither route can
+reach a tool with an unsupported action or a malformed argument. It rejects
+rather than repairs: no value is converted, parsed, truncated, clamped,
+defaulted, or normalized, and `bool` is not accepted where an integer is
+required. Unknown tool, unknown action, missing required argument, extra
+argument, wrong type, and out-of-range value each produce a distinct fixed
+refusal naming the tool, action, and field only, never the submitted value.
+
+Tools keep their own argument checks as defence in depth, so a malformed value
+passed straight to a tool object is refused there too rather than converted.
+An absent optional argument still receives its existing tool-owned default:
+`filesystem.list` defaults an absent `path` to the safe root, `notes.create`
+defaults an absent `title` to `Untitled`, and the listing actions default an
+absent `limit` to 20. A value that is *provided* is never repaired into a
+default. Every text field declares that blank or whitespace-only content is
+malformed, so a provided blank title, path, fact, query, body, or target is
+refused rather than replaced or defaulted. `calculator.calculate.expression`
+additionally declares the established 200-character maximum, measured on the
+stripped text. A provided `limit` must be an actual `int` between 1 and 100;
+values outside that window are refused rather than clamped. A path field's root
+class is classification metadata only; the registry resolves no path and
+touches no filesystem, and `FilesystemTool` remains solely responsible for
+canonical resolution, safe-root containment, symlink handling, and collisions.
+
+`core/memory.py` still clamps a listing limit internally, but that clamp is no
+longer the acceptance policy: it sits below the Brain, Tool Manager, and tool
+gates as defence in depth and is unchanged.
+
 ## Built-in Tools
 
 - `calculator`: basic arithmetic
@@ -33,6 +73,11 @@ math guarantees.
 
 The filesystem tool supports `read`, `list`, `rename`, and `move` inside the configured
 safe root. Rename and move always require explicit confirmation.
+
+Every path operand must be an actual `str`. A value of any other type is refused
+with `Path must be text.` rather than being rendered into a path, so a malformed
+direct call can no longer become a real filesystem target. `list` still defaults
+an absent `path` to the safe root.
 
 Internally the tool still resolves every operand to a canonical absolute path, and all
 containment validation, symlink resolution, and actual filesystem work happen on those
@@ -185,7 +230,10 @@ Showing the newest 20 notes. More notes exist.
 ```
 
 An explicit non-default `limit` argument passed to the tool is honored as before
-and never produces this suffix. Empty results remain `No notes found.`.
+and never produces this suffix. It must be an actual `int`, not a `bool`, between
+`1` and `100`; any other value returns `Notes limit must be a number.` or `Notes
+limit must be between 1 and 100.` rather than being converted or clamped. Empty
+results remain `No notes found.`.
 
 `retitle`, `edit`, and `delete` each validate an `id` argument the same way as
 the history tool (an actual `int`, not a `bool`, at least `1`), returning `Note
@@ -253,7 +301,10 @@ Showing the newest 20 matches. More matching memories exist.
 
 `list` appends the first form; `search` appends the second. An explicit
 non-default `limit` argument is honored as before and never produces either
-suffix. Empty results are successful operations with these messages:
+suffix. It must be an actual `int`, not a `bool`, between `1` and `100`; any
+other value returns `Memories limit must be a number.`, `Memory search limit
+must be a number.`, or the matching `must be between 1 and 100.` message rather
+than being converted or clamped. Empty results are successful operations with these messages:
 
 ```text
 No matching memories found.
@@ -268,7 +319,8 @@ that is non-blank after stripping; otherwise it returns `New memory fact is
 required.`, again without calling `Memory`. That value is never coerced with
 `str(...)`, so `None`, numbers, booleans, and arbitrary objects can never be
 persisted as memory text, and only the stripped value reaches `Memory`. The
-older `store` action keeps its own existing coercion behavior and is unchanged.
+`store` action now rejects a non-`str` `fact` the same way, returning `Memory
+fact must be text.` instead of converting it.
 
 A missing row returns `Memory not found: <id>.`. Success returns `Updated
 memory <id>.` or `Forgot memory <id>.` with `data={"id": <id>}` — never the old
@@ -349,8 +401,10 @@ Tool actions should return `ToolExecutionResult`.
 
 ## Safety Rules
 
-Tools should validate inputs and handle errors gracefully. File-modifying
-actions must be checked by `permissions.py` before execution. Filesystem
+Tools should validate inputs and handle errors gracefully. Every action's
+arguments are validated against its declared contract before `permissions.py`
+is consulted, and tools retain their own checks as defence in depth.
+File-modifying actions must be checked by `permissions.py` before execution. Filesystem
 delete behavior remains unimplemented. Interaction-history
 deletion (`history.delete`) is checked by `permissions.py` and always
 requires explicit confirmation before a row is removed. Note retitling,

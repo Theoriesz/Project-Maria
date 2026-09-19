@@ -6,6 +6,7 @@ from collections.abc import Mapping
 from logging import Logger
 from typing import Any
 
+from core.action_contracts import MAXIMUM_LIST_LIMIT, MINIMUM_LIST_LIMIT
 from core.logger import get_logger
 from core.memory import Memory
 from core.tool_manager import ToolExecutionResult
@@ -13,6 +14,9 @@ from core.tool_manager import ToolExecutionResult
 
 _DEFAULT_LIST_LIMIT = 20
 _MORE_NOTES_SUFFIX = "Showing the newest 20 notes. More notes exist."
+_LIST_LIMIT_RANGE_MESSAGE = (
+    f"Notes limit must be between {MINIMUM_LIST_LIMIT} and {MAXIMUM_LIST_LIMIT}."
+)
 
 
 class NotesTool:
@@ -57,8 +61,21 @@ class NotesTool:
 
     def _create(self, arguments: Mapping[str, Any]) -> ToolExecutionResult:
         """Create a note."""
-        title = str(arguments.get("title", "Untitled")).strip() or "Untitled"
-        body = str(arguments.get("body", "")).strip()
+        if "title" in arguments:
+            title = arguments["title"]
+            if type(title) is not str:
+                return ToolExecutionResult(False, "Note title must be text.")
+            if not title.strip():
+                return ToolExecutionResult(False, "Note title is required.")
+        else:
+            title = "Untitled"
+
+        body = arguments.get("body", "")
+        if type(body) is not str:
+            return ToolExecutionResult(False, "Note body must be text.")
+
+        title = title.strip()
+        body = body.strip()
         if not body:
             return ToolExecutionResult(False, "Note body is required.")
 
@@ -77,10 +94,11 @@ class NotesTool:
 
     def _list(self, arguments: Mapping[str, Any]) -> ToolExecutionResult:
         """List notes."""
-        try:
-            limit = int(arguments.get("limit", _DEFAULT_LIST_LIMIT))
-        except (TypeError, ValueError):
+        limit = arguments.get("limit", _DEFAULT_LIST_LIMIT)
+        if type(limit) is not int:
             return ToolExecutionResult(False, "Notes limit must be a number.")
+        if not MINIMUM_LIST_LIMIT <= limit <= MAXIMUM_LIST_LIMIT:
+            return ToolExecutionResult(False, _LIST_LIMIT_RANGE_MESSAGE)
 
         probe_default = limit == _DEFAULT_LIST_LIMIT
         query_limit = limit + 1 if probe_default else limit
@@ -104,7 +122,11 @@ class NotesTool:
 
     def _read(self, arguments: Mapping[str, Any]) -> ToolExecutionResult:
         """Read one note by id or exact title."""
-        target = str(arguments.get("target", "")).strip()
+        target = arguments.get("target", "")
+        if type(target) is not str:
+            return ToolExecutionResult(False, "Note id or title must be text.")
+
+        target = target.strip()
         if not target:
             return ToolExecutionResult(False, "Note id or title is required.")
 

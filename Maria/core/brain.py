@@ -10,6 +10,7 @@ from __future__ import annotations
 from dataclasses import dataclass
 from logging import Logger
 
+from core.action_contracts import ContractViolation
 from core.config import MariaConfig, load_config
 from core.logger import configure_logging, get_logger
 from core.memory import Memory
@@ -152,25 +153,41 @@ class MariaBrain:
         """Run an already-approved plan without planning the request again.
 
         The caller has bound the owner's approval to this exact plan, so
-        Brain retrieves no context and invokes no planner. It resolves the
-        plan's permissions again before dispatching anything, because an
-        approval authorises a plan rather than freezing the decisions that
-        were current when that plan was shown, then resumes the ordinary
+        Brain retrieves no context and invokes no planner. It validates the
+        same plan against the action contracts again and resolves its
+        permissions again before dispatching anything, because an approval
+        authorises a plan rather than freezing the contract and the decisions
+        that were current when that plan was shown, then resumes the ordinary
         dispatch and recording flow.
         """
         return self._run_plan(plan, confirmed=True)
 
     def _run_plan(self, plan: Plan, *, confirmed: bool) -> BrainResponse:
-        """Resolve a whole plan's permissions, then dispatch it generically.
+        """Validate, resolve, then dispatch a whole plan generically.
 
-        Resolution is a complete first phase: every step's permission is
-        decided before any step is dispatched. A denial anywhere denies the
-        entire plan, and an outstanding confirmation anywhere holds the
-        entire plan, so neither outcome can arrive after a step already ran.
-        Dispatch begins only once resolution has cleared the whole plan.
+        Three phases run in a fixed order. Every step is first validated
+        against the declared action contracts, then every step's permission
+        is decided, and only then is anything dispatched. A contract failure
+        anywhere refuses the plan before PermissionManager is consulted at
+        all. A denial anywhere denies the entire plan, and an outstanding
+        confirmation anywhere holds the entire plan, so neither outcome can
+        arrive after a step already ran.
         """
         if not plan.steps:
             response = plan.response_if_no_action or "I do not know how to handle that yet."
+            self._record_interaction(plan.original_request, response)
+            return BrainResponse(response, plan=plan)
+
+        violation = self._validate_plan(plan)
+        if violation is not None:
+            self.logger.warning(
+                "Rejected plan step by contract: %s %s.%s field=%s",
+                violation.kind.value,
+                violation.tool_name,
+                violation.action,
+                violation.field,
+            )
+            response = violation.message
             self._record_interaction(plan.original_request, response)
             return BrainResponse(response, plan=plan)
 
@@ -202,6 +219,32 @@ class MariaBrain:
             )
 
         return self._execute_resolved_plan(resolved)
+
+    def _validate_plan(self, plan: Plan) -> ContractViolation | None:
+        """Check every step against its action contract, in plan order.
+
+        This is the phase that must complete before any permission decision,
+        so a plan naming an unsupported action or carrying a malformed
+        argument never reaches PermissionManager or a tool at all. Steps are
+        inspected in order and the first violation stops the pass. Each step
+        and its immutable arguments are passed through untouched: nothing is
+        rebuilt, copied into a mutable mapping, normalized, or defaulted, so
+        the plan's fingerprint is the same afterwards as before.
+
+        The check goes through Tool Manager's non-executing validation entry
+        point rather than a registry of Brain's own, so this phase and the
+        defensive pass inside dispatch can only ever consult one active
+        registry.
+        """
+        for step in plan.steps:
+            violation = self.tool_manager.validate_action(
+                step.tool_name,
+                step.action,
+                step.arguments,
+            )
+            if violation is not None:
+                return violation
+        return None
 
     def _resolve_plan(self, plan: Plan) -> _ResolvedPlan:
         """Decide permission for every step before any step is dispatched.
