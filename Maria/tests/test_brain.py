@@ -283,6 +283,16 @@ class MariaBrainTests(unittest.TestCase):
         )
 
     def test_failed_tool_result_stops_later_plan_steps_and_is_recorded(self) -> None:
+        """Lock in the deliberate V1-05 reversal of this test's contract.
+
+        This test previously asserted that permission was checked once
+        for a two-step plan, because the old loop checked a step and
+        dispatched it in the same iteration and never reached the second
+        step after the first result failed. Permission for the whole plan
+        is now resolved before any dispatch, so both steps are checked.
+        The executed, displayed, and recorded behavior is unchanged:
+        the failing first step still stops the plan.
+        """
         first_arguments = {"path": "missing.txt"}
         plan = Plan(
             original_request="synthetic failure",
@@ -300,7 +310,13 @@ class MariaBrainTests(unittest.TestCase):
         response = self.brain.process("synthetic failure")
 
         self.assertEqual(response.text, "File not found: missing.txt")
-        self.permissions.check.assert_called_once_with("filesystem", "read")
+        self.assertEqual(
+            self.permissions.check.call_args_list,
+            [
+                call("filesystem", "read"),
+                call("system", "current_time"),
+            ],
+        )
         self.tool_manager.execute_tool.assert_called_once_with(
             "filesystem",
             "read",

@@ -8,7 +8,8 @@ Maria is organized around a small set of modules with clear ownership.
 2. `session.py` holds the owner's confirmation state and forwards the request.
 3. `brain.py` coordinates the request and retrieves recent interaction context.
 4. `planner.py` converts explicit commands into structured plan steps.
-5. `permissions.py` decides whether each planned action is allowed.
+5. `permissions.py` decides whether each planned action is allowed. Brain
+   resolves every step of a plan before any step is dispatched.
 6. `tool_manager.py` dispatches allowed actions to registered tools.
 7. Tools perform their focused work and return a `ToolExecutionResult`.
 8. `memory.py` owns persistent interactions, notes, and explicit memories in
@@ -119,9 +120,11 @@ confirmation-required response returns before completed-interaction recording.
 If confirmation is cancelled, the cancellation response is not recorded, and
 neither is a refused confirmation, because neither executed anything. If it is
 approved, the session calls `MariaBrain.execute_confirmed_plan()` with the
-exact plan it was holding; Brain rechecks permission and dispatches that plan
-without retrieving context or planning again, then attempts to record the
-completed result through the normal path. The request half of that row is the
+exact plan it was holding; Brain re-resolves that whole plan's permissions and
+dispatches it only if nothing is denied, without retrieving context or planning
+again, then attempts to record the completed result through the normal path. A
+denial found by that recheck executes nothing and is recorded as any other
+denial is. The request half of that row is the
 approved plan's `original_request`, which is the same cleaned text the first
 and only planning pass received.
 
@@ -197,7 +200,10 @@ a file, or configuration, never serialized, and never logged; only a plan's
 fingerprint could be logged, because the canonical content behind it can
 contain note bodies, memory facts, and absolute paths. `PermissionManager` is
 consumed unchanged: the session decides nothing about permission, and Brain
-still checks every step before dispatching it.
+resolves every step of a plan before dispatching any of them. The session
+stores no permission resolution alongside the pending plan, because
+confirmation re-resolves the plan's current permissions rather than replaying
+the decisions that were current when it was shown.
 
 ## Permission Policy
 
@@ -222,6 +228,52 @@ can never remove them.
 
 Direct tool invocation bypasses planning and permission checks and therefore
 remains an internal trusted-code boundary.
+
+### Whole-Plan Resolution Before Execution
+
+Executing a plan is two separate phases, and no tool is dispatched while the
+first is incomplete.
+
+Resolution comes first and covers the complete plan. Brain walks the steps in
+their original order, calls `PermissionManager.check()` once per step, and
+keeps each step paired with the result it got back. Nothing executes during
+that pass, the plan is neither rebuilt nor mutated, no step's arguments are
+copied into a mutable dictionary, and no planner or context lookup happens.
+
+Denial takes precedence over the whole plan. If any step resolves to denied,
+the plan is denied, no tool runs, no confirmation becomes pending, and the
+earliest denied step in plan order supplies the reason. An earlier allowed step
+does not run first, and an earlier confirmation-required step does not prompt.
+Confirmation is offered only once resolution has found no denial anywhere.
+
+Approving a plan does not freeze its decisions. Confirmed execution resolves
+the same immutable plan's permissions again before dispatching the first tool,
+which is an execution-time safety recheck rather than replanning. If that
+recheck now finds a denial, nothing executes, the denial is recorded through
+the normal path, and the approval the session already consumed stays spent.
+
+Dispatch is the second phase. Steps run in plan order, at most once each, and
+each receives the immutable arguments object its `PlanStep` holds. The first
+unsuccessful `ToolExecutionResult` stops the plan: later steps do not run, and
+Maria neither rolls back nor compensates for the steps that already succeeded.
+There is no transaction, undo, or workflow persistence across steps, and the
+displayed and recorded text covers exactly the prefix of steps that ran.
+
+The resolved plan is transient execution state. It is private to `brain.py`,
+frozen, never persisted, never logged, and never handed to another module, and
+it reports which decisions came back without making any of them.
+`PermissionManager` itself is unchanged: no new arguments, no bulk-check
+method, no altered precedence, and no permission policy in Brain, the session,
+`main.py`, Tool Manager, or a tool.
+
+Production plans still contain at most one step, because the planner emits at
+most one. These guarantees therefore protect plans a later stage may produce;
+they change no command available today. A single-step confirmation keeps its
+existing wording, while a longer plan is rendered as a deterministic,
+plan-ordered list of each step's tool action and resolved permission outcome.
+That rendering repeats no argument value, so it exposes no absolute host path,
+no fingerprint, and no canonical plan content; it is not logged, and a pending
+confirmation is not written to interaction history.
 
 ## Persistence Models
 

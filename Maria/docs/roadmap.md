@@ -456,9 +456,13 @@ they find gets its own focused `fix/<topic>` branch, never a release branch.
 - Architecture affected: `core/brain.py` execution loop, `core/permissions.py` consumed
   unchanged, the core session module, brain tests.
 - Privacy and security: A denial is now reached before any side effect. Resolved-plan
-  rendering reuses the filesystem tool's display-path sanitisation and never prints
-  absolute host paths. `PermissionManager` stays unchanged so its deliberately
-  locked-in default-allow tests remain valid.
+  rendering is deterministic and lists every step's tool, action, and resolved
+  permission outcome in plan order. This stage deliberately omits argument values and
+  raw fingerprints, so the rendering cannot expose absolute host paths or private
+  argument content. Exact validated argument rendering remains required before
+  model-originated execution in V1-18, after V1-06's per-action contracts can classify
+  and validate path arguments safely. `PermissionManager` stays unchanged so its
+  deliberately locked-in default-allow tests remain valid.
 - Non-goals: The planner still emits at most one step; multi-step generation is V1-19.
   No transaction, rollback, or compensation across steps: stop-on-failure with an
   explicit report is the documented, tested semantics. No new commands and no change to
@@ -467,7 +471,9 @@ they find gets its own focused `fix/<topic>` branch, never a release branch.
   zero steps, asserted by counting tool invocations; a synthetic two-step plan requiring
   confirmation executes zero steps before approval and each step exactly once after;
   single-step output text and recorded rows stay identical against a temporary database;
-  resolved-plan rendering contains no absolute host path.
+  multi-step resolved-plan rendering follows plan order, names every step's tool and
+  action, names every resolved permission outcome, omits argument values, omits raw
+  fingerprints, is neither logged nor persisted, and contains no absolute host path.
 - Changelog: one entry — Maria now resolves permissions for an entire plan before
   executing any part of it.
 
