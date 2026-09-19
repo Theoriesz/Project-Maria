@@ -5,10 +5,73 @@ public network APIs.
 
 ## Brain
 
-`MariaBrain.process(user_input: str, confirmed: bool = False) -> BrainResponse`
+`MariaBrain.process(user_input: str) -> BrainResponse`
 
-Coordinates a request from input to plan, permission check, tool execution, and
-interaction-history recording.
+Plans one request and coordinates it from input to plan, permission check, tool
+execution, and interaction-history recording. A step that requires confirmation
+returns before execution, carrying its `Plan` on the response.
+
+`MariaBrain.execute_confirmed_plan(plan: Plan) -> BrainResponse`
+
+Runs a plan whose approval a caller has already bound, resuming the same
+permission, dispatch, and recording flow without retrieving context or invoking
+Planner again. There is no raw-text confirmation parameter: an approved request
+is never planned a second time.
+
+Both entry points share one internal helper, so zero-step, denied, allowed,
+successful, and failed-result behavior is identical on either path. The request
+half of a recorded interaction is the plan's `original_request`, which Planner
+sets to the cleaned input it was given.
+
+## Session
+
+`MariaSession(brain: MariaBrain, logger: Logger | None = None)`
+
+The interface-agnostic confirmation boundary. It needs no standard input,
+standard output, or terminal, so the CLI and any later interface share one
+contract. It holds at most one pending approval and owns the whole policy for
+invalidation, replay prevention, and refusal.
+
+`MariaSession.submit(user_input: str) -> BrainResponse`
+
+Discards any approval still pending, then plans the request exactly once.
+A confirmation-required response becomes the single pending approval.
+
+`MariaSession.confirm() -> BrainResponse`
+
+Executes the pending plan exactly as it was presented. The approval is consumed
+before execution is attempted, so neither a failing tool nor a raised exception
+can leave it replayable.
+
+`MariaSession.cancel() -> bool`
+
+Discards the pending plan, planning and executing nothing, and returns whether
+an approval was actually pending.
+
+`MariaSession.pending_approval -> PendingApproval | None`
+
+The plan awaiting approval, or `None` when the session is idle.
+
+`PendingApproval` is a frozen value object holding exactly two fields: the
+immutable `plan` and the `fingerprint` captured when that plan became pending.
+It lives only in process memory. It is never written to SQLite, a file, or
+configuration, never serialized, and never logged, because the plan it wraps
+can contain note bodies, memory facts, and file paths.
+
+Confirmation compares the pending plan's current `fingerprint` with the value
+captured when it became pending. A confirmation that binds no pending plan, or
+whose plan no longer matches, executes nothing and returns one fixed message:
+
+```text
+No pending action matches that confirmation. Please make the request again.
+```
+
+That refusal repeats no request text, argument, canonical payload, stored
+content, file path, fingerprint, or object representation. It reaches the owner
+through the same interface wording as any other response. The same message
+covers a second confirmation after success, a confirmation after cancellation,
+and a confirmation after an intervening request, because all four mean the
+approval binds no executable plan.
 
 ## Planner
 

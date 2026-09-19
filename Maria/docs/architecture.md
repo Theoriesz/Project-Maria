@@ -5,23 +5,25 @@ Maria is organized around a small set of modules with clear ownership.
 ## Core Flow
 
 1. `main.py` receives user input from the command line.
-2. `brain.py` coordinates the request and retrieves recent interaction context.
-3. `planner.py` converts explicit commands into structured plan steps.
-4. `permissions.py` decides whether each planned action is allowed.
-5. `tool_manager.py` dispatches allowed actions to registered tools.
-6. Tools perform their focused work and return a `ToolExecutionResult`.
-7. `memory.py` owns persistent interactions, notes, and explicit memories in
+2. `session.py` holds the owner's confirmation state and forwards the request.
+3. `brain.py` coordinates the request and retrieves recent interaction context.
+4. `planner.py` converts explicit commands into structured plan steps.
+5. `permissions.py` decides whether each planned action is allowed.
+6. `tool_manager.py` dispatches allowed actions to registered tools.
+7. Tools perform their focused work and return a `ToolExecutionResult`.
+8. `memory.py` owns persistent interactions, notes, and explicit memories in
    SQLite.
-8. `brain.py` forms the final response and, on recordable completion paths,
+9. `brain.py` forms the final response and, on recordable completion paths,
    attempts to record the cleaned request and response as an interaction.
-9. `logger.py` configures Maria's named logger; application modules emit
-   operational events through it.
+10. `logger.py` configures Maria's named logger; application modules emit
+    operational events through it.
 
 An explicit memory request uses the same execution path as every other tool
 request:
 
 ```text
 CLI
+-> MariaSession
 -> MariaBrain
 -> Planner
 -> PermissionManager
@@ -44,6 +46,7 @@ boundary:
 
 ```text
 CLI
+-> MariaSession
 -> Brain
 -> Planner
 -> PermissionManager
@@ -113,11 +116,14 @@ blank input passed directly to `process()` returns before logging, context
 retrieval, planning, or recording. `exit`, `quit`, `q`, main-prompt EOF or
 Ctrl+C, and startup failures do not become interaction rows. An initial
 confirmation-required response returns before completed-interaction recording.
-If confirmation is cancelled, the CLI-only cancellation response is not
-recorded. If it is approved, the CLI calls `process()` again with
-`confirmed=True`; Brain retrieves context, re-plans, rechecks permission, and
-attempts to record only the second call's completed result through the normal
-path.
+If confirmation is cancelled, the cancellation response is not recorded, and
+neither is a refused confirmation, because neither executed anything. If it is
+approved, the session calls `MariaBrain.execute_confirmed_plan()` with the
+exact plan it was holding; Brain rechecks permission and dispatches that plan
+without retrieving context or planning again, then attempts to record the
+completed result through the normal path. The request half of that row is the
+approved plan's `original_request`, which is the same cleaned text the first
+and only planning pass received.
 
 Post-startup processing has no broad exception handler. If an exception
 propagates before a recordable branch calls `Memory.record_interaction()`, no
@@ -132,7 +138,13 @@ deletion policy.
 
 Operational logging and interaction persistence are separate boundaries.
 `logger.py` configures Maria's namespaced file logger; default startup targets
-`logs/maria.log` for application events, warnings, and failures.
+`logs/maria.log` for application events, warnings, and failures. Configuring
+logging again is honoured rather than ignored: Maria's own file handlers are
+flushed, detached, and closed, and one new handler for the requested directory
+replaces them, so a second call never duplicates a handler and never keeps
+writing to the previous directory. The replacement happens only once the new
+handler exists, so a failure to create the directory or open the file
+propagates with the previous configuration intact.
 `Memory.record_interaction()` separately writes request and response text to
 SQLite. A log message that omits full request or response content does not
 prevent that content from appearing in interaction history.
@@ -152,9 +164,40 @@ insensitively; blank or unrecognized input re-prompts rather than approving or
 cancelling. Either interruption (EOF or Ctrl+C) cancels the pending action
 immediately without executing it, even if it occurs after one or more invalid
 answers. This boundary intentionally does not add a broad exception handler
-around Brain processing after startup. Confirmation still uses deterministic
-re-planning with `brain.process(original_input, confirmed=True)`; binding
-confirmation to an immutable plan remains deferred.
+around Brain processing after startup.
+
+`main.py` owns terminal concerns only: reading input, printing output, showing
+the confirmation prompt, accepting its aliases, and mapping the owner's answer
+to the session's confirm or cancel operation. It never calls Planner, builds or
+copies a plan, compares fingerprints, evaluates permission, holds the pending
+plan, or re-sends the original request after approval.
+
+## Session Boundary
+
+`core/session.py` owns the confirmation lifecycle for every interface. It needs
+no standard input, standard output, or terminal, so a headless caller drives
+the same contract the CLI does.
+
+A session is idle or holds exactly one pending approval. Submitting a request
+first discards any approval still pending, then plans exactly once. A
+confirmation-required response becomes the pending approval: the immutable
+`Plan` and the fingerprint captured at that moment, and nothing else.
+
+Confirming compares the pending plan's current fingerprint with the captured
+one, and refuses if they differ. The approval is consumed before execution is
+attempted, so a failing tool or a raised exception cannot make it replayable.
+Cancelling discards the pending approval and executes and plans nothing. A
+second confirmation, a confirmation after cancellation, and a confirmation
+after any intervening request all execute nothing and return one fixed,
+content-free refusal, so an approval can never be transferred to a plan the
+owner was not shown even when two requests read identically.
+
+The pending approval is transient process state. It is never written to SQLite,
+a file, or configuration, never serialized, and never logged; only a plan's
+fingerprint could be logged, because the canonical content behind it can
+contain note bodies, memory facts, and absolute paths. `PermissionManager` is
+consumed unchanged: the session decides nothing about permission, and Brain
+still checks every step before dispatching it.
 
 ## Permission Policy
 

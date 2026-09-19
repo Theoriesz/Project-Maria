@@ -11,6 +11,7 @@ from unittest.mock import Mock, call, patch
 
 import main as main_module
 from core.brain import BrainResponse
+from core.planner import Plan, PlanStep
 
 
 MAIN_PATH = Path(__file__).resolve().parents[1] / "main.py"
@@ -23,6 +24,26 @@ STARTUP_FAILURE_MESSAGE = (
     "Maria: Startup failed. Review the configuration and available logs."
 )
 STARTUP_INTERRUPTED_MESSAGE = "Maria: Startup interrupted."
+RENAME_PLAN = Plan(
+    original_request="rename old.txt to new.txt",
+    steps=(
+        PlanStep(
+            "filesystem",
+            "rename",
+            {"source": "old.txt", "destination": "new.txt"},
+        ),
+    ),
+)
+MOVE_PLAN = Plan(
+    original_request="move source.txt to docs/source.txt",
+    steps=(
+        PlanStep(
+            "filesystem",
+            "move",
+            {"source": "source.txt", "destination": "docs/source.txt"},
+        ),
+    ),
+)
 
 
 class MainCliTests(unittest.TestCase):
@@ -278,13 +299,15 @@ class MainCliTests(unittest.TestCase):
         confirmation = BrainResponse(
             "Confirmation required: filesystem.rename requires explicit confirmation.",
             needs_confirmation=True,
+            plan=RENAME_PLAN,
         )
         completed = BrainResponse("Renamed old.txt to new.txt")
 
         for approval in ("yes", " YeS \t", "y", " Y \t"):
             with self.subTest(approval=approval):
                 brain = Mock(spec=main_module.MariaBrain)
-                brain.process.side_effect = [confirmation, completed]
+                brain.process.return_value = confirmation
+                brain.execute_confirmed_plan.return_value = completed
                 factory = Mock(return_value=brain)
 
                 status, stdout, stderr, input_mock = self._run_cli(
@@ -293,10 +316,8 @@ class MainCliTests(unittest.TestCase):
                 )
 
                 self.assertEqual(status, 0)
-                self.assertEqual(
-                    brain.process.call_args_list,
-                    [call(request), call(request, confirmed=True)],
-                )
+                brain.process.assert_called_once_with(request)
+                brain.execute_confirmed_plan.assert_called_once_with(RENAME_PLAN)
                 self.assertEqual(
                     input_mock.call_args_list,
                     [call("You: "), call(CONFIRMATION_PROMPT), call("You: ")],
@@ -311,6 +332,7 @@ class MainCliTests(unittest.TestCase):
         confirmation = BrainResponse(
             "Confirmation required: filesystem.rename requires explicit confirmation.",
             needs_confirmation=True,
+            plan=RENAME_PLAN,
         )
         next_response = BrainResponse("System ready.")
 
@@ -330,6 +352,7 @@ class MainCliTests(unittest.TestCase):
                     brain.process.call_args_list,
                     [call(request), call("system")],
                 )
+                brain.execute_confirmed_plan.assert_not_called()
                 self.assertEqual(stdout.count("Maria: Action cancelled.\n"), 1)
                 self.assertIn("Maria: System ready.\n", stdout)
                 self.assertEqual(
@@ -350,6 +373,7 @@ class MainCliTests(unittest.TestCase):
         confirmation = BrainResponse(
             "Confirmation required: filesystem.rename requires explicit confirmation.",
             needs_confirmation=True,
+            plan=RENAME_PLAN,
         )
         completed = BrainResponse("Renamed old.txt to new.txt")
 
@@ -363,10 +387,8 @@ class MainCliTests(unittest.TestCase):
         for description, bad_answer, resolution, approves in cases:
             with self.subTest(description=description):
                 brain = Mock(spec=main_module.MariaBrain)
-                if approves:
-                    brain.process.side_effect = [confirmation, completed]
-                else:
-                    brain.process.return_value = confirmation
+                brain.process.return_value = confirmation
+                brain.execute_confirmed_plan.return_value = completed
                 factory = Mock(return_value=brain)
 
                 status, stdout, stderr, input_mock = self._run_cli(
@@ -384,14 +406,12 @@ class MainCliTests(unittest.TestCase):
                         call("You: "),
                     ],
                 )
+                brain.process.assert_called_once_with(request)
                 if approves:
-                    self.assertEqual(
-                        brain.process.call_args_list,
-                        [call(request), call(request, confirmed=True)],
-                    )
+                    brain.execute_confirmed_plan.assert_called_once_with(RENAME_PLAN)
                     self.assertNotIn("Action cancelled", stdout)
                 else:
-                    brain.process.assert_called_once_with(request)
+                    brain.execute_confirmed_plan.assert_not_called()
                     self.assertEqual(stdout.count("Maria: Action cancelled.\n"), 1)
                 self.assertEqual(stderr, "")
 
@@ -402,10 +422,12 @@ class MainCliTests(unittest.TestCase):
         confirmation = BrainResponse(
             "Confirmation required: filesystem.rename requires explicit confirmation.",
             needs_confirmation=True,
+            plan=RENAME_PLAN,
         )
         completed = BrainResponse("Renamed old.txt to new.txt")
         brain = Mock(spec=main_module.MariaBrain)
-        brain.process.side_effect = [confirmation, completed]
+        brain.process.return_value = confirmation
+        brain.execute_confirmed_plan.return_value = completed
         factory = Mock(return_value=brain)
 
         status, stdout, stderr, input_mock = self._run_cli(
@@ -425,10 +447,8 @@ class MainCliTests(unittest.TestCase):
                 call("You: "),
             ],
         )
-        self.assertEqual(
-            brain.process.call_args_list,
-            [call(request), call(request, confirmed=True)],
-        )
+        brain.process.assert_called_once_with(request)
+        brain.execute_confirmed_plan.assert_called_once_with(RENAME_PLAN)
         self.assertNotIn("Action cancelled", stdout)
         self.assertEqual(stderr, "")
 
@@ -483,6 +503,7 @@ class MainCliTests(unittest.TestCase):
         confirmation = BrainResponse(
             "Confirmation required: filesystem.move requires explicit confirmation.",
             needs_confirmation=True,
+            plan=MOVE_PLAN,
         )
         cases = (
             ("keyboard_interrupt", KeyboardInterrupt(), "exit"),
@@ -502,6 +523,7 @@ class MainCliTests(unittest.TestCase):
 
                 self.assertEqual(status, 0)
                 brain.process.assert_called_once_with(request)
+                brain.execute_confirmed_plan.assert_not_called()
                 self.assertEqual(stdout.count("Maria: Action cancelled.\n"), 1)
                 self.assertTrue(stdout.endswith("Maria: Goodbye.\n"))
                 self.assertNotIn("Traceback", stdout)

@@ -203,7 +203,16 @@ class MariaBrainTests(unittest.TestCase):
         self.tool_manager.execute_tool.assert_not_called()
         self.memory.record_interaction.assert_not_called()
 
-    def test_confirmed_request_replans_and_executes_confirmation_step(self) -> None:
+    def test_confirmation_executes_the_approved_plan_without_replanning(self) -> None:
+        """Lock in the deliberate V1-04 reversal of this test's contract.
+
+        This test previously asserted the opposite behavior: confirming
+        re-sent the raw request, so Planner and context retrieval each ran
+        a second time and Brain executed whatever that second pass
+        produced. Confirmation now executes the exact plan that was
+        presented for approval, so planning and context retrieval happen
+        exactly once across the whole lifecycle.
+        """
         arguments = {"source": "old.txt", "destination": "new.txt"}
         plan = _single_step_plan(
             "rename old.txt to new.txt",
@@ -222,16 +231,14 @@ class MariaBrainTests(unittest.TestCase):
         )
 
         unconfirmed = self.brain.process("rename old.txt to new.txt")
-        confirmed = self.brain.process(
-            "rename old.txt to new.txt",
-            confirmed=True,
-        )
+        confirmed = self.brain.execute_confirmed_plan(unconfirmed.plan)
 
         self.assertTrue(unconfirmed.needs_confirmation)
+        self.assertIs(unconfirmed.plan, plan)
         self.assertEqual(confirmed.text, "Renamed old.txt to new.txt")
         self.assertFalse(confirmed.needs_confirmation)
-        self.assertEqual(self.planner.create_plan.call_count, 2)
-        self.assertEqual(self.memory.get_recent_interactions.call_count, 2)
+        self.assertEqual(self.planner.create_plan.call_count, 1)
+        self.assertEqual(self.memory.get_recent_interactions.call_count, 1)
         self.tool_manager.execute_tool.assert_called_once_with(
             "filesystem",
             "rename",
@@ -241,6 +248,12 @@ class MariaBrainTests(unittest.TestCase):
             "rename old.txt to new.txt",
             "Renamed old.txt to new.txt",
         )
+
+    def test_process_exposes_no_raw_text_confirmation_bypass(self) -> None:
+        parameters = inspect.signature(MariaBrain.process).parameters
+
+        self.assertEqual(list(parameters), ["self", "user_input"])
+        self.assertNotIn("confirmed", parameters)
 
     def test_denied_step_prevents_dispatch_and_records_denial(self) -> None:
         plan = _single_step_plan(

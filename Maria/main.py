@@ -7,6 +7,7 @@ from collections.abc import Callable
 
 from core.brain import BrainResponse, MariaBrain
 from core.constants import APP_NAME, APP_VERSION
+from core.session import MariaSession
 
 
 EXIT_COMMANDS = {"exit", "quit", "q"}
@@ -60,6 +61,8 @@ def run_cli(
         print(_STARTUP_FAILURE_MESSAGE, file=sys.stderr)
         return _EXIT_STARTUP_FAILURE
 
+    session = MariaSession(brain)
+
     print(f"{APP_NAME} v{APP_VERSION}")
     print("Type 'help' for supported commands. Type 'exit' to quit.")
 
@@ -77,14 +80,14 @@ def run_cli(
             print(f"{APP_NAME}: Goodbye.")
             break
 
-        response = brain.process(user_input)
+        response = session.submit(user_input)
 
         if response.needs_confirmation:
             print_response(response)
             if ask_for_confirmation():
-                response = brain.process(user_input, confirmed=True)
-                print_response(response)
+                print_response(session.confirm())
             else:
+                session.cancel()
                 print(f"{APP_NAME}: Action cancelled.")
             continue
 

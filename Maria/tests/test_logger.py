@@ -8,6 +8,7 @@ import unittest
 from pathlib import Path
 from unittest.mock import patch
 
+import core.logger as logger_module
 from core.logger import configure_logging, get_logger
 
 
@@ -36,6 +37,21 @@ class LoggerTests(unittest.TestCase):
         self.maria_logger.setLevel(self.original_level)
         self.maria_logger.propagate = self.original_propagate
         self.maria_logger.disabled = self.original_disabled
+
+    def _attach_foreign_file_handler(self) -> tuple[Path, logging.FileHandler]:
+        """Attach a real file handler Maria did not create, and clean it up."""
+        foreign_dir = Path(self.temporary_directory.name) / "embedder" / "logs"
+        foreign_dir.mkdir(parents=True, exist_ok=True)
+        foreign_path = foreign_dir / "embedder.log"
+        foreign = logging.FileHandler(foreign_path, encoding="utf-8")
+        self.addCleanup(self._detach_and_close, foreign)
+        self.maria_logger.addHandler(foreign)
+        return foreign_path, foreign
+
+    def _detach_and_close(self, handler: logging.Handler) -> None:
+        """Detach and close one handler before the temporary directory goes."""
+        self.maria_logger.removeHandler(handler)
+        handler.close()
 
     def test_configuration_creates_directory_file_and_uses_utf8(self) -> None:
         logger = configure_logging(self.log_dir)
@@ -91,6 +107,154 @@ class LoggerTests(unittest.TestCase):
         log_text = (self.log_dir / "maria.log").read_text(encoding="utf-8")
         self.assertEqual(log_text.count(marker), 1)
 
+    def test_second_configuration_targets_the_new_directory(self) -> None:
+        second_dir = Path(self.temporary_directory.name) / "second" / "logs"
+        first_logger = configure_logging(self.log_dir)
+        first_logger.info("first-directory-marker")
+
+        second_logger = configure_logging(second_dir)
+        second_logger.info("second-directory-marker")
+        _flush_handlers(second_logger)
+
+        self.assertIs(second_logger, first_logger)
+        handlers = _file_handlers(second_logger)
+        self.assertEqual(len(handlers), 1)
+        self.assertEqual(
+            Path(handlers[0].baseFilename).resolve(),
+            (second_dir / "maria.log").resolve(),
+        )
+        first_text = (self.log_dir / "maria.log").read_text(encoding="utf-8")
+        second_text = (second_dir / "maria.log").read_text(encoding="utf-8")
+        self.assertIn("first-directory-marker", first_text)
+        self.assertNotIn("second-directory-marker", first_text)
+        self.assertIn("second-directory-marker", second_text)
+
+    def test_second_configuration_closes_the_handler_it_replaces(self) -> None:
+        first_logger = configure_logging(self.log_dir)
+        replaced = _file_handlers(first_logger)[0]
+
+        configure_logging(self.log_dir)
+
+        self.assertNotIn(replaced, first_logger.handlers)
+        self.assertIsNone(replaced.stream)
+
+    def test_second_configuration_applies_the_new_level(self) -> None:
+        configure_logging(self.log_dir, level="info")
+
+        logger = configure_logging(self.log_dir, level="debug")
+
+        self.assertEqual(logger.level, logging.DEBUG)
+
+    def test_reconfiguration_leaves_a_foreign_handler_attached(self) -> None:
+        configure_logging(self.log_dir)
+        foreign = logging.NullHandler()
+        self.maria_logger.addHandler(foreign)
+
+        logger = configure_logging(self.log_dir)
+
+        self.assertIn(foreign, logger.handlers)
+        self.assertEqual(len(_file_handlers(logger)), 1)
+
+    def test_first_configuration_leaves_a_foreign_file_handler_untouched(self) -> None:
+        foreign_path, foreign = self._attach_foreign_file_handler()
+
+        logger = configure_logging(self.log_dir)
+
+        self.assertIn(foreign, logger.handlers)
+        self.assertIsNotNone(foreign.stream)
+        managed = _managed_handlers(logger)
+        self.assertEqual(len(managed), 1)
+        self.assertNotIn(foreign, managed)
+        self.assertEqual(
+            Path(managed[0].baseFilename).resolve(),
+            (self.log_dir / "maria.log").resolve(),
+        )
+
+        logger.info("first-configuration-marker")
+        _flush_handlers(logger)
+        self.assertIn(
+            "first-configuration-marker",
+            foreign_path.read_text(encoding="utf-8"),
+        )
+
+    def test_reconfiguration_leaves_a_foreign_file_handler_untouched(self) -> None:
+        foreign_path, foreign = self._attach_foreign_file_handler()
+        second_dir = Path(self.temporary_directory.name) / "second" / "logs"
+        configure_logging(self.log_dir)
+
+        logger = configure_logging(second_dir)
+
+        self.assertIn(foreign, logger.handlers)
+        self.assertIsNotNone(foreign.stream)
+        self.assertNotIn(foreign, _managed_handlers(logger))
+
+        logger.info("foreign-survivor-marker")
+        _flush_handlers(logger)
+        self.assertIn(
+            "foreign-survivor-marker",
+            foreign_path.read_text(encoding="utf-8"),
+        )
+
+        managed = _managed_handlers(logger)
+        self.assertEqual(len(managed), 1)
+        self.assertEqual(
+            Path(managed[0].baseFilename).resolve(),
+            (second_dir / "maria.log").resolve(),
+        )
+        self.assertNotIn(
+            "foreign-survivor-marker",
+            (self.log_dir / "maria.log").read_text(encoding="utf-8"),
+        )
+
+    def test_ownership_is_not_inferred_from_the_log_path(self) -> None:
+        self.log_dir.mkdir(parents=True, exist_ok=True)
+        shared = logging.FileHandler(self.log_dir / "maria.log", encoding="utf-8")
+        self.addCleanup(self._detach_and_close, shared)
+        self.maria_logger.addHandler(shared)
+
+        logger = configure_logging(self.log_dir)
+
+        self.assertIn(shared, logger.handlers)
+        self.assertIsNotNone(shared.stream)
+        self.assertNotIn(shared, _managed_handlers(logger))
+        self.assertEqual(len(_managed_handlers(logger)), 1)
+
+    def test_ownership_marker_is_not_public_api(self) -> None:
+        public_names = [
+            name for name in vars(logger_module) if not name.startswith("_")
+        ]
+
+        self.assertEqual(
+            [name for name in public_names if "managed" in name.lower()],
+            [],
+        )
+
+    def test_failed_reconfiguration_keeps_managed_and_foreign_handlers_working(
+        self,
+    ) -> None:
+        logger = configure_logging(self.log_dir)
+        original_handler = _managed_handlers(logger)[0]
+        foreign_path, foreign = self._attach_foreign_file_handler()
+        second_dir = Path(self.temporary_directory.name) / "failed" / "logs"
+
+        with patch(
+            "core.logger.logging.FileHandler",
+            side_effect=OSError("handler construction failed"),
+        ):
+            with self.assertRaisesRegex(OSError, "handler construction failed"):
+                configure_logging(second_dir)
+
+        self.assertEqual(_managed_handlers(logger), [original_handler])
+        self.assertIn(foreign, logger.handlers)
+        self.assertIsNotNone(original_handler.stream)
+        self.assertIsNotNone(foreign.stream)
+
+        logger.info("survivor-marker")
+        _flush_handlers(logger)
+        log_text = (self.log_dir / "maria.log").read_text(encoding="utf-8")
+        self.assertIn("survivor-marker", log_text)
+        self.assertIn("survivor-marker", foreign_path.read_text(encoding="utf-8"))
+
     def test_directory_creation_failure_propagates(self) -> None:
         with patch.object(
             Path,
@@ -131,6 +295,15 @@ def _file_handlers(logger: logging.Logger) -> list[logging.FileHandler]:
         handler
         for handler in logger.handlers
         if isinstance(handler, logging.FileHandler)
+    ]
+
+
+def _managed_handlers(logger: logging.Logger) -> list[logging.FileHandler]:
+    """Return only the file handlers configure_logging created and owns."""
+    return [
+        handler
+        for handler in logger.handlers
+        if getattr(handler, logger_module._MANAGED_ATTRIBUTE, False)
     ]
 
 
