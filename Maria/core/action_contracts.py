@@ -105,7 +105,7 @@ def _safe_component(value: Any, fallback: str, *, named: bool) -> str | None:
 class RootClass(str, Enum):
     """Named root class a path argument is understood to belong to."""
 
-    SAFE_FILESYSTEM_ROOT = "safe_filesystem_root"
+    NAMED_FILESYSTEM_ROOT = "named_filesystem_root"
 
 
 class ContractFailure(str, Enum):
@@ -708,13 +708,16 @@ def _text(
     )
 
 
-def _safe_path(name: str, required: bool = True) -> ArgumentContract:
-    """Declare a path argument governed by the configured safe filesystem root.
+def _named_root_path(name: str, required: bool = True) -> ArgumentContract:
+    """Declare a path argument governed by Maria's named filesystem roots.
 
     FilesystemTool raises ``Path is required.`` for text that is empty after
     stripping, so a blank path is malformed for every path field, and no path
     field has an established length ceiling. The root class is classification
-    metadata: nothing here resolves a path or touches the filesystem.
+    metadata and stays that: nothing here creates a ``Path``, resolves one,
+    selects a root, reads the filesystem, consults configuration, or decides
+    permission. Which named root a path lands in, and whether it is reachable
+    at all, are settled later by ``FilesystemRoots`` and ``FilesystemTool``.
     """
     return ArgumentContract(
         name,
@@ -723,7 +726,7 @@ def _safe_path(name: str, required: bool = True) -> ArgumentContract:
         allow_blank=False,
         minimum_length=None,
         maximum_length=None,
-        root_class=RootClass.SAFE_FILESYSTEM_ROOT,
+        root_class=RootClass.NAMED_FILESYSTEM_ROOT,
     )
 
 
@@ -742,21 +745,21 @@ BUILT_IN_ACTION_CONTRACTS = ActionContractRegistry(
                 ),
             ),
         ),
-        ActionContract("filesystem", "read", (_safe_path("path"),)),
+        ActionContract("filesystem", "read", (_named_root_path("path"),)),
         ActionContract(
             "filesystem",
             "list",
-            (_safe_path("path", required=False),),
+            (_named_root_path("path", required=False),),
         ),
         ActionContract(
             "filesystem",
             "rename",
-            (_safe_path("source"), _safe_path("destination")),
+            (_named_root_path("source"), _named_root_path("destination")),
         ),
         ActionContract(
             "filesystem",
             "move",
-            (_safe_path("source"), _safe_path("destination")),
+            (_named_root_path("source"), _named_root_path("destination")),
         ),
         ActionContract("history", "list"),
         ActionContract(

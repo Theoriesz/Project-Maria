@@ -9,8 +9,15 @@ from pathlib import Path
 from tempfile import TemporaryDirectory
 from unittest.mock import patch
 
+import core.brain as brain_module
 from core.brain import MariaBrain
 from core.config import MariaConfig
+from core.filesystem_roots import (
+    FilesystemProtections,
+    FilesystemRoot,
+    FilesystemRoots,
+    RootPolicy,
+)
 from core.permissions import PermissionDecision
 from core.session import MariaSession
 
@@ -27,6 +34,24 @@ class StartupIntegrationTests(unittest.TestCase):
             self.temporary_root / "runtime" / "database" / "maria.db"
         )
         self.log_dir = self.temporary_root / "runtime" / "logs"
+        self.workspace_root = self.temporary_root / "workspace"
+        self.filesystem_roots = FilesystemRoots(
+            (
+                FilesystemRoot(
+                    name="workspace",
+                    path=self.workspace_root,
+                    policy=RootPolicy.ORGANIZE,
+                    enabled=True,
+                ),
+            ),
+            "workspace",
+        )
+        self.workspace_was_missing = not self.workspace_root.exists()
+        self.filesystem_protections = FilesystemProtections(
+            database_path=self.database_path,
+            log_dir=self.log_dir,
+            prompt_path=self.temporary_root / "runtime" / "prompts" / "system.txt",
+        )
         self.config = MariaConfig(
             app_name="Maria",
             version="0.1.0",
@@ -34,7 +59,8 @@ class StartupIntegrationTests(unittest.TestCase):
             database_path=self.database_path,
             log_dir=self.log_dir,
             prompt_path=self.temporary_root / "runtime" / "prompts" / "system.txt",
-            safe_filesystem_root=self.temporary_root / "safe-filesystem-root",
+            filesystem_roots=self.filesystem_roots,
+            filesystem_protections=self.filesystem_protections,
             log_level="DEBUG",
             confirmation_required=frozenset(),
             denied_actions=frozenset(),
@@ -760,9 +786,9 @@ class StartupIntegrationTests(unittest.TestCase):
     def test_all_runtime_paths_and_file_handlers_are_temporary(self) -> None:
         self.assertTrue(self.config.database_path.is_relative_to(self.temporary_root))
         self.assertTrue(self.config.log_dir.is_relative_to(self.temporary_root))
-        self.assertTrue(
-            self.config.safe_filesystem_root.is_relative_to(self.temporary_root)
-        )
+        for root in self.config.filesystem_roots.roots:
+            with self.subTest(root=root.name):
+                self.assertTrue(root.path.is_relative_to(self.temporary_root))
         self.assertEqual(self.brain.config, self.config)
         self.assertEqual(self.brain.memory.database_path, self.database_path)
 
@@ -775,6 +801,179 @@ class StartupIntegrationTests(unittest.TestCase):
         handler_path = Path(file_handlers[0].baseFilename).resolve()
         self.assertTrue(handler_path.is_relative_to(self.temporary_root))
         self.assertEqual(handler_path, self.log_dir / "maria.log")
+
+    def test_startup_prepares_the_configured_workspace_root(self) -> None:
+        self.assertTrue(self.workspace_was_missing)
+        self.assertTrue(self.workspace_root.is_dir())
+        self.assertTrue(self.workspace_root.is_relative_to(self.temporary_root))
+        self.assertEqual(
+            self.brain.config.filesystem_roots.default_root.path,
+            self.workspace_root,
+        )
+
+    def test_the_prepared_workspace_serves_real_filesystem_commands(self) -> None:
+        (self.workspace_root / "inbox").mkdir()
+        (self.workspace_root / "inbox" / "order.txt").write_text(
+            "order",
+            encoding="utf-8",
+        )
+
+        listed = self.brain.process("list inbox")
+        read = self.brain.process("read file inbox/order.txt")
+
+        self.assertEqual(listed.text, "file: order.txt")
+        self.assertEqual(read.text, "order")
+
+    def test_a_refused_root_stops_startup_before_the_database_exists(self) -> None:
+        occupied = self.temporary_root / "occupied-workspace"
+        occupied.write_text("not a directory", encoding="utf-8")
+        database_path = self.temporary_root / "refused" / "database" / "maria.db"
+        refused = MariaConfig(
+            app_name="Maria",
+            version="0.1.0",
+            environment="test",
+            database_path=database_path,
+            log_dir=self.temporary_root / "refused" / "logs",
+            prompt_path=self.temporary_root / "refused" / "prompts" / "system.txt",
+            filesystem_roots=FilesystemRoots(
+                (
+                    FilesystemRoot(
+                        name="workspace",
+                        path=occupied,
+                        policy=RootPolicy.ORGANIZE,
+                        enabled=True,
+                    ),
+                ),
+                "workspace",
+            ),
+            filesystem_protections=FilesystemProtections(
+                database_path=database_path,
+                log_dir=self.temporary_root / "refused" / "logs",
+                prompt_path=self.temporary_root / "refused" / "prompts" / "system.txt",
+            ),
+            log_level="DEBUG",
+            confirmation_required=frozenset(),
+            denied_actions=frozenset(),
+        )
+
+        with patch("core.brain.load_config", return_value=refused):
+            with self.assertRaises(ValueError) as caught:
+                MariaBrain.from_defaults()
+
+        self.assertEqual(
+            str(caught.exception),
+            "An enabled filesystem root must be a directory.",
+        )
+        self.assertFalse(database_path.exists())
+        self.assertFalse(database_path.parent.exists())
+        self.assertTrue(occupied.is_file())
+
+    def test_root_preparation_receives_the_exact_active_protections(self) -> None:
+        recorded: list[object] = []
+        real_prepare = brain_module.prepare_roots
+
+        def recording_prepare(roots: object, protections: object) -> None:
+            recorded.append((roots, protections))
+            real_prepare(roots, protections)
+
+        with patch("core.brain.load_config", return_value=self.config):
+            with patch.object(brain_module, "prepare_roots", recording_prepare):
+                MariaBrain.from_defaults()
+
+        self.assertEqual(len(recorded), 1)
+        prepared_roots, prepared_protections = recorded[0]
+        self.assertIs(prepared_roots, self.config.filesystem_roots)
+        self.assertIs(prepared_protections, self.config.filesystem_protections)
+
+    def test_a_root_naming_an_active_runtime_location_is_refused(self) -> None:
+        refused_log_dir = self.temporary_root / "refused-runtime" / "logs"
+        database_path = (
+            self.temporary_root / "refused-runtime" / "database" / "maria.db"
+        )
+        refused = MariaConfig(
+            app_name="Maria",
+            version="0.1.0",
+            environment="test",
+            database_path=database_path,
+            log_dir=refused_log_dir,
+            prompt_path=self.temporary_root / "refused-runtime" / "system.txt",
+            filesystem_roots=FilesystemRoots(
+                (
+                    FilesystemRoot(
+                        name="workspace",
+                        path=refused_log_dir,
+                        policy=RootPolicy.ORGANIZE,
+                        enabled=True,
+                    ),
+                ),
+                "workspace",
+            ),
+            filesystem_protections=FilesystemProtections(
+                database_path=database_path,
+                log_dir=refused_log_dir,
+                prompt_path=self.temporary_root / "refused-runtime" / "system.txt",
+            ),
+            log_level="DEBUG",
+            confirmation_required=frozenset(),
+            denied_actions=frozenset(),
+        )
+
+        with patch("core.brain.load_config", return_value=refused):
+            with self.assertRaises(ValueError) as caught:
+                MariaBrain.from_defaults()
+
+        self.assertEqual(
+            str(caught.exception),
+            "A filesystem root may not be a permanently excluded location.",
+        )
+        # The refusal precedes every side effect: the root was not created,
+        # the active log directory configuring logging would have created was
+        # not created, and the database was never opened.
+        self.assertFalse(refused_log_dir.exists())
+        self.assertFalse(refused_log_dir.parent.exists())
+        self.assertFalse(database_path.exists())
+
+    def test_a_refused_root_precedes_logging_configuration(self) -> None:
+        occupied = self.temporary_root / "occupied-root"
+        occupied.write_text("not a directory", encoding="utf-8")
+        log_dir = self.temporary_root / "unreached" / "logs"
+        refused = MariaConfig(
+            app_name="Maria",
+            version="0.1.0",
+            environment="test",
+            database_path=self.temporary_root / "unreached" / "database" / "maria.db",
+            log_dir=log_dir,
+            prompt_path=self.temporary_root / "unreached" / "system.txt",
+            filesystem_roots=FilesystemRoots(
+                (
+                    FilesystemRoot(
+                        name="workspace",
+                        path=occupied,
+                        policy=RootPolicy.ORGANIZE,
+                        enabled=True,
+                    ),
+                ),
+                "workspace",
+            ),
+            filesystem_protections=FilesystemProtections(
+                database_path=self.temporary_root
+                / "unreached"
+                / "database"
+                / "maria.db",
+                log_dir=log_dir,
+                prompt_path=self.temporary_root / "unreached" / "system.txt",
+            ),
+            log_level="DEBUG",
+            confirmation_required=frozenset(),
+            denied_actions=frozenset(),
+        )
+
+        with patch("core.brain.load_config", return_value=refused):
+            with self.assertRaises(ValueError):
+                MariaBrain.from_defaults()
+
+        self.assertFalse(log_dir.exists())
+        self.assertTrue(occupied.is_file())
 
     def test_temporary_logging_handler_closes_before_directory_cleanup(self) -> None:
         file_handlers = [

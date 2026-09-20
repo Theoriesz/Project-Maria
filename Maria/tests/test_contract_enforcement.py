@@ -27,6 +27,12 @@ from core.action_contracts import (
 )
 from core.brain import BrainResponse, MariaBrain
 from core.config import MariaConfig
+from core.filesystem_roots import (
+    FilesystemProtections,
+    FilesystemRoot,
+    FilesystemRoots,
+    RootPolicy,
+)
 from core.memory import Memory
 from core.permissions import (
     PermissionDecision,
@@ -86,6 +92,30 @@ def _plan(request: str, *steps: tuple[str, str, dict[str, Any]]) -> Plan:
     )
 
 
+def _temporary_filesystem_protections(root: Path) -> FilesystemProtections:
+    """Return active runtime locations beneath a temporary directory."""
+    return FilesystemProtections(
+        database_path=root / "database" / "maria.db",
+        log_dir=root / "logs",
+        prompt_path=root / "system_prompt.txt",
+    )
+
+
+def _temporary_filesystem_roots(root: Path) -> FilesystemRoots:
+    """Return one enabled organizing root beneath a temporary directory."""
+    return FilesystemRoots(
+        (
+            FilesystemRoot(
+                name="workspace",
+                path=root,
+                policy=RootPolicy.ORGANIZE,
+                enabled=True,
+            ),
+        ),
+        "workspace",
+    )
+
+
 def _temporary_config(root: Path) -> MariaConfig:
     """Return a complete config whose paths remain under a temporary root."""
     return MariaConfig(
@@ -95,7 +125,8 @@ def _temporary_config(root: Path) -> MariaConfig:
         database_path=root / "database" / "maria.db",
         log_dir=root / "logs",
         prompt_path=root / "system_prompt.txt",
-        safe_filesystem_root=root,
+        filesystem_roots=_temporary_filesystem_roots(root),
+        filesystem_protections=_temporary_filesystem_protections(root),
         log_level="INFO",
         confirmation_required=frozenset(),
         denied_actions=frozenset(),
@@ -1738,7 +1769,11 @@ class ToolDefenceInDepthTests(unittest.TestCase):
 
     def test_filesystem_path_fields_are_not_converted(self) -> None:
         (self.root / "present.txt").write_text("content", encoding="utf-8")
-        tool = FilesystemTool(root_path=self.root, logger=self.logger)
+        tool = FilesystemTool(
+            roots=_temporary_filesystem_roots(self.root),
+            protections=_temporary_filesystem_protections(self.root),
+            logger=self.logger,
+        )
         cases = (
             ("read", {"path": 7}, "File read failed: Path must be text."),
             ("list", {"path": 7}, "Directory listing failed: Path must be text."),
@@ -1777,7 +1812,11 @@ class ToolDefenceInDepthTests(unittest.TestCase):
 
     def test_filesystem_absent_optional_path_still_lists_the_root(self) -> None:
         (self.root / "present.txt").write_text("content", encoding="utf-8")
-        tool = FilesystemTool(root_path=self.root, logger=self.logger)
+        tool = FilesystemTool(
+            roots=_temporary_filesystem_roots(self.root),
+            protections=_temporary_filesystem_protections(self.root),
+            logger=self.logger,
+        )
 
         result = tool.execute("list", {})
 
@@ -1967,7 +2006,11 @@ class ToolDefenceInDepthTests(unittest.TestCase):
         )
 
     def test_blank_filesystem_path_defence_is_unchanged(self) -> None:
-        tool = FilesystemTool(root_path=self.root, logger=self.logger)
+        tool = FilesystemTool(
+            roots=_temporary_filesystem_roots(self.root),
+            protections=_temporary_filesystem_protections(self.root),
+            logger=self.logger,
+        )
 
         self.assertEqual(
             tool.execute("read", {"path": "  "}),

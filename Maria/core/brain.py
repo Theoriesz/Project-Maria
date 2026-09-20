@@ -12,6 +12,7 @@ from logging import Logger
 
 from core.action_contracts import ContractViolation
 from core.config import MariaConfig, load_config
+from core.filesystem_roots import prepare_roots
 from core.logger import configure_logging, get_logger
 from core.memory import Memory
 from core.permissions import (
@@ -100,6 +101,19 @@ class MariaBrain:
     def from_defaults(cls) -> "MariaBrain":
         """Create a fully wired MariaBrain from config.toml."""
         config = load_config()
+
+        # Loading settles what the roots are; this is the one boundary that
+        # makes them usable. It runs before logging is configured because
+        # configuring logging creates the active log directory, and a root
+        # declaration that names a protected runtime location has to be
+        # refused before anything is created rather than after. It still runs
+        # before the memory layer opens the database, so a misdeclared root
+        # stops startup rather than being discovered later by the first
+        # filesystem command. Nothing is logged on this path either way: a
+        # refusal raises, and main.py reports it as a sanitized startup
+        # failure.
+        prepare_roots(config.filesystem_roots, config.filesystem_protections)
+
         configure_logging(config.log_dir, config.log_level)
         logger = get_logger(__name__)
 

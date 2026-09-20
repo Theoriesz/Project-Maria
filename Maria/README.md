@@ -77,6 +77,86 @@ Retitling and editing are deliberately separate commands, so neither can
 overwrite the other's field. Filesystem delete functionality remains
 intentionally unimplemented.
 
+## Filesystem Access
+
+Maria reads, lists, renames, and moves files only inside named filesystem roots
+declared in `config/config.toml`. The shipped declaration is exactly two:
+
+| Name | Configured path | Policy | Enabled |
+|---|---|---|---|
+| `workspace` | `~/MariaWorkspace` | `organize` | yes |
+| `project_maria` | `..` (Maria's repository root) | `read_only` | no |
+
+`workspace` is the default root, so a relative path such as `inbox/order.txt`
+resolves inside it. An absolute path is accepted only when it falls inside an
+enabled root. Maria creates a missing enabled organizing root at startup; it
+never creates a read-only root, and it never creates a disabled one.
+
+`project_maria` is declared but disabled, reserved for a later capability. A path
+beneath it is refused exactly like any path outside Maria's roots, and the refusal
+names neither the path nor the root.
+
+A `read_only` root permits `read` and `list` only. Rename and move are refused
+there, and a rename or move whose source and destination are in different roots is
+refused as well, even when both roots organize.
+
+Some locations are permanently out of reach of every filesystem command:
+
+- Maria's live database file and its SQLite `-journal`, `-wal`, and `-shm`
+  sidecars, wherever `[paths] database` puts them
+- Maria's live log directory and everything beneath it, including rotated logs,
+  wherever `[paths] logs` puts it
+- Maria's active system prompt, wherever `[paths] system_prompt` puts it
+- the default `database/` and `logs/` directories inside Maria's own project
+- the repository's `.git`, whether it is a directory or a gitdir-pointer file
+- `config/config.local.toml`, which Maria never creates and never loads
+- inside Maria's repository, at any depth: `.env` and any `.env.*` file,
+  `__pycache__`, `.venv`, `venv`, `env`, `.pytest_cache`, `.mypy_cache`,
+  `.ruff_cache`, `maria_cli_test`, `.claude`, and any name ending `.tmp` or
+  `.bak`
+
+`.env.example` is the one exemption, and only as an exact final path component.
+
+The first three follow the running configuration rather than Maria's default
+layout, so pointing `[paths]` at somewhere inside your workspace keeps those
+locations protected there too. Each covers itself and anything beneath it, which
+matters only if one of those names turns out to be a directory rather than a file.
+An unrelated file that merely sits beside the database or the prompt — such as
+`maria.db.notes` — stays usable, and so does the directory holding them.
+
+Renaming and moving go further than reading. A directory that *contains* the live
+database, one of its sidecars, or the system prompt cannot be renamed or moved, and
+neither can an ancestor of the live log directory, because relocating a directory
+would carry those files along with it. Reading and listing such a directory still
+work normally, with the protected entries filtered out; it is only the mutating
+commands that refuse. An ordinary directory with nothing protected inside it
+renames and moves as usual.
+
+Separately, Maria's whole repository — its source, documentation, prompts, shipped
+configuration, and any untracked file beside them — is unavailable to the generic
+`read`, `list`, `rename`, and `move` commands. Declaring a root around the
+repository does not change that.
+
+Each rule is applied both to the path you asked for and to the path it actually
+resolves to, so a `..` traversal, a symbolic link, or a Windows junction cannot
+spell its way past them in either direction: a protected name that points outward
+is still refused, and an ordinary name that points at something protected is
+refused too. The repository-scoped name rules stay scoped to Maria's repository,
+so your own workspace may hold an `env`, `venv`, or `.claude` directory and
+`notes.tmp` or `archive.bak` files, and Maria can still use them.
+
+A refused path produces one of four fixed messages that repeat no path, home
+location, repository location, root name, or excluded filename:
+
+```text
+Path is outside Maria's configured safe root.
+Path is permanently excluded from Maria's filesystem access.
+This filesystem root is read-only.
+Source and destination must be inside the same filesystem root.
+```
+
+Filesystem delete and write functionality remains intentionally unimplemented.
+
 ## Persistent Memory
 
 Maria stores deliberately remembered facts in SQLite, so they remain available
@@ -241,11 +321,12 @@ directory:
 python -m unittest discover -s tests -v
 ```
 
-Tests use temporary databases, log directories, and filesystem roots, so
-production runtime files are not required. The suite covers the CLI,
-configuration, permissions, calculator, memory, Logger, Tool Manager,
-notes, interaction history, filesystem, system information, Brain,
-Planner, and clean startup wiring.
+Tests use temporary databases, log directories, homes, and filesystem roots, so
+production runtime files are not required and no test creates or reads a real
+`~/MariaWorkspace`. The suite covers the CLI, configuration, permissions,
+calculator, memory, Logger, Tool Manager, notes, interaction history,
+filesystem, filesystem roots and permanent exclusions, system information,
+Brain, Planner, and clean startup wiring.
 
 ## Project Layout
 
@@ -253,7 +334,7 @@ Planner, and clean startup wiring.
   configuration, and constants
 - `tools/`: built-in tools
 - `database/`: SQLite database
-- `config/`: TOML configuration
+- `config/`: TOML configuration, including the named filesystem roots
 - `prompts/`: starter prompt text
 - `logs/`: runtime logs
 - `docs/`: architecture and development documentation

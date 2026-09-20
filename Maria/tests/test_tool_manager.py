@@ -17,6 +17,12 @@ from core.action_contracts import (
     ArgumentContract,
 )
 from core.config import MariaConfig
+from core.filesystem_roots import (
+    FilesystemProtections,
+    FilesystemRoot,
+    FilesystemRoots,
+    RootPolicy,
+)
 from core.failures import FailureKind
 from core.logger import configure_logging
 from core.memory import Memory
@@ -583,6 +589,30 @@ class _StubTool:
         return self.result
 
 
+def _temporary_filesystem_protections(root: Path) -> FilesystemProtections:
+    """Return active runtime locations beneath a temporary directory."""
+    return FilesystemProtections(
+        database_path=root / "database" / "maria.db",
+        log_dir=root / "logs",
+        prompt_path=root / "system_prompt.txt",
+    )
+
+
+def _temporary_filesystem_roots(root: Path) -> FilesystemRoots:
+    """Return one enabled organizing root beneath a temporary directory."""
+    return FilesystemRoots(
+        (
+            FilesystemRoot(
+                name="workspace",
+                path=root,
+                policy=RootPolicy.ORGANIZE,
+                enabled=True,
+            ),
+        ),
+        "workspace",
+    )
+
+
 def _temporary_config(root: Path) -> MariaConfig:
     """Return a complete config whose paths remain under a temporary root."""
     return MariaConfig(
@@ -592,7 +622,8 @@ def _temporary_config(root: Path) -> MariaConfig:
         database_path=root / "database" / "maria.db",
         log_dir=root / "logs",
         prompt_path=root / "system_prompt.txt",
-        safe_filesystem_root=root,
+        filesystem_roots=_temporary_filesystem_roots(root),
+        filesystem_protections=_temporary_filesystem_protections(root),
         log_level="INFO",
         confirmation_required=frozenset({"filesystem.rename", "filesystem.move"}),
         denied_actions=frozenset({"filesystem.delete", "filesystem.write"}),

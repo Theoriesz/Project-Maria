@@ -18,6 +18,28 @@ from core.permissions import (
 )
 
 
+# Maria's named filesystem roots are a required section, so every fixture that
+# loads a real configuration file has to declare them. The permission fixtures
+# below are about the permission baseline only, so they append this shipped
+# declaration verbatim rather than restating any root policy of their own.
+VALID_FILESYSTEM_SECTION = """
+[filesystem]
+default_root = "workspace"
+
+[[filesystem.roots]]
+name = "workspace"
+path = "~/MariaWorkspace"
+policy = "organize"
+enabled = true
+
+[[filesystem.roots]]
+name = "project_maria"
+path = ".."
+policy = "read_only"
+enabled = false
+"""
+
+
 class PermissionManagerTests(unittest.TestCase):
     """Verify mandatory policy, configured extensions, and logging."""
 
@@ -423,7 +445,8 @@ class PermissionManagerTests(unittest.TestCase):
             config_path.write_text(
                 "[permissions]\n"
                 "require_confirmation = [\"calendar.create\"]\n"
-                "deny = [\"memory.store\", \"calendar.create\"]\n",
+                "deny = [\"memory.store\", \"calendar.create\"]\n"
+                + VALID_FILESYSTEM_SECTION,
                 encoding="utf-8",
             )
             config = load_config(config_path)
@@ -473,7 +496,10 @@ class PermissionManagerTests(unittest.TestCase):
             with self.subTest(description=description):
                 with TemporaryDirectory() as temporary_directory:
                     config_path = Path(temporary_directory) / "config.toml"
-                    config_path.write_text(config_text, encoding="utf-8")
+                    config_path.write_text(
+                        config_text + VALID_FILESYSTEM_SECTION,
+                        encoding="utf-8",
+                    )
                     config = load_config(config_path)
 
                 manager = PermissionManager(

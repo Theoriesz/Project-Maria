@@ -25,7 +25,7 @@ refusal naming the tool, action, and field only, never the submitted value.
 Tools keep their own argument checks as defence in depth, so a malformed value
 passed straight to a tool object is refused there too rather than converted.
 An absent optional argument still receives its existing tool-owned default:
-`filesystem.list` defaults an absent `path` to the safe root, `notes.create`
+`filesystem.list` defaults an absent `path` to its governing root, `notes.create`
 defaults an absent `title` to `Untitled`, and the listing actions default an
 absent `limit` to 20. A value that is *provided* is never repaired into a
 default. Every text field declares that blank or whitespace-only content is
@@ -45,7 +45,7 @@ gates as defence in depth and is unchanged.
 ## Built-in Tools
 
 - `calculator`: basic arithmetic
-- `filesystem`: read, list, rename, and move inside the configured safe root
+- `filesystem`: read, list, rename, and move inside Maria's named filesystem roots
 - `history`: list, search, read, and delete SQLite-backed interaction-history
   rows
 - `memory`: store, search, list, update, and forget explicit SQLite-backed
@@ -71,21 +71,164 @@ math guarantees.
 
 ## Filesystem Tool
 
-The filesystem tool supports `read`, `list`, `rename`, and `move` inside the configured
-safe root. Rename and move always require explicit confirmation.
+The filesystem tool supports `read`, `list`, `rename`, and `move` inside Maria's named
+filesystem roots. Rename and move always require explicit confirmation. There is no
+write, delete, copy, overwrite, glob, recursion, bulk, or archive action, and none is
+reachable by argument.
 
-Every path operand must be an actual `str`. A value of any other type is refused
-with `Path must be text.` rather than being rendered into a path, so a malformed
-direct call can no longer become a real filesystem target. `list` still defaults
-an absent `path` to the safe root.
+### Named Roots
 
-Internally the tool still resolves every operand to a canonical absolute path, and all
-containment validation, symlink resolution, and actual filesystem work happen on those
+Maria no longer has a single configured safe directory. `config/config.toml` declares
+named roots in a `[filesystem]` section, and the shipped declaration is exactly two:
+
+| Name | Configured path | Policy | Enabled |
+|---|---|---|---|
+| `workspace` | `~/MariaWorkspace` | `organize` | yes |
+| `project_maria` | `..` (Maria's repository root) | `read_only` | no |
+
+`default_root` is `workspace`. A relative path resolves against the default enabled
+root, an absolute path is accepted only inside an enabled root, and a `~` prefix
+expands first. The current working directory is never consulted, so Maria's roots do
+not move with the shell that started it.
+
+A root's policy decides what may happen inside it. An `organize` root permits all four
+actions. A `read_only` root permits `read` and `list` only; `rename` and `move` are
+refused there, on the source operand and on the destination operand alike.
+
+`project_maria` is declared but disabled, reserved for a later Project Maria capability.
+A path beneath a disabled root is treated exactly as a path outside Maria's roots and
+produces the same content-free refusal, which never names the root.
+
+Rename and move resolve source and destination independently and then require both to
+be in the *same* root. A cross-root operation is refused even when both roots are
+`organize` roots.
+
+An enabled `organize` root is created at startup if it is missing. An enabled
+`read_only` root is never created and must already exist. A disabled root is neither
+created nor required to exist. Configuration loading itself creates nothing.
+
+### Permanently Excluded Paths
+
+Two separate rules keep content out of reach. Each is applied to *two* identities of a
+submitted path: the absolute pre-resolution spelling that was asked for, and the
+canonical target it resolves to. One identity alone is not enough. Checking only the
+target would let a protected name such as `Maria/logs` be reached by making it a
+junction pointing out of the repository; checking only the spelling would let an
+ordinary-looking link point in. Containment in a root is still decided by the canonical
+target alone.
+
+The first rule is the *universal permanent exclusion*, which every filesystem
+capability applies, including the Project Maria capability planned for a later stage.
+It has two halves.
+
+The fixed half follows from Maria's source layout:
+
+- `Maria/database/` and everything beneath it, including database sidecars
+- `Maria/logs/` and everything beneath it, including rotated logs
+- the repository's `.git`, whether it is a directory or a gitdir-pointer file
+- `Maria/config/config.local.toml`, which Maria never creates and never loads
+- inside the repository, at any depth: `.env` and any `.env.*` component,
+  `__pycache__`, `.venv`, `venv`, `env`, `.pytest_cache`, `.mypy_cache`,
+  `.ruff_cache`, `maria_cli_test`, `.claude`, and any component ending `.tmp` or
+  `.bak`
+
+The active half protects the runtime locations the *running* configuration chose,
+which the fixed half cannot know about. Configuration may legitimately place any of
+them inside an enabled root, and they stay unreachable there:
+
+- the active database file, `[paths] database`, and its SQLite sidecars
+  `-journal`, `-wal`, and `-shm`
+- the active log directory, `[paths] logs`, as a complete subtree, so every rotation
+  beneath it is covered without naming rotations
+- the active system prompt, `[paths] system_prompt`, as an exact file
+
+The database, its sidecars, and the prompt are each protected as an identity *and*
+everything beneath it. Under the ordinary file shape that costs nothing, because a
+file has no descendants; it matters when one of those names turns out to be occupied
+by a directory or a directory reparse point, where protecting only the exact path
+would leave the contents reachable one level down. An unrelated neighbour in the same
+directory — `maria.db.notes`, say — is unaffected and stays usable.
+
+A sidecar contributes two identities: the name beside the database, and — when that
+name already resolves elsewhere through a link — the canonical target it points at,
+so the content stays protected under the name it actually lives at, and so does
+anything beneath it.
+
+Both halves are settled once at startup and handed to the filesystem tool, so the
+boundary a command meets is the one configuration established.
+
+### Relocating a Directory
+
+`rename` and `move` ask a wider question than `read` and `list` do, because relocating
+a directory carries everything beneath it. An operand is refused when it *contains* an
+active location as well as when it *is* one: a directory holding the live database, one
+of its sidecars, or the system prompt cannot be renamed or moved, and neither can an
+ancestor of the active log directory. The rule is pure path arithmetic, so a
+destination that does not exist yet is judged the same way — a directory that would
+*become* an ancestor of the configured prompt is refused before it is created. The
+repository barrier widens for a mutation too: a path that contains the repository is
+refused as well as one inside it.
+
+Both identities of both operands are checked, and the check runs after placement and
+direct reachability but before the policy check, the same-root check, and every
+existence check, so nothing is created, renamed, or moved on the way to finding out.
+Every refusal is the same fixed message and names neither the operand nor the active
+location that caused it.
+
+This is deliberately *not* the direct rule. An ordinary parent directory holding a
+protected child stays readable and listable with that child filtered out; it is simply
+immovable. An ordinary sibling directory with no protected descendant renames and moves
+normally.
+
+`.env.example` is the one exemption, and it is exact: the spelling must match and it
+must be the final component. A *directory* named `.env.example` is therefore not an
+allowed subtree, and nothing beneath one is exempt.
+
+The component rules above are repository-scoped: they apply only once a canonical path
+is known to lie inside Maria's own repository. A workspace may hold its own `env`,
+`venv`, or `.claude` directory and its own `notes.tmp` or `archive.bak` file, and all
+of them remain readable, listable, and movable.
+
+The second rule is the *general filesystem repository barrier*. Any path at or beneath
+Maria's repository root — by spelling or by target — is unavailable to
+`filesystem.read`, `filesystem.list`, `filesystem.rename`, and `filesystem.move`. That
+covers tracked source, documentation, prompts, `config.toml`, and any untracked file
+beside them. Declaring a root around the repository does not defeat it, and neither
+does a repository path that links outward nor a workspace path that links in.
+
+### Listing Behavior
+
+`list` settles each child before describing it. The raw entry name gives the child's
+spelling beneath the already-canonical parent, and resolving it gives the target; both
+go through the governing-root check, the universal exclusions, and the repository
+barrier. Only a child that survives all of it is classified as a file or a directory,
+so a child that escapes the root, points into a protected location, or *is* a protected
+name pointing outward is never stat'ed.
+
+A child that is conclusively outside the root, universally excluded, or behind the
+repository barrier is omitted silently. The parent listing still succeeds, its ordinary
+siblings remain visible, and the response names neither the omitted entry nor what it
+pointed at. A directory whose every child was filtered away reports the unchanged
+`Directory is empty.`
+
+Silence stops there. An unexpected `OSError` while resolving or classifying a child is
+not swallowed: the whole listing fails through the usual sanitized
+`Directory listing failed: ...` path rather than returning a short listing that looks
+complete.
+
+### Paths and Messages
+
+Every path operand must be an actual `str`. A value of any other type is refused with
+`Path must be text.` rather than being rendered into a path, so a malformed direct call
+can no longer become a real filesystem target. `list` still defaults an absent `path`
+to the governing root.
+
+Internally the tool resolves every operand to a canonical absolute path, and all
+containment validation, link resolution, and actual filesystem work happen on those
 absolute paths. Only the user-facing message text is rendered differently.
 
-User-facing messages show paths relative to the configured safe root, always using
-forward slashes so output is identical on every platform. The safe root itself displays
-as `.`:
+User-facing messages show paths relative to the governing root, always using forward
+slashes so output is identical on every platform. The root itself displays as `.`:
 
 ```text
 Not a file: archive/processed/Customer Order.txt
@@ -97,27 +240,37 @@ Moved inbox/Customer Order.txt to archive/processed/Customer Order.txt.
 ```
 
 Displayed paths are derived after resolution, so redundant `.` and `..` components are
-removed and an absolute operand inside the safe root is still shown relative to it.
-Spaces, Unicode, casing, and quote characters are preserved as literal path characters;
-the tool performs no shell or quote parsing.
+removed and an absolute operand inside a root is still shown relative to it. Spaces,
+Unicode, casing, and quote characters are preserved as literal path characters; the
+tool performs no shell or quote parsing.
 
-A path that resolves outside the safe root is rejected with one generic message that
-never names the rejected path:
+Four fixed refusals carry no operand at all. Each interpolates nothing:
 
 ```text
 Path is outside Maria's configured safe root.
+Path is permanently excluded from Maria's filesystem access.
+This filesystem root is read-only.
+Source and destination must be inside the same filesystem root.
 ```
 
+No response reveals the submitted absolute path, the owner's home location, the
+repository location, a root name, an excluded filename, raw OS exception text, or an
+object repr or address.
+
 Failures are reported with a sanitized reason. Raw `OSError` and `shutil.Error` text is
-never copied into a response, and neither are the `filename`, `filename2`, `strerror`, or
-`args` fields those exceptions carry. A reason is chosen as follows:
+never copied into a response, and neither are the `filename`, `filename2`, `strerror`,
+or `args` fields those exceptions carry. A reason is chosen as follows:
 
 - For an `OSError`, the reason comes from `os.strerror(exc.errno)`.
-- For a `ValueError`, only these two fixed Maria-controlled messages are preserved:
+- For a `ValueError`, only Maria's fixed controlled messages are preserved:
 
   ```text
   Path is required.
+  Path must be text.
   Path is outside Maria's configured safe root.
+  Path is permanently excluded from Maria's filesystem access.
+  This filesystem root is read-only.
+  Source and destination must be inside the same filesystem root.
   ```
 
 - Every other `ValueError`, and any failure without a usable numeric error code —
@@ -132,6 +285,8 @@ So a response carries one of these forms:
 ```text
 File read failed: Permission denied
 File read failed: Path is outside Maria's configured safe root.
+Directory listing failed: Path is permanently excluded from Maria's filesystem access.
+Rename failed: This filesystem root is read-only.
 Move failed: The operating system reported an unspecified error.
 ```
 
