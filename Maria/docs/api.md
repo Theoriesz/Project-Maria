@@ -589,9 +589,167 @@ A field order of type, then blank policy, then length or numeric bounds means a
 malformed value never reaches a text operation. A blank, too-short, too-long,
 or out-of-range value all report `OUT_OF_RANGE`.
 The supplied mapping is read, never rebuilt or copied into a mutable mapping,
-so a `Plan` fingerprint is unchanged by validation. A path field's `root_class`
-is classification metadata: the registry resolves no path and touches no
-filesystem.
+so a `Plan` fingerprint is unchanged by validation. `RootClass` has one member,
+`NAMED_FILESYSTEM_ROOT`, and all six filesystem path fields declare it:
+`read.path`, `list.path`, `rename.source`, `rename.destination`, `move.source`,
+and `move.destination`. It is classification metadata and stays that: the
+registry creates no `Path`, resolves nothing, selects no root, reads no
+filesystem, consults no configuration or other ambient state, and decides no
+permission. Which named root a path lands in, and whether it is reachable at
+all, are settled later by `FilesystemRoots` and `FilesystemTool`.
+
+## Filesystem Roots
+
+`FilesystemRoot(name, path, policy, enabled)`
+
+One named filesystem root. `name` must be an exact `str` reading as a non-empty
+plain ASCII identifier of at most 32 characters. `path` must be the exact
+concrete `Path` class for the platform and must be absolute; the constructor
+settles and stores `path.resolve()`, so no non-canonical path can exist inside a
+root. `policy` must be a `RootPolicy` member and `enabled` an exact `bool`; both
+are checked by `type()`, so a string equal to a policy's value and an integer
+standing in for a bool are both refused. A resolution failure becomes the single
+fixed `ValueError` `A filesystem root path could not be settled as a canonical
+absolute path.`, which repeats nothing it was handed.
+
+`RootPolicy` is a closed set with two members: `ORGANIZE`, which permits all four
+filesystem actions, and `READ_ONLY`, which permits `read` and `list` only.
+
+`root.contains(path)` reports whether a canonical path lies at or beneath the
+root.
+
+`FilesystemRoots(roots, default_name)`
+
+Every declared root plus the name of the one relative text resolves against. The
+constructor snapshots its iterable into a tuple, so a list mutated afterwards
+cannot change a settled value, and the roots are retained as that tuple rather
+than as a dictionary or a proxy over private mutable storage. Construction
+refuses an empty declaration, a member that is not exactly a `FilesystemRoot`, a
+repeated name, a root that shares or contains another's canonical path, and a
+default that is unknown or disabled. Because overlap is refused, at most one root
+can contain any canonical path.
+
+`roots.default_root` returns the default root, `roots.enabled_roots` the enabled
+ones in declaration order, `roots.by_name(name)` one root or `None`, and
+`roots.containing(path)` the single enabled root holding a canonical path or
+`None`. A disabled root is never considered by `containing`, so a path beneath one
+reports exactly as a path outside Maria's available roots.
+
+`roots.resolve_path(value) -> ResolvedPath | None`
+
+Settles submitted path text against the enabled roots: `~` expands first, text
+that is still relative is taken against the default enabled root, and an absolute
+path is taken as given. The result is a `ResolvedPath` carrying the governing
+root, the absolute pre-resolution `candidate` spelling — lexically collapsed, with
+no link followed — and the canonical `target`, or `None` when the target lies
+outside every enabled root. `None` is content-free: it reports only that no root
+applies, never which path was submitted or which root was nearest. An unexpected
+`OSError` from canonicalisation propagates so the caller reports it through its own
+sanitized failure path.
+
+`ResolvedPath(root, candidate, target)`
+
+The two identities a protection rule needs, in one sealed value. A protected name
+that links outward escapes a target-only rule, and an innocuous name that links
+inward escapes a candidate-only rule, so both are carried and both are checked.
+Containment is decided by `target` alone. Neither path is ever rendered into
+owner-visible text, a log record, or result data.
+
+`FilesystemProtections(database_path, log_dir, prompt_path)`
+
+The runtime locations the active configuration chose, settled canonically in the
+constructor. Each must be the exact concrete platform `Path` and absolute;
+anything else raises a fixed `ValueError` that repeats neither the path nor the
+underlying error. `core/config.py` builds it from `[paths]` and stores it on
+`MariaConfig`; `core/filesystem_roots.py` never imports `MariaConfig`.
+
+`database_sidecars` is a fourth, derived field holding every identity the
+`-journal`, `-wal`, and `-shm` files can be reached by: the lexical name beside the
+database, plus the canonical target whenever that name already resolves elsewhere
+through a link. It is recomputed from the settled database path on every
+*construction*, so it cannot be replaced independently or forged through `_make` or
+`_replace`, and resolving once here keeps `protects` a pure path comparison. Like
+any path-based rule it describes the filesystem as it stood when the value was
+settled; no path check can close the window between validating a path and acting
+on it.
+
+Construction and duplication are different operations. Constructing settles the
+live filesystem once; `__copy__` and `__deepcopy__` return the value itself and
+`__reduce__` serialises the four settled fields to a private rebuild function, so
+copying, deep-copying, and unpickling preserve the exact snapshot and perform no
+filesystem access. The rebuild function is not a public alternate constructor: it
+takes one positional snapshot, names the concrete type itself so no subtype can be
+reconstructed through it, and refuses a snapshot of the wrong shape with a fixed
+message. Pickle input is trusted input, as it is everywhere in Python.
+
+`protections.protects(path)` reports whether one canonical path is an active
+runtime location. Each protected identity covers itself and everything beneath it,
+so the log directory's rotations are covered without naming rotations and a
+database, sidecar, or prompt name occupied by a directory cannot leak through a
+child path; under the ordinary file shape the descendant half is free, because a
+file has no descendants. An *ancestor* is deliberately not protected, so an
+unrelated neighbour stays usable and the database's parent directory stays
+listable.
+
+`protections.intersects_mutation(*paths) -> bool`
+
+The wider question `rename` and `move` ask. A path intersects when it is directly
+protected, when it lies inside a protected location, or when a protected location
+lies inside *it* — so a directory containing the live database, one of its
+sidecars, or the prompt, and any ancestor of the log directory, are all refused as
+mutation operands. The comparison is pure path arithmetic, so a destination is
+judged identically whether or not it exists yet. `protects` and `excludes` keep
+their narrower meaning, which is what leaves an ordinary parent listable.
+
+`protections.excludes(*paths) -> bool`
+
+The complete universal boundary — the fixed source-layout half and the active
+runtime half — applied to every identity it is handed. This is what a filesystem
+capability applies. Callers pass both a candidate and a target where a submitted
+path has two, and a single path where it has one, such as an already-canonical
+declared root. The value is sealed exactly as the roots are: no instance
+dictionary, refused assignment and deletion, no `object.__setattr__` route, no
+subclassing, `_make` and `_replace` validated, structural equality and hashing,
+and `copy`, `deepcopy`, and `pickle` preserving exact values.
+
+Both value objects are sealed the way `Failure` is. Neither has an instance
+dictionary, ordinary assignment and deletion are refused, `object.__setattr__`
+can neither replace a settled field nor add an undeclared one, subclassing raises
+`TypeError`, and `_make` and `_replace` are routed back through the validating
+constructor. Equality and hashing are structural, so a root stays findable in the
+set or mapping it was put into, and `copy`, `deepcopy`, and `pickle` preserve
+exact values.
+
+`is_universally_excluded(path) -> bool`
+
+The layout-fixed *half* of the universal boundary, not the whole of it. It
+classifies a path only: no file is opened, no directory is read, and no metadata
+is consulted, so the answer does not depend on the path existing. It covers
+`Maria/database/`, `Maria/logs/`, the repository's `.git` as either a directory or
+a gitdir-pointer file, `Maria/config/config.local.toml`, and, for paths proven to
+be inside the repository, credential components (`.env` and any `.env.*`, with an
+exact final-component exemption for `.env.example`), the cache and environment
+directories `__pycache__`, `.venv`, `venv`, `env`, `.pytest_cache`,
+`.mypy_cache`, `.ruff_cache`, `maria_cli_test`, and `.claude`, and any component
+ending `.tmp` or `.bak`. Component comparison is case-folded.
+
+It knows nothing about the runtime locations configuration chose, so a capability
+must never apply it alone: ask a settled `FilesystemProtections` through
+`excludes` instead.
+
+`prepare_roots(filesystem_roots, protections) -> None`
+
+The one boundary allowed to create a filesystem root, called once by
+`MariaBrain.from_defaults` with the same settled protections the filesystem tool
+receives. It runs before `configure_logging` — which creates the active log
+directory — and before the memory layer opens the database, so a root naming a
+protected runtime location is refused before anything is created. An enabled
+organizing root is created when missing, parents included; an enabled read-only
+root is never created and must already be a directory; a disabled root is neither
+created nor required to exist; and every root, enabled or not, is checked against
+the protections first. Every refusal raises `ValueError` with one of the module's
+fixed messages, so a startup failure never carries the configured path, the
+owner's home location, or an underlying `OSError`'s text.
 
 ## Shared Failures
 

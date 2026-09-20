@@ -24,6 +24,12 @@ from core.action_contracts import (
     RootClass,
 )
 from core.config import MariaConfig
+from core.filesystem_roots import (
+    FilesystemProtections,
+    FilesystemRoot,
+    FilesystemRoots,
+    RootPolicy,
+)
 from core.memory import Memory
 from core.planner import PlanArguments
 from core.tool_manager import ToolManager
@@ -68,6 +74,30 @@ EXPECTED_PATH_FIELDS = frozenset(
 UNREGISTERED_ACTIONS = ("write", "delete")
 
 
+def _temporary_filesystem_protections(root: Path) -> FilesystemProtections:
+    """Return active runtime locations beneath a temporary directory."""
+    return FilesystemProtections(
+        database_path=root / "database" / "maria.db",
+        log_dir=root / "logs",
+        prompt_path=root / "system_prompt.txt",
+    )
+
+
+def _temporary_filesystem_roots(root: Path) -> FilesystemRoots:
+    """Return one enabled organizing root beneath a temporary directory."""
+    return FilesystemRoots(
+        (
+            FilesystemRoot(
+                name="workspace",
+                path=root,
+                policy=RootPolicy.ORGANIZE,
+                enabled=True,
+            ),
+        ),
+        "workspace",
+    )
+
+
 def _temporary_config(root: Path) -> MariaConfig:
     """Return a complete config whose paths remain under a temporary root."""
     return MariaConfig(
@@ -77,7 +107,8 @@ def _temporary_config(root: Path) -> MariaConfig:
         database_path=root / "database" / "maria.db",
         log_dir=root / "logs",
         prompt_path=root / "system_prompt.txt",
-        safe_filesystem_root=root,
+        filesystem_roots=_temporary_filesystem_roots(root),
+        filesystem_protections=_temporary_filesystem_protections(root),
         log_level="INFO",
         confirmation_required=frozenset(),
         denied_actions=frozenset(),
@@ -480,7 +511,7 @@ class RegistryCompletenessTests(unittest.TestCase):
                 )
                 self.assertEqual(
                     argument.root_class,
-                    RootClass.SAFE_FILESYSTEM_ROOT,
+                    RootClass.NAMED_FILESYSTEM_ROOT,
                 )
 
     def test_no_non_path_field_carries_a_path_root_class(self) -> None:
@@ -676,7 +707,7 @@ class RegistryConstructionTests(unittest.TestCase):
                 "value",
                 int,
                 required=True,
-                root_class=RootClass.SAFE_FILESYSTEM_ROOT,
+                root_class=RootClass.NAMED_FILESYSTEM_ROOT,
             )
 
     def test_explicitly_unbounded_text_metadata_is_accepted(self) -> None:
@@ -883,7 +914,7 @@ class DeclarationInvariantTests(unittest.TestCase):
                 self.assertIn(label, str(caught.exception))
 
     def test_a_root_class_that_is_not_a_member_is_rejected(self) -> None:
-        for value in ("safe_filesystem_root", 1, object()):
+        for value in ("named_filesystem_root", 1, object()):
             with self.subTest(root_class=type(value).__name__):
                 with self.assertRaises(ValueError) as caught:
                     self._text_argument(root_class=value)

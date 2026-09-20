@@ -19,6 +19,12 @@ from unittest.mock import Mock
 
 from core.brain import BrainResponse, MariaBrain
 from core.config import MariaConfig
+from core.filesystem_roots import (
+    FilesystemProtections,
+    FilesystemRoot,
+    FilesystemRoots,
+    RootPolicy,
+)
 from core.memory import Memory
 from core.permissions import (
     PermissionDecision,
@@ -723,7 +729,22 @@ class SingleStepDatabaseEquivalenceTests(unittest.TestCase):
             database_path=database_path,
             log_dir=root / "logs",
             prompt_path=root / "prompts" / "system.txt",
-            safe_filesystem_root=root / "safe-filesystem-root",
+            filesystem_roots=FilesystemRoots(
+                (
+                    FilesystemRoot(
+                        name="workspace",
+                        path=root / "workspace",
+                        policy=RootPolicy.ORGANIZE,
+                        enabled=True,
+                    ),
+                ),
+                "workspace",
+            ),
+            filesystem_protections=FilesystemProtections(
+                database_path=database_path,
+                log_dir=root / "logs",
+                prompt_path=root / "prompts" / "system.txt",
+            ),
             log_level="DEBUG",
             confirmation_required=frozenset(),
             denied_actions=frozenset(),

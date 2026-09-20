@@ -2,6 +2,118 @@
 
 ## Unreleased
 
+- Replaced Maria's single configured safe directory with named filesystem
+  roots, and put the things Maria must never reach behind one shared,
+  permanent boundary. `config/config.toml` now declares roots in a
+  `[filesystem]` section, and the shipped declaration is exactly two: an
+  enabled `workspace` root at `~/MariaWorkspace` that may be organized, and a
+  disabled, read-only `project_maria` root at Maria's repository root, which is
+  reserved for a later capability and is inert today. A relative path resolves
+  against the default enabled root, an absolute path is accepted only inside an
+  enabled root, a `~` prefix expands first, and the current working directory is
+  never consulted. A path beneath a disabled root is refused exactly like a path
+  outside Maria's roots. A read-only root permits reading and listing only, and
+  a rename or move whose source and destination fall in different roots is
+  refused even when both roots may be organized. The roots themselves are a
+  sealed, tuple-backed value model that cannot be mutated, extended, or
+  subclassed after construction, and each root's canonical path is settled
+  inside its constructor, so a non-canonical root path never exists. The whole
+  `[filesystem]` section fails closed: a missing or malformed section, an
+  unknown key, a missing or wrongly typed field, an unknown policy, a repeated
+  name, a repeated or nested canonical path, a missing, unknown, or disabled
+  default, a root path that is an ordinary file, a root name Maria has no
+  semantics for, or a production root whose path, policy, or enabled flag is
+  wrong are all refused rather than repaired. Configuration loading creates
+  nothing; one controlled startup boundary creates a missing enabled organizing
+  root, never creates a read-only or disabled one, and refuses a root inside an
+  excluded location.
+  Maria's live database file and its SQLite journal, write-ahead-log, and
+  shared-memory sidecars, its live log directory and every rotation beneath it,
+  and its active system prompt are now permanently unreachable by every
+  filesystem capability, wherever configuration puts them. That is deliberately
+  stronger than protecting the shipped layout: all three locations are
+  configurable, so a valid configuration could otherwise place the live database,
+  the live log, or the prompt inside an enabled workspace and have the generic
+  filesystem commands hand them straight back out. The active locations are
+  settled once when configuration loads and handed to both root preparation and
+  the filesystem tool, so the two can never disagree about what is protected.
+  The default `database/` and `logs/` directories, `.git` — as a directory or as
+  a gitdir-pointer file — and the reserved, never-loaded
+  `config/config.local.toml` remain unreachable as well, as do repository-scoped
+  credential files, cache and environment directories, local smoke-test
+  artifacts, assistant working state, and `.tmp` and `.bak` artifacts at any
+  depth, with one exact exemption for an `.env.example` template as a final path
+  component. Those name rules are scoped to Maria's own repository, so an owner's
+  workspace may still hold `env`, `venv`, or `.claude` directories and `.tmp` or
+  `.bak` files and use them normally. Separately, Maria's whole repository —
+  tracked source, documentation, prompts, the shipped configuration, and
+  untracked files beside them — is now unavailable to the generic read, list,
+  rename, and move commands, and declaring a root around the repository does not
+  defeat that.
+  Every one of these rules is applied to two identities of a path: the spelling
+  that was asked for and the canonical target it resolves to. Checking only the
+  target would have let a protected name such as `Maria/logs` be reached by
+  making it a junction pointing out of the repository, and checking only the
+  spelling would have let an ordinary name be a link pointing in. Neither
+  direction gets through now, and which root contains a path is still decided by
+  the canonical target alone. Neither identity is ever repeated into a response,
+  a log record, or result data.
+  Renaming and moving now ask a wider question than reading does, because
+  relocating a directory carries everything beneath it. A directory that merely
+  contains the live database, one of its SQLite sidecars, or the system prompt
+  cannot be renamed or moved, and neither can an ancestor of the live log
+  directory; previously such a directory could be relocated, which left the
+  protected files reachable at their new location because protection still
+  pointed at the old one. The same widening applies to Maria's repository, so a
+  broad root can no longer relocate the checkout by naming its parent. Reading
+  and listing such a directory are deliberately unchanged: the parent still
+  lists successfully with its protected children filtered out, and an ordinary
+  directory with nothing protected inside it still renames and moves normally.
+  The check covers both identities of both operands and runs before the policy
+  check, the same-root check, and every existence check, so nothing is created,
+  renamed, or moved on the way to refusing.
+  A database sidecar is now protected by its canonical target as well as by its
+  name. When a sidecar name already resolves elsewhere through a link, the
+  location it points at is settled alongside it, so the content can no longer be
+  reached under an alternate name. Each protected identity — the database, its
+  sidecars, and the prompt — now also covers everything beneath it, so a name that
+  turns out to be a directory rather than a file cannot hand its contents out one
+  level down; under the ordinary file shape this changes nothing, because a file
+  has no descendants. Ancestors are deliberately still not protected, so unrelated
+  neighbours such as `maria.db.notes` stay usable and the directory holding the
+  database is still listable with its protected children filtered out.
+  Copying, deep-copying, and unpickling a settled protection value now preserve
+  that value exactly instead of re-deriving it from the filesystem as it looks at
+  the time. Previously a duplicate could come back describing different locations
+  if a link had been repointed in between, which broke the value-object guarantee
+  that copies compare and hash equal. Construction still settles the live
+  filesystem once, and `_make` and `_replace` are still construction, so they
+  continue to recompute the derived sidecar identities and continue to refuse a
+  forged one.
+  Root preparation now runs before logging is configured rather than after,
+  because configuring logging creates the active log directory: a root
+  declaration that names a protected runtime location has to be refused before
+  anything is created. It still runs before the memory layer opens the database,
+  and a refusal is still reported as the existing sanitized startup failure.
+  Listing now settles every child before describing it: a child that is
+  conclusively outside its root, permanently excluded, or inside the repository
+  is omitted without ever being classified, while the parent listing still
+  succeeds and its ordinary siblings stay visible. A directory whose every child
+  was filtered still reports `Directory is empty.` An unexpected error while
+  resolving or classifying a child is not hidden: the whole listing fails
+  through the existing sanitized message instead.
+  Three fixed refusals were added — `Path is permanently excluded from Maria's
+  filesystem access.`, `This filesystem root is read-only.`, and `Source and
+  destination must be inside the same filesystem root.` — and the existing
+  outside-root message and the four action prefixes are unchanged. None of them
+  interpolates anything, so no response reveals the submitted path, the owner's
+  home or repository location, a root name, an excluded filename, raw operating
+  system text, or an object repr. The four filesystem actions, the command
+  grammar, the 128 KiB read limit, replacement decoding, the result-data and
+  display-path contracts, and the deliberate log-versus-response asymmetry are
+  all unchanged, the action-contract inventory remains exactly 22 actions with
+  no write or delete contract, and the mandatory permission sets are untouched.
+  No schema or version change was introduced.
 - Bound confirmation to the exact plan the owner approved. Confirming a
   sensitive action now executes the plan that was presented for approval
   instead of re-sending the original request text, so Maria no longer

@@ -13,6 +13,12 @@ from unittest.mock import call, patch
 import core.brain as brain_module
 from core.brain import MariaBrain
 from core.config import MariaConfig
+from core.filesystem_roots import (
+    FilesystemProtections,
+    FilesystemRoot,
+    FilesystemRoots,
+    RootPolicy,
+)
 from core.memory import Memory
 from core.permissions import PermissionManager
 from core.planner import PlanStep, Planner
@@ -221,6 +227,30 @@ def _build_components(
     return brain, memory, tool_manager, permissions
 
 
+def _temporary_filesystem_protections(root: Path) -> FilesystemProtections:
+    """Return active runtime locations beneath a temporary directory."""
+    return FilesystemProtections(
+        database_path=root / "database" / "maria.db",
+        log_dir=root / "logs",
+        prompt_path=root / "system_prompt.txt",
+    )
+
+
+def _temporary_filesystem_roots(root: Path) -> FilesystemRoots:
+    """Return one enabled organizing root beneath a temporary directory."""
+    return FilesystemRoots(
+        (
+            FilesystemRoot(
+                name="workspace",
+                path=root,
+                policy=RootPolicy.ORGANIZE,
+                enabled=True,
+            ),
+        ),
+        "workspace",
+    )
+
+
 def _temporary_config(root_path: Path) -> MariaConfig:
     """Create a MariaConfig whose writable paths are all temporary."""
     return MariaConfig(
@@ -230,7 +260,8 @@ def _temporary_config(root_path: Path) -> MariaConfig:
         database_path=root_path / "database" / "maria.db",
         log_dir=root_path / "logs",
         prompt_path=root_path / "system_prompt.txt",
-        safe_filesystem_root=root_path,
+        filesystem_roots=_temporary_filesystem_roots(root_path),
+        filesystem_protections=_temporary_filesystem_protections(root_path),
         log_level="CRITICAL",
         confirmation_required=frozenset({"filesystem.rename", "filesystem.move"}),
         denied_actions=frozenset({"filesystem.delete", "filesystem.write"}),

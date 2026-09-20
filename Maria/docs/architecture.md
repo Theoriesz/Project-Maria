@@ -21,6 +21,11 @@ Maria is organized around a small set of modules with clear ownership.
     attempts to record the cleaned request and response as an interaction.
 11. `logger.py` configures Maria's named logger; application modules emit
     operational events through it.
+12. `filesystem_roots.py` holds Maria's named filesystem roots, the settled
+    protections covering every location that is permanently out of reach, and the
+    two-identity resolution both rely on. Startup prepares the declared roots
+    once, before logging is configured and before the memory layer opens the
+    database.
 
 An explicit memory request uses the same execution path as every other tool
 request:
@@ -379,6 +384,124 @@ That rendering repeats no argument value, so it exposes no absolute host path,
 no fingerprint, and no canonical plan content; it is not logged, and a pending
 confirmation is not written to interaction history.
 
+## Filesystem Roots and Permanent Exclusions
+
+`core/filesystem_roots.py` owns Maria's one canonical model of where a path may
+live. `FilesystemRoot` holds a name, a canonical absolute path, a policy, and an
+enabled flag; `FilesystemRoots` holds the declared roots as a tuple together with
+the name of the default one. Both are sealed the way `core/failures.py` is sealed:
+tuple-backed, with no instance dictionary, no writable slot for
+`object.__setattr__` to reach through, no subclass route for a payload field, and
+no construction path — including `_make` and `_replace` — that skips validation.
+The canonical-path invariant is established inside `FilesystemRoot.__new__`, which
+requires an absolute concrete path for the platform and stores `path.resolve()`,
+so a non-canonical path never exists inside a root.
+
+`core/config.py` owns production policy and the module owns none of it. A root's
+name, path, policy, and flag are validated there, and the whole `[filesystem]`
+section fails closed: a missing or non-table section, roots that are not an array
+of tables, an unknown key at either level, a missing field, a wrongly typed value,
+an unknown policy, a repeated name, a repeated or nested canonical path, a missing,
+unknown, or disabled default, a root path that is an ordinary file, a name outside
+the two Maria accepts, or a production root whose meaning is wrong are all
+refusals. Nothing is repaired, coerced, disabled, or substituted. Loading remains
+side-effect free.
+
+Creation is a separate, single boundary. `prepare_roots` runs once in
+`MariaBrain.from_defaults`, taking the same settled protections the filesystem
+tool will use so the two can never disagree about what is protected. It runs
+*before* `configure_logging` and before the memory layer opens the database,
+because configuring logging creates the active log directory: a root declaration
+that names a protected runtime location has to be refused before anything is
+created, not after. Nothing is logged on that path either way — a refusal raises,
+and `main.py` reports it as a sanitized startup failure. An enabled organizing
+root is created when missing; an enabled read-only root is never created and must
+already be a directory; a disabled root is neither created nor required; and a
+root inside a permanently excluded location is refused whatever its policy. The
+repository root itself is not a protected location, so the disabled
+`project_maria` declaration stays valid.
+
+Two predicates sit over that one model, and the separation is deliberate.
+
+`FilesystemProtections.excludes` is the complete universal boundary, and it is
+the one a filesystem capability applies. It has two halves, because a path can
+be out of bounds for two unrelated reasons.
+
+The fixed half, `is_universally_excluded`, follows from the source layout alone:
+`Maria/database/`, `Maria/logs/`, the repository's `.git` as a directory or a
+gitdir-pointer file, `Maria/config/config.local.toml`, and a set of
+repository-scoped components — credential files, cache and environment
+directories, local smoke-test artifacts, assistant working state, and
+`.tmp`/`.bak` artifacts — inspected at every component of a path's
+repository-relative form. The component rules apply only once a path is proven
+to lie inside the repository, which is why a workspace may hold its own `env`,
+`venv`, or `.claude` directory.
+
+The active half protects where the *running* configuration keeps Maria's live
+state: the database file named by `[paths] database` together with its SQLite
+`-journal`, `-wal`, and `-shm` sidecars, the whole subtree of `[paths] logs`, and
+the file named by `[paths] system_prompt`. Each protected identity covers itself
+and everything beneath it, which is free under the ordinary file shape and
+fail-closed when one of those names is occupied by a directory or a directory
+reparse point. Each sidecar is settled to two identities in the constructor — the
+name beside the database and, when that name already resolves elsewhere through a
+link, its canonical target — so `protects` stays a pure path comparison while
+still covering the location the content really occupies.
+
+Settling happens at construction and only at construction. Copying, deep-copying,
+and unpickling a protection value restore the snapshot that was already settled
+rather than re-reading the filesystem, so a duplicate can never come back
+describing somewhere else; `__copy__` and `__deepcopy__` return the value itself
+and `__reduce__` hands the four settled fields to a private rebuild function that
+performs no filesystem access. `_make` and `_replace` remain construction, so they
+still recompute the derived field and still refuse a forged one. A layout-only policy could not
+see any of them, because all three are configurable and a valid configuration may
+place them inside an enabled root. `FilesystemProtections` is a sealed,
+tuple-backed value carrying those three canonical paths and nothing else;
+`core/config.py` builds it from the active configuration and stores it on
+`MariaConfig`, and this module never imports `MariaConfig` or reads configuration
+itself. `is_universally_excluded` is therefore one half of a policy rather than
+the policy, and a capability that applied it alone would hand out whatever the
+running configuration happened to place in a root.
+
+`FilesystemProtections` answers two different questions over that same data.
+`excludes` settles *direct* reachability, which is what reading and listing need.
+`intersects_mutation` settles whether relocating a path would disturb an active
+location, which is wider because renaming or moving a directory carries everything
+beneath it: a path that merely *contains* the live database, a sidecar, the prompt,
+or the log directory is refused as a mutation operand. Keeping the two questions
+apart is exactly what lets an ordinary parent stay listable with its protected
+children filtered out while remaining immovable. `tools/filesystem.py` asks the
+wider question in `_operands`, after placement and direct reachability and before
+the policy check, the same-root check, and every existence check, and it widens the
+repository barrier the same way, so a synthetic root cannot relocate the checkout by
+naming its parent.
+
+Both halves are evaluated against two identities of a submitted path.
+`FilesystemRoots.resolve_path` returns a sealed `ResolvedPath` carrying the
+governing root, the absolute pre-resolution candidate spelling, and the canonical
+target. Checking only the target would let a protected name such as `Maria/logs`
+be reached by being a junction pointing out of the repository; checking only the
+candidate would let an ordinary name be a link pointing in. Root containment stays
+a question about the target alone, and neither identity is ever rendered into
+owner-visible text, a log record, or result data.
+
+The general filesystem repository barrier lives in `tools/filesystem.py` instead,
+because it is a property of the four generic commands rather than of the path
+model. It makes any path at or beneath the repository root unreachable by `read`,
+`list`, `rename`, and `move`, and it is applied symmetrically to both identities,
+which keeps tracked source, documentation, prompts, `config.toml`, and arbitrary
+untracked repository files out of generic filesystem reach even under a root
+declared around them.
+
+A later Project Maria capability is expected to reuse `FilesystemRoot`,
+`FilesystemRoots`, `ResolvedPath`, canonical containment, and
+`FilesystemProtections.excludes` unchanged, and to add its own tracked-source
+admission predicate on top. It may not bypass the universal exclusions and may not
+introduce a second path model. Making the generic tool's root available is not how
+that capability is switched on. A later stage that settles an export location must
+add that location to the same universal exclusion boundary.
+
 ## Persistence Models
 
 Maria keeps three kinds of persistent data separate:
@@ -426,7 +549,11 @@ guaranteed. There is no compensating rollback, retry, or replay.
 
 The brain does not run SQL or perform tool work directly. The planner does not
 execute tools. Tools do not decide global permissions. The memory module is the
-only module that opens SQLite connections or executes SQL. The action-contract
+only module that opens SQLite connections or executes SQL. `core/filesystem_roots.py`
+is the only canonical model of where a filesystem path may live, and the only
+owner of the universal permanent exclusions; `core/config.py` decides which roots
+production accepts, and `tools/filesystem.py` adds the barrier that keeps the
+generic filesystem commands out of Maria's own repository. The action-contract
 registry declares argument shapes only: it holds no tool logic, never calls a
 tool to decide whether arguments are valid, and decides nothing about
 permission.

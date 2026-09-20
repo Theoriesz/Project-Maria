@@ -7,7 +7,21 @@ environment = "development"
 database = "database/maria.db"
 logs = "logs"
 system_prompt = "prompts/system_prompt.txt"
-safe_filesystem_root = "."
+
+[filesystem]
+default_root = "workspace"
+
+[[filesystem.roots]]
+name = "workspace"
+path = "~/MariaWorkspace"
+policy = "organize"
+enabled = true
+
+[[filesystem.roots]]
+name = "project_maria"
+path = ".."
+policy = "read_only"
+enabled = false
 
 [logging]
 level = "INFO"
