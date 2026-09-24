@@ -223,15 +223,20 @@ same transaction.
 Raises `TypedFailureError` carrying `FailureKind.DATABASE_SCHEMA_TOO_NEW` when
 the file is stamped above `DATABASE_SCHEMA_VERSION`, refusing before anything
 is written. Every other refusal and failure - an unrecognised or drifted
-structure, a half-created database, an invalid migration set, a failed
-migration, and a corrupt or unreadable file - raises
+structure, a file holding another application's objects, a half-created
+database, an invalid migration set, a failed migration, and a corrupt or
+unreadable file - raises
 `RuntimeError("Unable to initialize Maria database.")`. Contention keeps the
-shared classification described above: a `SQLITE_BUSY` or `SQLITE_LOCKED`
-result, including one raised while a migration is starting, raises
-`RuntimeError("Database is busy. Try again shortly.")` instead, because it is
-transient and worth retrying rather than a failed migration.
-`docs/database.md` describes the classification, migration, and refusal rules
-in full.
+shared classification described above, but this method applies it itself
+rather than inheriting it: a `SQLITE_BUSY` or `SQLITE_LOCKED` result raises
+`RuntimeError("Database is busy. Try again shortly.")` wherever it arises,
+including while the connection is being opened, because it is transient and
+worth retrying rather than a broken database.
+
+Unlike every other method here, this one logs nothing derived from the failure:
+a refusal records one fixed sentence carrying a stable event code, never an
+exception, its text, a traceback, or the database path. `docs/database.md`
+describes the classification, migration, refusal, and logging rules in full.
 
 `Memory.schema_version() -> int`
 
@@ -239,7 +244,9 @@ Returns the schema version currently stamped on the database, which is what is
 stored rather than what this build expects. An unstamped or absent database
 returns `0`. This is the only way to read the marker from outside the memory
 layer; no caller opens its own connection or issues its own pragma. SQLite
-failures raise `RuntimeError("Unable to read database schema version.")`.
+failures raise `RuntimeError("Unable to read database schema version.")` and,
+like `initialize()`, are logged as a fixed event code rather than as an
+exception.
 
 ### Interaction History
 

@@ -9,12 +9,14 @@ current schema happens to create.
 
 from __future__ import annotations
 
+import ast
 import hashlib
 import inspect
 import logging
 import re
 import sqlite3
 import tempfile
+import textwrap
 import unittest
 from pathlib import Path
 from tempfile import TemporaryDirectory
@@ -56,6 +58,43 @@ UNVERSIONED = 0
 PRE_MEMORIES_VERSION = 1
 
 BASELINE_TABLES = frozenset({"interactions", "notes", "memories"})
+
+# The two constraints the v0.2.0 ``memories`` table is required to carry,
+# written out in their normalized form rather than read back from the module,
+# so the test pins what must be verified instead of agreeing with whatever the
+# classifier currently extracts.
+REQUIRED_MEMORY_CHECKS = ("length(fact)>0", "length(normalized_fact)>0")
+
+# The same v0.2.0 schema spelled as differently as SQL allows while stating
+# exactly the same thing: uppercase keywords, no spacing, every identifier
+# quoted in a different style, redundant parentheses, a comment, and the
+# checks moved from their columns to the table. None of that changes a single
+# rule, so all of it has to be accepted.
+FORMATTING_EQUIVALENT_BASELINE = (
+    'CREATE TABLE "interactions" ("id" INTEGER PRIMARY KEY AUTOINCREMENT,'
+    '"user_input" TEXT NOT NULL,"response" TEXT NOT NULL,'
+    '"created_at" TEXT NOT NULL)',
+    'CREATE TABLE [notes] ([id] INTEGER PRIMARY KEY AUTOINCREMENT,'
+    '[title] TEXT NOT NULL,[body] TEXT NOT NULL,[created_at] TEXT NOT NULL,'
+    '[updated_at] TEXT NOT NULL)',
+    """
+    CREATE TABLE `memories` (   -- the published baseline, spelled differently
+        `id`   INTEGER   PRIMARY KEY   AUTOINCREMENT ,
+        `fact` TEXT NOT NULL ,
+        `normalized_fact` TEXT NOT NULL UNIQUE ,
+        `created_at` TEXT NOT NULL ,
+        CHECK ((  LENGTH ( `fact` )  >  0  )) ,
+        CHECK (
+            ( length ( [normalized_fact] ) > 0 )
+        )
+    )
+    """,
+    "CREATE INDEX idx_interactions_created_at ON interactions(created_at)",
+    "CREATE INDEX idx_notes_title ON notes(title)",
+)
+
+# A distinctive value a SQLite failure carries but nothing may repeat.
+SQLITE_DETAIL_SENTINEL = "private-sqlite-detail-6c1af03d92"
 
 # A statement that only succeeds once ``memories`` exists, so a ladder that
 # ran its steps out of order could not complete.
@@ -374,6 +413,86 @@ class DriftRefusalTests(_TemporaryDatabaseTestCase):
             for statement in V0_2_0_BASELINE_SCHEMA
         )
         create_schema(self.database_path, without_unique)
+
+        self._assert_refused_untouched()
+
+    def test_a_missing_fact_check_is_refused(self) -> None:
+        create_schema(self.database_path, _without_check(r"length\(fact\)"))
+
+        self._assert_refused_untouched()
+
+    def test_a_missing_normalized_fact_check_is_refused(self) -> None:
+        create_schema(
+            self.database_path,
+            _without_check(r"length\(normalized_fact\)"),
+        )
+
+        self._assert_refused_untouched()
+
+    def test_a_weakened_fact_check_is_refused(self) -> None:
+        weakened = tuple(
+            statement.replace(
+                "CHECK (length(fact) > 0)",
+                "CHECK (length(fact) >= 0)",
+            )
+            for statement in V0_2_0_BASELINE_SCHEMA
+        )
+        self.assertNotEqual(weakened, V0_2_0_BASELINE_SCHEMA)
+        create_schema(self.database_path, weakened)
+
+        self._assert_refused_untouched()
+
+    def test_a_changed_normalized_fact_check_is_refused(self) -> None:
+        changed = tuple(
+            statement.replace(
+                "CHECK (length(normalized_fact) > 0)",
+                "CHECK (length(normalized_fact) > -1)",
+            )
+            for statement in V0_2_0_BASELINE_SCHEMA
+        )
+        self.assertNotEqual(changed, V0_2_0_BASELINE_SCHEMA)
+        create_schema(self.database_path, changed)
+
+        self._assert_refused_untouched()
+
+    def test_a_check_on_the_wrong_column_is_refused(self) -> None:
+        misdirected = tuple(
+            statement.replace(
+                "CHECK (length(normalized_fact) > 0)",
+                "CHECK (length(fact) > 0)",
+            )
+            for statement in V0_2_0_BASELINE_SCHEMA
+        )
+        self.assertNotEqual(misdirected, V0_2_0_BASELINE_SCHEMA)
+        create_schema(self.database_path, misdirected)
+
+        self._assert_refused_untouched()
+
+    def test_a_check_that_is_only_commented_out_is_refused(self) -> None:
+        """A commented rule is not a rule, however much it looks like one."""
+        commented = tuple(
+            statement.replace(
+                "fact TEXT NOT NULL CHECK (length(fact) > 0),",
+                "fact TEXT NOT NULL, -- CHECK (length(fact) > 0)\n",
+            )
+            for statement in V0_2_0_BASELINE_SCHEMA
+        )
+        self.assertNotEqual(commented, V0_2_0_BASELINE_SCHEMA)
+        create_schema(self.database_path, commented)
+
+        self._assert_refused_untouched()
+
+    def test_an_extra_check_is_refused(self) -> None:
+        widened = tuple(
+            statement.replace(
+                "created_at TEXT NOT NULL\n    )",
+                "created_at TEXT NOT NULL,\n"
+                "        CHECK (length(created_at) > 0)\n    )",
+            )
+            for statement in V0_2_0_BASELINE_SCHEMA
+        )
+        self.assertNotEqual(widened, V0_2_0_BASELINE_SCHEMA)
+        create_schema(self.database_path, widened)
 
         self._assert_refused_untouched()
 
@@ -1019,6 +1138,533 @@ class FixtureIndependenceTests(unittest.TestCase):
             memory_module._reference_schema(V0_2_0_BASELINE_SCHEMA),
             memory_module._reference_schema(memory_module._CURRENT_SCHEMA_STATEMENTS),
         )
+
+
+class CheckConstraintTests(_TemporaryDatabaseTestCase):
+    """Verify the required CHECK constraints are part of being the baseline.
+
+    No pragma reports a CHECK, so a validator built on pragmas alone would
+    stamp a ``memories`` table that accepts the empty facts the real baseline
+    refuses. These prove the constraints are verified, and verified on what
+    they say rather than on how they were typed.
+    """
+
+    @staticmethod
+    def _memories_shape(description: tuple) -> tuple:
+        """Return the ``memories`` entry of a schema description."""
+        return next(table for table in description if table[0] == "memories")
+
+    def test_the_frozen_baseline_declares_exactly_the_required_checks(self) -> None:
+        reference = memory_module._reference_schema(V0_2_0_BASELINE_SCHEMA)
+
+        self.assertEqual(
+            self._memories_shape(reference)[5],
+            REQUIRED_MEMORY_CHECKS,
+        )
+        for table in reference:
+            if table[0] != "memories":
+                with self.subTest(table=table[0]):
+                    self.assertEqual(table[5], ())
+
+    def test_the_genuine_frozen_fixture_is_accepted(self) -> None:
+        create_v0_2_0_baseline(self.database_path)
+
+        self.memory.initialize()
+
+        self.assertEqual(read_schema_version(self.database_path), EXPECTED_SCHEMA_VERSION)
+        self.assertEqual(
+            self._memories_shape(self.describe())[5],
+            REQUIRED_MEMORY_CHECKS,
+        )
+
+    def test_formatting_equivalent_checks_are_accepted(self) -> None:
+        """The same rules typed differently are the same rules."""
+        create_schema(
+            self.database_path,
+            FORMATTING_EQUIVALENT_BASELINE,
+            with_rows=True,
+            with_memories=True,
+        )
+        self.assertNotEqual(
+            FORMATTING_EQUIVALENT_BASELINE,
+            V0_2_0_BASELINE_SCHEMA,
+        )
+
+        self.memory.initialize()
+
+        self.assertEqual(read_schema_version(self.database_path), EXPECTED_SCHEMA_VERSION)
+        self.assertEqual(
+            self._memories_shape(self.describe())[5],
+            REQUIRED_MEMORY_CHECKS,
+        )
+        for identifier, fact, _normalized, created_at in BASELINE_MEMORIES:
+            self.assertEqual(
+                self.memory.get_memory(identifier),
+                {"id": identifier, "fact": fact, "created_at": created_at},
+            )
+
+    def test_the_stamped_baseline_still_refuses_an_empty_fact(self) -> None:
+        """The point of verifying the checks: they have to still be enforced."""
+        create_schema(
+            self.database_path,
+            FORMATTING_EQUIVALENT_BASELINE,
+            with_rows=True,
+            with_memories=True,
+        )
+        self.memory.initialize()
+
+        connection = sqlite3.connect(self.database_path)
+        try:
+            with self.assertRaises(sqlite3.IntegrityError):
+                connection.execute(
+                    """
+                    INSERT INTO memories (fact, normalized_fact, created_at)
+                    VALUES (?, ?, ?)
+                    """,
+                    ("", "", "2026-02-01T00:00:00+00:00"),
+                )
+        finally:
+            connection.close()
+
+    def test_equivalent_spellings_normalize_to_one_expression(self) -> None:
+        equivalent = (
+            "CHECK (length(fact) > 0)",
+            "check(length(fact)>0)",
+            "CHECK ( LENGTH ( fact ) > 0 )",
+            'CHECK ((length("fact") > 0))',
+            "CHECK (\n    length([fact])\n    >\n    0\n)",
+            "CHECK (length(`fact`) > 0)",
+        )
+
+        for spelling in equivalent:
+            with self.subTest(spelling=spelling):
+                tokens = memory_module._tokenize_definition(
+                    f"CREATE TABLE t (fact TEXT {spelling})"
+                )
+                self.assertEqual(
+                    memory_module._check_constraints(tokens),
+                    ("length(fact)>0",),
+                )
+
+    def test_different_conditions_stay_different(self) -> None:
+        different = (
+            "CHECK (length(fact) >= 0)",
+            "CHECK (length(fact) > 1)",
+            "CHECK (length(other) > 0)",
+            "CHECK (length(fact) <> 0)",
+        )
+
+        for spelling in different:
+            with self.subTest(spelling=spelling):
+                tokens = memory_module._tokenize_definition(
+                    f"CREATE TABLE t (fact TEXT, other TEXT, {spelling})"
+                )
+                self.assertNotEqual(
+                    memory_module._check_constraints(tokens),
+                    ("length(fact)>0",),
+                )
+
+    def test_a_check_inside_a_literal_or_comment_is_not_a_check(self) -> None:
+        disguises = (
+            "CREATE TABLE t (fact TEXT DEFAULT 'CHECK (length(fact) > 0)')",
+            "CREATE TABLE t (fact TEXT) -- CHECK (length(fact) > 0)",
+            "CREATE TABLE t (/* CHECK (length(fact) > 0) */ fact TEXT)",
+            "CREATE TABLE t (checksum TEXT)",
+        )
+
+        for disguise in disguises:
+            with self.subTest(disguise=disguise[:48]):
+                tokens = memory_module._tokenize_definition(disguise)
+                self.assertEqual(memory_module._check_constraints(tokens), ())
+
+    def test_the_classifier_never_compares_whole_stored_statements(self) -> None:
+        """Equality on stored SQL is what the token form exists to avoid."""
+        source = inspect.getsource(memory_module._describe_table)
+
+        self.assertNotIn("sql ==", source)
+        self.assertNotIn(".strip()", source)
+        self.assertIn("_tokenize_definition", source)
+
+
+class ForeignDatabaseTests(_TemporaryDatabaseTestCase):
+    """Verify emptiness is decided on every object, not on Maria's names.
+
+    A file that belongs to another application must never be treated as a
+    blank one to build Maria's schema inside, and the only way to be sure of
+    that is to count what is actually in it rather than to look for names
+    Maria would recognise.
+    """
+
+    def _assert_untouched_and_refused(self, expected_objects: set[str]) -> None:
+        """Assert a refusal that wrote no table, no marker, and no byte."""
+        before = self.database_path.read_bytes()
+
+        with self.assertRaisesRegex(
+            RuntimeError,
+            r"^Unable to initialize Maria database\.$",
+        ):
+            self.memory.initialize()
+
+        self.assertEqual(self.database_path.read_bytes(), before)
+        self.assertEqual(read_schema_version(self.database_path), UNVERSIONED)
+        self.assertEqual(table_names(self.database_path) & BASELINE_TABLES, frozenset())
+        self.assertEqual(set(_object_names(self.database_path)), expected_objects)
+
+    def test_a_file_with_no_user_defined_object_becomes_a_new_database(self) -> None:
+        self.database_path.parent.mkdir(parents=True, exist_ok=True)
+        sqlite3.connect(self.database_path).close()
+        self.assertEqual(_object_names(self.database_path), ())
+
+        self.memory.initialize()
+
+        self.assertEqual(read_schema_version(self.database_path), EXPECTED_SCHEMA_VERSION)
+        self.assertEqual(table_names(self.database_path), BASELINE_TABLES)
+
+    def test_a_file_holding_only_sqlite_internals_is_still_empty(self) -> None:
+        """``sqlite_sequence`` outlives the table that created it."""
+        self.database_path.parent.mkdir(parents=True, exist_ok=True)
+        connection = sqlite3.connect(self.database_path)
+        try:
+            connection.execute(
+                "CREATE TABLE gone (id INTEGER PRIMARY KEY AUTOINCREMENT)"
+            )
+            connection.execute("INSERT INTO gone DEFAULT VALUES")
+            connection.execute("DROP TABLE gone")
+            connection.commit()
+        finally:
+            connection.close()
+        self.assertEqual(_object_names(self.database_path), ())
+        self.assertIn("sqlite_sequence", _all_object_names(self.database_path))
+
+        self.memory.initialize()
+
+        self.assertEqual(read_schema_version(self.database_path), EXPECTED_SCHEMA_VERSION)
+        self.assertEqual(table_names(self.database_path), BASELINE_TABLES)
+
+    def test_one_unrelated_table_makes_the_file_somebody_elses(self) -> None:
+        create_schema(
+            self.database_path,
+            ("CREATE TABLE payroll (id INTEGER PRIMARY KEY, amount TEXT)",),
+        )
+
+        self._assert_untouched_and_refused({"payroll"})
+
+    def test_several_unrelated_tables_are_refused(self) -> None:
+        create_schema(
+            self.database_path,
+            (
+                "CREATE TABLE payroll (id INTEGER PRIMARY KEY, amount TEXT)",
+                "CREATE TABLE invoices (id INTEGER PRIMARY KEY, total TEXT)",
+                "CREATE INDEX idx_invoices_total ON invoices (total)",
+            ),
+        )
+
+        self._assert_untouched_and_refused(
+            {"payroll", "invoices", "idx_invoices_total"}
+        )
+
+    def test_a_file_holding_only_a_view_is_not_empty(self) -> None:
+        self.database_path.parent.mkdir(parents=True, exist_ok=True)
+        connection = sqlite3.connect(self.database_path)
+        try:
+            connection.execute("CREATE TABLE seed (id INTEGER)")
+            connection.execute("CREATE VIEW seen AS SELECT id FROM seed")
+            connection.execute("DROP TABLE seed")
+            connection.commit()
+        finally:
+            connection.close()
+
+        self._assert_untouched_and_refused({"seen"})
+
+    def test_a_foreign_table_beside_the_baseline_is_refused(self) -> None:
+        create_schema(
+            self.database_path,
+            V0_2_0_BASELINE_SCHEMA
+            + ("CREATE TABLE payroll (id INTEGER PRIMARY KEY, amount TEXT)",),
+            with_rows=True,
+            with_memories=True,
+        )
+        before = self.database_path.read_bytes()
+
+        with self.assertRaisesRegex(
+            RuntimeError,
+            r"^Unable to initialize Maria database\.$",
+        ):
+            self.memory.initialize()
+
+        self.assertEqual(self.database_path.read_bytes(), before)
+        self.assertEqual(read_schema_version(self.database_path), UNVERSIONED)
+
+
+class InitializationLogPrivacyTests(unittest.TestCase):
+    """Prove a failed initialization tells the log nothing about the failure.
+
+    The real ``configure_logging()`` installs the real handler and these
+    assertions read the file it wrote, all beneath a temporary directory.
+    Maria's live log is never opened.
+    """
+
+    def setUp(self) -> None:
+        self._temporary_directory = tempfile.TemporaryDirectory()
+        self.addCleanup(self._temporary_directory.cleanup)
+        self.root = Path(self._temporary_directory.name)
+        self.database_path = self.root / "database" / "maria-test.db"
+        self.log_dir = self.root / "logs"
+        self.log_file = self.log_dir / "maria.log"
+
+        self.maria_logger = logging.getLogger("maria")
+        self.original_handlers = tuple(self.maria_logger.handlers)
+        self.original_level = self.maria_logger.level
+        self.original_propagate = self.maria_logger.propagate
+        for handler in self.original_handlers:
+            self.maria_logger.removeHandler(handler)
+        self.addCleanup(self._restore_maria_logger)
+
+    def _restore_maria_logger(self) -> None:
+        """Close what this test configured and put the previous state back."""
+        for handler in list(self.maria_logger.handlers):
+            try:
+                handler.flush()
+            finally:
+                self.maria_logger.removeHandler(handler)
+                handler.close()
+        for handler in self.original_handlers:
+            self.maria_logger.addHandler(handler)
+        self.maria_logger.setLevel(self.original_level)
+        self.maria_logger.propagate = self.original_propagate
+
+    def _flush(self) -> None:
+        """Flush every handler so the file reflects what was logged."""
+        for handler in self.maria_logger.handlers:
+            handler.flush()
+
+    def _forbidden_values(self) -> tuple[str, ...]:
+        """Return every value a failed initialization must not repeat."""
+        return (
+            SQLITE_DETAIL_SENTINEL,
+            str(self.database_path),
+            str(self.database_path.parent),
+            "Traceback",
+            "DatabaseError",
+            "OperationalError",
+            "sqlite3",
+            "PRAGMA",
+            "user_version",
+        )
+
+    def test_a_sqlite_failure_reaches_neither_the_response_nor_the_log(
+        self,
+    ) -> None:
+        create_v0_2_0_baseline(self.database_path)
+        configure_logging(self.log_dir, "DEBUG")
+        failure = sqlite3.DatabaseError(SQLITE_DETAIL_SENTINEL)
+        memory = Memory(self.database_path, logger=get_logger("memory"))
+
+        with patch.object(
+            memory_module,
+            "_read_schema_version",
+            side_effect=failure,
+        ):
+            with self.assertRaises(RuntimeError) as raised:
+                memory.initialize()
+        self._flush()
+
+        self.assertEqual(
+            str(raised.exception),
+            "Unable to initialize Maria database.",
+        )
+        self.assertIs(raised.exception.__cause__, failure)
+        self.assertNotIn(SQLITE_DETAIL_SENTINEL, str(raised.exception))
+        self.assertNotIn(str(self.database_path), str(raised.exception))
+
+        logged = self.log_file.read_text(encoding="utf-8")
+        self.assertIn("Database initialization stopped: database_unreadable.", logged)
+        assert_log_omits(self, self.log_file, self._forbidden_values())
+
+    def test_a_failure_while_opening_the_connection_is_equally_silent(
+        self,
+    ) -> None:
+        configure_logging(self.log_dir, "DEBUG")
+        failure = sqlite3.OperationalError(SQLITE_DETAIL_SENTINEL)
+        memory = Memory(self.database_path, logger=get_logger("memory"))
+
+        with patch.object(memory, "_connect", side_effect=failure):
+            with self.assertRaises(RuntimeError) as raised:
+                memory.initialize()
+        self._flush()
+
+        self.assertEqual(
+            str(raised.exception),
+            "Unable to initialize Maria database.",
+        )
+        self.assertIs(raised.exception.__cause__, failure)
+        assert_log_omits(self, self.log_file, self._forbidden_values())
+
+    def test_a_real_corrupt_file_is_refused_without_describing_itself(
+        self,
+    ) -> None:
+        self.database_path.parent.mkdir(parents=True, exist_ok=True)
+        self.database_path.write_bytes(
+            f"not a database {SQLITE_DETAIL_SENTINEL} ".encode("utf-8") * 64
+        )
+        before = self.database_path.read_bytes()
+        configure_logging(self.log_dir, "DEBUG")
+
+        with self.assertRaises(RuntimeError) as raised:
+            Memory(self.database_path, logger=get_logger("memory")).initialize()
+        self._flush()
+
+        self.assertNotIsInstance(raised.exception, TypedFailureError)
+        self.assertEqual(
+            str(raised.exception),
+            "Unable to initialize Maria database.",
+        )
+        self.assertEqual(self.database_path.read_bytes(), before)
+        assert_log_omits(
+            self,
+            self.log_file,
+            self._forbidden_values() + ("file is not a database",),
+        )
+
+    def test_contention_is_recorded_as_a_code_rather_than_an_exception(
+        self,
+    ) -> None:
+        create_v0_2_0_baseline(self.database_path)
+        configure_logging(self.log_dir, "DEBUG")
+        busy = sqlite3.OperationalError(SQLITE_DETAIL_SENTINEL)
+        busy.sqlite_errorcode = sqlite3.SQLITE_BUSY
+        memory = Memory(self.database_path, logger=get_logger("memory"))
+
+        with patch.object(
+            memory_module,
+            "_read_schema_version",
+            side_effect=busy,
+        ):
+            with self.assertRaisesRegex(
+                RuntimeError,
+                r"^Database is busy\. Try again shortly\.$",
+            ):
+                memory.initialize()
+        self._flush()
+
+        logged = self.log_file.read_text(encoding="utf-8")
+        self.assertIn("Database initialization stopped: database_busy.", logged)
+        assert_log_omits(self, self.log_file, self._forbidden_values())
+
+    def test_reading_the_schema_version_is_equally_silent(self) -> None:
+        create_v0_2_0_baseline(self.database_path)
+        configure_logging(self.log_dir, "DEBUG")
+        failure = sqlite3.DatabaseError(SQLITE_DETAIL_SENTINEL)
+        memory = Memory(self.database_path, logger=get_logger("memory"))
+
+        with patch.object(memory, "_connect", side_effect=failure):
+            with self.assertRaisesRegex(
+                RuntimeError,
+                r"^Unable to read database schema version\.$",
+            ):
+                memory.schema_version()
+        self._flush()
+
+        assert_log_omits(self, self.log_file, self._forbidden_values())
+
+    def test_the_initialization_boundary_hands_the_logger_nothing_private(
+        self,
+    ) -> None:
+        """A source guard, because a reintroduced leak would itself be silent.
+
+        Each logging call is read as a call rather than as text, so the check
+        is on what is actually handed to the logger. ``initialize`` legitimately
+        uses the database path to create its parent directory; what it may not
+        do is pass that path, or anything derived from the failure, to a log
+        record.
+        """
+        inspected = 0
+
+        for name in (
+            "initialize",
+            "schema_version",
+            "_settle_schema_version",
+            "_classify_unversioned_database",
+            "_apply_pending_migrations",
+        ):
+            source = textwrap.dedent(inspect.getsource(getattr(Memory, name)))
+            for node in ast.walk(ast.parse(source)):
+                if not isinstance(node, ast.Call):
+                    continue
+                function = node.func
+                if not isinstance(function, ast.Attribute):
+                    continue
+                if not isinstance(function.value, ast.Attribute):
+                    continue
+                if function.value.attr != "logger":
+                    continue
+
+                inspected += 1
+                rendered = " ".join(
+                    [ast.unparse(argument) for argument in node.args]
+                    + [
+                        f"{keyword.arg}={ast.unparse(keyword.value)}"
+                        for keyword in node.keywords
+                    ]
+                )
+                with self.subTest(method=name, call=function.attr):
+                    self.assertNotEqual(function.attr, "exception")
+                    self.assertNotIn("exc_info", rendered)
+                    self.assertNotIn("database_path", rendered)
+                    self.assertNotRegex(rendered, r"\bexc\b")
+                    self.assertNotRegex(rendered, r"\bstr\(|\brepr\(")
+
+        # The walk has to have found something, or it would pass by reaching
+        # nothing at all.
+        self.assertGreaterEqual(inspected, 6)
+
+
+def _object_names(database_path: Path) -> tuple[str, ...]:
+    """Return a database's user-defined object names, in name order."""
+    connection = sqlite3.connect(database_path)
+    try:
+        return tuple(
+            str(row[0])
+            for row in connection.execute(
+                """
+                SELECT name
+                FROM sqlite_master
+                WHERE name NOT LIKE 'sqlite~_%' ESCAPE '~'
+                ORDER BY name
+                """
+            )
+        )
+    finally:
+        connection.close()
+
+
+def _all_object_names(database_path: Path) -> tuple[str, ...]:
+    """Return every object name a database holds, SQLite's own included."""
+    connection = sqlite3.connect(database_path)
+    try:
+        return tuple(
+            str(row[0])
+            for row in connection.execute(
+                "SELECT name FROM sqlite_master ORDER BY name"
+            )
+        )
+    finally:
+        connection.close()
+
+
+def _without_check(column_pattern: str) -> tuple[str, ...]:
+    """Return the baseline schema with one CHECK clause removed."""
+    removed = tuple(
+        re.sub(
+            r"\s*CHECK \(" + column_pattern + r" > 0\)",
+            "",
+            statement,
+        )
+        for statement in V0_2_0_BASELINE_SCHEMA
+    )
+    if removed == V0_2_0_BASELINE_SCHEMA:
+        raise ValueError("The CHECK clause to remove was not found.")
+    return removed
 
 
 if __name__ == "__main__":

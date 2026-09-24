@@ -48,28 +48,71 @@ is known.
 
 | Database state | What happens |
 | --- | --- |
-| No marker, no tables of Maria's own (including a zero-byte file) | Created directly at the current schema, with the marker, in one transaction. It is never mistaken for a migrated owner database. |
+| No marker, no user-defined object at all (including a zero-byte file) | Created directly at the current schema, with the marker, in one transaction. It is never mistaken for a migrated owner database. |
 | No marker, structure matches version 2 | Classified as the v0.2.0 baseline and stamped `2`. No schema statement runs and no row is touched. |
 | No marker, structure matches version 1 | Classified as the pre-`memories` baseline, stamped `1`, then migrated forward. |
 | Marker below the current version | Every missing migration runs in ascending order. |
 | Marker equal to the current version | Nothing at all runs. The file is left byte for byte as it was. |
 | Marker above the current version | Refused. See "Refusing a newer schema" below. |
-| No marker, structure matches nothing Maria shipped | Refused with `RuntimeError("Unable to initialize Maria database.")` and nothing written. |
-| Corrupt, unreadable, or not a SQLite database | The same `RuntimeError`, raised from the underlying SQLite error. It is never reported as a newer schema. |
+| No marker, any user-defined object that is not Maria's exact schema | Refused with `RuntimeError("Unable to initialize Maria database.")` and nothing written: no Maria table is created, no marker is stamped, and the file is unchanged. |
+| Corrupt, unreadable, or not a SQLite database | The same `RuntimeError`, raised from the underlying SQLite error. It is never reported as a newer schema, and nothing about the underlying error is logged. |
+
+### What "empty" means
+
+A file is a new database only when it holds no object SQLite did not create
+itself: no table, index, view, or trigger of anyone's. Emptiness is
+deliberately not decided by looking for Maria's own table names, because a
+file full of another application's tables would then look empty and have
+Maria's schema built inside it. Only SQLite's reserved `sqlite_` objects are
+ignored, and `sqlite_sequence` in particular, which appears as soon as any
+`AUTOINCREMENT` table exists and can outlive it, so a genuinely empty file is
+not mistaken for a populated one.
+
+A file holding even one unrelated object is therefore somebody else's. It is
+refused: no Maria table is created in it, its `user_version` is not stamped,
+and it is left byte for byte as it was found.
+
+### What is validated
 
 A missing marker on a populated file is not taken as proof that the file is
 the baseline. The structure is validated first, against SQLite's own catalogue
 rather than against the text of the stored `CREATE` statements: tables,
 columns in order with their declared types, nullability, defaults and
-primary-key positions, indexes with their columns and uniqueness, foreign
-keys, and whether each table declares `AUTOINCREMENT`. A database whose
-formatting differs but whose structure matches is still recognised, while a
-missing table, a missing or extra column, a changed column definition, a
-different primary-key shape, a missing `normalized_fact` uniqueness
-constraint, a missing index, a half-created database, and a foreign database
-that merely reuses the table names are all refused. `CHECK` constraints are
-not compared, because SQLite exposes them structurally nowhere and the
-application validates the same conditions before it writes.
+primary-key positions, indexes with their columns and uniqueness, and foreign
+keys. A database whose formatting differs but whose structure matches is still
+recognised, while a missing table, a missing or extra column, a changed column
+definition, a different primary-key shape, a missing `normalized_fact`
+uniqueness constraint, a missing index, a half-created database, and a foreign
+database that merely reuses the table names are all refused.
+
+Two things no pragma reports are read from the stored `CREATE` statement
+instead: `AUTOINCREMENT`, which decides whether a deleted row's id can come
+back, and the table's `CHECK` constraints. The checks matter because a
+`memories` table whose `CHECK (length(fact) > 0)` or
+`CHECK (length(normalized_fact) > 0)` is missing or weakened accepts rows the
+real baseline refuses, so stamping it as the v0.2.0 baseline would be a false
+claim about what the database enforces.
+
+Neither is read by comparing stored SQL. The statement is reduced to tokens
+first — whitespace and comments dropped, keywords and identifiers casefolded,
+every quoting style (`"x"`, `` `x` ``, `[x]`) reduced to the bare name, string
+literals kept whole and never read as syntax — and each `CHECK` is then lifted
+out as its own expression with any parentheses that merely wrap it removed. So
+all of these state the same rule and all are accepted:
+
+```sql
+CHECK (length(fact) > 0)
+check(length(fact)>0)
+CHECK ( LENGTH ( "fact" ) > 0 )
+CHECK ((length([fact]) > 0))
+```
+
+while `CHECK (length(fact) >= 0)`, a check on a different column, a check that
+is only present in a comment or inside a string literal, and a missing check
+are all refused. A check declared beside its column and the same check
+declared for the table compare alike, because SQLite evaluates both per row.
+The statement as a whole is never compared, so formatting alone can never
+decide the outcome.
 
 Migrations are ordered, forward-only, idempotent, and atomic. The set of steps
 is validated before the database is opened, so a gap, a repeat, a step below
@@ -133,10 +176,26 @@ Maria: This database was written by a newer version of Maria and cannot be opene
 A corrupt file, an I/O error, or a locked database is never converted into
 this diagnosis; each keeps its own existing controlled result.
 
-Migration logging records step names and version numbers only. No row value,
-note title or body, memory fact, interaction request or response, absolute
-database path, SQL parameter, or SQLite error text is written to the log on
-any migration path, including the refusal and rollback paths.
+### What initialization logs
+
+Nothing the initialization boundary writes to the log is derived from what
+went wrong. A successful run records the schema version it reached and, for
+each migration, that step's name and the version it produced. A refusal
+records one fixed sentence carrying a stable event code and nothing else:
+
+```
+Database initialization stopped: database_unreadable.
+Database initialization stopped: database_busy.
+```
+
+No row value, note title or body, memory fact, interaction request or
+response, database path, SQL statement, SQL parameter, SQLite message, or
+traceback is written on any path — success, migration failure, rollback,
+drift refusal, newer-schema refusal, or an unreadable file. The underlying
+exception is still attached to the raised `RuntimeError` as its `__cause__`
+for a caller that needs it; it is simply never written down. Reading the
+schema version through `Memory.schema_version()` records failures the same
+way, since it reads the same header of the same file.
 
 ## Tables
 

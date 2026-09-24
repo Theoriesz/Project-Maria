@@ -16,18 +16,35 @@
   as proof of the baseline: the structure is validated first against SQLite's
   own catalogue — tables, columns in order with their types, nullability,
   defaults and primary-key positions, indexes with their columns and
-  uniqueness, foreign keys, and `AUTOINCREMENT` — so a database whose
-  formatting differs is still recognised, while a missing table, a missing or
-  extra column, a changed column definition, a different primary-key shape, a
-  missing `normalized_fact` uniqueness constraint, a missing index, a
-  half-created database, and a foreign database that merely reuses the table
-  names are all refused with nothing written. A database matching the
-  published v0.2.0 shape is stamped as that baseline and nothing else runs; the
-  earlier shape Maria created before explicit memories existed is stamped as
-  the version it is and then migrated forward. A brand-new or empty file is
+  uniqueness, and foreign keys — so a database whose formatting differs is
+  still recognised, while a missing table, a missing or extra column, a
+  changed column definition, a different primary-key shape, a missing
+  `normalized_fact` uniqueness constraint, a missing index, a half-created
+  database, and a foreign database that merely reuses the table names are all
+  refused with nothing written. The two things no pragma reports,
+  `AUTOINCREMENT` and each table's `CHECK` constraints, are read from the
+  stored statement's tokens rather than by comparing its text: the checks are
+  part of what makes a database the baseline, because a `memories` table whose
+  `length(fact)` or `length(normalized_fact)` check is missing or weakened
+  accepts rows the real baseline refuses. Whitespace, line breaks, casing,
+  identifier quoting, comments, redundant parentheses, and a check written for
+  the table rather than beside its column all state the same rule and are all
+  accepted; a weakened, retargeted, extra, or missing check is refused, and a
+  check that exists only inside a comment or a string literal is not a check.
+  A database matching the published v0.2.0 shape is stamped as that baseline
+  and nothing else runs; the earlier shape Maria created before explicit
+  memories existed is stamped as the version it is and then migrated forward.
+  Every owner record, id, and timestamp is preserved either way.
+  A file is treated as a new database only when it holds no object SQLite did
+  not create itself — no table, index, view, or trigger of anyone's — rather
+  than merely no table Maria would recognise, so another application's
+  database is never mistaken for a blank one to build inside. Only SQLite's
+  own reserved objects are ignored, including a `sqlite_sequence` that has
+  outlived the table that created it. A brand-new or genuinely empty file is
   created directly at the current schema in one step and is never mistaken for
-  a migrated owner database. Every owner record, id, and timestamp is
-  preserved either way.
+  a migrated owner database; a file holding even one unrelated object is
+  refused with no Maria table created, no marker stamped, and not one byte
+  changed.
   Migrations are forward-only and validated as a set before the database is
   opened, so a gap, a repeat, or an unknown step is refused rather than found
   part-way up. Each step runs in one explicit transaction together with the
@@ -44,9 +61,17 @@
   instead of the general startup message, so the owner is told what is wrong
   without any path, record, SQL, or SQLite error text travelling with it. A
   corrupt, locked, or unreadable database is never reported as a newer schema
-  and keeps its existing controlled result. Migration logging records step
-  names and version numbers only, on the success, rollback, and refusal paths
-  alike, and the initialization log no longer names the database file.
+  and keeps its existing controlled result.
+  Nothing the initialization boundary writes to the operational log is derived
+  from what went wrong. A successful run records the schema version it reached
+  and each migration's step name and resulting version; a refusal records one
+  fixed sentence carrying a stable event code and nothing else. No row value,
+  note title or body, memory fact, interaction request or response, database
+  path, SQL statement or parameter, SQLite message, or traceback is written on
+  any path, including a corrupt or unreadable file, which previously produced
+  an exception log carrying SQLite's own text. The underlying exception is
+  still attached to the raised error for a caller that needs it; it is simply
+  never written down. Reading the schema version is recorded the same way.
 - Replaced Maria's single configured safe directory with named filesystem
   roots, and put the things Maria must never reach behind one shared,
   permanent boundary. `config/config.toml` now declares roots in a

@@ -31,6 +31,18 @@ _BUSY_OR_LOCKED_PRIMARY_CODES = frozenset(
 
 _DATABASE_REFUSED_MESSAGE = "Unable to initialize Maria database."
 
+_SCHEMA_VERSION_UNREADABLE_MESSAGE = "Unable to read database schema version."
+
+# The stable codes the initialization boundary is allowed to record. A failure
+# there can only be described by one of these: the underlying exception is
+# never logged, formatted, or attached, because SQLite states what it could
+# not read in terms of the file it was reading, and an operational log is not
+# where that belongs. The owner-visible message is decided separately and is
+# equally fixed.
+_EVENT_DATABASE_UNREADABLE = "database_unreadable"
+_EVENT_DATABASE_BUSY = "database_busy"
+_INITIALIZATION_STOPPED = "Database initialization stopped: %s."
+
 # SQLite's default value for ``PRAGMA user_version``. It is not a Maria schema
 # version: it means no marker was ever written, so the database has to be
 # classified by its structure before anything is done to it.
@@ -228,12 +240,20 @@ class Memory:
         ``FailureKind.DATABASE_SCHEMA_TOO_NEW`` when the file belongs to a
         newer build, and ``RuntimeError`` with a fixed, content-free message
         for every other refusal or failure, including an unrecognised shape
-        and a corrupt or unreadable file.
+        and a corrupt or unreadable file. Contention keeps the shared busy
+        message, because it is worth retrying rather than a broken database,
+        and is never reported as a newer schema.
+
+        Nothing this boundary logs is derived from what went wrong. Every
+        outcome, success and refusal alike, is recorded as a fixed sentence
+        with at most a version number or a stable event code in it, so no
+        path, row, statement, SQLite message, or traceback can reach the
+        operational log from here.
         """
         _validate_migration_ladder()
         self.database_path.parent.mkdir(parents=True, exist_ok=True)
         try:
-            with self._connection() as connection:
+            with self._connection(classify_contention=False) as connection:
                 version = _read_schema_version(connection)
                 version = self._settle_schema_version(connection, version)
                 self._apply_pending_migrations(connection, version)
@@ -242,7 +262,18 @@ class Memory:
                 DATABASE_SCHEMA_VERSION,
             )
         except sqlite3.Error as exc:
-            self.logger.exception("Database initialization failed.")
+            # One fixed code and nothing else. A corrupt, truncated, or
+            # unreadable file makes SQLite describe the file it failed on, so
+            # neither its text, its traceback, nor the path may be recorded.
+            # The exception stays available as ``__cause__`` for a caller that
+            # needs it; it is simply never written down.
+            if _is_busy_or_locked(exc):
+                self.logger.error(_INITIALIZATION_STOPPED, _EVENT_DATABASE_BUSY)
+                raise RuntimeError(_DATABASE_BUSY_MESSAGE) from exc
+            self.logger.error(
+                _INITIALIZATION_STOPPED,
+                _EVENT_DATABASE_UNREADABLE,
+            )
             raise RuntimeError(_DATABASE_REFUSED_MESSAGE) from exc
 
     def _settle_schema_version(
@@ -285,15 +316,18 @@ class Memory:
 
         A missing marker proves only that nothing ever wrote one, so the file
         is identified by its structure rather than assumed to be the baseline.
-        A file holding none of Maria's own tables is a new database and is
-        created directly at the current schema. A populated file is compared
+        A file holding no object that SQLite did not create itself is a new
+        database and is created directly at the current schema. Emptiness is
+        decided on every user-defined object rather than on Maria's own table
+        names, so another application's database is never treated as a blank
+        one to build inside. A populated file is compared
         against each shape Maria shipped before stamping existed, and is
         stamped only on an exact structural match. Anything else, from a
         half-created database or a drifted column to a missing uniqueness
         constraint or a foreign database that merely shares table names, is
         refused with nothing written.
         """
-        if not _user_table_names(connection):
+        if not _user_defined_object_names(connection):
             _run_in_one_transaction(
                 connection,
                 _CURRENT_SCHEMA_STATEMENTS,
@@ -389,8 +423,14 @@ class Memory:
             with self._connection() as connection:
                 return _read_schema_version(connection)
         except sqlite3.Error as exc:
-            self.logger.exception("Failed to read the database schema version.")
-            raise RuntimeError("Unable to read database schema version.") from exc
+            # Recorded the same way initialization records its failures: this
+            # reads the same header of the same file, so an exception log here
+            # would reintroduce exactly what that boundary refuses to write.
+            self.logger.error(
+                "Reading the database schema version stopped: %s.",
+                _EVENT_DATABASE_UNREADABLE,
+            )
+            raise RuntimeError(_SCHEMA_VERSION_UNREADABLE_MESSAGE) from exc
 
     def record_interaction(self, user_input: str, response: str) -> int:
         """Record a user interaction and return its database id."""
@@ -906,15 +946,28 @@ class Memory:
             raise RuntimeError("Unable to delete note.") from exc
 
     @contextmanager
-    def _connection(self) -> Iterator[sqlite3.Connection]:
-        """Open a SQLite connection and close it after use."""
+    def _connection(
+        self,
+        *,
+        classify_contention: bool = True,
+    ) -> Iterator[sqlite3.Connection]:
+        """Open a SQLite connection and close it after use.
+
+        Contention is normally recognised and converted here, so every method
+        answers a busy database with the same message. ``classify_contention``
+        turns that off for the initialization boundary, which classifies the
+        error itself: the conversion carries an exception log with it, and
+        that boundary records a fixed event code instead. Rollback and close
+        are unaffected either way, and every other error still propagates
+        unchanged.
+        """
         connection = self._connect()
         try:
             yield connection
             connection.commit()
         except sqlite3.Error as exc:
             connection.rollback()
-            if _is_busy_or_locked(exc):
+            if classify_contention and _is_busy_or_locked(exc):
                 self.logger.exception("Database busy or locked.")
                 raise RuntimeError(_DATABASE_BUSY_MESSAGE) from exc
             raise
@@ -1024,19 +1077,28 @@ def _run_in_one_transaction(
         raise
 
 
-def _user_table_names(connection: sqlite3.Connection) -> tuple[str, ...]:
-    """Return the database's own table names, in name order.
+def _user_defined_object_names(
+    connection: sqlite3.Connection,
+) -> tuple[str, ...]:
+    """Return every object the database holds that SQLite did not create.
 
-    SQLite maintains internal tables such as ``sqlite_sequence`` on its own,
-    so they are excluded: their presence says nothing about which schema a
-    database is at, and counting them would make a brand-new database look
-    populated.
+    Tables, indexes, views, and triggers all count, because this settles
+    whether a file is a new database or somebody's existing one, and a file
+    holding a view or a trigger is nobody's idea of empty. Deciding that on
+    Maria's own table names would be worse still: a database full of another
+    application's tables would look empty and have Maria's schema created
+    inside it.
+
+    Only SQLite's own objects are excluded, by the ``sqlite_`` prefix it
+    reserves for them. ``sqlite_sequence`` appears as soon as any
+    ``AUTOINCREMENT`` table exists and can outlive it, so counting it would
+    make a database that is genuinely empty look populated.
     """
     rows = connection.execute(
         """
         SELECT name
         FROM sqlite_master
-        WHERE type = 'table' AND name NOT LIKE 'sqlite~_%' ESCAPE '~'
+        WHERE name NOT LIKE 'sqlite~_%' ESCAPE '~'
         ORDER BY name
         """
     ).fetchall()
@@ -1060,10 +1122,14 @@ def _describe_schema(connection: sqlite3.Connection) -> tuple[Any, ...]:
     it is read as a keyword from the stored statement rather than by comparing
     that statement as a whole.
 
-    ``CHECK`` constraints are deliberately not compared. SQLite exposes them
-    structurally nowhere, the application validates the same conditions before
-    it writes, and matching them would mean falling back to comparing SQL
-    text.
+    ``CHECK`` constraints are compared too, because a column whose check is
+    missing or weakened accepts rows the real baseline refuses, and no pragma
+    reports one. They are the one part read from the stored statement, and
+    only the checks themselves are read from it: each is lifted out as its own
+    expression and reduced to tokens, so whitespace, line breaks, casing,
+    identifier quoting, comments, and redundant parentheses around the same
+    condition all compare equal while a different condition does not. The
+    statement as a whole is never compared.
     """
     rows = connection.execute(
         """
@@ -1089,6 +1155,12 @@ def _describe_table(
     Every pragma is read through its table-valued function so the table name
     travels as a bound parameter. A drifted or foreign database supplies these
     names, and a name is not something to paste into statement text.
+
+    ``AUTOINCREMENT`` and the table's ``CHECK`` constraints are the two things
+    no pragma reports, so both are read from the stored statement's tokens
+    rather than from its text. A check declared beside its column and the same
+    check declared for the table compare alike, because SQLite evaluates both
+    per row and the distinction is a spelling rather than a rule.
     """
     columns = tuple(
         (
@@ -1162,28 +1234,217 @@ def _describe_table(
         )
     )
 
+    tokens = _tokenize_definition(definition)
     return (
         table_name,
         columns,
         tuple(sorted(indexes)),
         foreign_keys,
-        _declares_autoincrement(definition),
+        _declares_autoincrement(tokens),
+        _check_constraints(tokens),
     )
 
 
-def _declares_autoincrement(definition: str) -> bool:
-    """Return whether a stored CREATE TABLE statement declares AUTOINCREMENT.
+# The closing character for each way SQLite lets an identifier be quoted.
+_IDENTIFIER_QUOTES = {'"': '"', "`": "`", "[": "]"}
 
-    The keyword is looked for as a whole word in a casefolded copy, so
-    spacing, line breaks, and casing do not matter and a column merely named
-    something similar cannot match. This is a keyword test rather than a
-    comparison of the statement, which stays the text SQLite happened to
-    store.
+# Characters that continue a bare identifier or number once one has started.
+_WORD_TAIL = "_$"
+
+
+def _tokenize_definition(definition: str) -> tuple[tuple[str, str], ...]:
+    """Reduce a stored CREATE statement to comparable tokens.
+
+    This is the one place a schema statement is read as text, and it exists so
+    that nothing else has to. Whitespace disappears, comments disappear,
+    keywords and identifiers are casefolded, and an identifier keeps only its
+    name whichever of SQLite's quoting styles it arrived in, so two statements
+    that declare the same thing produce the same tokens however they were
+    written. String literals are kept whole and marked as literals, so text
+    that merely looks like SQL inside one can never be mistaken for the real
+    thing.
+
+    Nothing here interprets the statement. It has no notion of columns,
+    constraints, or clauses; callers that need one work from the tokens.
     """
-    words = definition.casefold()
-    for separator in "(),":
-        words = words.replace(separator, " ")
-    return "autoincrement" in words.split()
+    tokens: list[tuple[str, str]] = []
+    index = 0
+    end = len(definition)
+
+    while index < end:
+        character = definition[index]
+
+        if character.isspace():
+            index += 1
+            continue
+
+        # A comment is not part of what the statement declares, and leaving it
+        # in the stream would let commented-out text be read as a real clause.
+        if definition.startswith("--", index):
+            line_end = definition.find("\n", index)
+            index = end if line_end == -1 else line_end + 1
+            continue
+        if definition.startswith("/*", index):
+            comment_end = definition.find("*/", index + 2)
+            index = end if comment_end == -1 else comment_end + 2
+            continue
+
+        if character == "'":
+            literal, index = _read_delimited(definition, index, "'")
+            tokens.append(("literal", literal))
+            continue
+
+        if character in _IDENTIFIER_QUOTES:
+            name, index = _read_delimited(
+                definition,
+                index,
+                _IDENTIFIER_QUOTES[character],
+            )
+            tokens.append(("word", name.casefold()))
+            continue
+
+        if character.isalnum() or character in _WORD_TAIL:
+            start = index
+            while index < end and (
+                definition[index].isalnum() or definition[index] in _WORD_TAIL
+            ):
+                index += 1
+            tokens.append(("word", definition[start:index].casefold()))
+            continue
+
+        tokens.append(("punctuation", character))
+        index += 1
+
+    return tuple(tokens)
+
+
+def _read_delimited(
+    definition: str,
+    start: int,
+    closing: str,
+) -> tuple[str, int]:
+    """Return one quoted run's contents and the index just past its close.
+
+    ``start`` addresses the opening delimiter. A doubled closing delimiter is
+    SQLite's escape for a literal one, so it is consumed as content rather
+    than ending the run. An unterminated run ends at the end of the statement
+    instead of raising: a malformed definition has to be describable so that
+    the classifier can refuse it, rather than aborting the inspection.
+    """
+    contents: list[str] = []
+    index = start + 1
+    end = len(definition)
+    while index < end:
+        if definition[index] == closing:
+            if definition.startswith(closing * 2, index):
+                contents.append(closing)
+                index += 2
+                continue
+            return "".join(contents), index + 1
+        contents.append(definition[index])
+        index += 1
+    return "".join(contents), end
+
+
+def _declares_autoincrement(tokens: tuple[tuple[str, str], ...]) -> bool:
+    """Return whether a tokenized CREATE TABLE declares AUTOINCREMENT.
+
+    The keyword is looked for as a whole token, so spacing, line breaks, and
+    casing do not matter, while a column merely named something similar, a
+    string literal containing the word, and a comment mentioning it all
+    cannot match.
+    """
+    return ("word", "autoincrement") in tokens
+
+
+def _check_constraints(
+    tokens: tuple[tuple[str, str], ...],
+) -> tuple[str, ...]:
+    """Return every CHECK expression a tokenized CREATE TABLE declares.
+
+    Each expression is returned as its tokens joined together, which is a
+    normalized form rather than the text that produced it: two statements
+    spelling the same condition with different spacing, casing, identifier
+    quoting, or redundant parentheses yield the same string, while a condition
+    that was weakened or removed does not. The results are sorted, so the
+    order the checks were written in does not matter either.
+
+    Only the expression inside each ``CHECK`` is taken. The surrounding
+    statement contributes nothing, so this can never become an equality test
+    on stored SQL by another name.
+    """
+    expressions: list[str] = []
+    position = 0
+    total = len(tokens)
+
+    while position < total:
+        if tokens[position] != ("word", "check"):
+            position += 1
+            continue
+        opening = position + 1
+        if opening >= total or tokens[opening] != ("punctuation", "("):
+            position += 1
+            continue
+        expression, position = _read_parenthesized(tokens, opening)
+        expressions.append(_strip_redundant_parentheses(expression))
+
+    return tuple(sorted(expressions))
+
+
+def _read_parenthesized(
+    tokens: tuple[tuple[str, str], ...],
+    opening: int,
+) -> tuple[str, int]:
+    """Return one balanced parenthesized group's contents and the next index.
+
+    ``opening`` addresses the group's own ``(``, which is syntax rather than
+    part of the condition and is therefore dropped along with its closing
+    partner. Nesting inside is kept, because it is part of the expression. A
+    literal contributes its text without its quotes having to be reproduced,
+    since a literal is already a single token by the time it arrives here.
+    """
+    contents: list[str] = []
+    depth = 0
+    index = opening
+    total = len(tokens)
+
+    while index < total:
+        kind, value = tokens[index]
+        if kind == "punctuation" and value == "(":
+            depth += 1
+            if depth > 1:
+                contents.append(value)
+        elif kind == "punctuation" and value == ")":
+            depth -= 1
+            if depth == 0:
+                return "".join(contents), index + 1
+            contents.append(value)
+        else:
+            contents.append(value)
+        index += 1
+
+    return "".join(contents), total
+
+
+def _strip_redundant_parentheses(expression: str) -> str:
+    """Remove parentheses that wrap a whole expression without changing it.
+
+    ``(length(fact)>0)`` and ``length(fact)>0`` state the same condition, so
+    they have to compare equal. A pair is only removed when it genuinely
+    encloses everything: ``(a)>(b)`` opens and closes before the end, so it is
+    left exactly as it is.
+    """
+    while expression.startswith("(") and expression.endswith(")"):
+        depth = 0
+        for position, character in enumerate(expression):
+            if character == "(":
+                depth += 1
+            elif character == ")":
+                depth -= 1
+                if depth == 0 and position < len(expression) - 1:
+                    return expression
+        expression = expression[1:-1]
+    return expression
 
 
 def _reference_schema(statements: tuple[str, ...]) -> tuple[Any, ...]:
