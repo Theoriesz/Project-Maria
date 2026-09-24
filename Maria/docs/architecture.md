@@ -193,6 +193,15 @@ stderr output and status 1, while startup `KeyboardInterrupt` maps to status
 130. `MemoryError` and `SystemExit` are not converted into ordinary startup
 failures.
 
+A startup `TypedFailureError` is the one case that reports something more
+specific than the generic message. It carries a `Failure` whose owner-visible
+sentence is fixed per kind and interpolates nothing, so printing it is exactly
+as sanitized as the generic message while saying which refusal happened. The
+status is still 1. This exists because a database written by a newer build has
+to be named rather than hidden behind "startup failed", which is the silent
+half-working outcome that refusal replaces. The entrypoint chooses nothing
+about the wording: it prints what the carried failure already decided.
+
 EOF or Ctrl+C at the main prompt exits normally. At the confirmation prompt,
 `y` or `yes` approves and `n` or `no` cancels, case- and whitespace-
 insensitively; blank or unrecognized input re-prompts rather than approving or
@@ -503,6 +512,16 @@ that capability is switched on. A later stage that settles an export location mu
 add that location to the same universal exclusion boundary.
 
 ## Persistence Models
+
+The database carries its own schema version, stamped in the SQLite header and
+advanced only by `core/memory.py`. It is a separate number from `APP_VERSION`
+and is never derived from it, so the application version can stay frozen while
+the schema advances. Startup settles that version once, classifies an
+unversioned database structurally against the shapes Maria actually shipped,
+runs any missing forward migrations in order, and refuses a database stamped
+newer than the running build before writing anything.
+`docs/database.md` describes the rules; the three record types below are
+unchanged by them.
 
 Maria keeps three kinds of persistent data separate:
 

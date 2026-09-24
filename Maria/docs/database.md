@@ -6,14 +6,137 @@ Maria uses SQLite through `core/memory.py`.
 
 The default database path is `database/maria.db`.
 
+## Schema Version
+
+The database carries its own version, stored in the SQLite header as
+`PRAGMA user_version` and readable through `Memory.schema_version()`. The
+version this build expects is `DATABASE_SCHEMA_VERSION` in
+`core/constants.py`.
+
+That number is deliberately not `APP_VERSION` and is never derived from it.
+The application version stays frozen across a release effort while the schema
+may advance, and a schema change may ship without any application version
+change at all, so tying one to the other would make both wrong. It is a plain
+counter over Maria's schema history rather than a release number:
+
+| Version | Meaning |
+| --- | --- |
+| 0 | SQLite's default. No marker was ever written; the database has to be classified by its structure. |
+| 1 | The earliest schema Maria created: `interactions`, `notes`, and the two secondary indexes. |
+| 2 | The published v0.2.0 baseline, which adds `memories`. This is the current schema. |
+
+Versions 1 and 2 are the only shapes that can exist without a marker, because
+every database Maria creates or migrates from this build onwards is stamped.
+That set is therefore closed and cannot grow.
+
+The marker is a header pragma rather than a version table on purpose. It adds
+no table, column, or record type of any kind, it reads as `0` from a brand-new
+or empty file without creating anything to answer the question, and SQLite
+rolls a change to it back with the transaction that made it, so a schema change
+and the version recording it cannot come apart. A metadata table was considered
+and rejected: it would have introduced exactly the extra table this stage rules
+out, would itself have needed drift detection, and would still not have
+distinguished "unversioned" from "the table is missing".
+
 ## Initialization and Migration
 
-`Memory.initialize()` creates required tables and indexes with `IF NOT EXISTS`.
-Adding explicit memory is therefore an additive, idempotent migration for an
-existing Maria database. It does not alter or remove existing `interactions` or
-`notes` data, and repeated initialization preserves stored memories.
+`Memory.initialize()` settles the database's version first and does everything
+else from there. It is the only place that classification happens, so no other
+method decides for itself what shape of database it is looking at. Reading the
+marker is a read: nothing is created, written, or repaired before the outcome
+is known.
 
-Maria does not copy or infer explicit memories from existing interaction rows.
+| Database state | What happens |
+| --- | --- |
+| No marker, no tables of Maria's own (including a zero-byte file) | Created directly at the current schema, with the marker, in one transaction. It is never mistaken for a migrated owner database. |
+| No marker, structure matches version 2 | Classified as the v0.2.0 baseline and stamped `2`. No schema statement runs and no row is touched. |
+| No marker, structure matches version 1 | Classified as the pre-`memories` baseline, stamped `1`, then migrated forward. |
+| Marker below the current version | Every missing migration runs in ascending order. |
+| Marker equal to the current version | Nothing at all runs. The file is left byte for byte as it was. |
+| Marker above the current version | Refused. See "Refusing a newer schema" below. |
+| No marker, structure matches nothing Maria shipped | Refused with `RuntimeError("Unable to initialize Maria database.")` and nothing written. |
+| Corrupt, unreadable, or not a SQLite database | The same `RuntimeError`, raised from the underlying SQLite error. It is never reported as a newer schema. |
+
+A missing marker on a populated file is not taken as proof that the file is
+the baseline. The structure is validated first, against SQLite's own catalogue
+rather than against the text of the stored `CREATE` statements: tables,
+columns in order with their declared types, nullability, defaults and
+primary-key positions, indexes with their columns and uniqueness, foreign
+keys, and whether each table declares `AUTOINCREMENT`. A database whose
+formatting differs but whose structure matches is still recognised, while a
+missing table, a missing or extra column, a changed column definition, a
+different primary-key shape, a missing `normalized_fact` uniqueness
+constraint, a missing index, a half-created database, and a foreign database
+that merely reuses the table names are all refused. `CHECK` constraints are
+not compared, because SQLite exposes them structurally nowhere and the
+application validates the same conditions before it writes.
+
+Migrations are ordered, forward-only, idempotent, and atomic. The set of steps
+is validated before the database is opened, so a gap, a repeat, a step below
+the oldest recognisable schema, or a step beyond what this build expects is
+refused rather than discovered part-way up. Each step then runs inside one
+explicit `BEGIN IMMEDIATE` transaction together with the `PRAGMA user_version`
+write that records it. The explicit transaction is required rather than
+decorative: Python's `sqlite3` driver opens one implicitly only for
+row-changing statements, so schema statements would otherwise each commit
+alone. Because both the schema change and the marker are in the same
+transaction, a failure part-way through leaves the database whole at the
+previous version with no partial schema, and re-running initialization resumes
+at exactly the step that failed and applies it once.
+
+A database held by another process is contention rather than failure: a
+`SQLITE_BUSY` or `SQLITE_LOCKED` result during a migration applies nothing,
+leaves the version where it was, and raises the shared
+`RuntimeError("Database is busy. Try again shortly.")` rather than the
+initialization message, so a retryable condition is not reported as a broken
+database.
+
+There is currently one migration, `create_memories`, which brings a version 1
+database to version 2 by adding the `memories` table. It adds no column to an
+existing table, rewrites no row, and deletes nothing. Maria does not copy or
+infer explicit memories from existing interaction rows.
+
+### No pre-migration backup
+
+V1-09 writes no backup copy before migrating, and that is a decision rather
+than an omission. Every step it defines is additive schema creation plus the
+version stamp, committed in a single transaction that SQLite rolls back in
+full on any failure, so the failure a backup would protect against — a
+half-applied migration — cannot be reached. No step reads, rewrites,
+transforms, or removes an owner record, so there is nothing for a copy to
+preserve that the original does not still hold. Writing one anyway would place
+a second complete copy of every interaction, note, and memory beside the live
+database indefinitely, which is a privacy cost with no reliability gain.
+
+A pre-migration copy becomes necessary when a migration rewrites or drops
+owner data, which no migration here does. The owner-facing backup capability
+is a separate, later concern and is not what this would have been.
+
+### Refusing a newer schema
+
+A database stamped above `DATABASE_SCHEMA_VERSION` belongs to a build that
+knew things this one does not, so Maria refuses it instead of half-working
+against it. The refusal happens before any write: no migration runs, no schema
+is created, no marker is changed, and the file and its directory are left byte
+for byte as they were found.
+
+The refusal raises `TypedFailureError` carrying
+`Failure(FailureKind.DATABASE_SCHEMA_TOO_NEW)`. That value holds a kind and
+nothing else, and its message is fixed and interpolates nothing, so no path,
+row, SQL statement, or SQLite error text can travel with it. `main.py` prints
+that fixed message and exits with status 1:
+
+```
+Maria: This database was written by a newer version of Maria and cannot be opened by this one.
+```
+
+A corrupt file, an I/O error, or a locked database is never converted into
+this diagnosis; each keeps its own existing controlled result.
+
+Migration logging records step names and version numbers only. No row value,
+note title or body, memory fact, interaction request or response, absolute
+database path, SQL parameter, or SQLite error text is written to the log on
+any migration path, including the refusal and rollback paths.
 
 ## Tables
 

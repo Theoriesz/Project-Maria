@@ -7,6 +7,7 @@ from collections.abc import Callable
 
 from core.brain import BrainResponse, MariaBrain
 from core.constants import APP_NAME, APP_VERSION
+from core.failures import TypedFailureError
 from core.session import MariaSession
 
 
@@ -57,6 +58,13 @@ def run_cli(
         return _EXIT_STARTUP_INTERRUPTED
     except MemoryError:
         raise
+    except TypedFailureError as typed_failure:
+        # A startup refusal that already decided what the owner may be told.
+        # Its message is the fixed sentence its failure kind declares and
+        # interpolates nothing, so printing it directly stays as sanitized as
+        # the generic message below while saying which refusal happened.
+        print(f"{APP_NAME}: {typed_failure}", file=sys.stderr)
+        return _EXIT_STARTUP_FAILURE
     except Exception:
         print(_STARTUP_FAILURE_MESSAGE, file=sys.stderr)
         return _EXIT_STARTUP_FAILURE

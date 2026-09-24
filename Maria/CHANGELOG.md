@@ -2,6 +2,51 @@
 
 ## Unreleased
 
+- Gave Maria's database a schema version of its own, independent of the
+  application version, and put an ordered, idempotent, atomic forward
+  migration runner behind it. The version lives in the SQLite header rather
+  than in a new table, so nothing was added to what the database stores, and
+  it is a plain counter over Maria's schema history rather than a release
+  number: it is never `APP_VERSION` and is never derived from it, because the
+  application version stays frozen while the schema may advance. Startup now
+  settles that version once, in the memory layer, and everything else follows
+  from it instead of each call site assuming what it is looking at.
+  An existing database with no marker keeps working and is classified
+  explicitly rather than assumed to be current. A missing marker is not taken
+  as proof of the baseline: the structure is validated first against SQLite's
+  own catalogue — tables, columns in order with their types, nullability,
+  defaults and primary-key positions, indexes with their columns and
+  uniqueness, foreign keys, and `AUTOINCREMENT` — so a database whose
+  formatting differs is still recognised, while a missing table, a missing or
+  extra column, a changed column definition, a different primary-key shape, a
+  missing `normalized_fact` uniqueness constraint, a missing index, a
+  half-created database, and a foreign database that merely reuses the table
+  names are all refused with nothing written. A database matching the
+  published v0.2.0 shape is stamped as that baseline and nothing else runs; the
+  earlier shape Maria created before explicit memories existed is stamped as
+  the version it is and then migrated forward. A brand-new or empty file is
+  created directly at the current schema in one step and is never mistaken for
+  a migrated owner database. Every owner record, id, and timestamp is
+  preserved either way.
+  Migrations are forward-only and validated as a set before the database is
+  opened, so a gap, a repeat, or an unknown step is refused rather than found
+  part-way up. Each step runs in one explicit transaction together with the
+  version marker it writes, so a failure part-way through leaves the database
+  whole at the previous version with no partial schema, and re-running startup
+  resumes at exactly the step that failed and applies it once. Re-running
+  startup on a current database now does nothing at all and leaves the file
+  byte for byte unchanged.
+  A database written by a newer version of Maria is refused rather than half
+  worked against. The refusal happens before any write, runs no migration,
+  creates no schema, and leaves the file and its directory byte for byte as
+  they were found. It raises a typed failure whose owner-visible sentence is
+  fixed and interpolates nothing, and the command line prints that sentence
+  instead of the general startup message, so the owner is told what is wrong
+  without any path, record, SQL, or SQLite error text travelling with it. A
+  corrupt, locked, or unreadable database is never reported as a newer schema
+  and keeps its existing controlled result. Migration logging records step
+  names and version numbers only, on the success, rollback, and refusal paths
+  alike, and the initialization log no longer names the database file.
 - Replaced Maria's single configured safe directory with named filesystem
   roots, and put the things Maria must never reach behind one shared,
   permanent boundary. `config/config.toml` now declares roots in a

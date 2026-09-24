@@ -208,6 +208,39 @@ operation-specific static `RuntimeError` message. Every other SQLite failure
 likewise continues to raise that method's existing operation-specific
 `RuntimeError` message, unchanged.
 
+### Schema
+
+`Memory.initialize() -> None`
+
+Brings the configured database up to `DATABASE_SCHEMA_VERSION`, creating it
+when it does not exist. It settles the database's own version first and
+classifies an unversioned file once, structurally, so no other method has to
+decide what shape of database it is looking at. A file already at the current
+version is left byte for byte unchanged, and every migration runs in ascending
+order, one transaction per step, with the version marker written inside that
+same transaction.
+
+Raises `TypedFailureError` carrying `FailureKind.DATABASE_SCHEMA_TOO_NEW` when
+the file is stamped above `DATABASE_SCHEMA_VERSION`, refusing before anything
+is written. Every other refusal and failure - an unrecognised or drifted
+structure, a half-created database, an invalid migration set, a failed
+migration, and a corrupt or unreadable file - raises
+`RuntimeError("Unable to initialize Maria database.")`. Contention keeps the
+shared classification described above: a `SQLITE_BUSY` or `SQLITE_LOCKED`
+result, including one raised while a migration is starting, raises
+`RuntimeError("Database is busy. Try again shortly.")` instead, because it is
+transient and worth retrying rather than a failed migration.
+`docs/database.md` describes the classification, migration, and refusal rules
+in full.
+
+`Memory.schema_version() -> int`
+
+Returns the schema version currently stamped on the database, which is what is
+stored rather than what this build expects. An unstamped or absent database
+returns `0`. This is the only way to read the marker from outside the memory
+layer; no caller opens its own connection or issues its own pragma. SQLite
+failures raise `RuntimeError("Unable to read database schema version.")`.
+
 ### Interaction History
 
 `Memory.record_interaction(user_input: str, response: str) -> int`
@@ -756,12 +789,17 @@ owner's home location, or an underlying `OSError`'s text.
 `Failure(kind: FailureKind)`
 
 An immutable typed failure carrying a kind and nothing else. `FailureKind`
-is a closed set and currently has one member, `TOOL_EXECUTION_FAILED`.
-`.code` returns that kind's stable identifier, `tool_execution_failed`,
-which is what an operational log record may name. `.message` returns the
-fixed owner-visible sentence for the kind, `Tool execution failed.`. The
-kind is checked by exact type, so a plain string equal to a member's value
-raises `ValueError` rather than reaching the message table.
+is a closed set with two members:
+
+| Kind | `.code` | `.message` |
+| --- | --- | --- |
+| `TOOL_EXECUTION_FAILED` | `tool_execution_failed` | `Tool execution failed.` |
+| `DATABASE_SCHEMA_TOO_NEW` | `database_schema_too_new` | `This database was written by a newer version of Maria and cannot be opened by this one.` |
+
+`.code` returns the kind's stable identifier, which is what an operational log
+record may name. `.message` returns the fixed owner-visible sentence for the
+kind. The kind is checked by exact type, so a plain string equal to a member's
+value raises `ValueError` rather than reaching the message table.
 
 The value object has no field for a request, a response, an arguments
 mapping, an exception, its text, a path, an endpoint, a credential, or a
@@ -770,6 +808,18 @@ an underlying failure's text can travel with it. Constructing one logs
 nothing and touches no file. `ContractFailure` in `core/action_contracts.py`
 is separate and unchanged: it is the action-contract vocabulary rather than
 this shared spine.
+
+`TypedFailureError(failure: Failure)`
+
+The exception a boundary raises when it has to stop rather than return a
+value. It carries one `Failure` and derives everything it shows from that
+failure's kind: `args` holds the failure alone, `str()` is the kind's fixed
+owner-visible sentence, and `repr()` names the kind. The failure is checked by
+exact type, so anything else raises `ValueError`. It derives from `Exception`
+rather than a more specific built-in, so an existing `except RuntimeError` or
+`except sqlite3.Error` handler cannot silently absorb a refusal the owner is
+meant to see. `Memory.initialize()` raises it for a database written by a
+newer build, and `run_cli()` prints its message.
 
 ## Tool Manager
 

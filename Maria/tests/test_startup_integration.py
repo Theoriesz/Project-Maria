@@ -12,6 +12,8 @@ from unittest.mock import patch
 import core.brain as brain_module
 from core.brain import MariaBrain
 from core.config import MariaConfig
+from core.constants import DATABASE_SCHEMA_VERSION
+from core.failures import Failure, FailureKind, TypedFailureError
 from core.filesystem_roots import (
     FilesystemProtections,
     FilesystemRoot,
@@ -20,6 +22,11 @@ from core.filesystem_roots import (
 )
 from core.permissions import PermissionDecision
 from core.session import MariaSession
+from tests.schema_fixtures import (
+    create_v0_2_0_baseline,
+    read_schema_version,
+    stamp_schema_version,
+)
 
 
 class StartupIntegrationTests(unittest.TestCase):
@@ -104,6 +111,69 @@ class StartupIntegrationTests(unittest.TestCase):
         table_names = {str(row[0]) for row in rows}
         self.assertTrue(
             {"interactions", "notes", "memories"}.issubset(table_names)
+        )
+
+    def test_clean_start_stamps_the_database_with_the_current_schema(self) -> None:
+        self.assertEqual(
+            read_schema_version(self.database_path),
+            DATABASE_SCHEMA_VERSION,
+        )
+        self.assertEqual(self.brain.memory.schema_version(), DATABASE_SCHEMA_VERSION)
+
+    def test_a_database_from_a_newer_build_stops_startup_with_its_own_message(
+        self,
+    ) -> None:
+        """Prove the refusal survives the whole real startup path.
+
+        This is the boundary the owner meets: configuration is loaded, roots
+        are prepared, logging is configured, and the memory layer then refuses
+        the file. The exception has to reach ``from_defaults``' caller intact,
+        because ``main.py`` decides what to print from its carried failure.
+        """
+        newer_root = self.temporary_root / "newer"
+        database_path = newer_root / "database" / "maria.db"
+        create_v0_2_0_baseline(database_path)
+        stamp_schema_version(database_path, DATABASE_SCHEMA_VERSION + 1)
+        before = database_path.read_bytes()
+        newer_config = MariaConfig(
+            app_name="Maria",
+            version="0.1.0",
+            environment="test",
+            database_path=database_path,
+            log_dir=newer_root / "logs",
+            prompt_path=newer_root / "prompts" / "system.txt",
+            filesystem_roots=self.filesystem_roots,
+            filesystem_protections=FilesystemProtections(
+                database_path=database_path,
+                log_dir=newer_root / "logs",
+                prompt_path=newer_root / "prompts" / "system.txt",
+            ),
+            log_level="DEBUG",
+            confirmation_required=frozenset(),
+            denied_actions=frozenset(),
+        )
+
+        with patch("core.brain.load_config", return_value=newer_config):
+            with self.assertRaises(TypedFailureError) as caught:
+                MariaBrain.from_defaults()
+
+        self.assertEqual(
+            caught.exception.failure,
+            Failure(FailureKind.DATABASE_SCHEMA_TOO_NEW),
+        )
+        self.assertEqual(
+            str(caught.exception),
+            "This database was written by a newer version of Maria and "
+            "cannot be opened by this one.",
+        )
+        self.assertEqual(database_path.read_bytes(), before)
+        self.assertEqual(
+            read_schema_version(database_path),
+            DATABASE_SCHEMA_VERSION + 1,
+        )
+        self.assertEqual(
+            sorted(path.name for path in database_path.parent.iterdir()),
+            ["maria.db"],
         )
 
     def test_real_tools_load_and_calculator_executes(self) -> None:

@@ -3,7 +3,9 @@
 A boundary that cannot complete an operation has to say so without handing the
 owner, or the operational log, whatever the underlying failure happened to
 carry. This module supplies the small vocabulary for that: a closed set of
-failure kinds and one immutable value object holding a kind and nothing else.
+failure kinds, one immutable value object holding a kind and nothing else, and
+one exception that carries such a value for a boundary that must stop rather
+than return.
 
 What the object deliberately cannot hold is the point. There is no field for a
 request, a response, an arguments mapping, an exception, its text, a path, an
@@ -35,6 +37,7 @@ class FailureKind(str, Enum):
     """Why an internal boundary could not complete an operation."""
 
     TOOL_EXECUTION_FAILED = "tool_execution_failed"
+    DATABASE_SCHEMA_TOO_NEW = "database_schema_too_new"
 
 
 # The one owner-visible sentence each kind is allowed to produce. The text is
@@ -43,6 +46,10 @@ class FailureKind(str, Enum):
 _FAILURE_MESSAGES: Mapping[FailureKind, str] = MappingProxyType(
     {
         FailureKind.TOOL_EXECUTION_FAILED: "Tool execution failed.",
+        FailureKind.DATABASE_SCHEMA_TOO_NEW: (
+            "This database was written by a newer version of Maria and "
+            "cannot be opened by this one."
+        ),
     }
 )
 
@@ -121,3 +128,44 @@ class Failure(_FailureBase):
     def message(self) -> str:
         """Return the fixed owner-visible message for this kind."""
         return _FAILURE_MESSAGES[self.kind]
+
+
+class TypedFailureError(Exception):
+    """An exception whose whole meaning is the one typed failure it carries.
+
+    A boundary that has to stop rather than return a value needs a way to say
+    which failure stopped it without the exception itself becoming the leak an
+    ordinary ``raise RuntimeError(detail)`` would be. This carries a
+    ``Failure`` and derives everything it shows from that failure's kind: its
+    ``args`` hold the failure alone, ``str()`` is the kind's fixed
+    owner-visible sentence, and ``repr()`` names the kind. No caller value,
+    underlying exception, path, or SQL reaches any of them, so a handler may
+    print ``str(exc)`` straight to the owner and a log may record
+    ``exc.failure.code``.
+
+    It derives from ``Exception`` rather than a more specific built-in on
+    purpose. An existing ``except RuntimeError`` or ``except sqlite3.Error``
+    handler, written to contain an ordinary operational failure, must not
+    silently absorb a typed refusal that the owner is meant to see.
+    """
+
+    def __init__(self, failure: Failure) -> None:
+        """Settle the carried failure by exact type before the value exists.
+
+        The check goes through ``type()`` for the same reason ``Failure``
+        does: a look-alike object that merely quacks like one must not reach
+        a handler that will print its message. The failure is stored only in
+        ``args``, so there is no second place for a payload to be kept.
+        """
+        if type(failure) is not Failure:
+            raise ValueError("A typed failure error must carry a Failure.")
+        super().__init__(failure)
+
+    @property
+    def failure(self) -> Failure:
+        """Return the typed failure this exception was raised with."""
+        return self.args[0]
+
+    def __str__(self) -> str:
+        """Return the carried kind's fixed owner-visible message."""
+        return self.failure.message
