@@ -11,6 +11,7 @@ from unittest.mock import Mock, call, patch
 
 import main as main_module
 from core.brain import BrainResponse
+from core.failures import Failure, FailureKind, TypedFailureError
 from core.planner import Plan, PlanStep
 
 
@@ -24,6 +25,10 @@ STARTUP_FAILURE_MESSAGE = (
     "Maria: Startup failed. Review the configuration and available logs."
 )
 STARTUP_INTERRUPTED_MESSAGE = "Maria: Startup interrupted."
+SCHEMA_TOO_NEW_MESSAGE = (
+    "Maria: This database was written by a newer version of Maria and "
+    "cannot be opened by this one."
+)
 RENAME_PLAN = Plan(
     original_request="rename old.txt to new.txt",
     steps=(
@@ -129,6 +134,31 @@ class MainCliTests(unittest.TestCase):
         self.assertNotIn("Traceback", stderr)
         self.assertNotIn(busy_message, stderr)
         self.assertNotIn("busy", stderr.lower())
+        self.assertNotIn(BANNER, stdout)
+
+    def test_startup_typed_failure_reports_its_own_fixed_message(self) -> None:
+        """A refusal that already chose its wording says which one it was.
+
+        The generic startup message would tell an owner holding a database
+        from a newer build only that something failed, which is the silent
+        half-working outcome this refusal exists to replace.
+        """
+        factory = Mock(
+            side_effect=TypedFailureError(
+                Failure(FailureKind.DATABASE_SCHEMA_TOO_NEW)
+            )
+        )
+
+        status, stdout, stderr, input_mock = self._run_cli(factory, [])
+
+        self.assertEqual(status, 1)
+        factory.assert_called_once_with()
+        input_mock.assert_not_called()
+        self.assertEqual(stdout, "")
+        self.assertEqual(stderr, f"{SCHEMA_TOO_NEW_MESSAGE}\n")
+        self.assertNotIn(STARTUP_FAILURE_MESSAGE, stderr)
+        self.assertNotIn("Traceback", stderr)
+        self.assertNotIn("TypedFailureError", stderr)
         self.assertNotIn(BANNER, stdout)
 
     def test_startup_keyboard_interrupt_returns_130(self) -> None:

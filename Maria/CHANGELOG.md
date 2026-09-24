@@ -2,6 +2,93 @@
 
 ## Unreleased
 
+- Gave Maria's database a schema version of its own, independent of the
+  application version, and put an ordered, idempotent, atomic forward
+  migration runner behind it. The version lives in the SQLite header rather
+  than in a new table, so nothing was added to what the database stores, and
+  it is a plain counter over Maria's schema history rather than a release
+  number: it is never `APP_VERSION` and is never derived from it, because the
+  application version stays frozen while the schema may advance. Startup now
+  settles that version once, in the memory layer, and everything else follows
+  from it instead of each call site assuming what it is looking at.
+  An existing database with no marker keeps working and is classified
+  explicitly rather than assumed to be current. Neither a missing marker nor a
+  present one is taken as proof of what a database is: an unversioned file is
+  identified by its structure, and a stamped file has its structure confirmed
+  against the frozen schema for the version it claims before any migration
+  statement runs, because a marker records which build wrote a database rather
+  than what the database currently is. A database matching the published
+  v0.2.0 shape is stamped as that baseline and nothing else runs; the earlier
+  shape Maria created before explicit memories existed is stamped as the
+  version it is and then migrated forward; a database already at the current
+  version is validated read-only and left byte for byte unchanged. Every owner
+  record, id, and timestamp is preserved either way.
+  What a database is compared against is a fingerprint of everything it
+  declares, not of the parts that happened to be easy to read. Every
+  user-defined object counts — tables, explicit indexes, views, and triggers —
+  so the exact baseline plus one unrelated view or trigger is another
+  application's database and is refused. For each object, SQLite's own
+  catalogue supplies the object type, column count, `WITHOUT ROWID` and
+  `STRICT` flags, every column including the generated and hidden ones
+  `table_info` omits, each index's uniqueness, origin, partial flag, key
+  columns, sort direction and collation, and the full identity of every
+  foreign key.
+  What SQLite reports nowhere — a conflict clause, a collation on a column no
+  index covers, a table option, an `AUTOINCREMENT` clause, a `CHECK`
+  condition, a trigger body — comes from the statement that created the
+  object, reduced to typed tokens rather than compared as text, raw or
+  whitespace-stripped. Each token keeps what kind of thing it is, so
+  whitespace, line breaks, comments, casing, and the choice of identifier
+  quoting all stop mattering while things that merely read alike stay apart: a
+  numeric `0` is not the string `'0'`, and a constraint named
+  `"autoincrement"` is not the `AUTOINCREMENT` clause, which is now recognised
+  only where SQLite defines it, immediately after `PRIMARY KEY`. `CHECK`
+  conditions are lifted out and compared separately, so one written beside its
+  column and the same one written for the table compare alike, and parentheses
+  that merely wrap a condition are dropped. A weakened, retargeted, extra, or
+  missing check is refused, and a check that exists only inside a comment or a
+  string literal is not a check. A condition rewritten into a different but
+  equivalent form is refused rather than guessed at.
+  A file is treated as a new database only when it holds no object SQLite did
+  not create itself, rather than merely no table Maria would recognise, so
+  another application's database is never mistaken for a blank one to build
+  inside.
+  Only SQLite's own reserved objects are ignored, including a `sqlite_sequence`
+  that has outlived the table that created it. A brand-new or genuinely empty
+  file is created directly at the current schema in one step and is never
+  mistaken for a migrated owner database; a file holding even one unrelated
+  object is refused with no Maria table created, no marker stamped, and not
+  one byte changed.
+  Migrations are forward-only and validated as a set before the database is
+  opened, so a gap, a repeat, or an unknown step is refused rather than found
+  part-way up. Each step runs in one explicit transaction together with the
+  version marker it writes, so a failure part-way through leaves the database
+  whole at the previous version with no partial schema, and re-running startup
+  resumes at exactly the step that failed and applies it once. Re-running
+  startup on a current database now does nothing at all and leaves the file
+  byte for byte unchanged.
+  A database written by a newer version of Maria is refused rather than half
+  worked against. The refusal happens before any write, runs no migration,
+  creates no schema, and leaves the file and its directory byte for byte as
+  they were found. It raises a typed failure whose owner-visible sentence is
+  fixed and interpolates nothing, and the command line prints that sentence
+  instead of the general startup message, so the owner is told what is wrong
+  without any path, record, SQL, or SQLite error text travelling with it. A
+  corrupt, locked, or unreadable database is never reported as a newer schema
+  and keeps its existing controlled result.
+  Nothing the initialization boundary writes to the operational log is derived
+  from what went wrong. A successful run records the schema version it reached
+  and each migration's step name and resulting version; a refusal records one
+  fixed sentence carrying a stable event code and nothing else. No row value,
+  note title or body, memory fact, interaction request or response, database
+  path, SQL statement or parameter, SQLite message, or traceback is written on
+  any path, including a corrupt or unreadable file and a database another
+  process is holding, either of which previously produced an exception log
+  carrying SQLite's own text and a traceback. The underlying exception is
+  still attached to the raised error for a caller that needs it; it is simply
+  never written down. Reading the schema version is recorded the same way, and
+  both boundaries classify contention themselves rather than inheriting the
+  shared conversion that logs on its way past.
 - Replaced Maria's single configured safe directory with named filesystem
   roots, and put the things Maria must never reach behind one shared,
   permanent boundary. `config/config.toml` now declares roots in a

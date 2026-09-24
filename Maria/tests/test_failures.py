@@ -9,13 +9,19 @@ import unittest
 from enum import Enum
 
 import core.failures as failures_module
-from core.failures import Failure, FailureKind
+from core.failures import Failure, FailureKind, TypedFailureError
 
 
 # The exact owner-visible sentence. Declared as a literal here rather than
 # read back from the module, so the test asserts the contract instead of
 # agreeing with whatever the implementation currently says.
 TOOL_EXECUTION_FAILED_MESSAGE = "Tool execution failed."
+
+# Likewise for the schema refusal the owner sees at startup.
+DATABASE_SCHEMA_TOO_NEW_MESSAGE = (
+    "This database was written by a newer version of Maria and "
+    "cannot be opened by this one."
+)
 
 # The exact representation, likewise written out rather than derived, so
 # a change to what a failure shows in a log line has to be deliberate.
@@ -263,6 +269,96 @@ class FailureTests(unittest.TestCase):
             r"(?:core|tools|main|sqlite3|logging|tomllib|configparser"
             r"|urllib|http|socket|ssl|subprocess|os|pathlib)\b",
         )
+
+
+class DatabaseSchemaFailureTests(unittest.TestCase):
+    """Verify the schema refusal joins the vocabulary on the same terms."""
+
+    def test_the_kind_carries_its_fixed_owner_message_and_stable_code(self) -> None:
+        failure = Failure(FailureKind.DATABASE_SCHEMA_TOO_NEW)
+
+        self.assertEqual(failure.message, DATABASE_SCHEMA_TOO_NEW_MESSAGE)
+        self.assertEqual(failure.code, "database_schema_too_new")
+
+    def test_the_message_names_no_path_version_or_record(self) -> None:
+        message = Failure(FailureKind.DATABASE_SCHEMA_TOO_NEW).message
+
+        for forbidden in ("{", "%", "/", "\\", ".db", "sqlite", "SELECT"):
+            with self.subTest(forbidden=forbidden):
+                self.assertNotIn(forbidden, message)
+
+    def test_the_kinds_stay_distinct_and_closed(self) -> None:
+        self.assertEqual(
+            {kind.value for kind in FailureKind},
+            {"tool_execution_failed", "database_schema_too_new"},
+        )
+        self.assertNotEqual(
+            Failure(FailureKind.DATABASE_SCHEMA_TOO_NEW),
+            Failure(FailureKind.TOOL_EXECUTION_FAILED),
+        )
+
+
+class TypedFailureErrorTests(unittest.TestCase):
+    """Verify the raising carrier shows its kind and never a payload."""
+
+    def test_it_renders_only_the_carried_kinds_fixed_message(self) -> None:
+        raised = TypedFailureError(Failure(FailureKind.DATABASE_SCHEMA_TOO_NEW))
+
+        self.assertEqual(str(raised), DATABASE_SCHEMA_TOO_NEW_MESSAGE)
+        self.assertEqual(
+            raised.failure,
+            Failure(FailureKind.DATABASE_SCHEMA_TOO_NEW),
+        )
+        self.assertEqual(raised.args, (raised.failure,))
+        self.assertIn("DATABASE_SCHEMA_TOO_NEW", repr(raised))
+
+    def test_it_refuses_anything_that_is_not_a_failure(self) -> None:
+        candidates = (
+            "database_schema_too_new",
+            FailureKind.DATABASE_SCHEMA_TOO_NEW,
+            None,
+            RuntimeError("private detail"),
+        )
+
+        for candidate in candidates:
+            with self.subTest(candidate=type(candidate).__name__):
+                with self.assertRaises(ValueError) as caught:
+                    TypedFailureError(candidate)
+
+                self.assertIn("Failure", str(caught.exception))
+
+    def test_no_exception_text_survives_into_what_it_renders(self) -> None:
+        sentinel = "private-schema-detail-77b1c4e802"
+        try:
+            raise sqlite_like_error(sentinel)
+        except RuntimeError:
+            raised = TypedFailureError(Failure(FailureKind.DATABASE_SCHEMA_TOO_NEW))
+
+        rendered = f"{raised!r} {raised} {raised.failure.code}"
+        self.assertNotIn(sentinel, rendered)
+        self.assertNotIn("RuntimeError", rendered)
+
+    def test_it_is_not_caught_by_handlers_written_for_operational_failures(
+        self,
+    ) -> None:
+        raised = TypedFailureError(Failure(FailureKind.DATABASE_SCHEMA_TOO_NEW))
+
+        self.assertIsInstance(raised, Exception)
+        self.assertNotIsInstance(raised, RuntimeError)
+        self.assertNotIsInstance(raised, ValueError)
+        self.assertNotIsInstance(raised, OSError)
+
+    def test_raising_one_logs_nothing(self) -> None:
+        with self.assertNoLogs("maria"):
+            with self.assertRaises(TypedFailureError):
+                raise TypedFailureError(
+                    Failure(FailureKind.DATABASE_SCHEMA_TOO_NEW)
+                )
+
+
+def sqlite_like_error(detail: str) -> RuntimeError:
+    """Return an exception carrying a value that must never travel."""
+    return RuntimeError(detail)
 
 
 if __name__ == "__main__":

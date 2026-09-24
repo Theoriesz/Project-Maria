@@ -28,6 +28,12 @@ message and returns status 130. Startup failures do not print raw tracebacks or
 exception details. Review the configuration and available logs when startup
 fails.
 
+Most startup failures share one general message. A database written by a newer
+version of Maria is the exception: it is refused with its own fixed message,
+still with status 1 and still without any path, record, or underlying error
+text, because half-working against a schema this build does not understand
+would be worse than stopping. Nothing is written to the database on that path.
+
 At a confirmation prompt, `y` or `yes` approves and `n` or `no` cancels the
 pending action, ignoring casing and surrounding whitespace. Blank or
 unrecognized input re-prompts instead of approving or cancelling. EOF or
