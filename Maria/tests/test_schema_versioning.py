@@ -60,10 +60,28 @@ PRE_MEMORIES_VERSION = 1
 BASELINE_TABLES = frozenset({"interactions", "notes", "memories"})
 
 # The two constraints the v0.2.0 ``memories`` table is required to carry,
-# written out in their normalized form rather than read back from the module,
-# so the test pins what must be verified instead of agreeing with whatever the
-# classifier currently extracts.
-REQUIRED_MEMORY_CHECKS = ("length(fact)>0", "length(normalized_fact)>0")
+# written out as the typed tokens they must reduce to rather than read back
+# from the module, so the test pins what has to be verified instead of
+# agreeing with whatever the classifier currently extracts. The literal ``0``
+# is a number and must stay one: a schema that tests against the string
+# ``'0'`` is a different schema.
+FACT_CHECK = (
+    ("identifier", "length"),
+    ("operator", "("),
+    ("identifier", "fact"),
+    ("operator", ")"),
+    ("operator", ">"),
+    ("number", "0"),
+)
+NORMALIZED_FACT_CHECK = (
+    ("identifier", "length"),
+    ("operator", "("),
+    ("identifier", "normalized_fact"),
+    ("operator", ")"),
+    ("operator", ">"),
+    ("number", "0"),
+)
+REQUIRED_MEMORY_CHECKS = (FACT_CHECK, NORMALIZED_FACT_CHECK)
 
 # The same v0.2.0 schema spelled as differently as SQL allows while stating
 # exactly the same thing: uppercase keywords, no spacing, every identifier
@@ -167,6 +185,34 @@ class _TemporaryDatabaseTestCase(unittest.TestCase):
         finally:
             connection.close()
 
+    def _assert_refused_untouched(self, *, marker: int = UNVERSIONED) -> None:
+        """Assert initialization refuses and leaves the file exactly as found.
+
+        Three things have to hold together for a refusal to be safe: the owner
+        sees the fixed message, the marker is whatever it already was, and not
+        one byte moved. Asserting only the exception would pass for a refusal
+        that had already half-built a schema.
+        """
+        before_bytes = self.database_path.read_bytes()
+        before_objects = _object_names(self.database_path)
+
+        with patch.object(
+            memory_module,
+            "_run_in_one_transaction",
+            side_effect=AssertionError("a refused database may not be written"),
+        ):
+            with self.assertRaisesRegex(
+                RuntimeError,
+                r"^Unable to initialize Maria database\.$",
+            ):
+                self.memory.initialize()
+
+        self.assertEqual(self.database_path.read_bytes(), before_bytes)
+        self.assertEqual(read_schema_version(self.database_path), marker)
+        # Named separately from the byte comparison so a refusal that created
+        # a Maria table reports what it created rather than a size mismatch.
+        self.assertEqual(_object_names(self.database_path), before_objects)
+
 
 class NewDatabaseTests(_TemporaryDatabaseTestCase):
     """Verify a database Maria creates itself starts stamped and current."""
@@ -244,7 +290,7 @@ class BaselineClassificationTests(_TemporaryDatabaseTestCase):
         self.assertEqual(
             self.describe(),
             memory_module._reference_schema(
-                memory_module._HISTORICAL_UNVERSIONED_SCHEMAS[0][1]
+                memory_module._frozen_schema(EXPECTED_SCHEMA_VERSION)
             ),
         )
 
@@ -353,19 +399,6 @@ class BaselineClassificationTests(_TemporaryDatabaseTestCase):
 
 class DriftRefusalTests(_TemporaryDatabaseTestCase):
     """Verify a missing marker is never taken as proof of the baseline."""
-
-    def _assert_refused_untouched(self) -> None:
-        """Assert initialization refuses and leaves the file exactly as found."""
-        before = self.database_path.read_bytes()
-
-        with self.assertRaisesRegex(
-            RuntimeError,
-            r"^Unable to initialize Maria database\.$",
-        ):
-            self.memory.initialize()
-
-        self.assertEqual(self.database_path.read_bytes(), before)
-        self.assertEqual(read_schema_version(self.database_path), UNVERSIONED)
 
     def test_a_partially_created_database_is_refused(self) -> None:
         create_schema(self.database_path, V0_2_0_BASELINE_SCHEMA[:2])
@@ -655,6 +688,27 @@ class MigrationRunnerTests(_TemporaryDatabaseTestCase):
         create_pre_memories_baseline(self.database_path)
 
     @staticmethod
+    def _probe_frozen_schemas() -> tuple:
+        """Return frozen schemas for the versions the probe ladder reaches.
+
+        A build that declares migrations up to version 4 has to freeze the
+        schema each of those versions produces, because a database stamped at
+        one of them is validated before it is migrated. The probe simulates
+        such a build, so it supplies them the same way.
+        """
+        frozen_two = V0_2_0_BASELINE_SCHEMA
+        frozen_three = frozen_two + (DEPENDS_ON_MEMORIES,)
+        frozen_four = frozen_three + (
+            "CREATE TABLE probe (id INTEGER PRIMARY KEY)",
+        )
+        return (
+            (4, frozen_four),
+            (3, frozen_three),
+            (2, frozen_two),
+            (1, PRE_MEMORIES_SCHEMA),
+        )
+
+    @staticmethod
     def _probe_ladder(*, include_third: bool = True) -> tuple:
         """Return a three-step ladder whose later steps need the earlier one."""
         steps = [
@@ -685,6 +739,11 @@ class MigrationRunnerTests(_TemporaryDatabaseTestCase):
         with (
             patch.object(memory_module, "DATABASE_SCHEMA_VERSION", 4),
             patch.object(memory_module, "_MIGRATIONS", self._probe_ladder()),
+            patch.object(
+                memory_module,
+                "_FROZEN_SCHEMAS",
+                self._probe_frozen_schemas(),
+            ),
         ):
             migrating.initialize()
 
@@ -1118,7 +1177,7 @@ class FixtureIndependenceTests(unittest.TestCase):
         )
 
     def test_the_fixture_and_the_frozen_production_history_agree(self) -> None:
-        declared = dict(memory_module._HISTORICAL_UNVERSIONED_SCHEMAS)
+        declared = dict(memory_module._FROZEN_SCHEMAS)
 
         self.assertEqual(
             memory_module._reference_schema(V0_2_0_BASELINE_SCHEMA),
@@ -1127,6 +1186,12 @@ class FixtureIndependenceTests(unittest.TestCase):
         self.assertEqual(
             memory_module._reference_schema(PRE_MEMORIES_SCHEMA),
             memory_module._reference_schema(declared[PRE_MEMORIES_VERSION]),
+        )
+        # Every version a marker could name has to be frozen, or a database
+        # claiming it could not be checked before being migrated.
+        self.assertEqual(
+            sorted(declared),
+            list(range(PRE_MEMORIES_VERSION, DATABASE_SCHEMA_VERSION + 1)),
         )
 
     def test_the_frozen_baseline_still_describes_the_current_schema(self) -> None:
@@ -1150,21 +1215,21 @@ class CheckConstraintTests(_TemporaryDatabaseTestCase):
     """
 
     @staticmethod
-    def _memories_shape(description: tuple) -> tuple:
+    def _memories_shape(description: tuple):
         """Return the ``memories`` entry of a schema description."""
-        return next(table for table in description if table[0] == "memories")
+        return next(shape for shape in description if shape.name == "memories")
 
     def test_the_frozen_baseline_declares_exactly_the_required_checks(self) -> None:
         reference = memory_module._reference_schema(V0_2_0_BASELINE_SCHEMA)
 
         self.assertEqual(
-            self._memories_shape(reference)[5],
+            self._memories_shape(reference).checks,
             REQUIRED_MEMORY_CHECKS,
         )
-        for table in reference:
-            if table[0] != "memories":
-                with self.subTest(table=table[0]):
-                    self.assertEqual(table[5], ())
+        for shape in reference:
+            if shape.name != "memories":
+                with self.subTest(object_name=shape.name):
+                    self.assertEqual(shape.checks, ())
 
     def test_the_genuine_frozen_fixture_is_accepted(self) -> None:
         create_v0_2_0_baseline(self.database_path)
@@ -1173,7 +1238,7 @@ class CheckConstraintTests(_TemporaryDatabaseTestCase):
 
         self.assertEqual(read_schema_version(self.database_path), EXPECTED_SCHEMA_VERSION)
         self.assertEqual(
-            self._memories_shape(self.describe())[5],
+            self._memories_shape(self.describe()).checks,
             REQUIRED_MEMORY_CHECKS,
         )
 
@@ -1194,7 +1259,7 @@ class CheckConstraintTests(_TemporaryDatabaseTestCase):
 
         self.assertEqual(read_schema_version(self.database_path), EXPECTED_SCHEMA_VERSION)
         self.assertEqual(
-            self._memories_shape(self.describe())[5],
+            self._memories_shape(self.describe()).checks,
             REQUIRED_MEMORY_CHECKS,
         )
         for identifier, fact, _normalized, created_at in BASELINE_MEMORIES:
@@ -1243,7 +1308,7 @@ class CheckConstraintTests(_TemporaryDatabaseTestCase):
                 )
                 self.assertEqual(
                     memory_module._check_constraints(tokens),
-                    ("length(fact)>0",),
+                    (FACT_CHECK,),
                 )
 
     def test_different_conditions_stay_different(self) -> None:
@@ -1252,6 +1317,8 @@ class CheckConstraintTests(_TemporaryDatabaseTestCase):
             "CHECK (length(fact) > 1)",
             "CHECK (length(other) > 0)",
             "CHECK (length(fact) <> 0)",
+            # A string literal that reads like the number is not the number.
+            "CHECK (length(fact) > '0')",
         )
 
         for spelling in different:
@@ -1261,7 +1328,7 @@ class CheckConstraintTests(_TemporaryDatabaseTestCase):
                 )
                 self.assertNotEqual(
                     memory_module._check_constraints(tokens),
-                    ("length(fact)>0",),
+                    (FACT_CHECK,),
                 )
 
     def test_a_check_inside_a_literal_or_comment_is_not_a_check(self) -> None:
@@ -1279,11 +1346,69 @@ class CheckConstraintTests(_TemporaryDatabaseTestCase):
 
     def test_the_classifier_never_compares_whole_stored_statements(self) -> None:
         """Equality on stored SQL is what the token form exists to avoid."""
-        source = inspect.getsource(memory_module._describe_table)
+        source = inspect.getsource(memory_module._describe_object)
 
         self.assertNotIn("sql ==", source)
+        self.assertNotIn("definition ==", source)
         self.assertNotIn(".strip()", source)
         self.assertIn("_tokenize_definition", source)
+
+    def test_the_token_model_keeps_every_kind_distinct(self) -> None:
+        """A number, a string, a keyword, and a name must never merge."""
+        tokens = memory_module._tokenize_definition(
+            "CREATE TABLE t (a TEXT DEFAULT 'autoincrement' "
+            "CHECK (a > 0 AND a > '0'), b INTEGER PRIMARY KEY AUTOINCREMENT)"
+        )
+
+        self.assertIn(("keyword", "autoincrement"), tokens)
+        self.assertIn(("string", "autoincrement"), tokens)
+        self.assertIn(("number", "0"), tokens)
+        self.assertIn(("string", "0"), tokens)
+        self.assertIn(("identifier", "a"), tokens)
+        self.assertNotIn(("keyword", "a"), tokens)
+        self.assertNotEqual(("number", "0"), ("string", "0"))
+
+    def test_a_quoted_identifier_is_never_the_keyword_it_spells(self) -> None:
+        for quoting in ('"autoincrement"', "`autoincrement`", "[autoincrement]"):
+            with self.subTest(quoting=quoting):
+                tokens = memory_module._tokenize_definition(
+                    f"CREATE TABLE t (id INTEGER CONSTRAINT {quoting} PRIMARY KEY)"
+                )
+
+                self.assertIn(("identifier", "autoincrement"), tokens)
+                self.assertNotIn(("keyword", "autoincrement"), tokens)
+                self.assertFalse(memory_module._declares_autoincrement(tokens))
+
+    def test_autoincrement_is_read_as_the_primary_key_clause(self) -> None:
+        declaring = (
+            "CREATE TABLE t (id INTEGER PRIMARY KEY AUTOINCREMENT)",
+            "CREATE TABLE t (id INTEGER PRIMARY KEY ASC AUTOINCREMENT)",
+            "CREATE TABLE t (id INTEGER PRIMARY KEY "
+            "ON CONFLICT REPLACE AUTOINCREMENT)",
+        )
+        not_declaring = (
+            "CREATE TABLE t (id INTEGER PRIMARY KEY)",
+            'CREATE TABLE t (id INTEGER CONSTRAINT "autoincrement" PRIMARY KEY)',
+            "CREATE TABLE t (autoincrement INTEGER PRIMARY KEY)",
+            "CREATE TABLE t (id INTEGER PRIMARY KEY, a TEXT DEFAULT "
+            "'autoincrement')",
+            "CREATE TABLE t (id INTEGER PRIMARY KEY) -- AUTOINCREMENT",
+        )
+
+        for statement in declaring:
+            with self.subTest(declaring=statement[:56]):
+                self.assertTrue(
+                    memory_module._declares_autoincrement(
+                        memory_module._tokenize_definition(statement)
+                    )
+                )
+        for statement in not_declaring:
+            with self.subTest(not_declaring=statement[:56]):
+                self.assertFalse(
+                    memory_module._declares_autoincrement(
+                        memory_module._tokenize_definition(statement)
+                    )
+                )
 
 
 class ForeignDatabaseTests(_TemporaryDatabaseTestCase):
@@ -1565,6 +1690,86 @@ class InitializationLogPrivacyTests(unittest.TestCase):
                 memory.schema_version()
         self._flush()
 
+        logged = self.log_file.read_text(encoding="utf-8")
+        self.assertIn(
+            "Reading the database schema version stopped: database_unreadable.",
+            logged,
+        )
+        assert_log_omits(self, self.log_file, self._forbidden_values())
+
+    def test_contention_reading_the_schema_version_is_silent_too(self) -> None:
+        """The connection opens, then the read contends: the hardest case.
+
+        A failure raised after the shared connection has yielded is the one
+        that used to reach its contention handler, which logs the exception on
+        its way past. Opening successfully and failing inside is therefore the
+        only shape that proves this boundary classifies contention itself.
+        """
+        create_v0_2_0_baseline(self.database_path)
+        configure_logging(self.log_dir, "DEBUG")
+        busy = sqlite3.OperationalError(SQLITE_DETAIL_SENTINEL)
+        busy.sqlite_errorcode = sqlite3.SQLITE_BUSY
+        memory = Memory(self.database_path, logger=get_logger("memory"))
+        opened: list[bool] = []
+
+        real_connect = memory._connect
+
+        def record_open() -> sqlite3.Connection:
+            opened.append(True)
+            return real_connect()
+
+        with (
+            patch.object(memory, "_connect", side_effect=record_open),
+            patch.object(
+                memory_module,
+                "_read_schema_version",
+                side_effect=busy,
+            ),
+        ):
+            with self.assertRaisesRegex(
+                RuntimeError,
+                r"^Database is busy\. Try again shortly\.$",
+            ) as raised:
+                memory.schema_version()
+        self._flush()
+
+        self.assertEqual(opened, [True])
+        self.assertIs(raised.exception.__cause__, busy)
+        self.assertNotIn(SQLITE_DETAIL_SENTINEL, str(raised.exception))
+
+        logged = self.log_file.read_text(encoding="utf-8")
+        self.assertIn(
+            "Reading the database schema version stopped: database_busy.",
+            logged,
+        )
+        self.assertNotIn("Database busy or locked", logged)
+        assert_log_omits(self, self.log_file, self._forbidden_values())
+
+    def test_contention_during_initialization_is_silent_after_opening(
+        self,
+    ) -> None:
+        """The same shape at the initialization boundary, for symmetry."""
+        create_v0_2_0_baseline(self.database_path)
+        configure_logging(self.log_dir, "DEBUG")
+        busy = sqlite3.OperationalError(SQLITE_DETAIL_SENTINEL)
+        busy.sqlite_errorcode = sqlite3.SQLITE_LOCKED
+        memory = Memory(self.database_path, logger=get_logger("memory"))
+
+        with patch.object(
+            memory_module,
+            "_read_schema_version",
+            side_effect=busy,
+        ):
+            with self.assertRaisesRegex(
+                RuntimeError,
+                r"^Database is busy\. Try again shortly\.$",
+            ):
+                memory.initialize()
+        self._flush()
+
+        logged = self.log_file.read_text(encoding="utf-8")
+        self.assertIn("Database initialization stopped: database_busy.", logged)
+        self.assertNotIn("Database busy or locked", logged)
         assert_log_omits(self, self.log_file, self._forbidden_values())
 
     def test_the_initialization_boundary_hands_the_logger_nothing_private(
@@ -1617,6 +1822,361 @@ class InitializationLogPrivacyTests(unittest.TestCase):
         # The walk has to have found something, or it would pass by reaching
         # nothing at all.
         self.assertGreaterEqual(inspected, 6)
+
+
+class AdversarialSchemaTests(_TemporaryDatabaseTestCase):
+    """Refuse schemas that pass a partial fingerprint but are not the baseline.
+
+    Each of these differs from the v0.2.0 baseline in a way that changes what
+    the database accepts, enforces, or stores, while agreeing with it on
+    whichever facts a narrower comparison happened to look at. Stamping any of
+    them as the baseline would be a false claim about the database.
+    """
+
+    def _variant(self, original: str, replacement: str) -> tuple[str, ...]:
+        """Return the baseline with one statement replaced."""
+        variant = tuple(
+            replacement if statement == original else statement
+            for statement in V0_2_0_BASELINE_SCHEMA
+        )
+        self.assertNotEqual(variant, V0_2_0_BASELINE_SCHEMA)
+        return variant
+
+    def _memories_variant(self, body: str) -> tuple[str, ...]:
+        """Return the baseline with its ``memories`` statement replaced."""
+        original = next(
+            statement
+            for statement in V0_2_0_BASELINE_SCHEMA
+            if "CREATE TABLE memories" in statement
+        )
+        return self._variant(original, body)
+
+    def _notes_index_variant(self, body: str) -> tuple[str, ...]:
+        """Return the baseline with its notes index replaced."""
+        original = next(
+            statement
+            for statement in V0_2_0_BASELINE_SCHEMA
+            if "idx_notes_title" in statement
+        )
+        return self._variant(original, body)
+
+    def test_a_constraint_named_autoincrement_is_not_autoincrement(self) -> None:
+        """A name that spells the keyword does not declare the clause."""
+        create_schema(self.database_path, self._memories_variant("""
+            CREATE TABLE memories (
+                id INTEGER CONSTRAINT "autoincrement" PRIMARY KEY,
+                fact TEXT NOT NULL CHECK (length(fact) > 0),
+                normalized_fact TEXT NOT NULL UNIQUE
+                    CHECK (length(normalized_fact) > 0),
+                created_at TEXT NOT NULL
+            )
+        """))
+
+        self._assert_refused_untouched()
+
+    def test_a_string_literal_zero_is_not_the_number_zero(self) -> None:
+        """``> '0'`` is true for every non-empty fact and for many empty ones."""
+        create_schema(self.database_path, self._memories_variant("""
+            CREATE TABLE memories (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                fact TEXT NOT NULL CHECK (length(fact) > '0'),
+                normalized_fact TEXT NOT NULL UNIQUE
+                    CHECK (length(normalized_fact) > 0),
+                created_at TEXT NOT NULL
+            )
+        """))
+
+        self._assert_refused_untouched()
+
+    def test_an_extra_virtual_generated_column_is_refused(self) -> None:
+        create_schema(self.database_path, self._memories_variant("""
+            CREATE TABLE memories (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                fact TEXT NOT NULL CHECK (length(fact) > 0),
+                normalized_fact TEXT NOT NULL UNIQUE
+                    CHECK (length(normalized_fact) > 0),
+                created_at TEXT NOT NULL,
+                copied TEXT GENERATED ALWAYS AS (fact) VIRTUAL
+            )
+        """))
+
+        self._assert_refused_untouched()
+
+    def test_an_extra_stored_generated_column_is_refused(self) -> None:
+        create_schema(self.database_path, self._memories_variant("""
+            CREATE TABLE memories (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                fact TEXT NOT NULL CHECK (length(fact) > 0),
+                normalized_fact TEXT NOT NULL UNIQUE
+                    CHECK (length(normalized_fact) > 0),
+                created_at TEXT NOT NULL,
+                copied TEXT GENERATED ALWAYS AS (fact) STORED
+            )
+        """))
+
+        self._assert_refused_untouched()
+
+    def test_a_strict_table_is_refused(self) -> None:
+        create_schema(self.database_path, self._memories_variant("""
+            CREATE TABLE memories (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                fact TEXT NOT NULL CHECK (length(fact) > 0),
+                normalized_fact TEXT NOT NULL UNIQUE
+                    CHECK (length(normalized_fact) > 0),
+                created_at TEXT NOT NULL
+            ) STRICT
+        """))
+
+        self._assert_refused_untouched()
+
+    def test_a_without_rowid_table_is_refused(self) -> None:
+        original = next(
+            statement
+            for statement in V0_2_0_BASELINE_SCHEMA
+            if "CREATE TABLE notes" in statement
+        )
+        create_schema(self.database_path, self._variant(original, """
+            CREATE TABLE notes (
+                id INTEGER NOT NULL PRIMARY KEY,
+                title TEXT NOT NULL,
+                body TEXT NOT NULL,
+                created_at TEXT NOT NULL,
+                updated_at TEXT NOT NULL
+            ) WITHOUT ROWID
+        """))
+
+        self._assert_refused_untouched()
+
+    def test_a_case_insensitive_normalized_fact_is_refused(self) -> None:
+        """NOCASE would silently change which facts count as duplicates."""
+        create_schema(self.database_path, self._memories_variant("""
+            CREATE TABLE memories (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                fact TEXT NOT NULL CHECK (length(fact) > 0),
+                normalized_fact TEXT NOT NULL COLLATE NOCASE UNIQUE
+                    CHECK (length(normalized_fact) > 0),
+                created_at TEXT NOT NULL
+            )
+        """))
+
+        self._assert_refused_untouched()
+
+    def test_a_different_unique_conflict_resolution_is_refused(self) -> None:
+        """ON CONFLICT IGNORE would turn a refused duplicate into a silent one."""
+        create_schema(self.database_path, self._memories_variant("""
+            CREATE TABLE memories (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                fact TEXT NOT NULL CHECK (length(fact) > 0),
+                normalized_fact TEXT NOT NULL UNIQUE ON CONFLICT IGNORE
+                    CHECK (length(normalized_fact) > 0),
+                created_at TEXT NOT NULL
+            )
+        """))
+
+        self._assert_refused_untouched()
+
+    def test_a_descending_secondary_index_is_refused(self) -> None:
+        create_schema(
+            self.database_path,
+            self._notes_index_variant(
+                "CREATE INDEX idx_notes_title ON notes (title DESC)"
+            ),
+        )
+
+        self._assert_refused_untouched()
+
+    def test_a_changed_index_collation_is_refused(self) -> None:
+        create_schema(
+            self.database_path,
+            self._notes_index_variant(
+                "CREATE INDEX idx_notes_title ON notes (title COLLATE NOCASE)"
+            ),
+        )
+
+        self._assert_refused_untouched()
+
+    def test_a_partial_secondary_index_is_refused(self) -> None:
+        create_schema(
+            self.database_path,
+            self._notes_index_variant(
+                "CREATE INDEX idx_notes_title ON notes (title) WHERE id > 5"
+            ),
+        )
+
+        self._assert_refused_untouched()
+
+    def test_the_exact_baseline_plus_a_view_is_refused(self) -> None:
+        """An extra object is another application's, whatever it reads."""
+        create_schema(
+            self.database_path,
+            V0_2_0_BASELINE_SCHEMA
+            + ("CREATE VIEW exported AS SELECT fact FROM memories",),
+            with_rows=True,
+            with_memories=True,
+        )
+
+        self._assert_refused_untouched()
+
+    def test_the_exact_baseline_plus_a_trigger_is_refused(self) -> None:
+        create_schema(
+            self.database_path,
+            V0_2_0_BASELINE_SCHEMA
+            + (
+                "CREATE TRIGGER copy_fact AFTER INSERT ON memories BEGIN "
+                "INSERT INTO notes (title, body, created_at, updated_at) "
+                "VALUES (new.fact, new.fact, new.created_at, new.created_at); "
+                "END",
+            ),
+            with_rows=True,
+            with_memories=True,
+        )
+
+        self._assert_refused_untouched()
+
+    def test_the_genuine_baseline_remains_accepted(self) -> None:
+        """The whole point of the refusals above is that this still works."""
+        create_v0_2_0_baseline(self.database_path)
+
+        self.memory.initialize()
+
+        self.assertEqual(read_schema_version(self.database_path), EXPECTED_SCHEMA_VERSION)
+        self.assertEqual(table_names(self.database_path), BASELINE_TABLES)
+
+
+class StampedSchemaValidationTests(_TemporaryDatabaseTestCase):
+    """Verify a marker is checked against the schema rather than believed.
+
+    A marker records which build wrote a database, not what the database
+    currently is. Migrating on the strength of it alone would run a step
+    against a schema it was never written for, which is the one failure a
+    forward-only runner cannot undo.
+    """
+
+    def test_a_version_one_marker_on_an_incompatible_database_is_refused(
+        self,
+    ) -> None:
+        drifted = tuple(
+            statement.replace("body TEXT NOT NULL", "body TEXT")
+            for statement in PRE_MEMORIES_SCHEMA
+        )
+        self.assertNotEqual(drifted, PRE_MEMORIES_SCHEMA)
+        create_schema(self.database_path, drifted, with_rows=True)
+        stamp_schema_version(self.database_path, PRE_MEMORIES_VERSION)
+
+        self._assert_refused_untouched(marker=PRE_MEMORIES_VERSION)
+
+    def test_a_version_one_marker_with_an_unexpected_memories_table_is_refused(
+        self,
+    ) -> None:
+        """Claiming version 1 while already carrying version 2's table."""
+        create_v0_2_0_baseline(self.database_path)
+        stamp_schema_version(self.database_path, PRE_MEMORIES_VERSION)
+
+        self._assert_refused_untouched(marker=PRE_MEMORIES_VERSION)
+
+    def test_a_version_two_marker_missing_a_required_table_is_refused(
+        self,
+    ) -> None:
+        without_notes = tuple(
+            statement
+            for statement in V0_2_0_BASELINE_SCHEMA
+            if "notes" not in statement
+        )
+        create_schema(self.database_path, without_notes)
+        stamp_schema_version(self.database_path, EXPECTED_SCHEMA_VERSION)
+
+        self._assert_refused_untouched(marker=EXPECTED_SCHEMA_VERSION)
+
+    def test_a_version_two_marker_with_a_changed_constraint_is_refused(
+        self,
+    ) -> None:
+        weakened = tuple(
+            statement.replace(
+                "CHECK (length(fact) > 0)",
+                "CHECK (length(fact) >= 0)",
+            )
+            for statement in V0_2_0_BASELINE_SCHEMA
+        )
+        self.assertNotEqual(weakened, V0_2_0_BASELINE_SCHEMA)
+        create_schema(
+            self.database_path,
+            weakened,
+            with_rows=True,
+            with_memories=True,
+        )
+        stamp_schema_version(self.database_path, EXPECTED_SCHEMA_VERSION)
+
+        self._assert_refused_untouched(marker=EXPECTED_SCHEMA_VERSION)
+
+    def test_a_valid_version_one_marker_migrates_successfully(self) -> None:
+        create_pre_memories_baseline(self.database_path)
+        stamp_schema_version(self.database_path, PRE_MEMORIES_VERSION)
+
+        self.memory.initialize()
+
+        self.assertEqual(read_schema_version(self.database_path), EXPECTED_SCHEMA_VERSION)
+        self.assertEqual(table_names(self.database_path), BASELINE_TABLES)
+        for identifier, request, response, created_at in BASELINE_INTERACTIONS:
+            self.assertEqual(
+                self.memory.get_interaction(identifier),
+                {
+                    "id": identifier,
+                    "user_input": request,
+                    "response": response,
+                    "created_at": created_at,
+                },
+            )
+
+    def test_a_valid_version_two_marker_is_left_byte_for_byte_unchanged(
+        self,
+    ) -> None:
+        create_v0_2_0_baseline(self.database_path)
+        stamp_schema_version(self.database_path, EXPECTED_SCHEMA_VERSION)
+        before = self.database_path.read_bytes()
+
+        self.memory.initialize()
+        self.memory.initialize()
+
+        self.assertEqual(self.database_path.read_bytes(), before)
+        self.assertEqual(read_schema_version(self.database_path), EXPECTED_SCHEMA_VERSION)
+        for identifier, fact, _normalized, created_at in BASELINE_MEMORIES:
+            self.assertEqual(
+                self.memory.get_memory(identifier),
+                {"id": identifier, "fact": fact, "created_at": created_at},
+            )
+
+    def test_validating_a_current_database_reads_and_writes_nothing(
+        self,
+    ) -> None:
+        create_v0_2_0_baseline(self.database_path)
+        stamp_schema_version(self.database_path, EXPECTED_SCHEMA_VERSION)
+
+        with patch.object(
+            memory_module,
+            "_run_in_one_transaction",
+            side_effect=AssertionError("a current database may not be written"),
+        ):
+            self.memory.initialize()
+
+    def test_a_build_missing_a_frozen_schema_refuses_to_start(self) -> None:
+        """A version that cannot be validated must not be migrated from."""
+        create_pre_memories_baseline(self.database_path)
+        before = self.database_path.read_bytes()
+        incomplete = tuple(
+            entry
+            for entry in memory_module._FROZEN_SCHEMAS
+            if entry[0] != PRE_MEMORIES_VERSION
+        )
+
+        with patch.object(memory_module, "_FROZEN_SCHEMAS", incomplete):
+            with self.assertRaisesRegex(
+                RuntimeError,
+                r"^Unable to initialize Maria database\.$",
+            ):
+                self.memory.initialize()
+
+        self.assertEqual(self.database_path.read_bytes(), before)
+        self.assertEqual(read_schema_version(self.database_path), UNVERSIONED)
 
 
 def _object_names(database_path: Path) -> tuple[str, ...]:

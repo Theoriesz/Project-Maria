@@ -12,39 +12,53 @@
   settles that version once, in the memory layer, and everything else follows
   from it instead of each call site assuming what it is looking at.
   An existing database with no marker keeps working and is classified
-  explicitly rather than assumed to be current. A missing marker is not taken
-  as proof of the baseline: the structure is validated first against SQLite's
-  own catalogue — tables, columns in order with their types, nullability,
-  defaults and primary-key positions, indexes with their columns and
-  uniqueness, and foreign keys — so a database whose formatting differs is
-  still recognised, while a missing table, a missing or extra column, a
-  changed column definition, a different primary-key shape, a missing
-  `normalized_fact` uniqueness constraint, a missing index, a half-created
-  database, and a foreign database that merely reuses the table names are all
-  refused with nothing written. The two things no pragma reports,
-  `AUTOINCREMENT` and each table's `CHECK` constraints, are read from the
-  stored statement's tokens rather than by comparing its text: the checks are
-  part of what makes a database the baseline, because a `memories` table whose
-  `length(fact)` or `length(normalized_fact)` check is missing or weakened
-  accepts rows the real baseline refuses. Whitespace, line breaks, casing,
-  identifier quoting, comments, redundant parentheses, and a check written for
-  the table rather than beside its column all state the same rule and are all
-  accepted; a weakened, retargeted, extra, or missing check is refused, and a
-  check that exists only inside a comment or a string literal is not a check.
-  A database matching the published v0.2.0 shape is stamped as that baseline
-  and nothing else runs; the earlier shape Maria created before explicit
-  memories existed is stamped as the version it is and then migrated forward.
-  Every owner record, id, and timestamp is preserved either way.
+  explicitly rather than assumed to be current. Neither a missing marker nor a
+  present one is taken as proof of what a database is: an unversioned file is
+  identified by its structure, and a stamped file has its structure confirmed
+  against the frozen schema for the version it claims before any migration
+  statement runs, because a marker records which build wrote a database rather
+  than what the database currently is. A database matching the published
+  v0.2.0 shape is stamped as that baseline and nothing else runs; the earlier
+  shape Maria created before explicit memories existed is stamped as the
+  version it is and then migrated forward; a database already at the current
+  version is validated read-only and left byte for byte unchanged. Every owner
+  record, id, and timestamp is preserved either way.
+  What a database is compared against is a fingerprint of everything it
+  declares, not of the parts that happened to be easy to read. Every
+  user-defined object counts — tables, explicit indexes, views, and triggers —
+  so the exact baseline plus one unrelated view or trigger is another
+  application's database and is refused. For each object, SQLite's own
+  catalogue supplies the object type, column count, `WITHOUT ROWID` and
+  `STRICT` flags, every column including the generated and hidden ones
+  `table_info` omits, each index's uniqueness, origin, partial flag, key
+  columns, sort direction and collation, and the full identity of every
+  foreign key.
+  What SQLite reports nowhere — a conflict clause, a collation on a column no
+  index covers, a table option, an `AUTOINCREMENT` clause, a `CHECK`
+  condition, a trigger body — comes from the statement that created the
+  object, reduced to typed tokens rather than compared as text, raw or
+  whitespace-stripped. Each token keeps what kind of thing it is, so
+  whitespace, line breaks, comments, casing, and the choice of identifier
+  quoting all stop mattering while things that merely read alike stay apart: a
+  numeric `0` is not the string `'0'`, and a constraint named
+  `"autoincrement"` is not the `AUTOINCREMENT` clause, which is now recognised
+  only where SQLite defines it, immediately after `PRIMARY KEY`. `CHECK`
+  conditions are lifted out and compared separately, so one written beside its
+  column and the same one written for the table compare alike, and parentheses
+  that merely wrap a condition are dropped. A weakened, retargeted, extra, or
+  missing check is refused, and a check that exists only inside a comment or a
+  string literal is not a check. A condition rewritten into a different but
+  equivalent form is refused rather than guessed at.
   A file is treated as a new database only when it holds no object SQLite did
-  not create itself — no table, index, view, or trigger of anyone's — rather
-  than merely no table Maria would recognise, so another application's
-  database is never mistaken for a blank one to build inside. Only SQLite's
-  own reserved objects are ignored, including a `sqlite_sequence` that has
-  outlived the table that created it. A brand-new or genuinely empty file is
-  created directly at the current schema in one step and is never mistaken for
-  a migrated owner database; a file holding even one unrelated object is
-  refused with no Maria table created, no marker stamped, and not one byte
-  changed.
+  not create itself, rather than merely no table Maria would recognise, so
+  another application's database is never mistaken for a blank one to build
+  inside.
+  Only SQLite's own reserved objects are ignored, including a `sqlite_sequence`
+  that has outlived the table that created it. A brand-new or genuinely empty
+  file is created directly at the current schema in one step and is never
+  mistaken for a migrated owner database; a file holding even one unrelated
+  object is refused with no Maria table created, no marker stamped, and not
+  one byte changed.
   Migrations are forward-only and validated as a set before the database is
   opened, so a gap, a repeat, or an unknown step is refused rather than found
   part-way up. Each step runs in one explicit transaction together with the
@@ -68,10 +82,13 @@
   fixed sentence carrying a stable event code and nothing else. No row value,
   note title or body, memory fact, interaction request or response, database
   path, SQL statement or parameter, SQLite message, or traceback is written on
-  any path, including a corrupt or unreadable file, which previously produced
-  an exception log carrying SQLite's own text. The underlying exception is
+  any path, including a corrupt or unreadable file and a database another
+  process is holding, either of which previously produced an exception log
+  carrying SQLite's own text and a traceback. The underlying exception is
   still attached to the raised error for a caller that needs it; it is simply
-  never written down. Reading the schema version is recorded the same way.
+  never written down. Reading the schema version is recorded the same way, and
+  both boundaries classify contention themselves rather than inheriting the
+  shared conversion that logs on its way past.
 - Replaced Maria's single configured safe directory with named filesystem
   roots, and put the things Maria must never reach behind one shared,
   permanent boundary. `config/config.toml` now declares roots in a

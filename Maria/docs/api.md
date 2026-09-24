@@ -213,19 +213,21 @@ likewise continues to raise that method's existing operation-specific
 `Memory.initialize() -> None`
 
 Brings the configured database up to `DATABASE_SCHEMA_VERSION`, creating it
-when it does not exist. It settles the database's own version first and
-classifies an unversioned file once, structurally, so no other method has to
-decide what shape of database it is looking at. A file already at the current
-version is left byte for byte unchanged, and every migration runs in ascending
-order, one transaction per step, with the version marker written inside that
-same transaction.
+when it does not exist. It settles the database's own version first and does
+it once, so no other method has to decide what shape of database it is looking
+at: an unversioned file is identified by its structure, and a stamped file has
+its structure confirmed against the frozen schema for the version it claims
+before any migration statement runs. A file already at the current version is
+validated read-only and left byte for byte unchanged, and every migration runs
+in ascending order, one transaction per step, with the version marker written
+inside that same transaction.
 
 Raises `TypedFailureError` carrying `FailureKind.DATABASE_SCHEMA_TOO_NEW` when
 the file is stamped above `DATABASE_SCHEMA_VERSION`, refusing before anything
 is written. Every other refusal and failure - an unrecognised or drifted
-structure, a file holding another application's objects, a half-created
-database, an invalid migration set, a failed migration, and a corrupt or
-unreadable file - raises
+structure, a marker that disagrees with the schema it names, a file holding
+another application's objects, a half-created database, an invalid migration
+set, a failed migration, and a corrupt or unreadable file - raises
 `RuntimeError("Unable to initialize Maria database.")`. Contention keeps the
 shared classification described above, but this method applies it itself
 rather than inheriting it: a `SQLITE_BUSY` or `SQLITE_LOCKED` result raises
@@ -244,8 +246,10 @@ Returns the schema version currently stamped on the database, which is what is
 stored rather than what this build expects. An unstamped or absent database
 returns `0`. This is the only way to read the marker from outside the memory
 layer; no caller opens its own connection or issues its own pragma. SQLite
-failures raise `RuntimeError("Unable to read database schema version.")` and,
-like `initialize()`, are logged as a fixed event code rather than as an
+failures raise `RuntimeError("Unable to read database schema version.")`, and
+contention raises `RuntimeError("Database is busy. Try again shortly.")`. Like
+`initialize()`, this method classifies contention itself rather than
+inheriting the shared conversion, and logs a fixed event code rather than an
 exception.
 
 ### Interaction History

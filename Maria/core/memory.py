@@ -5,7 +5,7 @@ from __future__ import annotations
 import sqlite3
 from collections.abc import Iterator
 from contextlib import contextmanager
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from datetime import datetime, timezone
 from logging import Logger
 from pathlib import Path
@@ -42,6 +42,9 @@ _SCHEMA_VERSION_UNREADABLE_MESSAGE = "Unable to read database schema version."
 _EVENT_DATABASE_UNREADABLE = "database_unreadable"
 _EVENT_DATABASE_BUSY = "database_busy"
 _INITIALIZATION_STOPPED = "Database initialization stopped: %s."
+_SCHEMA_VERSION_READ_STOPPED = (
+    "Reading the database schema version stopped: %s."
+)
 
 # SQLite's default value for ``PRAGMA user_version``. It is not a Maria schema
 # version: it means no marker was ever written, so the database has to be
@@ -159,8 +162,14 @@ _HISTORICAL_NOTES_INDEX = """
         ON notes (title)
 """
 
-# Newest shape first, so the most likely match is tried first.
-_HISTORICAL_UNVERSIONED_SCHEMAS: tuple[tuple[int, tuple[str, ...]], ...] = (
+# Every version's complete schema, newest first. A marker is never taken at
+# its word: whatever version a database claims, its structure is checked
+# against the entry for that version before anything is migrated, so a file
+# stamped 1 that is not actually a version 1 database is refused rather than
+# migrated into an unknown state. Every version from the earliest recognised
+# one up to DATABASE_SCHEMA_VERSION therefore needs an entry here, and the
+# migration ladder refuses to run if one is missing.
+_FROZEN_SCHEMAS: tuple[tuple[int, tuple[str, ...]], ...] = (
     (
         _SCHEMA_V0_2_BASELINE,
         (
@@ -184,8 +193,17 @@ _HISTORICAL_UNVERSIONED_SCHEMAS: tuple[tuple[int, tuple[str, ...]], ...] = (
 
 # The oldest schema Maria can recognise at all, and therefore the version the
 # migration ladder has to start one step above.
-_EARLIEST_KNOWN_SCHEMA = min(
-    version for version, _ in _HISTORICAL_UNVERSIONED_SCHEMAS
+_EARLIEST_KNOWN_SCHEMA = min(version for version, _ in _FROZEN_SCHEMAS)
+
+# The only shapes that can exist with no marker at all, newest first. Maria
+# stamped nothing before schema versioning existed, so an unversioned file can
+# only have been produced by one of these two; every database written from
+# this build onwards carries a marker. Later versions are frozen above for
+# validation but are deliberately not candidates here, because a file at one
+# of them could not have reached that shape without also being stamped.
+_UNVERSIONED_SHAPE_VERSIONS: tuple[int, ...] = (
+    _SCHEMA_V0_2_BASELINE,
+    _SCHEMA_BEFORE_EXPLICIT_MEMORIES,
 )
 
 
@@ -283,9 +301,13 @@ class Memory:
     ) -> int:
         """Return the version to migrate from, refusing anything unusable.
 
-        This is the single place an unversioned database is classified, so no
-        later step has to guess again. It refuses before writing rather than
-        after: a newer stamp, a negative stamp, and an unrecognised shape all
+        This is the single place a database's version is settled, so no later
+        step has to guess again. An unversioned file is classified by its
+        structure; a stamped one has its structure confirmed against the
+        frozen schema for the version it claims, because a marker records what
+        wrote a database rather than what it currently is. It refuses before
+        writing rather than after: a newer stamp, a negative stamp, an
+        unrecognised shape, and a marker that disagrees with the schema all
         leave the file exactly as it was found.
         """
         if version > DATABASE_SCHEMA_VERSION:
@@ -304,9 +326,41 @@ class Memory:
             raise RuntimeError(_DATABASE_REFUSED_MESSAGE)
 
         if version != _UNVERSIONED_SCHEMA:
+            self._validate_stamped_schema(connection, version)
             return version
 
         return self._classify_unversioned_database(connection)
+
+    def _validate_stamped_schema(
+        self,
+        connection: sqlite3.Connection,
+        version: int,
+    ) -> None:
+        """Refuse a stamped database that is not the schema it claims to be.
+
+        A marker records what wrote the database, not what the database
+        currently is. Trusting it would let a migration run against a schema
+        the step was never written for, which is the one situation a forward
+        migration cannot recover from, so the structure is confirmed against
+        the frozen schema for that version first and nothing is written if it
+        does not match.
+
+        This also settles a database already at the current version: the check
+        is entirely read-only, so a valid file is left byte for byte as it was
+        found, while a drifted one is refused rather than reported as ready.
+        """
+        statements = _frozen_schema(version)
+        if statements is not None and _describe_schema(
+            connection
+        ) == _reference_schema(statements):
+            return
+
+        self.logger.error(
+            "Refused a database stamped at schema version %s whose structure "
+            "is not the frozen schema for that version.",
+            version,
+        )
+        raise RuntimeError(_DATABASE_REFUSED_MESSAGE)
 
     def _classify_unversioned_database(
         self,
@@ -340,8 +394,8 @@ class Memory:
             return DATABASE_SCHEMA_VERSION
 
         actual = _describe_schema(connection)
-        for version, statements in _HISTORICAL_UNVERSIONED_SCHEMAS:
-            if actual != _reference_schema(statements):
+        for version in _UNVERSIONED_SHAPE_VERSIONS:
+            if actual != _reference_schema(_frozen_schema(version)):
                 continue
             _run_in_one_transaction(connection, (), version)
             self.logger.info(
@@ -418,16 +472,28 @@ class Memory:
         rather than what is expected, so a database no build ever stamped
         reports ``0``. Like every other method here it opens the configured
         file, which SQLite creates when it is missing.
+
+        A busy or locked database raises the same retryable message every
+        other method answers contention with; anything else SQLite refuses on
+        raises the read failure below. Neither records anything derived from
+        the failure, only a fixed event code.
         """
         try:
-            with self._connection() as connection:
+            # Contention is classified here rather than by the shared
+            # connection, for the same reason initialization classifies its
+            # own: the shared conversion logs the exception on its way past,
+            # and this boundary records a fixed event code instead.
+            with self._connection(classify_contention=False) as connection:
                 return _read_schema_version(connection)
         except sqlite3.Error as exc:
-            # Recorded the same way initialization records its failures: this
-            # reads the same header of the same file, so an exception log here
-            # would reintroduce exactly what that boundary refuses to write.
+            if _is_busy_or_locked(exc):
+                self.logger.error(
+                    _SCHEMA_VERSION_READ_STOPPED,
+                    _EVENT_DATABASE_BUSY,
+                )
+                raise RuntimeError(_DATABASE_BUSY_MESSAGE) from exc
             self.logger.error(
-                "Reading the database schema version stopped: %s.",
+                _SCHEMA_VERSION_READ_STOPPED,
                 _EVENT_DATABASE_UNREADABLE,
             )
             raise RuntimeError(_SCHEMA_VERSION_UNREADABLE_MESSAGE) from exc
@@ -1015,8 +1081,10 @@ def _validate_migration_ladder() -> None:
     A ladder with a gap, a repeat, a step below the oldest recognisable
     schema, or a step beyond what this build expects would migrate a database
     somewhere no code is written for, so it is rejected before the database is
-    even opened rather than discovered part-way up. The check is on the set of
-    declared steps alone and reads nothing from disk.
+    even opened rather than discovered part-way up. A version with no frozen
+    schema is rejected for the same reason: a database claiming it could not
+    be checked before being migrated. The check is on the declared steps and
+    frozen schemas alone and reads nothing from disk.
     """
     expected = tuple(
         range(_EARLIEST_KNOWN_SCHEMA + 1, DATABASE_SCHEMA_VERSION + 1)
@@ -1024,6 +1092,29 @@ def _validate_migration_ladder() -> None:
     declared = tuple(migration.version for migration in _MIGRATIONS)
     if declared != expected:
         raise RuntimeError(_DATABASE_REFUSED_MESSAGE)
+
+    # Every version a marker could name has to have a frozen schema, or a
+    # database claiming that version could not be checked before it was
+    # migrated. A missing entry is a build that cannot validate what it is
+    # about to change, so it refuses to start rather than trusting the marker.
+    frozen = tuple(sorted(version for version, _ in _FROZEN_SCHEMAS))
+    if frozen != tuple(
+        range(_EARLIEST_KNOWN_SCHEMA, DATABASE_SCHEMA_VERSION + 1)
+    ):
+        raise RuntimeError(_DATABASE_REFUSED_MESSAGE)
+
+
+def _frozen_schema(version: int) -> tuple[str, ...] | None:
+    """Return the complete frozen schema for one version, or None.
+
+    A version with no frozen schema cannot be validated, which is a refusal
+    rather than a reason to skip the check; returning None rather than raising
+    keeps that decision with the caller that knows what it was about to do.
+    """
+    for frozen_version, statements in _FROZEN_SCHEMAS:
+        if frozen_version == version:
+            return statements
+    return None
 
 
 def _read_schema_version(connection: sqlite3.Connection) -> int:
@@ -1105,78 +1196,173 @@ def _user_defined_object_names(
     return tuple(str(row[0]) for row in rows)
 
 
-def _describe_schema(connection: sqlite3.Connection) -> tuple[Any, ...]:
-    """Return a comparable structural description of a database's schema.
+def _describe_schema(
+    connection: sqlite3.Connection,
+) -> tuple[_ObjectShape, ...]:
+    """Return a comparable fingerprint of everything a database declares.
 
-    Two databases compare equal here exactly when SQLite reports the same
-    tables, the same columns in the same order with the same declared types,
-    nullability, defaults, and primary-key positions, the same indexes over
-    the same columns with the same uniqueness and origin, and the same foreign
-    keys.
+    Two databases compare equal here exactly when they declare the same
+    objects with the same structure. The fingerprint is deliberately
+    comprehensive rather than sufficient for the cases anyone thought of: it
+    covers every user-defined object, not only tables, and for each one it
+    records everything SQLite will report plus a typed canonical form of the
+    statement that created it. Anything it does not recognise therefore
+    compares unequal and is refused, which is the direction a schema
+    classifier has to fail in.
 
-    The description is built from SQLite's own catalogue rather than from the
-    text of the stored ``CREATE`` statements, so a database that was written
-    with different indentation or a reordered constraint clause is recognised
-    on what it actually is. The one exception is ``AUTOINCREMENT``, which no
-    pragma reports and which changes whether a deleted row's id can come back;
-    it is read as a keyword from the stored statement rather than by comparing
-    that statement as a whole.
-
-    ``CHECK`` constraints are compared too, because a column whose check is
-    missing or weakened accepts rows the real baseline refuses, and no pragma
-    reports one. They are the one part read from the stored statement, and
-    only the checks themselves are read from it: each is lifted out as its own
-    expression and reduced to tokens, so whitespace, line breaks, casing,
-    identifier quoting, comments, and redundant parentheses around the same
-    condition all compare equal while a different condition does not. The
-    statement as a whole is never compared.
+    Objects SQLite maintains itself are excluded by the ``sqlite_`` prefix it
+    reserves for them, because they follow from the schema rather than
+    defining it. Everything else counts, so a stray view or trigger beside an
+    otherwise exact schema is a difference rather than something to overlook.
     """
     rows = connection.execute(
         """
-        SELECT name, sql
+        SELECT type, name, tbl_name, sql
         FROM sqlite_master
-        WHERE type = 'table' AND name NOT LIKE 'sqlite~_%' ESCAPE '~'
-        ORDER BY name
+        WHERE name NOT LIKE 'sqlite~_%' ESCAPE '~'
+        ORDER BY type, name
         """
     ).fetchall()
     return tuple(
-        _describe_table(connection, str(row[0]), str(row[1] or ""))
+        _describe_object(
+            connection,
+            str(row["type"]),
+            str(row["name"]),
+            str(row["tbl_name"]),
+            str(row["sql"] or ""),
+        )
         for row in rows
     )
 
 
-def _describe_table(
-    connection: sqlite3.Connection,
-    table_name: str,
-    definition: str,
-) -> tuple[Any, ...]:
-    """Return one table's structural description.
+@dataclass(frozen=True)
+class _ObjectShape:
+    """Everything one schema object declares, in comparable form.
 
-    Every pragma is read through its table-valued function so the table name
+    Two objects are the same object exactly when every field here matches.
+    The fields divide into what SQLite reports about an object and what only
+    its statement says, and both halves matter: the catalogue knows about
+    columns, indexes, and table options, while a conflict clause, a collation
+    on a column no index covers, and a trigger body live only in the
+    statement.
+
+    Nothing here is the stored SQL. ``statement`` is that statement reduced to
+    typed tokens, which is why formatting cannot make two identical schemas
+    differ, and ``checks`` is lifted out of it so that a constraint written
+    beside its column and the same constraint written for the table compare
+    alike.
+    """
+
+    object_type: str
+    name: str
+    owner: str
+    statement: tuple[tuple[str, str], ...]
+    checks: tuple[tuple[tuple[str, str], ...], ...]
+    autoincrement: bool
+    catalogue: tuple[Any, ...] | None = None
+    columns: tuple[tuple[Any, ...], ...] = ()
+    indexes: tuple[tuple[Any, ...], ...] = ()
+    foreign_keys: tuple[tuple[Any, ...], ...] = ()
+
+
+def _describe_object(
+    connection: sqlite3.Connection,
+    object_type: str,
+    name: str,
+    owner: str,
+    definition: str,
+) -> _ObjectShape:
+    """Return one object's full description, whatever kind of object it is.
+
+    Every object contributes its kind, its name, the table it belongs to, and
+    the typed canonical form of its statement. A table or a view contributes
+    its catalogue metadata as well, which is where SQLite reports the facts it
+    is willing to report structurally.
+
+    The canonical statement is what makes this exhaustive. Anything SQLite
+    exposes no pragma for - a conflict clause, a collation on a column no
+    index covers, a table option, the body of a trigger - still differs here
+    when it differs in the schema, so the description does not have to be
+    extended every time a new way of writing an incompatible table is found.
+    """
+    tokens = _tokenize_definition(definition)
+    shape = _ObjectShape(
+        object_type=object_type,
+        name=name,
+        owner=owner,
+        statement=_canonical_statement(tokens),
+        checks=_check_constraints(tokens),
+        autoincrement=_declares_autoincrement(tokens),
+    )
+    if object_type not in _CONTAINER_OBJECT_TYPES:
+        return shape
+
+    catalogue, columns, indexes, foreign_keys = _describe_container(
+        connection,
+        name,
+    )
+    return replace(
+        shape,
+        catalogue=catalogue,
+        columns=columns,
+        indexes=indexes,
+        foreign_keys=foreign_keys,
+    )
+
+
+def _describe_container(
+    connection: sqlite3.Connection,
+    name: str,
+) -> tuple[Any, ...]:
+    """Return the catalogue metadata SQLite reports for a table or view.
+
+    Every pragma is read through its table-valued function, so the object name
     travels as a bound parameter. A drifted or foreign database supplies these
     names, and a name is not something to paste into statement text.
 
-    ``AUTOINCREMENT`` and the table's ``CHECK`` constraints are the two things
-    no pragma reports, so both are read from the stored statement's tokens
-    rather than from its text. A check declared beside its column and the same
-    check declared for the table compare alike, because SQLite evaluates both
-    per row and the distinction is a spelling rather than a rule.
+    ``pragma_table_xinfo`` is used rather than ``pragma_table_info`` because
+    the latter omits hidden and generated columns entirely, which would let a
+    table carrying an extra generated column describe identically to one
+    without it. ``pragma_index_xinfo`` is used rather than
+    ``pragma_index_info`` for the same reason: only the extended form reports
+    sort direction, collation, and which entries are key columns rather than
+    the rowid SQLite appends.
     """
+    catalogue_row = connection.execute(
+        """
+        SELECT type, ncol, wr, "strict"
+        FROM pragma_table_list(?)
+        """,
+        (name,),
+    ).fetchone()
+    catalogue = (
+        None
+        if catalogue_row is None
+        else (
+            str(catalogue_row["type"]),
+            int(catalogue_row["ncol"]),
+            bool(catalogue_row["wr"]),
+            bool(catalogue_row["strict"]),
+        )
+    )
+
     columns = tuple(
         (
+            int(row["cid"]),
             str(row["name"]),
             str(row["type"]).upper(),
             bool(row["notnull"]),
             None if row["dflt_value"] is None else str(row["dflt_value"]),
             int(row["pk"]),
+            int(row["hidden"]),
         )
         for row in connection.execute(
             """
-            SELECT name, type, "notnull", dflt_value, pk
-            FROM pragma_table_info(?)
+            SELECT cid, name, type, "notnull", dflt_value, pk, hidden
+            FROM pragma_table_xinfo(?)
             ORDER BY cid
             """,
-            (table_name,),
+            (name,),
         )
     )
 
@@ -1186,16 +1372,23 @@ def _describe_table(
         SELECT name, "unique", origin, partial
         FROM pragma_index_list(?)
         """,
-        (table_name,),
+        (name,),
     ):
         index_name = str(row["name"])
         origin = str(row["origin"])
-        index_columns = tuple(
-            str(entry["name"])
+        entries = tuple(
+            (
+                int(entry["seqno"]),
+                int(entry["cid"]),
+                None if entry["name"] is None else str(entry["name"]),
+                bool(entry["desc"]),
+                str(entry["coll"]).upper(),
+                bool(entry["key"]),
+            )
             for entry in connection.execute(
                 """
-                SELECT name
-                FROM pragma_index_info(?)
+                SELECT seqno, cid, name, "desc", coll, "key"
+                FROM pragma_index_xinfo(?)
                 ORDER BY seqno
                 """,
                 (index_name,),
@@ -1204,65 +1397,130 @@ def _describe_table(
         indexes.append(
             (
                 # An index SQLite created for a UNIQUE or PRIMARY KEY clause
-                # carries a generated name that says nothing about the
-                # schema, so only an explicitly created index is compared by
-                # name. What such an index covers is still compared in full.
+                # carries a generated name that says nothing about the schema,
+                # so only an explicitly created index is compared by name.
+                # What every index covers is compared in full either way.
                 index_name if origin == "c" else "",
                 bool(row["unique"]),
                 origin,
                 bool(row["partial"]),
-                index_columns,
+                entries,
             )
         )
 
     foreign_keys = tuple(
         sorted(
             (
+                int(row["id"]),
+                int(row["seq"]),
                 str(row["table"]),
                 str(row["from"]),
                 None if row["to"] is None else str(row["to"]),
                 str(row["on_update"]),
                 str(row["on_delete"]),
+                str(row["match"]),
             )
             for row in connection.execute(
                 """
-                SELECT "table", "from", "to", on_update, on_delete
+                SELECT id, seq, "table", "from", "to",
+                       on_update, on_delete, "match"
                 FROM pragma_foreign_key_list(?)
                 """,
-                (table_name,),
+                (name,),
             )
         )
     )
 
-    tokens = _tokenize_definition(definition)
-    return (
-        table_name,
-        columns,
-        tuple(sorted(indexes)),
-        foreign_keys,
-        _declares_autoincrement(tokens),
-        _check_constraints(tokens),
-    )
+    return (catalogue, columns, tuple(sorted(indexes)), foreign_keys)
 
+
+# Objects SQLite will describe through ``pragma_table_list``. An index or a
+# trigger has no such entry and is compared on its statement alone.
+_CONTAINER_OBJECT_TYPES = frozenset({"table", "view"})
+
+
+# --- Typed canonical tokens ---------------------------------------------
+#
+# Some of what a schema means is visible only in the statement that created
+# it: whether a primary key is an AUTOINCREMENT one, what a CHECK actually
+# tests, which conflict resolution a UNIQUE clause carries. Comparing that
+# text directly would make indentation a schema change, so the statement is
+# reduced to typed tokens first and the tokens are what is compared.
+#
+# Typed is the operative word. Every token keeps the kind of thing it is, so
+# the canonical form can drop everything that carries no meaning - whitespace,
+# line breaks, comments, casing, the choice of quoting - without ever letting
+# two different things become the same one. A number and a string that both
+# read ``0`` stay different, and a quoted identifier never becomes the keyword
+# it happens to spell.
+
+_TOKEN_KEYWORD = "keyword"
+_TOKEN_IDENTIFIER = "identifier"
+_TOKEN_NUMBER = "number"
+_TOKEN_STRING = "string"
+_TOKEN_BLOB = "blob"
+_TOKEN_OPERATOR = "operator"
+
+# SQLite's documented keyword set. A bare word in it is a keyword; a bare word
+# outside it, and every quoted word whatever it spells, is an identifier. That
+# asymmetry is the point: SQLite lets a keyword be quoted into an ordinary
+# name, and a schema that names a constraint "autoincrement" must not read as
+# one that declares the AUTOINCREMENT clause.
+#
+# A word missing from this set can only be typed as an identifier, which makes
+# its quoted and bare spellings compare equal - which is what SQLite itself
+# means by a keyword usable as an identifier. It can never make a structural
+# difference disappear, because the catalogue metadata is compared separately.
+_SQL_KEYWORDS = frozenset(
+    """
+    abort action add after all alter always analyze and as asc attach
+    autoincrement before begin between by cascade case cast check collate
+    column commit conflict constraint create cross current current_date
+    current_time current_timestamp database default deferrable deferred
+    delete desc detach distinct do drop each else end escape except exclude
+    exclusive exists explain fail filter first following for foreign from
+    full generated glob group groups having if ignore immediate in index
+    indexed initially inner insert instead intersect into is isnull join key
+    last left like limit match materialized natural no not nothing notnull
+    null nulls of offset on or order others outer over partition plan pragma
+    preceding primary query raise range recursive references regexp reindex
+    release rename replace restrict returning right rollback row rows
+    savepoint select set table temp temporary then ties to transaction trigger
+    unbounded union unique update using vacuum values view virtual when where
+    window with without
+    """.split()
+)
 
 # The closing character for each way SQLite lets an identifier be quoted.
 _IDENTIFIER_QUOTES = {'"': '"', "`": "`", "[": "]"}
 
-# Characters that continue a bare identifier or number once one has started.
+# Characters that continue a bare word or number once one has started.
 _WORD_TAIL = "_$"
+
+# Operators SQLite spells with two characters. Reading them whole keeps
+# ``>=`` from comparing as ``>`` followed by something separate.
+_TWO_CHARACTER_OPERATORS = frozenset(
+    {"!=", "<>", "<=", ">=", "==", "||", "<<", ">>", "->"}
+)
+
+# The only tokens SQLite allows between PRIMARY KEY and AUTOINCREMENT. The
+# clause is ``PRIMARY KEY [ASC|DESC] [ON CONFLICT resolution] AUTOINCREMENT``,
+# so anything else ends the clause and whatever follows is a different one.
+_PRIMARY_KEY_CLAUSE_KEYWORDS = frozenset(
+    {"asc", "desc", "on", "conflict", "rollback", "abort", "fail", "ignore",
+     "replace"}
+)
 
 
 def _tokenize_definition(definition: str) -> tuple[tuple[str, str], ...]:
-    """Reduce a stored CREATE statement to comparable tokens.
+    """Reduce a stored CREATE statement to typed tokens.
 
     This is the one place a schema statement is read as text, and it exists so
-    that nothing else has to. Whitespace disappears, comments disappear,
-    keywords and identifiers are casefolded, and an identifier keeps only its
-    name whichever of SQLite's quoting styles it arrived in, so two statements
-    that declare the same thing produce the same tokens however they were
-    written. String literals are kept whole and marked as literals, so text
-    that merely looks like SQL inside one can never be mistaken for the real
-    thing.
+    that nothing else has to. Whitespace and comments disappear; words are
+    casefolded; an identifier keeps only its name whichever of SQLite's
+    quoting styles it arrived in. What survives is the kind of each token
+    alongside its value, so a later comparison can tell a keyword from a name
+    that spells one, and a number from a string that reads like one.
 
     Nothing here interprets the statement. It has no notion of columns,
     constraints, or clauses; callers that need one work from the tokens.
@@ -1291,7 +1549,7 @@ def _tokenize_definition(definition: str) -> tuple[tuple[str, str], ...]:
 
         if character == "'":
             literal, index = _read_delimited(definition, index, "'")
-            tokens.append(("literal", literal))
+            tokens.append((_TOKEN_STRING, literal))
             continue
 
         if character in _IDENTIFIER_QUOTES:
@@ -1300,22 +1558,71 @@ def _tokenize_definition(definition: str) -> tuple[tuple[str, str], ...]:
                 index,
                 _IDENTIFIER_QUOTES[character],
             )
-            tokens.append(("word", name.casefold()))
+            tokens.append((_TOKEN_IDENTIFIER, name.casefold()))
             continue
 
-        if character.isalnum() or character in _WORD_TAIL:
+        if character.isdigit() or (
+            character == "."
+            and index + 1 < end
+            and definition[index + 1].isdigit()
+        ):
+            number, index = _read_number(definition, index)
+            tokens.append((_TOKEN_NUMBER, number.casefold()))
+            continue
+
+        if character.isalpha() or character in _WORD_TAIL:
             start = index
             while index < end and (
                 definition[index].isalnum() or definition[index] in _WORD_TAIL
             ):
                 index += 1
-            tokens.append(("word", definition[start:index].casefold()))
+            word = definition[start:index].casefold()
+            # ``x'...'`` is a blob literal rather than a name beside a string.
+            if word == "x" and index < end and definition[index] == "'":
+                literal, index = _read_delimited(definition, index, "'")
+                tokens.append((_TOKEN_BLOB, literal.casefold()))
+                continue
+            tokens.append(
+                (
+                    _TOKEN_KEYWORD if word in _SQL_KEYWORDS
+                    else _TOKEN_IDENTIFIER,
+                    word,
+                )
+            )
             continue
 
-        tokens.append(("punctuation", character))
+        if definition[index:index + 2] in _TWO_CHARACTER_OPERATORS:
+            tokens.append((_TOKEN_OPERATOR, definition[index:index + 2]))
+            index += 2
+            continue
+
+        tokens.append((_TOKEN_OPERATOR, character))
         index += 1
 
     return tuple(tokens)
+
+
+def _read_number(definition: str, start: int) -> tuple[str, int]:
+    """Return one numeric literal's text and the index just past it.
+
+    Hexadecimal, decimal, and exponent forms are all read as a single token.
+    An unusual spelling that this stops short of simply becomes several
+    tokens, which compares unequal to the expected one rather than equal to
+    it, so the failure direction is the safe one.
+    """
+    index = start
+    end = len(definition)
+    while index < end and (
+        definition[index].isalnum() or definition[index] in "._"
+    ):
+        index += 1
+        if (
+            definition[index - 1] in "eE"
+            and index < end
+            and definition[index] in "+-"
+        ):
+            index += 1
+    return definition[start:index], index
 
 
 def _read_delimited(
@@ -1346,47 +1653,93 @@ def _read_delimited(
     return "".join(contents), end
 
 
-def _declares_autoincrement(tokens: tuple[tuple[str, str], ...]) -> bool:
-    """Return whether a tokenized CREATE TABLE declares AUTOINCREMENT.
-
-    The keyword is looked for as a whole token, so spacing, line breaks, and
-    casing do not matter, while a column merely named something similar, a
-    string literal containing the word, and a comment mentioning it all
-    cannot match.
-    """
-    return ("word", "autoincrement") in tokens
-
-
-def _check_constraints(
+def _canonical_statement(
     tokens: tuple[tuple[str, str], ...],
-) -> tuple[str, ...]:
-    """Return every CHECK expression a tokenized CREATE TABLE declares.
+) -> tuple[tuple[str, str], ...]:
+    """Return the statement's tokens with its CHECK clauses lifted out.
 
-    Each expression is returned as its tokens joined together, which is a
-    normalized form rather than the text that produced it: two statements
-    spelling the same condition with different spacing, casing, identifier
-    quoting, or redundant parentheses yield the same string, while a condition
-    that was weakened or removed does not. The results are sorted, so the
-    order the checks were written in does not matter either.
+    The checks are compared separately, because SQLite evaluates a check
+    declared beside its column and the same check declared for the table
+    identically, and a schema should not be a different schema for having
+    written one of them the other way. Removing them leaves the separators
+    that punctuated them, so runs of commas and a comma against a bracket are
+    collapsed afterwards and the two spellings converge.
 
-    Only the expression inside each ``CHECK`` is taken. The surrounding
-    statement contributes nothing, so this can never become an equality test
-    on stored SQL by another name.
+    Everything else is left exactly as it was tokenized. A conflict clause, a
+    collation, a table option, a generated column's expression, and a
+    trigger's body all still have to match token for token.
     """
-    expressions: list[str] = []
+    kept: list[tuple[str, str]] = []
     position = 0
     total = len(tokens)
 
     while position < total:
-        if tokens[position] != ("word", "check"):
+        if tokens[position] == (_TOKEN_KEYWORD, "check"):
+            opening = position + 1
+            if opening < total and tokens[opening] == (_TOKEN_OPERATOR, "("):
+                _, position = _read_parenthesized(tokens, opening)
+                continue
+        kept.append(tokens[position])
+        position += 1
+
+    return _collapse_separators(tuple(kept))
+
+
+def _collapse_separators(
+    tokens: tuple[tuple[str, str], ...],
+) -> tuple[tuple[str, str], ...]:
+    """Remove separators left dangling by a removed clause.
+
+    Only a comma that now has nothing on one side of it is dropped, which is
+    exactly the shape lifting a table-level constraint out leaves behind. A
+    comma between two things it genuinely separates is untouched.
+    """
+    comma = (_TOKEN_OPERATOR, ",")
+    opening = (_TOKEN_OPERATOR, "(")
+    closing = (_TOKEN_OPERATOR, ")")
+
+    collapsed: list[tuple[str, str]] = []
+    for token in tokens:
+        if token == comma and (
+            not collapsed or collapsed[-1] in (comma, opening)
+        ):
+            continue
+        if token == closing:
+            while collapsed and collapsed[-1] == comma:
+                collapsed.pop()
+        collapsed.append(token)
+    return tuple(collapsed)
+
+
+def _check_constraints(
+    tokens: tuple[tuple[str, str], ...],
+) -> tuple[tuple[tuple[str, str], ...], ...]:
+    """Return every CHECK expression a tokenized statement declares.
+
+    Each expression is returned as its own typed token sequence rather than as
+    text, so ``> 0`` and ``> '0'`` stay different conditions however alike
+    they look. The sequences are sorted, so the order the checks were written
+    in does not matter, and parentheses that merely wrap a whole expression
+    are dropped, so ``((length(fact) > 0))`` is the condition it states.
+
+    Only the expression inside each ``CHECK`` is taken. The surrounding
+    statement contributes nothing here, so this can never become an equality
+    test on stored SQL by another name.
+    """
+    expressions: list[tuple[tuple[str, str], ...]] = []
+    position = 0
+    total = len(tokens)
+
+    while position < total:
+        if tokens[position] != (_TOKEN_KEYWORD, "check"):
             position += 1
             continue
         opening = position + 1
-        if opening >= total or tokens[opening] != ("punctuation", "("):
+        if opening >= total or tokens[opening] != (_TOKEN_OPERATOR, "("):
             position += 1
             continue
         expression, position = _read_parenthesized(tokens, opening)
-        expressions.append(_strip_redundant_parentheses(expression))
+        expressions.append(_strip_enclosing_parentheses(expression))
 
     return tuple(sorted(expressions))
 
@@ -1394,39 +1747,39 @@ def _check_constraints(
 def _read_parenthesized(
     tokens: tuple[tuple[str, str], ...],
     opening: int,
-) -> tuple[str, int]:
-    """Return one balanced parenthesized group's contents and the next index.
+) -> tuple[tuple[tuple[str, str], ...], int]:
+    """Return one balanced parenthesized group's tokens and the next index.
 
     ``opening`` addresses the group's own ``(``, which is syntax rather than
-    part of the condition and is therefore dropped along with its closing
-    partner. Nesting inside is kept, because it is part of the expression. A
-    literal contributes its text without its quotes having to be reproduced,
-    since a literal is already a single token by the time it arrives here.
+    part of what it encloses and is dropped along with its closing partner.
+    Nesting inside is kept, because it is part of the expression.
     """
-    contents: list[str] = []
+    contents: list[tuple[str, str]] = []
     depth = 0
     index = opening
     total = len(tokens)
 
     while index < total:
-        kind, value = tokens[index]
-        if kind == "punctuation" and value == "(":
+        token = tokens[index]
+        if token == (_TOKEN_OPERATOR, "("):
             depth += 1
             if depth > 1:
-                contents.append(value)
-        elif kind == "punctuation" and value == ")":
+                contents.append(token)
+        elif token == (_TOKEN_OPERATOR, ")"):
             depth -= 1
             if depth == 0:
-                return "".join(contents), index + 1
-            contents.append(value)
+                return tuple(contents), index + 1
+            contents.append(token)
         else:
-            contents.append(value)
+            contents.append(token)
         index += 1
 
-    return "".join(contents), total
+    return tuple(contents), total
 
 
-def _strip_redundant_parentheses(expression: str) -> str:
+def _strip_enclosing_parentheses(
+    expression: tuple[tuple[str, str], ...],
+) -> tuple[tuple[str, str], ...]:
     """Remove parentheses that wrap a whole expression without changing it.
 
     ``(length(fact)>0)`` and ``length(fact)>0`` state the same condition, so
@@ -1434,12 +1787,19 @@ def _strip_redundant_parentheses(expression: str) -> str:
     encloses everything: ``(a)>(b)`` opens and closes before the end, so it is
     left exactly as it is.
     """
-    while expression.startswith("(") and expression.endswith(")"):
+    opening = (_TOKEN_OPERATOR, "(")
+    closing = (_TOKEN_OPERATOR, ")")
+
+    while (
+        len(expression) >= 2
+        and expression[0] == opening
+        and expression[-1] == closing
+    ):
         depth = 0
-        for position, character in enumerate(expression):
-            if character == "(":
+        for position, token in enumerate(expression):
+            if token == opening:
                 depth += 1
-            elif character == ")":
+            elif token == closing:
                 depth -= 1
                 if depth == 0 and position < len(expression) - 1:
                     return expression
@@ -1447,8 +1807,41 @@ def _strip_redundant_parentheses(expression: str) -> str:
     return expression
 
 
-def _reference_schema(statements: tuple[str, ...]) -> tuple[Any, ...]:
-    """Return the description a set of schema statements produces.
+def _declares_autoincrement(tokens: tuple[tuple[str, str], ...]) -> bool:
+    """Return whether a statement declares a real AUTOINCREMENT primary key.
+
+    The clause is looked for where SQLite defines it, immediately after
+    ``PRIMARY KEY`` and past only the sort order and conflict resolution it
+    allows in between. The keyword appearing anywhere else in the statement -
+    as a constraint's name, inside a string, in a comment, or as a column
+    called something similar - is not this clause and does not count.
+
+    Only a genuine keyword token can match, so a quoted ``"autoincrement"``,
+    which SQLite reads as an ordinary name, never does.
+    """
+    total = len(tokens)
+    for position in range(total - 1):
+        if tokens[position] != (_TOKEN_KEYWORD, "primary"):
+            continue
+        if tokens[position + 1] != (_TOKEN_KEYWORD, "key"):
+            continue
+        cursor = position + 2
+        while cursor < total:
+            kind, value = tokens[cursor]
+            if kind != _TOKEN_KEYWORD:
+                break
+            if value == "autoincrement":
+                return True
+            if value not in _PRIMARY_KEY_CLAUSE_KEYWORDS:
+                break
+            cursor += 1
+    return False
+
+
+def _reference_schema(
+    statements: tuple[str, ...],
+) -> tuple[_ObjectShape, ...]:
+    """Return the fingerprint a set of schema statements produces.
 
     The statements are built into a private in-memory database and described
     by the same function that describes a real one, so the expected shape is
