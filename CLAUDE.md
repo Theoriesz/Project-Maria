@@ -127,9 +127,9 @@ boundary.
 - `Maria/core/planner.py` — turns user input into structured `Plan` and `PlanStep` objects,
   and owns the no-action response copy and the help text.
 - `Maria/core/memory.py` — the **only production application module** that may import
-  `sqlite3` or execute SQL, and the only one that does. Guard tests cover this boundary in
-  several existing modules; keep it true. (Tests may connect to a temporary test database
-  directly when necessary — never to the live database.)
+  `sqlite3` or execute SQL, and the only one that does. One generalized guard test in
+  `Maria/tests/test_memory.py` enforces this boundary; keep it true. (Tests may connect
+  to a temporary test database directly when necessary — never to the live database.)
 - `Maria/core/permissions.py` — decides `ALLOWED` / `REQUIRES_CONFIRMATION` / `DENIED`.
 - `Maria/core/tool_manager.py` — discovers, loads, and dispatches tools.
 - `Maria/core/logger.py` — application logging only.

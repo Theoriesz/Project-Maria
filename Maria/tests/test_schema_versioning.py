@@ -120,16 +120,6 @@ DEPENDS_ON_MEMORIES = (
     "CREATE INDEX idx_probe_memories_created_at ON memories (created_at)"
 )
 
-# SQL that must not appear anywhere outside the memory boundary.
-SQL_STATEMENT = re.compile(
-    r"\b(?:SELECT\s+.+?\s+FROM|INSERT\s+INTO|UPDATE\s+\w+\s+SET|DELETE\s+FROM"
-    r"|CREATE\s+(?:UNIQUE\s+)?(?:TABLE|INDEX|VIEW|TRIGGER)|ALTER\s+TABLE"
-    r"|DROP\s+(?:TABLE|INDEX)|PRAGMA\s+\w+|BEGIN\s+IMMEDIATE|user_version"
-    r"|sqlite_master)\b",
-    re.IGNORECASE | re.DOTALL,
-)
-SQLITE_IMPORT = re.compile(r"(?m)^\s*(?:import|from)\s+sqlite3\b")
-
 
 class SchemaVersionConstantTests(unittest.TestCase):
     """Verify the schema version is its own number, not the app version."""
@@ -1049,55 +1039,6 @@ class MigrationLoggingTests(unittest.TestCase):
         for _identifier, fact, normalized, _created_at in BASELINE_MEMORIES:
             sentinels.extend((fact, normalized))
         assert_log_omits(self, self.log_file, sentinels)
-
-
-class SqlOwnershipGuardTests(unittest.TestCase):
-    """Verify the memory boundary is still the only place SQL lives."""
-
-    @staticmethod
-    def _production_modules() -> tuple[Path, ...]:
-        """Return every production module except the memory boundary itself."""
-        modules = (
-            sorted(( PROJECT_ROOT / "core").glob("*.py"))
-            + sorted((PROJECT_ROOT / "tools").glob("*.py"))
-            + [PROJECT_ROOT / "main.py"]
-        )
-        return tuple(
-            module
-            for module in modules
-            if module != PROJECT_ROOT / "core" / "memory.py"
-        )
-
-    def test_the_scan_actually_sees_the_production_modules(self) -> None:
-        scanned = {module.name for module in self._production_modules()}
-
-        self.assertIn("brain.py", scanned)
-        self.assertIn("main.py", scanned)
-        self.assertIn("notes.py", scanned)
-        self.assertNotIn("memory.py", {
-            module.name
-            for module in self._production_modules()
-            if module.parent.name == "core"
-        })
-
-    def test_no_production_module_outside_memory_imports_sqlite3(self) -> None:
-        for module in self._production_modules():
-            with self.subTest(module=module.name):
-                source = module.read_text(encoding="utf-8")
-                self.assertIsNone(SQLITE_IMPORT.search(source))
-
-    def test_no_production_module_outside_memory_contains_sql(self) -> None:
-        for module in self._production_modules():
-            with self.subTest(module=module.name):
-                source = module.read_text(encoding="utf-8")
-                found = [match.group(0) for match in SQL_STATEMENT.finditer(source)]
-                self.assertEqual(found, [])
-
-    def test_the_memory_boundary_is_where_the_schema_marker_is_read(self) -> None:
-        source = (PROJECT_ROOT / "core" / "memory.py").read_text(encoding="utf-8")
-
-        self.assertIn("PRAGMA user_version", source)
-        self.assertTrue(hasattr(Memory, "schema_version"))
 
 
 class LiveRuntimeGuardTests(unittest.TestCase):

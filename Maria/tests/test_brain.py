@@ -4,7 +4,6 @@ from __future__ import annotations
 
 import inspect
 import logging
-import re
 import unittest
 from typing import Any
 from unittest.mock import Mock, call
@@ -534,18 +533,9 @@ class MariaBrainTests(unittest.TestCase):
         )
         self.assertNotRegex(source, r"\.execute\s*\(")
 
-    def test_brain_contains_no_memory_specific_sql_or_command_dispatch(self) -> None:
+    def test_brain_contains_no_memory_specific_command_dispatch(self) -> None:
         source = inspect.getsource(brain_module)
 
-        self.assertNotRegex(source, r"(?m)^\s*(?:import|from)\s+sqlite3\b")
-        self.assertIsNone(
-            re.search(
-                r"\b(?:SELECT\s+.+?\s+FROM|INSERT\s+INTO|UPDATE\s+\w+\s+SET|"
-                r"DELETE\s+FROM|CREATE\s+TABLE|ALTER\s+TABLE|DROP\s+TABLE)\b",
-                source,
-                flags=re.IGNORECASE | re.DOTALL,
-            )
-        )
         for method_name in (
             "store_memory",
             "get_memory",

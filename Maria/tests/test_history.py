@@ -2,16 +2,13 @@
 
 from __future__ import annotations
 
-import inspect
 import logging
-import re
 import sqlite3
 import unittest
 from pathlib import Path
 from tempfile import TemporaryDirectory
 from unittest.mock import Mock, patch
 
-import tools.history as history_module
 from core.memory import Memory
 from core.tool_manager import ToolExecutionResult
 from tools.history import HistoryTool, build_tool
@@ -463,21 +460,6 @@ class HistoryToolTests(unittest.TestCase):
         self.assertNotIn(secret_input, logged_calls)
         self.assertNotIn(secret_response, logged_calls)
         self.assertNotIn(secret_query, logged_calls)
-
-    # --- sql ownership ----------------------------------------------------
-
-    def test_history_tool_contains_no_direct_sql_or_sqlite_import(self) -> None:
-        source = inspect.getsource(history_module)
-
-        self.assertNotRegex(source, r"(?m)^\s*(?:import|from)\s+sqlite3\b")
-        self.assertIsNone(
-            re.search(
-                r"\b(?:SELECT\s+.+?\s+FROM|INSERT\s+INTO|UPDATE\s+\w+\s+SET|"
-                r"DELETE\s+FROM|CREATE\s+TABLE|ALTER\s+TABLE|DROP\s+TABLE)\b",
-                source,
-                flags=re.IGNORECASE | re.DOTALL,
-            )
-        )
 
 
 if __name__ == "__main__":

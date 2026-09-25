@@ -2,9 +2,7 @@
 
 from __future__ import annotations
 
-import inspect
 import logging
-import re
 import tempfile
 import unittest
 from pathlib import Path
@@ -600,19 +598,6 @@ class MemoryToolTests(unittest.TestCase):
             self.assertNotIn("secret other fact", text)
             self.assertNotIn("secret new fact", text)
             self.assertNotIn("SECRET OTHER FACT", text)
-
-    def test_memory_tool_contains_no_direct_sql(self) -> None:
-        source = inspect.getsource(memory_tool_module)
-
-        self.assertNotRegex(source, r"(?m)^\s*(?:import|from)\s+sqlite3\b")
-        self.assertIsNone(
-            re.search(
-                r"\b(?:SELECT\s+.+?\s+FROM|INSERT\s+INTO|UPDATE\s+\w+\s+SET|"
-                r"DELETE\s+FROM|CREATE\s+TABLE|ALTER\s+TABLE|DROP\s+TABLE)\b",
-                source,
-                flags=re.IGNORECASE | re.DOTALL,
-            )
-        )
 
 
 def _quiet_logger(name: str) -> logging.Logger:
