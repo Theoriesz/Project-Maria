@@ -64,12 +64,25 @@ PRODUCTION_PACKAGES = ("core", "tools")
 PRODUCTION_ENTRY_POINTS = ("main.py",)
 TEST_PACKAGE = "tests"
 
-# Imports that reach SQLite. ``dbm`` and ``shelve`` are listed beside
-# ``sqlite3`` because Python 3.13 and later back both with SQLite by default.
-DATABASE_DRIVERS = frozenset({"sqlite3", "dbm", "shelve"})
+# Imports that reach SQLite. ``_sqlite3`` is the CPython extension ``sqlite3``
+# wraps, and ``dbm`` and ``shelve`` are listed because Python 3.13 and later
+# back both with SQLite by default.
+DATABASE_DRIVERS = frozenset({"sqlite3", "_sqlite3", "dbm", "shelve"})
+
+# The functions that import a module named by a string, and the standard
+# modules a caller can import them from under another name.
+DYNAMIC_IMPORT_FUNCTIONS = frozenset({"import_module", "__import__"})
+DYNAMIC_IMPORT_PROVIDERS = frozenset({"importlib", "builtins"})
 
 # The only name a module outside the memory boundary may import from it.
 MEMORY_FACADE = frozenset({"Memory"})
+
+# Names that, imported from the ``core`` package itself, would reach memory
+# without going through ``from core.memory import Memory``.
+CORE_MEMORY_ROUTES = frozenset({"memory", "Memory", "*"})
+
+# Calls whose first argument is a statement handed to SQLite.
+SQL_EXECUTION_METHODS = frozenset({"execute", "executemany", "executescript"})
 
 # One SQL name: quoted in any of SQLite's styles, a bare word, or the ``?``
 # that stands in for an f-string substitution.
@@ -116,6 +129,18 @@ SQL_STANDALONE_STATEMENT = re.compile(
     r"\s*(?:BEGIN|COMMIT|ROLLBACK|VACUUM"
     rf"|(?:SAVEPOINT|RELEASE|ROLLBACK\s+TO|DETACH|VACUUM)\s+{_SQL_NAME})"
     r"\s*;?\s*"
+)
+
+# A string handed to an execution method is a statement by position, so there
+# a short statement is recognised in any case: SQLite reads ``commit`` exactly
+# as it reads ``COMMIT``. Each ``;``-separated statement is judged on its own.
+SQL_EXECUTED_STATEMENT = re.compile(
+    r"\s*(?:(?:BEGIN(?:\s+(?:DEFERRED|IMMEDIATE|EXCLUSIVE))?|COMMIT|END|ROLLBACK)"
+    r"(?:\s+TRANSACTION)?"
+    r"|(?:SAVEPOINT|RELEASE(?:\s+SAVEPOINT)?|ROLLBACK(?:\s+TRANSACTION)?\s+TO"
+    rf"(?:\s+SAVEPOINT)?|DETACH(?:\s+DATABASE)?)\s+{_SQL_NAME}"
+    rf"|(?:VACUUM|ANALYZE|REINDEX)(?:\s+{_SQL_NAME})?)\s*",
+    re.IGNORECASE,
 )
 
 
@@ -1876,11 +1901,7 @@ class SqlOwnershipBoundaryTests(unittest.TestCase):
 
     def _modules_outside_the_boundary(self) -> tuple[Path, ...]:
         """Return every production module outside the memory boundary."""
-        modules = tuple(
-            module
-            for module in production_modules()
-            if not inside_memory_boundary(module)
-        )
+        modules = modules_outside_memory_boundary()
         # A scan that reached nothing would pass by reaching nothing.
         self.assertGreater(len(modules), 0)
         return modules
@@ -2012,6 +2033,47 @@ class SqlOwnershipBoundaryTests(unittest.TestCase):
             ("import sqlite3_helpers", []),
             ("from sqlite3_helpers import connect", []),
             ('"""Why nothing here imports sqlite3."""\n# import sqlite3', []),
+            ("import _sqlite3", ["_sqlite3"]),
+            ("from _sqlite3 import connect", ["_sqlite3"]),
+            ('importlib.import_module("_sqlite3")', ["_sqlite3"]),
+            ("import _sqlite3_helpers", []),
+            ('import importlib\nimportlib.import_module("sqlite3")', ["sqlite3"]),
+            (
+                'import importlib\nimportlib.import_module(name="sqlite3")',
+                ["sqlite3"],
+            ),
+            ('import importlib as il\nil.import_module("sqlite3")', ["sqlite3"]),
+            (
+                'from importlib import import_module\nimport_module("sqlite3")',
+                ["sqlite3"],
+            ),
+            (
+                'from importlib import import_module as load\nload("sqlite3")',
+                ["sqlite3"],
+            ),
+            (
+                'from importlib import import_module as load\nload(name="_sqlite3")',
+                ["_sqlite3"],
+            ),
+            (
+                'from importlib import import_module as load\nload("dbm")',
+                ["dbm"],
+            ),
+            (
+                'from importlib import import_module as load\nload("shelve")',
+                ["shelve"],
+            ),
+            ('__import__(name="sqlite3")', ["sqlite3"]),
+            ('import builtins\nbuiltins.__import__("shelve")', ["shelve"]),
+            ('from builtins import __import__ as fetch\nfetch("dbm")', ["dbm"]),
+            (
+                'import importlib\nload = importlib.import_module\nload("sqlite3")',
+                ["sqlite3"],
+            ),
+            ('importlib.import_module("sql" + "ite3")', ["sqlite3"]),
+            ('load("sqlite3")', []),
+            ('from json import load\nload("sqlite3")', []),
+            ("importlib.import_module(module_name)", []),
         ):
             with self.subTest(driver_source=source):
                 self.assertEqual(
@@ -2047,6 +2109,44 @@ class SqlOwnershipBoundaryTests(unittest.TestCase):
             with self.subTest(sql_source=source):
                 self.assertNotEqual(executable_sql(ast.parse(source)), [])
 
+        # Handed to an execution method, a short statement is SQL in any case.
+        for statement in (
+            "commit",
+            "COMMIT",
+            "Commit",
+            "rollback",
+            "ROLLBACK",
+            "RollBack",
+            "begin",
+            "BEGIN",
+            "Begin",
+            "begin immediate transaction",
+            "end",
+            "End Transaction",
+            "vacuum",
+            "savepoint step",
+            "release step",
+            "release savepoint step",
+            "rollback to step",
+            "detach backup",
+            "analyze",
+        ):
+            for method in sorted(SQL_EXECUTION_METHODS):
+                source = f'connection.{method}("{statement}")'
+                with self.subTest(executed_source=source):
+                    self.assertEqual(
+                        executable_sql(ast.parse(source)),
+                        [statement],
+                    )
+        for source, expected in (
+            ('connection.executescript("begin; commit;")', ["begin; commit;"]),
+            ('connection.execute("com" "mit")', ["commit"]),
+            ('connection.execute("com" + "mit")', ["commit"]),
+            ('connection.execute(f"rollback")', ["rollback"]),
+        ):
+            with self.subTest(executed_source=source):
+                self.assertEqual(executable_sql(ast.parse(source)), expected)
+
         for source in (
             '"""SELECT id FROM notes, in a module docstring."""',
             'class Probe:\n    """DELETE FROM notes WHERE id = ?, in a class."""',
@@ -2070,6 +2170,14 @@ class SqlOwnershipBoundaryTests(unittest.TestCase):
             'MESSAGE = "Detach the reminder."',
             'MESSAGE = "Pragma notes apply."',
             'MESSAGE = f"Updated memory {memory_id}."',
+            'MESSAGE = "commit"',
+            'MESSAGE = "Rollback"',
+            'print("begin")',
+            'logger.info("Vacuum")',
+            'tool.execute("list", {})',
+            'tool.execute("delete", {"id": 1})',
+            "connection.execute(statement)",
+            'connection.execute(f"{statement}")',
         ):
             with self.subTest(not_sql_source=source):
                 self.assertEqual(executable_sql(ast.parse(source)), [])
@@ -2097,6 +2205,36 @@ class SqlOwnershipBoundaryTests(unittest.TestCase):
             ("import tools.memory", []),
             ("from tools.memory import MemoryTool", []),
             ("from core import brain", []),
+            ("from core import Memory", ["core.Memory"]),
+            ("from core import *", ["core.*"]),
+            ("from . import Memory", ["core.Memory"]),
+            (
+                "import core\nvalue = core.memory._utc_timestamp",
+                ["core.memory._utc_timestamp"],
+            ),
+            ("import core\nstore = core.memory.Memory", ["core.memory.Memory"]),
+            ("import core\nmodule = core.memory", ["core.memory"]),
+            (
+                "import core.brain\nvalue = core.memory._MIGRATIONS",
+                ["core.memory._MIGRATIONS"],
+            ),
+            (
+                "import core as maria_core\nvalue = maria_core.memory._MIGRATIONS",
+                ["core.memory._MIGRATIONS"],
+            ),
+            (
+                'import core\nvalue = getattr(core, "memory")._connect',
+                ["core.memory._connect"],
+            ),
+            ('__import__(name="core.memory")', ["core.memory"]),
+            (
+                'from importlib import import_module as load\nload("core.memory")',
+                ["core.memory"],
+            ),
+            ("import core", []),
+            ("import core\nvalue = core.brain", []),
+            ('self.memory.store_memory("A fact")', []),
+            ("value = memory._utc_timestamp", []),
         ):
             with self.subTest(facade_source=source):
                 self.assertEqual(
@@ -2164,6 +2302,51 @@ class SqlOwnershipBoundaryTests(unittest.TestCase):
             _write(package / "__init__.py", "")
             self.assertEqual(len(memory_boundary_shapes(root)), 2)
 
+        # The combined regressions: one outside module reaches SQLite only
+        # through an aliased dynamic import and a lowercase statement, and
+        # another walks from an aliased ``core`` package into memory. Both are
+        # among the modules the guard checks, and both are reported there.
+        with TemporaryDirectory() as directory:
+            root = Path(directory)
+            _write(root / "main.py", "")
+            _write(root / "core" / "__init__.py", "")
+            _write(root / "core" / "memory.py", "import sqlite3\n")
+            database_probe = root / "core" / "database_probe.py"
+            _write(
+                database_probe,
+                "from importlib import import_module as load\n"
+                "\n"
+                'database = load("sqlite3")\n'
+                'connection = database.connect("example.db")\n'
+                'connection.execute("commit")\n',
+            )
+            facade_probe = root / "tools" / "facade_probe.py"
+            _write(
+                facade_probe,
+                "import core as maria_core\n"
+                "value = maria_core.memory._MIGRATIONS\n",
+            )
+
+            checked = modules_outside_memory_boundary(root)
+            self.assertIn(database_probe, checked)
+            self.assertIn(facade_probe, checked)
+            probe_tree = _parse(database_probe)
+            self.assertEqual(
+                database_driver_imports(
+                    probe_tree,
+                    _package_of(database_probe, root),
+                ),
+                ["sqlite3"],
+            )
+            self.assertEqual(executable_sql(probe_tree), ["commit"])
+            self.assertEqual(
+                memory_facade_bypasses(
+                    _parse(facade_probe),
+                    _package_of(facade_probe, root),
+                ),
+                ["core.memory._MIGRATIONS"],
+            )
+
 
 def production_modules(maria_root: Path = MARIA_ROOT) -> tuple[Path, ...]:
     """Return every production module, found rather than listed.
@@ -2210,6 +2393,17 @@ def inside_memory_boundary(module: Path, maria_root: Path = MARIA_ROOT) -> bool:
     return module == boundary.with_suffix(".py") or boundary in module.parents
 
 
+def modules_outside_memory_boundary(
+    maria_root: Path = MARIA_ROOT,
+) -> tuple[Path, ...]:
+    """Return every production module the ownership checks apply to."""
+    return tuple(
+        module
+        for module in production_modules(maria_root)
+        if not inside_memory_boundary(module, maria_root)
+    )
+
+
 def memory_boundary_shapes(maria_root: Path = MARIA_ROOT) -> tuple[Path, ...]:
     """Return each memory-boundary shape present: the module, the package, or both."""
     boundary = maria_root / "core" / "memory"
@@ -2229,9 +2423,11 @@ def imported_modules(
     ``import a.b`` gives ``("a.b", ())`` and ``from a import x`` gives
     ``("a", ("x",))``. A relative import is resolved against ``package``, and
     one reaching above the production tree is left out because it cannot
-    import anything. ``__import__`` and ``import_module`` count when the module
-    they name is a literal. Nothing is imported or run to find any of this out.
+    import anything. A dynamic import counts when its function is recognisably
+    an import function and the module it names is a literal, passed by
+    position or as ``name=``. Nothing is imported or run to find any of this out.
     """
+    importers = _dynamic_importers(tree)
     found: list[tuple[str, tuple[str, ...]]] = []
     for node in ast.walk(tree):
         if isinstance(node, ast.Import):
@@ -2240,8 +2436,10 @@ def imported_modules(
             module = _absolute_module(node, package)
             if module is not None:
                 found.append((module, tuple(alias.name for alias in node.names)))
-        elif isinstance(node, ast.Call) and _is_literal_dynamic_import(node):
-            found.append((node.args[0].value, ()))
+        elif isinstance(node, ast.Call):
+            module = _dynamically_imported_module(node, importers)
+            if module is not None:
+                found.append((module, ()))
     return found
 
 
@@ -2261,16 +2459,20 @@ def memory_facade_bypasses(
     tree: ast.Module,
     package: tuple[str, ...] = (),
 ) -> list[str]:
-    """Return every import that reaches memory other than through its facade.
+    """Return every route that reaches memory other than through its facade.
 
     Only ``from core.memory import Memory`` is allowed. Importing the module
-    object, a submodule, a private name, or everything at once would let a
-    caller reach past ``Memory`` into what it owns.
+    object, a submodule, a private name, or everything at once, importing
+    memory's names from the ``core`` package instead, or walking to
+    ``core.memory`` from an imported ``core`` package would each let a caller
+    reach past ``Memory`` into what it owns.
     """
     bypasses: list[str] = []
     for module, names in imported_modules(tree, package):
-        if module == "core" and "memory" in names:
-            bypasses.append("core.memory")
+        if module == "core":
+            bypasses.extend(
+                f"core.{name}" for name in names if name in CORE_MEMORY_ROUTES
+            )
         elif module == "core.memory" and names:
             bypasses.extend(
                 f"core.memory.{name}"
@@ -2279,6 +2481,7 @@ def memory_facade_bypasses(
             )
         elif module == "core.memory" or module.startswith("core.memory."):
             bypasses.append(module)
+    bypasses.extend(_core_memory_attribute_routes(tree))
     return bypasses
 
 
@@ -2300,12 +2503,21 @@ def runnable_strings(tree: ast.Module) -> list[str]:
 
 
 def executable_sql(tree: ast.Module) -> list[str]:
-    """Return every runnable string in a module that is a SQL statement."""
-    return [
+    """Return every runnable string in a module that is a SQL statement.
+
+    Anywhere in a module, a string is SQL when it has a statement's shape, and
+    a statement that can be a single word counts only when written in
+    capitals, so a message that is just "Commit" is not mistaken for one. A
+    string handed to an execution method is a statement by its position, so
+    there a short statement is recognised in any case.
+    """
+    statements = [text for text in runnable_strings(tree) if _is_sql(text)]
+    statements.extend(
         text
-        for text in runnable_strings(tree)
-        if SQL_STATEMENT.search(text) or SQL_STANDALONE_STATEMENT.fullmatch(text)
-    ]
+        for text in _executed_statements(tree)
+        if not _is_sql(text) and _is_executed_sql(text)
+    )
+    return statements
 
 
 def _python_files(directory: Path) -> list[Path]:
@@ -2344,21 +2556,173 @@ def _absolute_module(
     return ".".join(base + tuple(node.module.split(".") if node.module else ()))
 
 
-def _is_literal_dynamic_import(node: ast.Call) -> bool:
-    """Return whether a call dynamically imports a literal, absolute module."""
-    function = node.func
-    if isinstance(function, ast.Name):
-        name = function.id
-    elif isinstance(function, ast.Attribute):
-        name = function.attr
+def _dynamic_importers(tree: ast.Module) -> frozenset[str]:
+    """Return every bare name a call can use to import a module dynamically.
+
+    ``import_module`` and ``__import__`` always count. So does a name an import
+    from ``importlib`` or ``builtins`` binds to one of them, such as ``load``
+    in ``from importlib import import_module as load``, and a name a plain
+    assignment binds to one. An attribute call needs no binding: an attribute
+    named ``import_module`` or ``__import__`` counts whatever it is looked up
+    on, which covers ``importlib`` and every alias of it. Data flow beyond a
+    direct assignment - a container, a return value, ``getattr`` - is not
+    followed.
+    """
+    importers = set(DYNAMIC_IMPORT_FUNCTIONS)
+    for node in ast.walk(tree):
+        if (
+            isinstance(node, ast.ImportFrom)
+            and node.level == 0
+            and node.module in DYNAMIC_IMPORT_PROVIDERS
+        ):
+            importers.update(
+                alias.asname or alias.name
+                for alias in node.names
+                if alias.name in DYNAMIC_IMPORT_FUNCTIONS
+            )
+
+    assignments = [
+        (target.id, node.value)
+        for node in ast.walk(tree)
+        if isinstance(node, (ast.Assign, ast.AnnAssign)) and node.value is not None
+        for target in (
+            node.targets if isinstance(node, ast.Assign) else (node.target,)
+        )
+        if isinstance(target, ast.Name)
+    ]
+    # One assignment can alias another, so repeat until nothing new is bound.
+    growing = True
+    while growing:
+        growing = False
+        for name, value in assignments:
+            if name not in importers and _is_import_function(value, importers):
+                importers.add(name)
+                growing = True
+    return frozenset(importers)
+
+
+def _is_import_function(node: ast.AST, importers: set[str] | frozenset[str]) -> bool:
+    """Return whether an expression names a function that imports by string."""
+    if isinstance(node, ast.Name):
+        return node.id in importers
+    return isinstance(node, ast.Attribute) and node.attr in DYNAMIC_IMPORT_FUNCTIONS
+
+
+def _dynamically_imported_module(
+    node: ast.Call,
+    importers: frozenset[str],
+) -> str | None:
+    """Return the literal, absolute module a call imports, or None if none."""
+    if not _is_import_function(node.func, importers):
+        return None
+    if node.args and not isinstance(node.args[0], ast.Starred):
+        argument: ast.AST | None = node.args[0]
     else:
-        return False
+        argument = next(
+            (keyword.value for keyword in node.keywords if keyword.arg == "name"),
+            None,
+        )
+    module = None if argument is None else _literal_text(argument)
+    if module is None or module.startswith("."):
+        return None
+    return module
+
+
+def _core_memory_attribute_routes(tree: ast.Module) -> list[str]:
+    """Return every attribute route from an imported ``core`` package to memory.
+
+    ``import core``, ``import core as alias``, and ``import core.brain`` all
+    bind the package, and once anything has imported ``core.memory`` it is an
+    attribute of that package, so a caller holding the package could walk
+    past the facade. Every such route counts, ``getattr`` with a literal
+    ``"memory"`` included.
+    """
+    packages = _core_package_names(tree)
+    if not packages:
+        return []
+    routes: list[str] = []
+    continued: set[int] = set()
+    # The walk visits an outer attribute before the ``core.memory`` inside it,
+    # so a route that goes on to a name is reported once, with that name.
+    for node in ast.walk(tree):
+        if isinstance(node, ast.Attribute) and _is_core_memory(node.value, packages):
+            routes.append(f"core.memory.{node.attr}")
+            continued.add(id(node.value))
+        elif _is_core_memory(node, packages) and id(node) not in continued:
+            routes.append("core.memory")
+    return routes
+
+
+def _core_package_names(tree: ast.Module) -> set[str]:
+    """Return every name an ``import`` statement binds to the ``core`` package."""
+    names: set[str] = set()
+    for node in ast.walk(tree):
+        if not isinstance(node, ast.Import):
+            continue
+        for alias in node.names:
+            if alias.asname is None and alias.name.partition(".")[0] == "core":
+                names.add("core")
+            elif alias.asname is not None and alias.name == "core":
+                names.add(alias.asname)
+    return names
+
+
+def _is_core_memory(node: ast.AST, packages: set[str]) -> bool:
+    """Return whether an expression reaches ``core.memory`` through the package."""
+    if isinstance(node, ast.Attribute):
+        return (
+            node.attr == "memory"
+            and isinstance(node.value, ast.Name)
+            and node.value.id in packages
+        )
     return (
-        name in {"__import__", "import_module"}
-        and bool(node.args)
-        and isinstance(node.args[0], ast.Constant)
-        and isinstance(node.args[0].value, str)
-        and not node.args[0].value.startswith(".")
+        isinstance(node, ast.Call)
+        and isinstance(node.func, ast.Name)
+        and node.func.id == "getattr"
+        and len(node.args) >= 2
+        and isinstance(node.args[0], ast.Name)
+        and node.args[0].id in packages
+        and _literal_text(node.args[1]) == "memory"
+    )
+
+
+def _executed_statements(tree: ast.Module) -> list[str]:
+    """Return the text of every statement handed to an execution method."""
+    statements: list[str] = []
+    for node in ast.walk(tree):
+        if (
+            isinstance(node, ast.Call)
+            and _callable_name(node.func) in SQL_EXECUTION_METHODS
+            and node.args
+        ):
+            text = _string_text(node.args[0])
+            if text is not None:
+                statements.append(text)
+    return statements
+
+
+def _callable_name(function: ast.AST) -> str | None:
+    """Return the final name a call is made through, such as ``execute``."""
+    if isinstance(function, ast.Name):
+        return function.id
+    if isinstance(function, ast.Attribute):
+        return function.attr
+    return None
+
+
+def _is_sql(text: str) -> bool:
+    """Return whether a string is SQL wherever in a module it appears."""
+    return bool(
+        SQL_STATEMENT.search(text) or SQL_STANDALONE_STATEMENT.fullmatch(text)
+    )
+
+
+def _is_executed_sql(text: str) -> bool:
+    """Return whether a string handed to an execution method is a short statement."""
+    return any(
+        SQL_EXECUTED_STATEMENT.fullmatch(statement)
+        for statement in text.split(";")
+        if statement.strip()
     )
 
 
@@ -2399,6 +2763,25 @@ def _string_text(node: ast.AST) -> str | None:
         if left is None and right is None:
             return None
         return ("?" if left is None else left) + ("?" if right is None else right)
+    return None
+
+
+def _literal_text(node: ast.AST) -> str | None:
+    """Return a string expression's value if it is known without running it.
+
+    That is a literal, an f-string with no substitution, or a ``+`` chain of
+    those. Unlike ``_string_text`` nothing is stood in for: a value computed
+    at run time makes the whole expression unknown.
+    """
+    if isinstance(node, ast.Constant):
+        return node.value if isinstance(node.value, str) else None
+    if isinstance(node, ast.JoinedStr):
+        parts = [_literal_text(part) for part in node.values]
+        return None if None in parts else "".join(parts)
+    if isinstance(node, ast.BinOp) and isinstance(node.op, ast.Add):
+        left = _literal_text(node.left)
+        right = _literal_text(node.right)
+        return None if left is None or right is None else left + right
     return None
 
 
