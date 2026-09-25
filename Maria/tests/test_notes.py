@@ -2,15 +2,12 @@
 
 from __future__ import annotations
 
-import inspect
 import logging
-import re
 import unittest
 from pathlib import Path
 from tempfile import TemporaryDirectory
 from unittest.mock import Mock, patch
 
-import tools.notes as notes_module
 from core.memory import Memory
 from core.tool_manager import ToolExecutionResult
 from tools.notes import NotesTool, build_tool
@@ -661,19 +658,6 @@ class NotesToolTests(unittest.TestCase):
         self.assertTrue(result.success)
         logged_calls = " ".join(str(entry) for entry in self.logger.method_calls)
         self.assertNotIn(distinctive_body, logged_calls)
-
-    def test_notes_tool_contains_no_direct_sql_or_sqlite_import(self) -> None:
-        source = inspect.getsource(notes_module)
-
-        self.assertNotRegex(source, r"(?m)^\s*(?:import|from)\s+sqlite3\b")
-        self.assertIsNone(
-            re.search(
-                r"\b(?:SELECT\s+.+?\s+FROM|INSERT\s+INTO|UPDATE\s+\w+\s+SET|"
-                r"DELETE\s+FROM|CREATE\s+TABLE|ALTER\s+TABLE|DROP\s+TABLE)\b",
-                source,
-                flags=re.IGNORECASE | re.DOTALL,
-            )
-        )
 
 
 if __name__ == "__main__":

@@ -4,7 +4,6 @@ from __future__ import annotations
 
 import inspect
 import logging
-import re
 import tempfile
 import unittest
 from pathlib import Path
@@ -173,7 +172,7 @@ class BrainMemoryIntegrationTests(unittest.TestCase):
         )
         self.assertEqual(memories.text, f"{memory_id}: {original_fact}")
 
-    def test_brain_contains_no_memory_specific_dispatch_or_sql(self) -> None:
+    def test_brain_contains_no_memory_specific_dispatch(self) -> None:
         source = inspect.getsource(brain_module)
 
         for method_name in (
@@ -184,15 +183,6 @@ class BrainMemoryIntegrationTests(unittest.TestCase):
         ):
             with self.subTest(method_name=method_name):
                 self.assertNotIn(method_name, source)
-        self.assertNotRegex(source, r"(?m)^\s*(?:import|from)\s+sqlite3\b")
-        self.assertIsNone(
-            re.search(
-                r"\b(?:SELECT\s+.+?\s+FROM|INSERT\s+INTO|UPDATE\s+\w+\s+SET|"
-                r"DELETE\s+FROM|CREATE\s+TABLE|ALTER\s+TABLE|DROP\s+TABLE)\b",
-                source,
-                flags=re.IGNORECASE | re.DOTALL,
-            )
-        )
         self.assertNotRegex(
             source,
             r"(?:tool_name|step\.tool_name)\s*==\s*['\"]memory['\"]",
