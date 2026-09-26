@@ -630,16 +630,19 @@ class _LegacyInterleavedBrain(MariaBrain):
 
     This reproduces the V1-04 loop verbatim: it resolved one step's
     permission and dispatched that same step before looking at the next
-    one. Nothing in Maria uses it. The equivalence test below runs the same
-    real single-step commands through it and through the real controller,
-    then compares the interaction rows each run produced.
+    one. The only adaptation is that it hands the whole plan to the
+    recording helper, whose signature changed in V1-11; every plan it runs
+    keeps the default recording policy. Nothing in Maria uses it. The
+    equivalence test below runs the same real single-step commands through
+    it and through the real controller, then compares the interaction rows
+    each run produced.
     """
 
     def _run_plan(self, plan: Plan, *, confirmed: bool) -> BrainResponse:
         """Resolve and dispatch one step at a time, as V1-04 did."""
         if not plan.steps:
             response = plan.response_if_no_action or "I do not know how to handle that yet."
-            self._record_interaction(plan.original_request, response)
+            self._record_interaction(plan, response)
             return BrainResponse(response, plan=plan)
 
         results: list[ToolExecutionResult] = []
@@ -649,7 +652,7 @@ class _LegacyInterleavedBrain(MariaBrain):
 
             if permission.decision == PermissionDecision.DENIED:
                 response = f"Permission denied: {permission.reason}"
-                self._record_interaction(plan.original_request, response)
+                self._record_interaction(plan, response)
                 return BrainResponse(response, plan=plan)
 
             if (
@@ -674,7 +677,7 @@ class _LegacyInterleavedBrain(MariaBrain):
 
         response = self._format_results(results)
         self._record_interaction(
-            plan.original_request,
+            plan,
             self._format_recorded_results(results),
         )
         return BrainResponse(response, plan=plan)

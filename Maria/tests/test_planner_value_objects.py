@@ -2,12 +2,14 @@
 
 from __future__ import annotations
 
+import dataclasses
+import hashlib
 import logging
 import unittest
 from types import MappingProxyType
 from typing import Any
 
-from core.planner import Plan, PlanArguments, Planner, PlanStep
+from core.planner import Plan, PlanArguments, Planner, PlanStep, RecordingPolicy
 
 
 SENTINEL_REQUEST = "sentinel-request-4f7a21c8e9"
@@ -20,6 +22,27 @@ NO_ACTION_FINGERPRINT = (
 )
 SINGLE_STEP_FINGERPRINT = (
     "1a6b3bd0ced2c697281afe009cbcb6b79d9a61e0e670c58532fff82eeef997b3"
+)
+TRANSIENT_NO_ACTION_FINGERPRINT = (
+    "14bea83058b03660145137c624a08014d7e993c63d3928cff08e837f3a9a286a"
+)
+
+# The canonical bytes each golden digest above is the SHA-256 of, written
+# out by hand so the recording policy's place in the format is stated rather
+# than inferred from the implementation. A default plan carries no recording
+# key at all.
+NO_ACTION_CANONICAL = (
+    b'{"original_request":"help",'
+    b'"response_if_no_action":"Supported commands","steps":[]}'
+)
+SINGLE_STEP_CANONICAL = (
+    b'{"original_request":"remember My Fact","response_if_no_action":null,'
+    b'"steps":[{"action":"store","arguments":{"fact":"My Fact"},'
+    b'"tool_name":"memory"}]}'
+)
+TRANSIENT_NO_ACTION_CANONICAL = (
+    b'{"original_request":"help","recording":"transient",'
+    b'"response_if_no_action":"Supported commands","steps":[]}'
 )
 
 
@@ -192,6 +215,178 @@ class PlanFingerprintTests(unittest.TestCase):
             {name for name in public_names if "canonical" in name or "payload" in name},
             set(),
         )
+
+
+class PlanRecordingPolicyTests(unittest.TestCase):
+    """Verify the plan-level recording policy as part of the value object."""
+
+    def setUp(self) -> None:
+        self.step = PlanStep("memory", "store", {"fact": "My Fact"})
+
+    def test_the_policy_has_exactly_two_members(self) -> None:
+        self.assertEqual(
+            {member.name: member.value for member in RecordingPolicy},
+            {"RECORD": "record", "TRANSIENT": "transient"},
+        )
+
+    def test_default_policy_is_record(self) -> None:
+        for plan in (
+            Plan("help", ()),
+            Plan("help", (), "Supported commands"),
+            Plan("remember My Fact", (self.step,)),
+        ):
+            with self.subTest(plan=plan.original_request):
+                self.assertIs(plan.recording, RecordingPolicy.RECORD)
+
+    def test_existing_positional_construction_is_unchanged(self) -> None:
+        plan = Plan("remember My Fact", (self.step,), "unused response")
+
+        self.assertEqual(plan.original_request, "remember My Fact")
+        self.assertEqual(plan.steps, (self.step,))
+        self.assertEqual(plan.response_if_no_action, "unused response")
+        self.assertIs(plan.recording, RecordingPolicy.RECORD)
+
+    def test_explicit_record_is_indistinguishable_from_the_default(self) -> None:
+        pairs = (
+            (
+                Plan("help", (), "Supported commands"),
+                Plan("help", (), "Supported commands", RecordingPolicy.RECORD),
+            ),
+            (
+                Plan("remember My Fact", (self.step,)),
+                Plan(
+                    "remember My Fact",
+                    (self.step,),
+                    recording=RecordingPolicy.RECORD,
+                ),
+            ),
+        )
+
+        for default, explicit in pairs:
+            with self.subTest(plan=default.original_request):
+                self.assertEqual(default, explicit)
+                self.assertEqual(hash(default), hash(explicit))
+                self.assertEqual(default.fingerprint, explicit.fingerprint)
+
+    def test_default_plans_keep_their_recorded_golden_digests(self) -> None:
+        self.assertEqual(
+            Plan("help", (), "Supported commands", RecordingPolicy.RECORD).fingerprint,
+            NO_ACTION_FINGERPRINT,
+        )
+        self.assertEqual(
+            Plan(
+                "remember My Fact",
+                (self.step,),
+                recording=RecordingPolicy.RECORD,
+            ).fingerprint,
+            SINGLE_STEP_FINGERPRINT,
+        )
+
+    def test_golden_digests_hash_the_written_out_canonical_bytes(self) -> None:
+        for canonical, digest in (
+            (NO_ACTION_CANONICAL, NO_ACTION_FINGERPRINT),
+            (SINGLE_STEP_CANONICAL, SINGLE_STEP_FINGERPRINT),
+            (TRANSIENT_NO_ACTION_CANONICAL, TRANSIENT_NO_ACTION_FINGERPRINT),
+        ):
+            with self.subTest(digest=digest):
+                self.assertEqual(hashlib.sha256(canonical).hexdigest(), digest)
+
+    def test_transient_fingerprint_matches_its_recorded_canonical_value(self) -> None:
+        transient = Plan(
+            "help",
+            (),
+            "Supported commands",
+            recording=RecordingPolicy.TRANSIENT,
+        )
+
+        self.assertEqual(transient.fingerprint, TRANSIENT_NO_ACTION_FINGERPRINT)
+
+    def test_transient_plans_differ_from_otherwise_identical_default_plans(
+        self,
+    ) -> None:
+        pairs = (
+            (
+                Plan("help", (), "Supported commands"),
+                Plan(
+                    "help",
+                    (),
+                    "Supported commands",
+                    recording=RecordingPolicy.TRANSIENT,
+                ),
+            ),
+            (
+                Plan("remember My Fact", (self.step,)),
+                Plan(
+                    "remember My Fact",
+                    (self.step,),
+                    recording=RecordingPolicy.TRANSIENT,
+                ),
+            ),
+        )
+
+        for default, transient in pairs:
+            with self.subTest(plan=default.original_request):
+                self.assertNotEqual(default, transient)
+                self.assertNotEqual(default.fingerprint, transient.fingerprint)
+                self.assertEqual(len({default, transient}), 2)
+
+    def test_structurally_equal_transient_plans_share_one_fingerprint(self) -> None:
+        first = Plan("help", (), "Supported commands", RecordingPolicy.TRANSIENT)
+        second = Plan("help", (), "Supported commands", RecordingPolicy.TRANSIENT)
+
+        self.assertEqual(first, second)
+        self.assertEqual(hash(first), hash(second))
+        self.assertEqual(first.fingerprint, second.fingerprint)
+
+    def test_values_that_are_not_exactly_a_policy_member_are_refused(self) -> None:
+        spoof = _ClassSpoofingPolicy()
+        refused: tuple[Any, ...] = (
+            "record",
+            "transient",
+            "RECORD",
+            "TRANSIENT",
+            _TextSubclass("transient"),
+            b"transient",
+            True,
+            False,
+            None,
+            0,
+            1,
+            RecordingPolicy,
+            spoof,
+        )
+
+        # The spoof defeats an isinstance check, which is why the plan has to
+        # check the exact type instead.
+        self.assertIsInstance(spoof, RecordingPolicy)
+        for value in refused:
+            with self.subTest(value=type(value).__name__):
+                with self.assertRaises(TypeError) as raised:
+                    Plan("help", (), "Supported commands", value)
+
+                self.assertEqual(
+                    str(raised.exception),
+                    "Plan recording policy must be a RecordingPolicy.",
+                )
+
+    def test_rebuilding_a_plan_revalidates_its_policy(self) -> None:
+        plan = Plan("help", (), "Supported commands")
+
+        with self.assertRaises(TypeError):
+            dataclasses.replace(plan, recording="transient")
+
+        rebuilt = dataclasses.replace(plan, recording=RecordingPolicy.TRANSIENT)
+        self.assertIs(rebuilt.recording, RecordingPolicy.TRANSIENT)
+        self.assertIs(plan.recording, RecordingPolicy.RECORD)
+
+    def test_the_policy_of_a_constructed_plan_cannot_be_reassigned(self) -> None:
+        plan = Plan("help", (), "Supported commands")
+
+        with self.assertRaises(dataclasses.FrozenInstanceError):
+            plan.recording = RecordingPolicy.TRANSIENT
+
+        self.assertIs(plan.recording, RecordingPolicy.RECORD)
+        self.assertEqual(plan.fingerprint, NO_ACTION_FINGERPRINT)
 
 
 class PlanStepImmutabilityTests(unittest.TestCase):
@@ -729,6 +924,19 @@ class _MutablePlanArguments(PlanArguments):
     def __hash__(self) -> int:
         """Hash current backing content, so staleness would be visible."""
         return hash(frozenset(self.backing.items()))
+
+
+class _ClassSpoofingPolicy:
+    """An object that claims to be a RecordingPolicy through __class__."""
+
+    @property
+    def __class__(self) -> type:
+        """Report RecordingPolicy, which is enough to satisfy isinstance."""
+        return RecordingPolicy
+
+
+class _TextSubclass(str):
+    """A str subclass spelling a policy value."""
 
 
 class _RecordingHandler(logging.Handler):

@@ -20,7 +20,7 @@ from core.permissions import (
     PermissionManager,
     PermissionResult,
 )
-from core.planner import Plan, Planner, PlanStep
+from core.planner import Plan, Planner, PlanStep, RecordingPolicy
 from core.tool_manager import ToolExecutionResult, ToolManager
 
 
@@ -185,11 +185,13 @@ class MariaBrain:
         anywhere refuses the plan before PermissionManager is consulted at
         all. A denial anywhere denies the entire plan, and an outstanding
         confirmation anywhere holds the entire plan, so neither outcome can
-        arrive after a step already ran.
+        arrive after a step already ran. Every outcome that records goes
+        through _record_interaction, which honours the plan's recording
+        policy.
         """
         if not plan.steps:
             response = plan.response_if_no_action or "I do not know how to handle that yet."
-            self._record_interaction(plan.original_request, response)
+            self._record_interaction(plan, response)
             return BrainResponse(response, plan=plan)
 
         violation = self._validate_plan(plan)
@@ -202,7 +204,7 @@ class MariaBrain:
                 violation.field,
             )
             response = violation.message
-            self._record_interaction(plan.original_request, response)
+            self._record_interaction(plan, response)
             return BrainResponse(response, plan=plan)
 
         resolved = self._resolve_plan(plan)
@@ -215,7 +217,7 @@ class MariaBrain:
                 denied_step.step.action,
             )
             response = f"Permission denied: {denied_step.permission.reason}"
-            self._record_interaction(plan.original_request, response)
+            self._record_interaction(plan, response)
             return BrainResponse(response, plan=plan)
 
         awaiting_confirmation = resolved.confirmation_required_steps
@@ -314,15 +316,24 @@ class MariaBrain:
 
         response = self._format_results(results)
         self._record_interaction(
-            resolved.plan.original_request,
+            resolved.plan,
             self._format_recorded_results(results),
         )
         return BrainResponse(response, plan=resolved.plan)
 
-    def _record_interaction(self, user_input: str, response: str) -> None:
-        """Store an interaction without allowing memory failures to crash Maria."""
+    def _record_interaction(self, plan: Plan, response: str) -> None:
+        """Store a plan's interaction unless its producer made it transient.
+
+        This is Brain's only write to interaction history. It decides from
+        the plan's recording policy alone, never from a step's tool or
+        action or from a result's content. A transient plan writes no row at
+        all: neither its cleaned request nor any placeholder response. A
+        memory failure is logged rather than allowed to crash Maria.
+        """
+        if plan.recording is RecordingPolicy.TRANSIENT:
+            return
         try:
-            self.memory.record_interaction(user_input, response)
+            self.memory.record_interaction(plan.original_request, response)
         except RuntimeError as exc:
             self.logger.error("Unable to record interaction: %s", exc)
 

@@ -11,6 +11,7 @@ import hashlib
 import json
 from collections.abc import Iterator, Mapping
 from dataclasses import dataclass
+from enum import Enum
 from logging import Logger
 from types import MappingProxyType
 from typing import Any
@@ -117,13 +118,39 @@ class PlanStep:
         object.__setattr__(self, "arguments", PlanArguments(self.arguments))
 
 
+class RecordingPolicy(str, Enum):
+    """Whether Brain records a plan's interaction row."""
+
+    RECORD = "record"
+    TRANSIENT = "transient"
+
+
 @dataclass(frozen=True)
 class Plan:
-    """An executable plan created from user input."""
+    """An executable plan created from user input.
+
+    The recording policy defaults to RECORD, which is how every interaction
+    has always been recorded. TRANSIENT is a positive choice a plan's
+    producer makes explicitly, and it keeps the whole interaction row out of
+    history: the request as well as the response.
+    """
 
     original_request: str
     steps: tuple[PlanStep, ...]
     response_if_no_action: str | None = None
+    recording: RecordingPolicy = RecordingPolicy.RECORD
+
+    def __post_init__(self) -> None:
+        """Refuse any recording policy that is not exactly a RecordingPolicy.
+
+        The check is on the exact type, so neither a plain string nor an
+        object claiming the class through ``__class__`` passes. A string
+        would compare and hash equal to the member it spells while failing
+        every identity check made against that member, so it is refused
+        rather than coerced.
+        """
+        if type(self.recording) is not RecordingPolicy:
+            raise TypeError("Plan recording policy must be a RecordingPolicy.")
 
     @property
     def fingerprint(self) -> str:
@@ -147,8 +174,13 @@ class Plan:
         produce identical bytes whatever order their arguments were built
         in, while step order is preserved because steps stay a list.
         Escaping stays ASCII-only so that the payload always encodes.
+
+        The recording policy joins the payload only when it is not the
+        default. Every default plan therefore keeps exactly the bytes, and
+        the fingerprint, it had before the policy existed, while an otherwise
+        identical transient plan fingerprints differently.
         """
-        payload = {
+        payload: dict[str, Any] = {
             "original_request": self.original_request,
             "response_if_no_action": self.response_if_no_action,
             "steps": [
@@ -160,6 +192,8 @@ class Plan:
                 for step in self.steps
             ],
         }
+        if self.recording is not RecordingPolicy.RECORD:
+            payload["recording"] = self.recording.value
         return json.dumps(
             payload,
             sort_keys=True,
