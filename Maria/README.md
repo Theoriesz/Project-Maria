@@ -203,8 +203,10 @@ An enabled block must name all six active fields; none has a default and none
 is borrowed from the tracked file. `loopback` admits `127.0.0.0/8` and `::1`;
 `private_lan` admits `10.0.0.0/8`, `172.16.0.0/12`, `192.168.0.0/16`, and
 `fc00::/7`. The host is written as an address, never a name, in its canonical
-form. The model identifier is 1 to 128 ASCII letters, digits, or
-`. _ : / @ + -`, starting with a letter or digit. There is no setting for a
+form. The model identifier is an opaque label of 1 to 128 ASCII letters,
+digits, or `. _ : / @ + -`, starting with a letter or digit and never naming
+a Windows drive, so `publisher/model:tag` is accepted while
+`C:/models/local.gguf` is refused. There is no setting for a
 port, endpoint URL, model path, credential, token, or header, and any
 unknown key is refused. A missing, mistyped, out-of-range, or unknown value
 stops startup with the usual sanitized failure message, and nothing about the

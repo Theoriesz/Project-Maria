@@ -1462,6 +1462,26 @@ class LocalOverrideTests(unittest.TestCase):
             REASONING_MODEL_MESSAGE,
         )
 
+    def test_a_windows_drive_path_model_identifier_is_refused(self) -> None:
+        self._assert_values_refused(
+            "model",
+            (
+                '"C:/models/local.gguf"',
+                '"c:/models/local.gguf"',
+                "'Z:/m'",
+                '"C:models/local.gguf"',
+            ),
+            REASONING_MODEL_MESSAGE,
+        )
+
+    def test_opaque_model_labels_with_slashes_and_tags_are_accepted(
+        self,
+    ) -> None:
+        for model in ("publisher/model:tag", "llama3.1:8b"):
+            with self.subTest(model=model):
+                self._write_override(reasoning_block(model=f'"{model}"'))
+                self.assertEqual(self._load().reasoning.model, model)
+
     # Enumeration.
 
     def test_an_unknown_transport_class_is_refused(self) -> None:

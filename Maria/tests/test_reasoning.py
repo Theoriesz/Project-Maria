@@ -13,7 +13,9 @@ import ast
 import json
 import logging
 import tempfile
+import tracemalloc
 import unittest
+from collections.abc import Callable
 from dataclasses import FrozenInstanceError, fields
 from pathlib import Path
 from types import SimpleNamespace
@@ -51,6 +53,7 @@ from tests.log_assertions import assert_log_omits
 from tests.reasoning_fakes import (
     FAKE_EXCEPTION_SENTINEL,
     FAKE_PAYLOAD_SENTINEL,
+    OVERSIZED_BUDGET_MESSAGE,
     TRUNCATED_SOURCE,
     AdversarialReasoningProvider,
     HostileOutput,
@@ -66,6 +69,14 @@ HOST_SENTINEL = "fd4c:2b19:83a7::5e"
 MODEL_SENTINEL = "sentinel-model-4f8a2c:7b"
 
 OUTPUT_LIMIT = 4096
+
+# Text far larger than either hard ceiling. Encoding it would allocate a
+# buffer at least this many bytes long, which is what the bounded checks
+# must never do.
+HUGE_TEXT_LENGTH = 8 * max(
+    REASONING_MAXIMUM_INPUT_BYTES,
+    REASONING_MAXIMUM_OUTPUT_BYTES,
+)
 
 # Modules whose own import would give this interface a network, concurrency,
 # asynchronous, or process capability.
@@ -178,6 +189,25 @@ def forbidden_imports(source: str) -> set[str]:
     }
 
 
+def peak_allocation(action: Callable[[], object]) -> tuple[object, int]:
+    """Run an action and return its outcome and the peak bytes it allocated.
+
+    Anything the action raises is returned as its outcome, so a refusal can
+    be measured as well as a result. Only allocations made during the action
+    are traced; text built beforehand is not counted.
+    """
+    tracemalloc.start()
+    try:
+        try:
+            outcome: object = action()
+        except Exception as raised:  # noqa: BLE001 - measured, then asserted.
+            outcome = raised
+        peak = tracemalloc.get_traced_memory()[1]
+    finally:
+        tracemalloc.stop()
+    return outcome, peak
+
+
 def rendered(value: object) -> str:
     """Render a value through every ordinary formatting route at once."""
     return " ".join(
@@ -251,6 +281,32 @@ class ReasoningValueTests(unittest.TestCase):
                 # Fewer characters than the bound, but more bytes.
                 with self.assertRaises(ValueError):
                     value_type("\u00e9" * (maximum // 2 + 1))
+
+    def test_the_measurement_would_see_an_encoded_copy(self) -> None:
+        """Positive control for the no-copy tests below."""
+        huge = "a" * HUGE_TEXT_LENGTH
+
+        _, peak = peak_allocation(lambda: huge.encode("utf-8"))
+
+        self.assertGreaterEqual(peak, HUGE_TEXT_LENGTH)
+
+    def test_text_far_beyond_the_hard_ceiling_is_refused_without_a_copy(
+        self,
+    ) -> None:
+        huge = "a" * HUGE_TEXT_LENGTH
+        cases = (
+            (ReasoningRequest, REASONING_MAXIMUM_INPUT_BYTES, REASONING_PROMPT_MESSAGE),
+            (ReasoningResponse, REASONING_MAXIMUM_OUTPUT_BYTES, REASONING_TEXT_MESSAGE),
+        )
+        for value_type, ceiling, message in cases:
+            with self.subTest(value_type=value_type.__name__):
+                refused, peak = peak_allocation(lambda: value_type(huge))
+
+                self.assertIs(type(refused), ValueError)
+                self.assertEqual(str(refused), message)
+                # An encoded duplicate would need HUGE_TEXT_LENGTH bytes; the
+                # refusal must not allocate even one ceiling's worth.
+                self.assertLess(peak, ceiling)
 
     def test_no_route_shows_the_prompt_or_reply(self) -> None:
         for value in (
@@ -401,6 +457,30 @@ class ReasoningSettingsTests(unittest.TestCase):
                 with self.assertRaises(ValueError) as caught:
                     self._settings(model=model)
                 self.assertEqual(str(caught.exception), REASONING_MODEL_MESSAGE)
+
+    def test_windows_drive_paths_are_not_model_identifiers(self) -> None:
+        for model in (
+            "C:/models/local.gguf",
+            "c:/models/local.gguf",
+            "Z:/m",
+            "D:/",
+            "C:models/local.gguf",
+            "C:",
+        ):
+            with self.subTest(model=model):
+                with self.assertRaises(ValueError) as caught:
+                    self._settings(model=model)
+                self.assertEqual(str(caught.exception), REASONING_MODEL_MESSAGE)
+
+        for model in (
+            "publisher/model:tag",
+            "llama3.1:8b",
+            "hf.co/publisher/model:Q4_K_M",
+            "registry.lan:5000/publisher/model:tag",
+            "ab:c",
+        ):
+            with self.subTest(model=model):
+                self.assertEqual(self._settings(model=model).model, model)
 
     def test_integer_fields_are_exact_ints_within_their_range(self) -> None:
         cases = {
@@ -618,14 +698,76 @@ class RequestReasoningBoundaryTests(unittest.TestCase):
         self.assertEqual(result, Failure(FailureKind.REASONING_OUTPUT_OVER_BUDGET))
         self.assertEqual(provider.calls, 1)
 
-    def test_a_reply_too_large_to_exist_is_contained_as_unavailable(self) -> None:
+    def test_oversized_output_at_the_hard_ceiling_is_over_budget(self) -> None:
+        # The largest budget the fake accepts makes it emit a reply exactly
+        # as large as the hard ceiling: a valid response that only the
+        # configured budget refuses, never a construction failure reported
+        # as unavailability.
+        budget = REASONING_MAXIMUM_OUTPUT_BYTES - 1
         provider = AdversarialReasoningProvider.emitting(
-            HostileOutput.OVERSIZED_OUTPUT
+            HostileOutput.OVERSIZED_OUTPUT,
+            budget,
         )
 
-        result = self._ask(provider)
+        result = self._ask(
+            provider,
+            settings=enabled_settings(max_output_bytes=budget),
+        )
 
-        self.assertEqual(result, Failure(FailureKind.REASONING_UNAVAILABLE))
+        self.assertEqual(result, Failure(FailureKind.REASONING_OUTPUT_OVER_BUDGET))
+        self.assertEqual(provider.calls, 1)
+
+    def test_accepted_text_is_returned_byte_for_byte(self) -> None:
+        text = "Café 漢字 \U0001f600 line one\nline two\t"
+        size = len(text.encode("utf-8"))
+        provider = AdversarialReasoningProvider.returning(ReasoningResponse(text))
+
+        result = self._ask(
+            provider,
+            settings=enabled_settings(max_output_bytes=size),
+        )
+
+        self.assertIs(type(result), ReasoningResponse)
+        self.assertEqual(result.text, text)
+        self.assertEqual(result.text.encode("utf-8"), text.encode("utf-8"))
+
+    def test_a_prompt_enlarged_far_beyond_the_ceiling_is_refused_unread(
+        self,
+    ) -> None:
+        request = ReasoningRequest("question")
+        object.__setattr__(request, "prompt", "a" * HUGE_TEXT_LENGTH)
+        provider = AdversarialReasoningProvider.returning(ReasoningResponse("reply"))
+
+        result, peak = peak_allocation(
+            lambda: self._ask(provider, request=request)
+        )
+
+        self.assertEqual(result, Failure(FailureKind.REASONING_INPUT_OVER_BUDGET))
+        self.assertEqual(provider.calls, 0)
+        self.assertLess(peak, REASONING_MAXIMUM_INPUT_BYTES)
+
+    def test_a_reply_enlarged_far_beyond_the_ceiling_is_refused_uncopied(
+        self,
+    ) -> None:
+        cases = {
+            "ordinary text": "a" * HUGE_TEXT_LENGTH,
+            # Over-length text is over budget before its encodability is
+            # even considered, because deciding that would mean encoding it.
+            "over-length and unencodable": "a" * HUGE_TEXT_LENGTH + "\ud800",
+        }
+        for label, text in cases.items():
+            with self.subTest(case=label):
+                answer = ReasoningResponse("reply")
+                object.__setattr__(answer, "text", text)
+                provider = AdversarialReasoningProvider.returning(answer)
+
+                result, peak = peak_allocation(lambda: self._ask(provider))
+
+                self.assertEqual(
+                    result,
+                    Failure(FailureKind.REASONING_OUTPUT_OVER_BUDGET),
+                )
+                self.assertLess(peak, REASONING_MAXIMUM_OUTPUT_BYTES)
 
     def test_every_typed_reasoning_failure_passes_through_as_its_kind(
         self,
@@ -861,6 +1003,64 @@ class AdversarialFakeTests(unittest.TestCase):
                 self.assertGreater(size, limit)
                 if limit >= len(FAKE_PAYLOAD_SENTINEL):
                     self.assertEqual(size, limit + 1)
+
+    def test_the_oversized_mode_refuses_setup_without_a_usable_budget(
+        self,
+    ) -> None:
+        # Without a budget below the hard ceiling the payload could not be a
+        # valid response, and a test would silently exercise unavailability
+        # instead of the over-budget refusal it meant to check.
+        ceiling = REASONING_MAXIMUM_OUTPUT_BYTES
+        for budget in (None, 0, -1, ceiling, ceiling + 1, True, 10.0, "10"):
+            with self.subTest(budget=repr(budget)):
+                with self.assertRaises(ValueError) as payload_error:
+                    hostile_payload(HostileOutput.OVERSIZED_OUTPUT, budget)
+                with self.assertRaises(ValueError) as setup_error:
+                    AdversarialReasoningProvider.emitting(
+                        HostileOutput.OVERSIZED_OUTPUT,
+                        budget,
+                    )
+
+                self.assertEqual(
+                    str(payload_error.exception),
+                    OVERSIZED_BUDGET_MESSAGE,
+                )
+                self.assertEqual(
+                    str(setup_error.exception),
+                    OVERSIZED_BUDGET_MESSAGE,
+                )
+
+        with self.assertRaises(ValueError):
+            AdversarialReasoningProvider.emitting(HostileOutput.OVERSIZED_OUTPUT)
+
+    def test_the_largest_oversized_payload_is_still_a_valid_response(
+        self,
+    ) -> None:
+        payload = hostile_payload(
+            HostileOutput.OVERSIZED_OUTPUT,
+            REASONING_MAXIMUM_OUTPUT_BYTES - 1,
+        )
+
+        self.assertEqual(
+            len(payload.encode("utf-8")),
+            REASONING_MAXIMUM_OUTPUT_BYTES,
+        )
+        self.assertEqual(ReasoningResponse(payload).text, payload)
+
+    def test_every_other_mode_ignores_the_budget(self) -> None:
+        for output in HostileOutput:
+            if output is HostileOutput.OVERSIZED_OUTPUT:
+                continue
+            with self.subTest(output=output.value):
+                payload = hostile_payload(output)
+
+                self.assertEqual(hostile_payload(output, OUTPUT_LIMIT), payload)
+                self.assertEqual(
+                    AdversarialReasoningProvider.emitting(output).respond(
+                        ReasoningRequest("question")
+                    ),
+                    ReasoningResponse(payload),
+                )
 
     def test_the_fake_records_every_request_it_receives(self) -> None:
         provider = AdversarialReasoningProvider.emitting(

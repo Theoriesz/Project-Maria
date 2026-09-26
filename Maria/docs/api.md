@@ -864,6 +864,9 @@ non-empty, UTF-8-encodable `str` of at most 1,048,576 UTF-8 bytes
 (`REASONING_MAXIMUM_INPUT_BYTES` and `REASONING_MAXIMUM_OUTPUT_BYTES`);
 anything else raises `ValueError` with a fixed message that never repeats the
 value. Sizes are bytes, not tokens, so no runtime's tokenizer is assumed.
+Because every encodable character takes at least one UTF-8 byte, text with
+more characters than a limit is refused without being encoded, so text of any
+length is never copied just to be measured.
 There is no field for personal context, a system prompt, a template, a
 credential, a header, an endpoint, a port, or a model path. `repr()`,
 `str()`, and formatting show `<redacted>` rather than the text.
@@ -887,7 +890,7 @@ field, each checked by exact type with no default:
 | --- | --- |
 | `transport` | a `ReasoningTransport` member |
 | `host` | an IP address literal, in canonical form, inside the transport's networks; no host name, port, scope, or IPv4-mapped IPv6 address |
-| `model` | 1 to 128 ASCII letters, digits, or `. _ : / @ + -`, starting with a letter or digit |
+| `model` | an opaque label of 1 to 128 ASCII letters, digits, or `. _ : / @ + -`, starting with a letter or digit; a leading single letter and colon is refused, so no Windows drive-qualified path such as `C:/models/local.gguf` or `C:models` is accepted, while `publisher/model:tag` is |
 | `request_deadline_seconds` | an `int` from 1 to 300 |
 | `max_input_bytes` | an `int` from 1 to 1,048,576 |
 | `max_output_bytes` | an `int` from 1 to 1,048,576 |
@@ -928,7 +931,10 @@ provider is reached. Then, in order:
    encodable, exact `str` text returns `REASONING_MALFORMED_OUTPUT`. The text is
    read again rather than trusted from construction.
 5. Text over `max_output_bytes` returns `REASONING_OUTPUT_OVER_BUDGET`; it is
-   discarded whole, never truncated.
+   discarded whole, never truncated. Text with more characters than the budget
+   is judged over it before any encoding, even when it would also fail to
+   encode, so a reply enlarged after construction is never copied to be
+   measured. The prompt check in step 2 is bounded the same way.
 6. Otherwise a fresh `ReasoningResponse` holding the same text is returned.
 
 The reply is untrusted, inert text: nothing in this module parses, repairs,

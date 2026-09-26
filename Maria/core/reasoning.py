@@ -58,10 +58,14 @@ REASONING_MAXIMUM_MODEL_LENGTH = 128
 _MAXIMUM_HOST_LENGTH = 39
 
 # A model identifier is an opaque label such as ``name:tag`` or
-# ``publisher/name``. It starts with a letter or digit, so it cannot begin as
-# an absolute, relative, or home-relative path, and it carries no whitespace,
-# quote, backslash, or control character.
+# ``publisher/name:tag``, never a place on disk. It starts with a letter or
+# digit, so it cannot start with a separator, a dot, or a home marker, and a
+# leading single letter followed by a colon is refused, so it cannot be a
+# Windows drive-qualified path such as ``C:/models/local.gguf`` or
+# ``C:models``. It carries no whitespace, quote, backslash, or control
+# character. A label that contains a slash is still accepted as a label.
 _MODEL_PATTERN = re.compile(
+    r"(?![A-Za-z]:)"
     rf"[A-Za-z0-9][A-Za-z0-9._:/@+-]{{0,{REASONING_MAXIMUM_MODEL_LENGTH - 1}}}"
 )
 
@@ -117,7 +121,7 @@ REASONING_HOST_MESSAGE = (
 REASONING_MODEL_MESSAGE = (
     f"reasoning.model must be 1 to {REASONING_MAXIMUM_MODEL_LENGTH} ASCII "
     "letters, digits, or . _ : / @ + - characters, starting with a letter or "
-    "digit."
+    "digit, and must not name a Windows drive."
 )
 REASONING_DEADLINE_MESSAGE = (
     "reasoning.request_deadline_seconds must be a TOML integer from 1 to "
@@ -341,7 +345,10 @@ def _settle(
     if not settings.enabled:
         return Failure(FailureKind.REASONING_UNAVAILABLE)
 
-    prompt_size = _utf8_size(getattr(request, "prompt", None))
+    prompt_size = _bounded_utf8_size(
+        getattr(request, "prompt", None),
+        settings.max_input_bytes,
+    )
     if prompt_size is None or prompt_size == 0:
         raise ValueError(REASONING_PROMPT_MESSAGE)
     if prompt_size > settings.max_input_bytes:
@@ -382,13 +389,15 @@ def _settle_answer(
     """Accept exactly one bounded reply, or name why it is unusable.
 
     The text is read again rather than trusted from construction, because a
-    frozen dataclass can still be altered through ``object.__setattr__``.
+    frozen dataclass can still be altered through ``object.__setattr__``,
+    and it is measured against the budget without being copied, however
+    large it has grown since.
     """
     if type(answer) is not ReasoningResponse:
         return Failure(FailureKind.REASONING_MALFORMED_OUTPUT)
 
     text = getattr(answer, "text", None)
-    size = _utf8_size(text)
+    size = _bounded_utf8_size(text, settings.max_output_bytes)
     if size is None or size == 0:
         return Failure(FailureKind.REASONING_MALFORMED_OUTPUT)
     if size > settings.max_output_bytes:
@@ -396,10 +405,23 @@ def _settle_answer(
     return ReasoningResponse(text)
 
 
-def _utf8_size(text: object) -> int | None:
-    """Return the UTF-8 size of exact, encodable text, or None otherwise."""
+def _bounded_utf8_size(text: object, maximum_bytes: int) -> int | None:
+    """Measure text against a byte bound without copying oversized text.
+
+    Returns None for anything but exact, encodable text. Every encodable
+    character takes at least one UTF-8 byte, so text with more characters
+    than the bound is over it and is never encoded: the result is then
+    ``maximum_bytes + 1``, a value callers only compare against the bound.
+    Otherwise the exact UTF-8 size is returned, and the one encoding done
+    to find it covers at most ``maximum_bytes`` characters, so hostile text
+    of any length cannot make this allocate a copy proportional to itself.
+    Over-length text is therefore reported as over the bound even when it
+    would also fail to encode.
+    """
     if type(text) is not str:
         return None
+    if len(text) > maximum_bytes:
+        return maximum_bytes + 1
     try:
         return len(text.encode("utf-8"))
     except UnicodeEncodeError:
@@ -410,7 +432,7 @@ def _utf8_size(text: object) -> int | None:
 
 def _is_bounded_text(text: object, maximum_bytes: int) -> bool:
     """Return whether text is exact, encodable, non-empty, and within bound."""
-    size = _utf8_size(text)
+    size = _bounded_utf8_size(text, maximum_bytes)
     return size is not None and 0 < size <= maximum_bytes
 
 

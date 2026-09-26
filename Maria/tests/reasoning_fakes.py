@@ -106,21 +106,39 @@ _FIXED_PAYLOADS = {
 }
 
 
+OVERSIZED_BUDGET_MESSAGE = (
+    "OVERSIZED_OUTPUT needs the configured output budget it must exceed: an "
+    "exact int from 1 to one below the hard response ceiling."
+)
+
+
 def hostile_payload(
     output: HostileOutput,
-    output_limit_bytes: int = REASONING_MAXIMUM_OUTPUT_BYTES,
+    output_limit_bytes: int | None = None,
 ) -> str:
     """Return the exact text the fake emits for one hostile category.
 
-    The oversized payload is the sentinel followed by filler, exactly one
-    UTF-8 byte over ``output_limit_bytes``. Every other payload is fixed.
+    The oversized payload is built for one configured output budget: the
+    sentinel followed by filler, one UTF-8 byte over ``output_limit_bytes``
+    (or the sentinel alone, when that is already longer). The budget must be
+    below the hard response ceiling, so the payload is always a valid
+    ``ReasoningResponse`` that only the configured budget refuses; anything
+    else is a mistake in the test and is refused here, rather than silently
+    exercising a different failure. Every other payload is fixed and ignores
+    the budget.
     """
     if type(output) is not HostileOutput:
         raise ValueError("A hostile output must be a HostileOutput member.")
-    if output is HostileOutput.OVERSIZED_OUTPUT:
-        filler = "x" * max(0, output_limit_bytes + 1 - len(FAKE_PAYLOAD_SENTINEL))
-        return FAKE_PAYLOAD_SENTINEL + filler
-    return _FIXED_PAYLOADS[output]
+    if output is not HostileOutput.OVERSIZED_OUTPUT:
+        return _FIXED_PAYLOADS[output]
+
+    if (
+        type(output_limit_bytes) is not int
+        or not 1 <= output_limit_bytes < REASONING_MAXIMUM_OUTPUT_BYTES
+    ):
+        raise ValueError(OVERSIZED_BUDGET_MESSAGE)
+    filler = "x" * max(0, output_limit_bytes + 1 - len(FAKE_PAYLOAD_SENTINEL))
+    return FAKE_PAYLOAD_SENTINEL + filler
 
 
 class AdversarialReasoningProvider:
@@ -141,16 +159,18 @@ class AdversarialReasoningProvider:
     def emitting(
         cls,
         output: HostileOutput,
-        output_limit_bytes: int = REASONING_MAXIMUM_OUTPUT_BYTES,
+        output_limit_bytes: int | None = None,
     ) -> AdversarialReasoningProvider:
-        """Answer every request with one hostile payload as a response.
+        """Answer every request with one hostile payload as a valid response.
 
-        The response is built when a request arrives, so a payload too large
-        to exist as a ``ReasoningResponse`` fails inside ``respond``, exactly
-        where a real provider's failure would.
+        The response is built here, while the test is being set up, so a
+        payload that could not exist as a ``ReasoningResponse`` fails setup
+        loudly instead of surfacing later as some other failure.
+        ``OVERSIZED_OUTPUT`` requires the configured output budget it is
+        meant to exceed.
         """
-        payload = hostile_payload(output, output_limit_bytes)
-        return cls(lambda: ReasoningResponse(payload))
+        response = ReasoningResponse(hostile_payload(output, output_limit_bytes))
+        return cls(lambda: response)
 
     @classmethod
     def failing(cls, kind: FailureKind) -> AdversarialReasoningProvider:
