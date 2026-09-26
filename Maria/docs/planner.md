@@ -354,6 +354,7 @@ A plan contains:
 - The original request
 - Zero or more steps
 - An optional response when no action should run
+- A recording policy, `RECORD` by default; the planner never sets any other
 
 Each step names a tool, an action, and its arguments.
 

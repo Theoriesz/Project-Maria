@@ -178,7 +178,12 @@ rejected type, never the value.
 
 Returns a stable lowercase SHA-256 hexadecimal digest of the plan's complete
 logical content: `original_request`, every step in order with its `tool_name`,
-`action`, and complete arguments, and `response_if_no_action`. The digest comes
+`action`, and complete arguments, `response_if_no_action`, and the recording
+policy when it is not the default `RECORD`. A default plan's serialization
+carries no recording key, so its digest is exactly what it was before the
+policy existed, while an otherwise identical `TRANSIENT` plan has a different
+digest. See `docs/architecture.md`, "Interaction Recording Boundary", for what
+the policy does. The digest comes
 from a canonical JSON serialization with sorted mapping keys, fixed separators,
 and ASCII escaping, encoded as UTF-8, so it is deterministic across processes
 and independent of Python's randomized hashing. Structurally equal plans share

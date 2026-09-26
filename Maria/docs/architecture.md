@@ -68,25 +68,58 @@ CLI
 -> SQLite interactions table
 ```
 
-`MariaBrain.process()` strips non-empty input before planning. On the zero-step,
-permission-denial, and post-tool-result branches, Brain passes that cleaned
-request and the full final response text to `Memory.record_interaction()`. This
-includes help, unsupported commands, malformed-command usage responses,
-denials, successful tool results, and returned unsuccessful
-`ToolExecutionResult` values. The recording layer stores the supplied text
-rather than summaries or only metadata, subject to existing command and tool
-output limits. A recording `RuntimeError` is logged without replacing the
-primary response, so recording is attempted but a row is not guaranteed when
-the database write fails.
+`MariaBrain.process()` strips non-empty input before planning. Brain records
+on exactly four branches: the zero-step branch, the contract-refusal branch,
+the permission-denial branch, and the post-tool-result branch that follows
+completed execution. On each of them, unless the plan is transient (see
+below), Brain passes that cleaned request and the response chosen for
+recording to `Memory.record_interaction()`. That response normally matches the
+displayed response, but a completed tool result may supply a
+`recorded_message`, including an explicit empty string, to record in place of
+its displayed text. Recording covers help, unsupported commands,
+malformed-command usage responses, contract refusals, denials, successful tool
+results, and returned unsuccessful `ToolExecutionResult` values. The recording
+layer stores the supplied text rather than summaries or only metadata, subject
+to existing command and tool output limits. A recording `RuntimeError` is
+logged without replacing the primary response, so recording is attempted but a
+row is not guaranteed when the database write fails.
+
+All four branches record through one private Brain helper,
+`_record_interaction(plan, response)`, which is the only place Brain writes
+interaction history. It takes the whole plan rather than the request text, so
+the request half of every row is the plan's `original_request` and no branch
+can record without the plan's recording policy being consulted. `Plan` carries
+that policy as a `RecordingPolicy`: `RECORD`, the default, records exactly as
+described above; `TRANSIENT` writes no interaction row at all on any of the
+four branches, neither the cleaned request nor a placeholder response, while
+the displayed response, contract validation, permission resolution, and tool
+execution are unchanged. Suppression is a positive choice by the plan's
+producer, so a plan that says nothing is recorded, and only an explicit
+`TRANSIENT` keeps a row out of history. The policy governs only the interaction
+row: a transient plan's tools still store whatever they store, such as a note
+or an explicit memory. `Plan` accepts only an exact `RecordingPolicy` member,
+refusing a plain string or any lookalike, and the policy is part of plan
+equality, hashing, and the fingerprint, so an approval bound to one policy
+cannot execute a plan carrying the other. Brain decides from the plan's
+policy alone, never from a step's tool or action or a result's content. A
+static source-scan guard test checks the gate's opening transient return and
+its single interaction write, and rejects direct tool-, action-, or
+request-specific recording decisions in the Brain methods that lead to the gate
+and in the helpers that produce recorded text; it does not analyze aliasing or
+data flow in general. No command Maria currently understands
+produces a transient plan: every deterministic command keeps the default and
+records exactly what it recorded before the policy existed.
 
 `ToolExecutionResult` carries an optional `recorded_message` field. It
 defaults to `None`, and any result that does not opt in leaves it as `None`;
 `None` makes Brain record the same text it displays, exactly as before. A
 tool may instead set `recorded_message` to persist different text than the
 displayed `message` for that step; an explicit empty string is honored rather
-than falling back to `message`. Brain applies this generically, reading only
-`.message` and `.recorded_message`, with no branch on a tool's name or
-action.
+than falling back to `message`, so it still records a row, with an empty
+response half. Brain applies this generically, reading only `.message` and
+`.recorded_message`, with no branch on a tool's name or action. A result can
+therefore change what a recorded row's response half says, but never whether a
+row is written; only the plan's recording policy decides that.
 
 In the current implementation, `history.read` is the only
 result that supplies a non-`None` `recorded_message`, so that redisplaying
@@ -525,9 +558,11 @@ unchanged by them.
 
 Maria keeps three kinds of persistent data separate:
 
-- **Interaction history** records cleaned requests and final Maria responses
-  on the completed paths described above. The brain retrieves recent rows and
-  supplies them to the planner as context, although the strict planner
+- **Interaction history** records cleaned requests and the responses chosen
+  for recording on the four recording branches described above, for every
+  plan whose recording policy is `RECORD`, whether by default or set
+  explicitly; a `TRANSIENT` plan adds no row. The brain retrieves recent rows
+  and supplies them to the planner as context, although the strict planner
   discards that context. Interaction rows are never converted automatically
   into explicit memories.
 - **Notes** are structured title-and-body records deliberately created by the
