@@ -17,10 +17,11 @@ and no URL is ever built or parsed. The model identifier is only ever a JSON
 string value in the request body.
 
 Only the model identifier and the prompt, as one user message, are sent.
-Only the assistant message's ``content`` comes back, as one inert string:
-thinking text, tool calls, and every other field of the reply are dropped
-unread, and this module has no import path to planning, permissions, tool
-dispatch, or persistence, so nothing here can turn a reply into an action.
+Only the assistant message's ``content`` comes back, as one inert string.
+Thinking text, tool calls, and every other field of the reply are ignored
+after bounded JSON parsing; only ``message.content`` is returned. This module
+has no import path to planning, permissions, tool dispatch, or persistence,
+so nothing here can turn a reply into an action.
 
 One absolute monotonic deadline covers the whole exchange: connecting,
 sending, the response headers, and the body. Every socket wait is given only
@@ -76,7 +77,8 @@ MAXIMUM_RESPONSE_HEADER_BYTES = 16 * 1024
 
 # Room in a response body for everything that is not the answer: metadata,
 # timing counters, chunk framing, and any thinking text or tool calls, all of
-# which are dropped unread. A reply that needs more is refused as too large.
+# which are parsed within this bound and then ignored. A reply that needs more
+# is refused as too large.
 RESPONSE_ENVELOPE_OVERHEAD_BYTES = 64 * 1024
 
 # JSON may spell one byte of the answer as up to six: Ollama's encoder writes

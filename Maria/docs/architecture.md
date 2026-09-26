@@ -676,8 +676,9 @@ The request carries only the model identifier, as an opaque JSON string, and
 the prompt as one user message, with `stream` false; there is no system
 message, option, tool, or thinking request. Of the reply, only
 `message.content` is kept, as inert text. Thinking text, tool calls, and every
-other field are dropped unread, and the module has no import path to planning,
-permissions, dispatch, or persistence, so a reply cannot become an action.
+other field are ignored after bounded JSON parsing; only `message.content` is
+returned. The module has no import path to planning, permissions, dispatch, or
+persistence, so a reply cannot become an action.
 
 One absolute monotonic deadline, `request_deadline_seconds` from the start of
 `respond`, covers connecting, sending, the response headers, and the body.

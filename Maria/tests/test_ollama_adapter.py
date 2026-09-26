@@ -16,6 +16,16 @@ The last class is the network import-boundary guard: only the adapter may
 import a network module, and nothing Brain, the planner, permissions,
 ToolManager, the memory layer, configuration, or any tool imports, directly
 or through any other Maria module, may import a network or threading one.
+
+The guard is bounded static analysis: it parses source and never runs it.
+It scans every importable production root, recognised or not, and follows
+import statements at any depth, relative imports, and dynamic imports through
+``import_module`` or ``__import__`` whose module name is a literal, including
+through a name an import from ``importlib`` or ``builtins``, or a plain
+assignment, binds to one of them. Any other dynamic import fails the guard as
+unresolved, except ToolManager's one tool loader in its verified shape. It
+does not follow ``getattr``, containers, return values, ``exec`` or
+``eval``, ``sys.modules``, ``runpy``, or native extension modules.
 """
 
 from __future__ import annotations
@@ -1412,7 +1422,7 @@ class OllamaAdapterHostileReplyTests(StubbedAdapterTestCase):
         for spy in self.spies:
             spy.assert_not_called()
 
-    def test_tool_calls_and_thinking_are_dropped_unread(self) -> None:
+    def test_tool_calls_and_thinking_are_ignored_after_parsing(self) -> None:
         message = {
             "role": "assistant",
             "content": REPLY_SENTINEL,
@@ -1730,32 +1740,82 @@ GUARDED_CORE_MODULES = (
     "core.config",
 )
 
+# The importable production roots Maria recognises. Every importable root but
+# the test package is scanned as production whatever its name, so a new one is
+# checked as soon as it exists; the root-inventory test separately fails until
+# a stage adds it here. This is the V1-10 discovery policy in test_memory.py.
 PRODUCTION_PACKAGES = ("core", "tools")
 PRODUCTION_ENTRY_POINTS = ("main.py",)
+TEST_PACKAGE = "tests"
 
-# The one module that imports others by a name held in a variable, and the
-# names it can import that way. Any other such import fails the guard.
-KNOWN_DYNAMIC_IMPORTS = {"core.tool_manager": frozenset(BUILT_IN_TOOL_MODULES)}
-
+# The functions that import a module named by a string, and the standard
+# modules they can be imported from under another name.
 DYNAMIC_IMPORT_FUNCTIONS = frozenset({"import_module", "__import__"})
+DYNAMIC_IMPORT_PROVIDERS = frozenset({"importlib", "builtins"})
+
+# The one dynamic import whose module name is not a literal: ToolManager's
+# built-in tool loader. It is admitted only in the exact shape it has today,
+# verified from the source by ``_verified_tool_loader``, never for the module
+# as a whole.
+TOOL_LOADER_MODULE = "core.tool_manager"
+TOOL_REGISTRY_NAME = "BUILT_IN_TOOL_MODULES"
+
+
+def importable_top_level_roots(root: Path = PROJECT_ROOT) -> frozenset[str]:
+    """Return every name directly under the Maria root that Python could import.
+
+    A top-level ``.py`` file is a module, and a directory is a package,
+    regular or namespace, as soon as it holds Python source at any depth.
+    Caches, dot-directories, and virtual environments are not Maria's source
+    and are skipped.
+    """
+    roots: set[str] = set()
+    for entry in root.iterdir():
+        if entry.is_file():
+            if entry.suffix == ".py":
+                roots.add(entry.name)
+        elif not _is_excluded_directory(entry) and _python_files(entry):
+            roots.add(entry.name)
+    return frozenset(roots)
 
 
 def production_modules(root: Path = PROJECT_ROOT) -> list[Path]:
-    """Return every production module at any depth, found rather than listed."""
-    modules = [
-        root / name for name in PRODUCTION_ENTRY_POINTS if (root / name).is_file()
-    ]
-    for package in PRODUCTION_PACKAGES:
-        for current, directories, files in os.walk(root / package):
-            directories[:] = [
-                name
-                for name in directories
-                if name != "__pycache__" and not name.startswith(".")
-            ]
-            modules.extend(
-                Path(current) / name for name in files if name.endswith(".py")
-            )
+    """Return every production module at any depth, found rather than listed.
+
+    That is every importable top-level file, and every ``.py`` file beneath
+    every importable top-level package, except the test package.
+    """
+    modules: list[Path] = []
+    for name in importable_top_level_roots(root) - {TEST_PACKAGE}:
+        entry = root / name
+        if entry.is_file():
+            modules.append(entry)
+        else:
+            modules.extend(_python_files(entry))
     return sorted(modules)
+
+
+def _python_files(directory: Path) -> list[Path]:
+    """Return every ``.py`` file beneath a directory, pruning excluded ones."""
+    found: list[Path] = []
+    for current, subdirectories, files in os.walk(directory):
+        here = Path(current)
+        subdirectories[:] = [
+            name
+            for name in subdirectories
+            if not _is_excluded_directory(here / name)
+        ]
+        found.extend(here / name for name in files if name.endswith(".py"))
+    return found
+
+
+def _is_excluded_directory(directory: Path) -> bool:
+    """Return whether a directory holds caches or an environment, not source."""
+    return (
+        directory.name == "__pycache__"
+        or directory.name.startswith(".")
+        or (directory / "pyvenv.cfg").is_file()
+    )
 
 
 def module_name(path: Path, root: Path = PROJECT_ROOT) -> str:
@@ -1766,12 +1826,24 @@ def module_name(path: Path, root: Path = PROJECT_ROOT) -> str:
     return ".".join(parts)
 
 
-def module_path(name: str, root: Path = PROJECT_ROOT) -> Path | None:
-    """Return the production file a dotted name imports, or None if none."""
+def module_path(
+    name: str,
+    root: Path = PROJECT_ROOT,
+    roots: frozenset[str] | None = None,
+) -> Path | None:
+    """Return the Python source a dotted name imports from Maria, or None.
+
+    Any importable root counts, not only the recognised ones, so a guarded
+    module that imports a newly added root is followed into it rather than
+    skipped. A name outside every root, such as a standard-library module,
+    is None.
+    """
     parts = name.split(".")
-    if name == "main":
-        return root / "main.py"
-    if parts[0] not in PRODUCTION_PACKAGES:
+    if not all(parts):
+        return None
+    if roots is None:
+        roots = importable_top_level_roots(root)
+    if parts[0] not in {Path(entry).stem for entry in roots}:
         return None
     for candidate in (
         root.joinpath(*parts).with_suffix(".py"),
@@ -1785,19 +1857,29 @@ def module_path(name: str, root: Path = PROJECT_ROOT) -> Path | None:
 def imports_of(
     path: Path,
     root: Path = PROJECT_ROOT,
-) -> tuple[frozenset[str], bool]:
-    """Return every module a source imports itself, at any depth.
+) -> tuple[frozenset[str], tuple[int, ...]]:
+    """Return every module a source imports itself, and what it cannot follow.
 
-    Statements anywhere count, including inside functions; relative imports
-    are resolved against the module's package; and a dynamic import whose
-    name is a literal counts as that module. The flag says whether a
-    dynamic import names its module some other way, which this cannot follow.
+    Statements anywhere count, including inside functions, and relative
+    imports are resolved against the module's package. A call through a
+    dynamic import function counts as the module it names when that name is
+    a literal, passed by position or as ``name=``; ``_dynamic_importers``
+    says which calls those are. ToolManager's verified tool loader counts as
+    the literal tool names it can load. Every other dynamic import is
+    returned by line number as unresolved, so the guard fails closed on it.
     Nothing is imported or run to find any of this out.
     """
+    tree = ast.parse(path.read_text(encoding="utf-8"))
     package = path.relative_to(root).with_suffix("").parts[:-1]
+    importers = _dynamic_importers(tree)
+    approved, approved_names = (
+        _verified_tool_loader(tree)
+        if module_name(path, root) == TOOL_LOADER_MODULE
+        else (frozenset(), frozenset())
+    )
     names: set[str] = set()
-    unresolved = False
-    for node in ast.walk(ast.parse(path.read_text(encoding="utf-8"))):
+    unresolved: list[int] = []
+    for node in ast.walk(tree):
         if isinstance(node, ast.Import):
             names.update(alias.name for alias in node.names)
         elif isinstance(node, ast.ImportFrom):
@@ -1814,34 +1896,291 @@ def imports_of(
             names.update(
                 f"{base}.{alias.name}" for alias in node.names if alias.name != "*"
             )
-        elif isinstance(node, ast.Call) and _is_dynamic_import(node):
-            argument = _first_argument(node)
-            if isinstance(argument, ast.Constant) and isinstance(
-                argument.value, str
-            ):
-                names.add(argument.value)
+        elif isinstance(node, ast.Call) and _is_import_function(
+            node.func,
+            importers,
+        ):
+            if id(node) in approved:
+                names.update(approved_names)
+                continue
+            module = _literal_text(_module_argument(node))
+            if module is None or module.startswith("."):
+                unresolved.append(node.lineno)
             else:
-                unresolved = True
-    return frozenset(names), unresolved
+                names.add(module)
+    return frozenset(names), tuple(sorted(unresolved))
 
 
-def _is_dynamic_import(node: ast.Call) -> bool:
-    """Return whether a call is recognisably a dynamic import."""
-    if isinstance(node.func, ast.Name):
-        return node.func.id in DYNAMIC_IMPORT_FUNCTIONS
-    if isinstance(node.func, ast.Attribute):
-        return node.func.attr in DYNAMIC_IMPORT_FUNCTIONS
-    return False
+def _dynamic_importers(tree: ast.Module) -> frozenset[str]:
+    """Return every bare name a call can use to import a module dynamically.
+
+    ``import_module`` and ``__import__`` always count. So does a name an
+    import from ``importlib`` or ``builtins`` binds to one of them, such as
+    ``load`` in ``from importlib import import_module as load``, and a name
+    a plain assignment binds to one. An attribute call needs no binding: an
+    attribute named ``import_module`` or ``__import__`` counts whatever it is
+    looked up on, which covers ``importlib`` and every alias of it. This is
+    bounded analysis of bindings, not data flow: a container, a return value,
+    ``getattr``, or a lookup in ``__builtins__`` is not followed.
+    """
+    importers = set(DYNAMIC_IMPORT_FUNCTIONS)
+    for node in ast.walk(tree):
+        if (
+            isinstance(node, ast.ImportFrom)
+            and node.level == 0
+            and node.module in DYNAMIC_IMPORT_PROVIDERS
+        ):
+            importers.update(
+                alias.asname or alias.name
+                for alias in node.names
+                if alias.name in DYNAMIC_IMPORT_FUNCTIONS
+            )
+
+    assignments = [
+        (target.id, node.value)
+        for node in ast.walk(tree)
+        if isinstance(node, (ast.Assign, ast.AnnAssign)) and node.value is not None
+        for target in (
+            node.targets if isinstance(node, ast.Assign) else (node.target,)
+        )
+        if isinstance(target, ast.Name)
+    ]
+    # One assignment can alias another, so repeat until nothing new is bound.
+    growing = True
+    while growing:
+        growing = False
+        for name, value in assignments:
+            if name not in importers and _is_import_function(value, importers):
+                importers.add(name)
+                growing = True
+    return frozenset(importers)
 
 
-def _first_argument(node: ast.Call) -> ast.expr | None:
-    """Return the module-name argument of a dynamic import call."""
+def _is_import_function(
+    node: ast.AST,
+    importers: frozenset[str] | set[str],
+) -> bool:
+    """Return whether an expression names a function that imports by string."""
+    if isinstance(node, ast.Name):
+        return node.id in importers
+    return (
+        isinstance(node, ast.Attribute)
+        and node.attr in DYNAMIC_IMPORT_FUNCTIONS
+    )
+
+
+def _module_argument(node: ast.Call) -> ast.AST | None:
+    """Return the module-name argument of a dynamic import call, if visible."""
     if node.args:
-        return node.args[0]
-    for keyword in node.keywords:
-        if keyword.arg == "name":
-            return keyword.value
+        first = node.args[0]
+        return None if isinstance(first, ast.Starred) else first
+    return next(
+        (keyword.value for keyword in node.keywords if keyword.arg == "name"),
+        None,
+    )
+
+
+def _literal_text(node: ast.AST | None) -> str | None:
+    """Return a string expression's value if it is known without running it.
+
+    That is a literal, an f-string with no substitution, or a ``+`` chain of
+    those. A value computed at run time makes the whole expression unknown.
+    """
+    if isinstance(node, ast.Constant):
+        return node.value if isinstance(node.value, str) else None
+    if isinstance(node, ast.JoinedStr):
+        parts = [_literal_text(part) for part in node.values]
+        return None if None in parts else "".join(parts)
+    if isinstance(node, ast.BinOp) and isinstance(node.op, ast.Add):
+        left = _literal_text(node.left)
+        right = _literal_text(node.right)
+        return None if left is None or right is None else left + right
     return None
+
+
+def _verified_tool_loader(
+    tree: ast.Module,
+) -> tuple[frozenset[int], frozenset[str]]:
+    """Return ToolManager's verified loader call and the names it can import.
+
+    The call is admitted only in the shape it has today, checked from the
+    source: a module-level ``BUILT_IN_TOOL_MODULES`` bound exactly once, to
+    a tuple of string literals; ``importlib`` bound only by its plain module
+    import; one ``ToolManager`` class whose one ``discover_tools`` does
+    nothing but return that tuple; and, in its one ``load_tools``, exactly
+    one ``importlib.import_module(module_name)`` in the module, inside
+    ``for module_name in self.discover_tools():``, with ``module_name``
+    bound nowhere else in ``load_tools``. Anything else admits nothing, so
+    every other dynamic import in the module, including a second one beside
+    the loader, stays unresolved and fails the guard. A subclass or a
+    run-time replacement of ``discover_tools`` is beyond static analysis.
+    """
+    nothing: tuple[frozenset[int], frozenset[str]] = (frozenset(), frozenset())
+
+    registries = [
+        node
+        for node in tree.body
+        if isinstance(node, ast.Assign)
+        and len(node.targets) == 1
+        and _is_name(node.targets[0], TOOL_REGISTRY_NAME)
+    ]
+    if len(registries) != 1 or _bindings(tree, TOOL_REGISTRY_NAME) != 1:
+        return nothing
+    registry = registries[0].value
+    if not isinstance(registry, ast.Tuple) or not all(
+        isinstance(element, ast.Constant) and isinstance(element.value, str)
+        for element in registry.elts
+    ):
+        return nothing
+    tool_names = frozenset(element.value for element in registry.elts)
+
+    plain_import = any(
+        isinstance(node, ast.Import)
+        and any(
+            alias.name == "importlib" and alias.asname is None
+            for alias in node.names
+        )
+        for node in tree.body
+    )
+    if not plain_import or _bindings(tree, "importlib") != 1:
+        return nothing
+
+    managers = [
+        node
+        for node in tree.body
+        if isinstance(node, ast.ClassDef) and node.name == "ToolManager"
+    ]
+    if len(managers) != 1:
+        return nothing
+    methods: dict[str, list[ast.FunctionDef | ast.AsyncFunctionDef]] = {}
+    for node in managers[0].body:
+        if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef)):
+            methods.setdefault(node.name, []).append(node)
+    discover = methods.get("discover_tools", [])
+    load = methods.get("load_tools", [])
+    if len(discover) != 1 or len(load) != 1:
+        return nothing
+    if not _only_returns(discover[0], TOOL_REGISTRY_NAME):
+        return nothing
+
+    loops = [
+        node
+        for node in ast.walk(load[0])
+        if isinstance(node, ast.For)
+        and _is_name(node.target, "module_name")
+        and _is_self_call(node.iter, "discover_tools")
+    ]
+    if len(loops) != 1 or _bindings(load[0], "module_name") != 1:
+        return nothing
+
+    loaders = [
+        node
+        for node in ast.walk(tree)
+        if isinstance(node, ast.Call) and _is_tool_loader_call(node)
+    ]
+    inside_loop = {
+        id(node) for statement in loops[0].body for node in ast.walk(statement)
+    }
+    if len(loaders) != 1 or id(loaders[0]) not in inside_loop:
+        return nothing
+    return frozenset({id(loaders[0])}), tool_names
+
+
+def _is_name(node: ast.AST, name: str) -> bool:
+    """Return whether an expression is exactly the bare name given."""
+    return isinstance(node, ast.Name) and node.id == name
+
+
+def _is_self_call(node: ast.AST, method: str) -> bool:
+    """Return whether an expression is ``self.<method>()`` with no arguments."""
+    return (
+        isinstance(node, ast.Call)
+        and isinstance(node.func, ast.Attribute)
+        and _is_name(node.func.value, "self")
+        and node.func.attr == method
+        and not node.args
+        and not node.keywords
+    )
+
+
+def _is_tool_loader_call(node: ast.Call) -> bool:
+    """Return whether a call is exactly ``importlib.import_module(module_name)``."""
+    return (
+        isinstance(node.func, ast.Attribute)
+        and _is_name(node.func.value, "importlib")
+        and node.func.attr == "import_module"
+        and len(node.args) == 1
+        and _is_name(node.args[0], "module_name")
+        and not node.keywords
+    )
+
+
+def _only_returns(
+    function: ast.FunctionDef | ast.AsyncFunctionDef,
+    name: str,
+) -> bool:
+    """Return whether a method takes only ``self`` and just returns a name."""
+    arguments = function.args
+    parameters = [
+        argument.arg for argument in (*arguments.posonlyargs, *arguments.args)
+    ]
+    if (
+        parameters != ["self"]
+        or arguments.vararg
+        or arguments.kwonlyargs
+        or arguments.kwarg
+    ):
+        return False
+    body = list(function.body)
+    if (
+        body
+        and isinstance(body[0], ast.Expr)
+        and isinstance(body[0].value, ast.Constant)
+        and isinstance(body[0].value.value, str)
+    ):
+        body = body[1:]
+    return (
+        len(body) == 1
+        and isinstance(body[0], ast.Return)
+        and body[0].value is not None
+        and _is_name(body[0].value, name)
+    )
+
+
+def _bindings(scope: ast.AST, name: str) -> int:
+    """Count every syntactic form in a scope that binds or unbinds a name.
+
+    Assignment of every kind, loop, ``with``, and walrus targets, ``del``,
+    parameters, imports, definitions, exception and match names, and
+    ``global`` or ``nonlocal`` declarations are counted; nothing subtler,
+    such as ``globals()`` or ``setattr``, is attempted.
+    """
+    count = 0
+    for node in ast.walk(scope):
+        if isinstance(node, ast.Name):
+            bound = node.id == name and isinstance(node.ctx, (ast.Store, ast.Del))
+        elif isinstance(node, ast.arg):
+            bound = node.arg == name
+        elif isinstance(node, ast.alias):
+            bound = (node.asname or node.name.split(".")[0]) == name
+        elif isinstance(
+            node,
+            (
+                ast.FunctionDef,
+                ast.AsyncFunctionDef,
+                ast.ClassDef,
+                ast.ExceptHandler,
+                ast.MatchAs,
+                ast.MatchStar,
+            ),
+        ):
+            bound = node.name == name
+        elif isinstance(node, (ast.Global, ast.Nonlocal)):
+            bound = name in node.names
+        else:
+            bound = False
+        count += bound
+    return count
 
 
 def forbidden_in(path: Path, root: Path = PROJECT_ROOT) -> set[str]:
@@ -1863,28 +2202,48 @@ def reachable_modules(
     The walk follows each module's own imports, and the imports of those, to
     the end, so a forbidden import two modules away is found as surely as
     one in ``start`` itself. Importing ``a.b.c`` imports ``a`` and ``a.b``
-    as well. Also returned are the modules whose dynamic imports could not
-    be followed and are not in ``KNOWN_DYNAMIC_IMPORTS``.
+    as well, and a module in any importable root is followed, recognised or
+    not. Also returned are the modules holding a dynamic import that could
+    not be resolved, each of which fails the guard.
     """
+    roots = importable_top_level_roots(root)
     reached: dict[str, Path] = {}
     unfollowed: set[str] = set()
     pending = [start]
     while pending:
         name = pending.pop()
-        path = module_path(name, root)
+        path = module_path(name, root, roots)
         if path is None or name in reached:
             continue
         reached[name] = path
         names, unresolved = imports_of(path, root)
         if unresolved:
-            if name in KNOWN_DYNAMIC_IMPORTS:
-                names = names | KNOWN_DYNAMIC_IMPORTS[name]
-            else:
-                unfollowed.add(name)
+            unfollowed.add(name)
         for imported in names:
             parts = imported.split(".")
             pending.extend(".".join(parts[:end]) for end in range(1, len(parts) + 1))
     return reached, unfollowed
+
+
+def guard_findings(name: str, root: Path = PROJECT_ROOT) -> list[str]:
+    """Return every way one guarded module breaks the network boundary.
+
+    That is each module it reaches that imports a forbidden module, each
+    reached module holding a dynamic import that cannot be resolved, and
+    reaching the adapter at all. An empty list means the module is clean.
+    """
+    reached, unfollowed = reachable_modules(name, root)
+    findings = [
+        f"{reached_name}: imports {sorted(found)}"
+        for reached_name, path in sorted(reached.items())
+        if (found := forbidden_in(path, root))
+    ]
+    findings.extend(
+        f"{module}: unresolved dynamic import" for module in sorted(unfollowed)
+    )
+    if ADAPTER_MODULE in reached:
+        findings.append(f"reaches {ADAPTER_MODULE}")
+    return findings
 
 
 def guarded_module_names(root: Path = PROJECT_ROOT) -> list[str]:
@@ -2006,6 +2365,307 @@ class NetworkImportBoundaryTests(unittest.TestCase):
                 forbidden_in(root / "tools" / "nested" / "sneaky.py", root),
                 {"concurrent"},
             )
+
+    # Regression fixtures for three ways the guard was once escaped: an
+    # aliased dynamic import, a second dynamic import hidden behind
+    # ToolManager's exemption, and production code in a new root.
+
+    def fixture(self, sources: dict[str, str]) -> Path:
+        """Write a minimal synthetic Maria tree, plus the given sources.
+
+        The tree is parsed by the guard and never imported or run.
+        """
+        directory = tempfile.TemporaryDirectory()
+        self.addCleanup(directory.cleanup)
+        root = Path(directory.name)
+        base = {
+            "main.py": "",
+            "core/__init__.py": "",
+            "core/brain.py": "",
+            "tools/__init__.py": "",
+        }
+        for relative, text in {**base, **sources}.items():
+            target = root / relative
+            target.parent.mkdir(parents=True, exist_ok=True)
+            target.write_text(text, encoding="utf-8")
+        return root
+
+    def test_no_unrecognised_production_root_exists(self) -> None:
+        """Fail closed: a new top-level module or package must be inventoried."""
+        self.assertEqual(
+            importable_top_level_roots() - {TEST_PACKAGE},
+            frozenset(PRODUCTION_PACKAGES + PRODUCTION_ENTRY_POINTS),
+        )
+
+    def test_an_aliased_dynamic_import_is_seen(self) -> None:
+        cases = {
+            "an importlib alias": (
+                "from importlib import import_module as load\nload('socket')\n"
+            ),
+            "a builtins alias": (
+                "from builtins import __import__ as load\nload('socket')\n"
+            ),
+            "an alias called with name=": (
+                "from importlib import import_module as load\n"
+                "load(name='socket')\n"
+            ),
+            "an alias bound again by assignment": (
+                "from importlib import import_module as load\n"
+                "fetch = load\n"
+                "fetch('socket')\n"
+            ),
+            "an alias of the module": (
+                "import importlib as loader\nloader.import_module('socket')\n"
+            ),
+            "an alias inside a function": (
+                "def later():\n"
+                "    from builtins import __import__ as load\n"
+                "    return load('soc' + 'ket')\n"
+            ),
+        }
+        for case, source in cases.items():
+            with self.subTest(case=case):
+                root = self.fixture({"core/brain.py": source})
+
+                self.assertEqual(
+                    forbidden_in(root / "core" / "brain.py", root),
+                    {"socket"},
+                )
+                self.assertEqual(
+                    guard_findings("core.brain", root),
+                    ["core.brain: imports ['socket']"],
+                )
+
+    def test_an_unresolvable_dynamic_import_fails_closed(self) -> None:
+        cases = {
+            "an aliased import of a computed name": (
+                "from importlib import import_module as load\n"
+                "def later(suffix):\n"
+                "    return load('soc' + suffix)\n"
+            ),
+            "an aliased import of unpacked arguments": (
+                "from builtins import __import__ as load\n"
+                "names = ['socket']\n"
+                "load(*names)\n"
+            ),
+            "a relative name": (
+                "import importlib\n"
+                "importlib.import_module('.wire', package='core')\n"
+            ),
+        }
+        for case, source in cases.items():
+            with self.subTest(case=case):
+                root = self.fixture({"core/brain.py": source})
+
+                _, unresolved = imports_of(root / "core" / "brain.py", root)
+                self.assertTrue(unresolved)
+                self.assertEqual(
+                    guard_findings("core.brain", root),
+                    ["core.brain: unresolved dynamic import"],
+                )
+
+    def test_the_tool_loader_exemption_admits_only_the_verified_call(
+        self,
+    ) -> None:
+        real = (PROJECT_ROOT / "core" / "tool_manager.py").read_text(
+            encoding="utf-8"
+        )
+        loader = "            module = importlib.import_module(module_name)\n"
+        registry = "        return BUILT_IN_TOOL_MODULES\n"
+        first_tool = '    "tools.calculator",\n'
+        for anchor in (loader, registry, first_tool):
+            self.assertEqual(real.count(anchor), 1)
+
+        # The real loader, unchanged, is resolved to exactly its tool names.
+        root = self.fixture({"core/tool_manager.py": real})
+        names, unresolved = imports_of(root / "core" / "tool_manager.py", root)
+        self.assertEqual(unresolved, ())
+        self.assertLessEqual(set(BUILT_IN_TOOL_MODULES), names)
+        self.assertEqual(guard_findings("core.tool_manager", root), [])
+
+        escapes = {
+            "a second, computed import beside the loader": real.replace(
+                loader,
+                loader
+                + "            importlib.import_module(\n"
+                + '                "socket" if module is None else module_name\n'
+                + "            )\n",
+            ),
+            "the loader's own name computed": real.replace(
+                loader,
+                "            module = importlib.import_module(\n"
+                '                "socket" if module_name else module_name\n'
+                "            )\n",
+            ),
+            "a second loader call": real.replace(loader, loader + loader),
+            "the loop variable rebound": real.replace(
+                loader,
+                '            module_name = "socket"\n' + loader,
+            ),
+            "the registry not returned as it is": real.replace(
+                registry,
+                '        return (*BUILT_IN_TOOL_MODULES, "socket")\n',
+            ),
+            "a registry entry that is not a literal": real.replace(
+                first_tool,
+                '    "tools." + TOOL,\n',
+            ),
+            "the registry bound again": (
+                real + '\nBUILT_IN_TOOL_MODULES = ("socket",)\n'
+            ),
+            "importlib bound again": real + "\nimportlib = None\n",
+            "the same call in another module": None,
+        }
+        for case, source in escapes.items():
+            with self.subTest(case=case):
+                if source is None:
+                    root = self.fixture({"core/loader.py": real})
+                    self.assertEqual(
+                        guard_findings("core.loader", root),
+                        ["core.loader: unresolved dynamic import"],
+                    )
+                    continue
+                self.assertNotEqual(source, real)
+                root = self.fixture({"core/tool_manager.py": source})
+
+                self.assertEqual(
+                    guard_findings("core.tool_manager", root),
+                    ["core.tool_manager: unresolved dynamic import"],
+                )
+
+    def test_the_tool_loader_names_are_themselves_checked(self) -> None:
+        real = (PROJECT_ROOT / "core" / "tool_manager.py").read_text(
+            encoding="utf-8"
+        )
+        first_tool = '    "tools.calculator",\n'
+        root = self.fixture(
+            {
+                "core/tool_manager.py": real.replace(
+                    first_tool,
+                    first_tool + '    "socket",\n',
+                )
+            }
+        )
+
+        self.assertEqual(
+            forbidden_in(root / "core" / "tool_manager.py", root),
+            {"socket"},
+        )
+        self.assertEqual(
+            guard_findings("core.tool_manager", root),
+            ["core.tool_manager: imports ['socket']"],
+        )
+
+    def test_production_discovery_covers_new_roots_at_any_depth(self) -> None:
+        root = self.fixture(
+            {
+                "extra.py": "import socket\n",
+                "newpkg/__init__.py": "",
+                "newpkg/inner/__init__.py": "",
+                "newpkg/inner/deep.py": "import socket\n",
+                "spacepkg/inner/deep.py": "import threading\n",
+                "tests/__init__.py": "",
+                "tests/test_stub.py": "import socket\n",
+                ".venv/lib/site.py": "import socket\n",
+                "environment/pyvenv.cfg": "",
+                "environment/lib/site.py": "import socket\n",
+                "core/__pycache__/stale.py": "import socket\n",
+                "logs/maria.log": "",
+            }
+        )
+
+        found = {module_name(path, root) for path in production_modules(root)}
+        self.assertLessEqual(
+            {"extra", "newpkg.inner.deep", "spacepkg.inner.deep"},
+            found,
+        )
+        for excluded in (
+            "tests.test_stub",
+            ".venv.lib.site",
+            "environment.lib.site",
+            "core.__pycache__.stale",
+        ):
+            self.assertNotIn(excluded, found)
+        owners = {
+            module_name(path, root): found_here
+            for path in production_modules(root)
+            if (found_here := forbidden_in(path, root))
+        }
+        self.assertEqual(
+            owners,
+            {
+                "extra": {"socket"},
+                "newpkg.inner.deep": {"socket"},
+                "spacepkg.inner.deep": {"threading"},
+            },
+        )
+        self.assertEqual(
+            importable_top_level_roots(root)
+            - {TEST_PACKAGE}
+            - set(PRODUCTION_PACKAGES + PRODUCTION_ENTRY_POINTS),
+            {"extra.py", "newpkg", "spacepkg"},
+        )
+
+    def test_a_guarded_module_importing_a_new_root_is_followed(self) -> None:
+        cases = {
+            "a new root file": (
+                {"extra.py": "import socket\n"},
+                "import extra\n",
+                "extra",
+            ),
+            "a nested module of a new package": (
+                {
+                    "newpkg/__init__.py": "",
+                    "newpkg/inner/__init__.py": "",
+                    "newpkg/inner/deep.py": "import socket\n",
+                },
+                "from newpkg.inner import deep\n",
+                "newpkg.inner.deep",
+            ),
+            "a module of a new namespace package": (
+                {"spacepkg/inner/deep.py": "def later():\n    import socket\n"},
+                "def later():\n    import spacepkg.inner.deep\n",
+                "spacepkg.inner.deep",
+            ),
+        }
+        for case, (sources, brain, reached_name) in cases.items():
+            with self.subTest(case=case):
+                root = self.fixture({**sources, "core/brain.py": brain})
+
+                reached, _ = reachable_modules("core.brain", root)
+                self.assertIn(reached_name, reached)
+                self.assertEqual(
+                    guard_findings("core.brain", root),
+                    [f"{reached_name}: imports ['socket']"],
+                )
+
+    def test_the_corrected_guard_passes_the_real_tree_and_harmless_imports(
+        self,
+    ) -> None:
+        for name in guarded_module_names():
+            with self.subTest(module=name):
+                self.assertEqual(guard_findings(name), [])
+
+        names, unresolved = imports_of(PROJECT_ROOT / "core" / "tool_manager.py")
+        self.assertEqual(unresolved, ())
+        self.assertLessEqual(set(BUILT_IN_TOOL_MODULES), names)
+
+        root = self.fixture(
+            {
+                "core/brain.py": (
+                    "from importlib import import_module as load\n"
+                    "load('json')\n"
+                    "import importlib\n"
+                    "importlib.import_module(name='core.' + 'helper')\n"
+                ),
+                "core/helper.py": "def later():\n    from . import other\n",
+                "core/other.py": "import json\n",
+            }
+        )
+        reached, unfollowed = reachable_modules("core.brain", root)
+        self.assertLessEqual({"core.helper", "core.other"}, set(reached))
+        self.assertEqual(unfollowed, set())
+        self.assertEqual(guard_findings("core.brain", root), [])
 
 
 if __name__ == "__main__":

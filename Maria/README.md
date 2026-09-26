@@ -228,8 +228,9 @@ never downloads a model, installs software, or starts a process.
 
 It sends only the model identifier and the request text as one user message,
 and takes back only the answer text. Any separate thinking text and any tool
-calls in the reply are discarded unread, and an answer is only ever text,
-never an action. One hard deadline covers connecting, sending, and receiving
+calls in the reply are ignored after bounded JSON parsing; only
+`message.content` is returned, and an answer is only ever text, never an
+action. One hard deadline covers connecting, sending, and receiving
 the whole reply; the reply is size-bounded before it is parsed, and the answer
 must fit within `max_output_bytes` or is discarded whole. Every failure is one
 fixed, typed message, and no request, answer, address, model identifier, or

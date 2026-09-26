@@ -16,8 +16,9 @@
   Ollama cloud model. It connects straight to the numeric address with no name
   resolution, proxy, redirect, retry, or fallback, and it downloads,
   installs, and launches nothing. It sends only the model identifier and the
-  request text, and returns only the assistant's answer text, dropping any
-  thinking text and tool calls unread. One absolute deadline covers
+  request text, and returns only the assistant's answer text: any thinking
+  text and tool calls are ignored after bounded JSON parsing, and only
+  `message.content` is returned. One absolute deadline covers
   connecting, sending, and the whole reply, so a runtime that trickles bytes
   cannot stretch it; the headers and the whole reply are bounded before
   parsing, and an answer over the output budget is discarded whole. Timeout,
