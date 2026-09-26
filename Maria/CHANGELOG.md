@@ -2,6 +2,33 @@
 
 ## Unreleased
 
+- Added a typed, provider-independent local reasoning interface with typed
+  failure classes and fail-closed provider configuration, disabled by
+  default, with machine-specific settings confined to an untracked local
+  override. A new `core/reasoning.py` defines frozen, bounded request and
+  response values with no field for personal context, a provider protocol for
+  the later local adapter, and one boundary that returns every provider
+  outcome as either inert reply text or a typed failure: unavailable,
+  timeout, refused, malformed output, truncated output, or input or output
+  over budget. It contains no transport and no model, imports no network,
+  threading, asynchronous, or subprocess module, and nothing in Maria calls
+  it yet, so every command behaves exactly as before. The shipped
+  `config/config.toml` gains a `[reasoning]` template that must stay exactly
+  `enabled = false`. Active settings — a `loopback` or `private_lan`
+  destination class, one IP address inside it, a model identifier, a hard
+  deadline of 1 to 300 seconds, and input and output budgets of 1 to
+  1,048,576 bytes — belong only in the private `config/config.local.toml`,
+  which is now Git-ignored, which Maria never creates, and which only
+  startup reads. When absent, reasoning stays disabled. When present, it must
+  be a regular file holding exactly one `[reasoning]` table, which replaces
+  the tracked one completely; a link, including a dangling one, a directory,
+  a special entry, invalid TOML, any other section, an unknown or
+  credential-shaped key, a wrong type, an out-of-range value, or an enabled
+  block missing any field now stops startup with the usual sanitized
+  failure message instead of being silently accepted. No refusal, log line,
+  or representation carries the file's text, its location, the host, or the
+  model identifier. No schema, permission, command, or version change was
+  introduced.
 - Gave Maria's database a schema version of its own, independent of the
   application version, and put an ordered, idempotent, atomic forward
   migration runner behind it. The version lives in the SQLite header rather

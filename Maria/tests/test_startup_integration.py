@@ -12,7 +12,7 @@ from unittest.mock import patch
 import core.brain as brain_module
 from core.brain import MariaBrain
 from core.config import MariaConfig
-from core.constants import DATABASE_SCHEMA_VERSION
+from core.constants import DATABASE_SCHEMA_VERSION, LOCAL_CONFIG_PATH
 from core.failures import Failure, FailureKind, TypedFailureError
 from core.filesystem_roots import (
     FilesystemProtections,
@@ -88,7 +88,9 @@ class StartupIntegrationTests(unittest.TestCase):
         with patch("core.brain.load_config", return_value=self.config) as load_config:
             self.brain = MariaBrain.from_defaults()
 
-        load_config.assert_called_once_with()
+        # Startup names the private override deliberately and nothing else;
+        # the patched loader means no test here ever reads the real file.
+        load_config.assert_called_once_with(local_override_path=LOCAL_CONFIG_PATH)
         self._temporary_handlers = tuple(self._maria_logger.handlers)
         self.session = MariaSession(self.brain)
 

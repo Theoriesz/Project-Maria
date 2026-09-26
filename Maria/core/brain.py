@@ -12,6 +12,7 @@ from logging import Logger
 
 from core.action_contracts import ContractViolation
 from core.config import MariaConfig, load_config
+from core.constants import LOCAL_CONFIG_PATH
 from core.filesystem_roots import prepare_roots
 from core.logger import configure_logging, get_logger
 from core.memory import Memory
@@ -100,7 +101,11 @@ class MariaBrain:
     @classmethod
     def from_defaults(cls) -> "MariaBrain":
         """Create a fully wired MariaBrain from config.toml."""
-        config = load_config()
+        # Startup is the one caller that names the owner's private override,
+        # so every other caller of load_config reads the tracked file alone.
+        # The override can only change the reasoning settings, and nothing
+        # here consults them yet.
+        config = load_config(local_override_path=LOCAL_CONFIG_PATH)
 
         # Loading settles what the roots are; this is the one boundary that
         # makes them usable. It runs before logging is configured because

@@ -115,7 +115,9 @@ Some locations are permanently out of reach of every filesystem command:
 - Maria's active system prompt, wherever `[paths] system_prompt` puts it
 - the default `database/` and `logs/` directories inside Maria's own project
 - the repository's `.git`, whether it is a directory or a gitdir-pointer file
-- `config/config.local.toml`, which Maria never creates and never loads
+- `config/config.local.toml`, the private local override described under
+  "Local Reasoning Settings", which Maria never creates and reads only at
+  startup
 - inside Maria's repository, at any depth: `.env` and any `.env.*` file,
   `__pycache__`, `.venv`, `venv`, `env`, `.pytest_cache`, `.mypy_cache`,
   `.ruff_cache`, `maria_cli_test`, `.claude`, and any name ending `.tmp` or
@@ -162,6 +164,51 @@ Source and destination must be inside the same filesystem root.
 ```
 
 Filesystem delete and write functionality remains intentionally unimplemented.
+
+## Local Reasoning Settings
+
+Maria does not yet use a language model. Nothing in the CLI changes, and every
+command works exactly as before. What exists is the typed interface a later,
+owner-controlled local model will sit behind, and the configuration that will
+describe it.
+
+The tracked `config/config.toml` keeps reasoning disabled:
+
+```toml
+[reasoning]
+enabled = false
+```
+
+That block must stay exactly that way. Startup is refused if the tracked file
+enables reasoning or names any provider value, because such values are specific
+to one machine. They belong only in `config/config.local.toml`, a private file
+that Git ignores, that Maria never creates, and that no filesystem command can
+read. When it is absent, the shipped disabled configuration applies. When it is
+present, it must be a regular file — not a link, directory, or special entry —
+holding exactly one `[reasoning]` table and nothing else, and that table
+replaces the tracked one completely:
+
+```toml
+[reasoning]
+enabled = true
+transport = "loopback"          # or "private_lan"
+host = "127.0.0.1"              # an IP address inside that class
+model = "example-model:tag"
+request_deadline_seconds = 60   # 1 to 300
+max_input_bytes = 65536         # 1 to 1048576
+max_output_bytes = 16384        # 1 to 1048576
+```
+
+An enabled block must name all six active fields; none has a default and none
+is borrowed from the tracked file. `loopback` admits `127.0.0.0/8` and `::1`;
+`private_lan` admits `10.0.0.0/8`, `172.16.0.0/12`, `192.168.0.0/16`, and
+`fc00::/7`. The host is written as an address, never a name, in its canonical
+form. The model identifier is 1 to 128 ASCII letters, digits, or
+`. _ : / @ + -`, starting with a letter or digit. There is no setting for a
+port, endpoint URL, model path, credential, token, or header, and any
+unknown key is refused. A missing, mistyped, out-of-range, or unknown value
+stops startup with the usual sanitized failure message, and nothing about the
+file, its location, or its values is printed or logged.
 
 ## Persistent Memory
 
@@ -340,7 +387,8 @@ Brain, Planner, and clean startup wiring.
   configuration, and constants
 - `tools/`: built-in tools
 - `database/`: SQLite database
-- `config/`: TOML configuration, including the named filesystem roots
+- `config/`: TOML configuration, including the named filesystem roots and the
+  disabled reasoning template
 - `prompts/`: starter prompt text
 - `logs/`: runtime logs
 - `docs/`: architecture and development documentation

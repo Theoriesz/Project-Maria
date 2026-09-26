@@ -805,12 +805,22 @@ owner's home location, or an underlying `OSError`'s text.
 `Failure(kind: FailureKind)`
 
 An immutable typed failure carrying a kind and nothing else. `FailureKind`
-is a closed set with two members:
+is a closed set with nine members:
 
 | Kind | `.code` | `.message` |
 | --- | --- | --- |
 | `TOOL_EXECUTION_FAILED` | `tool_execution_failed` | `Tool execution failed.` |
 | `DATABASE_SCHEMA_TOO_NEW` | `database_schema_too_new` | `This database was written by a newer version of Maria and cannot be opened by this one.` |
+| `REASONING_UNAVAILABLE` | `reasoning_unavailable` | `The local reasoning model is unavailable.` |
+| `REASONING_TIMEOUT` | `reasoning_timeout` | `The local reasoning model did not respond in time.` |
+| `REASONING_REFUSED` | `reasoning_refused` | `The local reasoning model refused the request.` |
+| `REASONING_MALFORMED_OUTPUT` | `reasoning_malformed_output` | `The local reasoning model returned an unusable response.` |
+| `REASONING_OUTPUT_TRUNCATED` | `reasoning_output_truncated` | `The local reasoning model returned an incomplete response.` |
+| `REASONING_INPUT_OVER_BUDGET` | `reasoning_input_over_budget` | `The request is too large for the local reasoning model.` |
+| `REASONING_OUTPUT_OVER_BUDGET` | `reasoning_output_over_budget` | `The local reasoning model's response was too large and was discarded.` |
+
+The seven reasoning kinds are what `request_reasoning` returns in place of a
+reply; see "Reasoning Interface".
 
 `.code` returns the kind's stable identifier, which is what an operational log
 record may name. `.message` returns the fixed owner-visible sentence for the
@@ -836,6 +846,138 @@ rather than a more specific built-in, so an existing `except RuntimeError` or
 `except sqlite3.Error` handler cannot silently absorb a refusal the owner is
 meant to see. `Memory.initialize()` raises it for a database written by a
 newer build, and `run_cli()` prints its message.
+
+## Reasoning Interface
+
+`core/reasoning.py` is the provider-independent contract for Maria's one
+owner-controlled local model. It contains no transport, no model, and no
+provider; nothing in Maria calls a provider yet, and no command's behavior
+changes. Its own imports include no network, threading, asynchronous, or
+subprocess module, and it imports nothing from Maria except `core.failures`
+and `core.logger`, so it has no path to planning, permissions, tool dispatch,
+or persistence.
+
+`ReasoningRequest(prompt: str)` and `ReasoningResponse(text: str)`
+
+Frozen dataclasses with exactly one field each. The text must be an exact,
+non-empty, UTF-8-encodable `str` of at most 1,048,576 UTF-8 bytes
+(`REASONING_MAXIMUM_INPUT_BYTES` and `REASONING_MAXIMUM_OUTPUT_BYTES`);
+anything else raises `ValueError` with a fixed message that never repeats the
+value. Sizes are bytes, not tokens, so no runtime's tokenizer is assumed.
+There is no field for personal context, a system prompt, a template, a
+credential, a header, an endpoint, a port, or a model path. `repr()`,
+`str()`, and formatting show `<redacted>` rather than the text.
+
+`ReasoningTransport`
+
+A `str` enum naming where the one reasoning host may be, not how Maria
+reaches it: `LOOPBACK` (`loopback`: `127.0.0.0/8`, `::1`) and `PRIVATE_LAN`
+(`private_lan`: `10.0.0.0/8`, `172.16.0.0/12`, `192.168.0.0/16`, `fc00::/7`).
+It selects no protocol, port, runtime, or library.
+
+`ReasoningSettings(enabled, transport=None, host=None, model=None,
+request_deadline_seconds=None, max_input_bytes=None, max_output_bytes=None)`
+
+The validated provider settings, as a frozen dataclass. Disabled settings
+must carry no other value; `DISABLED_REASONING` is the one disabled instance
+and the default of `MariaConfig.reasoning`. Enabled settings require every
+field, each checked by exact type with no default:
+
+| Field | Accepted |
+| --- | --- |
+| `transport` | a `ReasoningTransport` member |
+| `host` | an IP address literal, in canonical form, inside the transport's networks; no host name, port, scope, or IPv4-mapped IPv6 address |
+| `model` | 1 to 128 ASCII letters, digits, or `. _ : / @ + -`, starting with a letter or digit |
+| `request_deadline_seconds` | an `int` from 1 to 300 |
+| `max_input_bytes` | an `int` from 1 to 1,048,576 |
+| `max_output_bytes` | an `int` from 1 to 1,048,576 |
+
+`bool` is refused wherever an `int` is required. Each violation raises
+`ValueError` with a fixed per-field message. Once enabled, the settings are
+machine-specific: `repr()` and `str()` show only
+`ReasoningSettings(enabled=True, <redacted>)`.
+
+`ReasoningProvider`
+
+The protocol the later local adapter implements: `respond(request) ->
+ReasoningResponse`, or raise `TypedFailureError` carrying one of the seven
+`REASONING_FAILURE_KINDS`. A provider enforces its own hard deadline and
+output budget, reports a timeout, an oversized reply, or a cut-off reply as
+that typed failure rather than returning partial text, and never puts a
+prompt, a reply, its host, its model identifier, or a runtime's own error
+text into an exception or a log line.
+
+`request_reasoning(provider, request, settings, logger=None) ->
+ReasoningResponse | Failure`
+
+The one boundary through which a provider is asked anything. Settings and
+the request must be exact types, or `ValueError` is raised before the
+provider is reached. Then, in order:
+
+1. Disabled settings return `REASONING_UNAVAILABLE` without asking the
+   provider.
+2. A prompt over `max_input_bytes` returns `REASONING_INPUT_OVER_BUDGET`
+   without asking the provider.
+3. The provider is asked exactly once. A `TypedFailureError` of exactly that
+   type, carrying a reasoning kind, returns that kind. Any other typed failure,
+   a derived or tampered carrier, and every other `Exception` return
+   `REASONING_UNAVAILABLE`; the exception is never bound to a name, so neither
+   it nor its text can reach the result or the log. `KeyboardInterrupt` and
+   `SystemExit` propagate.
+4. A result that is not exactly a `ReasoningResponse` holding non-empty,
+   encodable, exact `str` text returns `REASONING_MALFORMED_OUTPUT`. The text is
+   read again rather than trusted from construction.
+5. Text over `max_output_bytes` returns `REASONING_OUTPUT_OVER_BUDGET`; it is
+   discarded whole, never truncated.
+6. Otherwise a fresh `ReasoningResponse` holding the same text is returned.
+
+The reply is untrusted, inert text: nothing in this module parses, repairs,
+or acts on it. The log records `Reasoning request completed.` or
+`Reasoning request failed: code=<code>`, and nothing else.
+
+### Reasoning configuration and the local override
+
+`load_config(config_path=CONFIG_PATH, local_override_path=None) ->
+MariaConfig`
+
+`MariaConfig.reasoning` holds the settled `ReasoningSettings`. It is the last
+field and defaults to `DISABLED_REASONING`, so direct constructions that do
+not name it keep working.
+
+The tracked file's `[reasoning]` table is optional. When absent, reasoning is
+disabled. When present, it must be a table containing exactly
+`enabled = false`: a tracked file that enables reasoning, or names any other
+key, raises `ValueError`. Active settings belong only in the untracked
+override.
+
+`local_override_path` is `None` by default, so an ordinary caller loads the
+tracked file alone and never reads the owner's private settings.
+`MariaBrain.from_defaults()` is the one caller that passes `LOCAL_CONFIG_PATH`
+(`config/config.local.toml`, which Git ignores). The tracked file is settled
+in full first. Then:
+
+- When the override's directory entry does not exist, the tracked
+  configuration applies unchanged. Presence is decided with `os.lstat`, so a
+  dangling symbolic link is present, not absent.
+- A present entry must be a regular file. A symbolic link, including a
+  dangling one, a directory, and any special entry are refused before the file
+  is opened. Where the platform supports it, the open neither follows a link
+  nor waits on a special file, and the opened descriptor must still be the
+  same regular file.
+- The file must be at most 65,536 bytes of UTF-8 TOML containing exactly one
+  `[reasoning]` table and no other table or key.
+- That table replaces the tracked one completely: a disabled table must say
+  only `enabled = false`, and an enabled table must name all six active
+  fields. Nothing is merged and no missing field is borrowed. The override
+  can never affect permissions, roots, paths, logging, or any other section.
+
+Unknown keys are refused inside `[reasoning]` only; the existing rule that
+unknown keys in `[app]`, `[paths]`, `[logging]`, and `[permissions]` are
+ignored is unchanged. Every reasoning and override failure raises `ValueError`
+with a fixed message that names no path, host, model, file content, or parser
+or operating-system error text, and is raised with neither a cause nor a
+context, because Python's TOML error keeps the whole document it was parsing.
+Loading logs nothing.
 
 ## Tool Manager
 

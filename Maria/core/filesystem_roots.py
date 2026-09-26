@@ -450,9 +450,9 @@ class FilesystemRoots(_FilesystemRootsBase):
 # occupy that exact path, and a pointer file simply has no descendants.
 UNIVERSAL_EXCLUDED_SUBTREES = (DATABASE_DIR, LOG_DIR, GIT_DIR)
 
-# Exact private files no filesystem capability may read. The reserved local
-# configuration is excluded whether or not it exists; Maria never creates it
-# and never loads it.
+# Exact private files no filesystem capability may read. The local
+# configuration override is excluded whether or not it exists; Maria never
+# creates it, and only configuration loading at startup ever reads it.
 UNIVERSAL_EXCLUDED_FILES = (LOCAL_CONFIG_PATH,)
 
 # Directory names excluded at any depth inside the repository. These are

@@ -36,3 +36,9 @@ deny = [
   "filesystem.delete",
   "filesystem.write"
 ]
+
+# Reasoning stays disabled in this tracked file, which must never hold a
+# host, model, or any other machine-specific value. Active settings belong
+# only in the untracked, Git-ignored config/config.local.toml.
+[reasoning]
+enabled = false

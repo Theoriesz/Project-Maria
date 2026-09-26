@@ -17,9 +17,11 @@ REPOSITORY_ROOT = PROJECT_ROOT.parent
 
 CONFIG_PATH = PROJECT_ROOT / "config" / "config.toml"
 
-# Reserved for private local configuration. Maria never creates this file and
-# never loads it; the path exists here so the permanent-exclusion boundary can
-# name it.
+# The owner's optional, untracked local configuration override. Maria never
+# creates this file. Startup reads it, only when it is present, as the one
+# place machine-specific reasoning settings may live; it can hold a
+# [reasoning] table and nothing else. The permanent-exclusion boundary names
+# it too, so no filesystem capability can ever read it.
 LOCAL_CONFIG_PATH = PROJECT_ROOT / "config" / "config.local.toml"
 
 DATABASE_DIR = PROJECT_ROOT / "database"
