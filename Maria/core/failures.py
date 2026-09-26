@@ -39,6 +39,18 @@ class FailureKind(str, Enum):
     TOOL_EXECUTION_FAILED = "tool_execution_failed"
     DATABASE_SCHEMA_TOO_NEW = "database_schema_too_new"
 
+    # Why a request to the owner's local reasoning model produced no usable
+    # reply. The two budget kinds are separate because they happen at
+    # different moments: an oversized request is refused before the provider
+    # is asked anything, while an oversized reply is discarded afterwards.
+    REASONING_UNAVAILABLE = "reasoning_unavailable"
+    REASONING_TIMEOUT = "reasoning_timeout"
+    REASONING_REFUSED = "reasoning_refused"
+    REASONING_MALFORMED_OUTPUT = "reasoning_malformed_output"
+    REASONING_OUTPUT_TRUNCATED = "reasoning_output_truncated"
+    REASONING_INPUT_OVER_BUDGET = "reasoning_input_over_budget"
+    REASONING_OUTPUT_OVER_BUDGET = "reasoning_output_over_budget"
+
 
 # The one owner-visible sentence each kind is allowed to produce. The text is
 # fixed per kind and interpolates nothing, so a message can never widen to
@@ -49,6 +61,28 @@ _FAILURE_MESSAGES: Mapping[FailureKind, str] = MappingProxyType(
         FailureKind.DATABASE_SCHEMA_TOO_NEW: (
             "This database was written by a newer version of Maria and "
             "cannot be opened by this one."
+        ),
+        FailureKind.REASONING_UNAVAILABLE: (
+            "The local reasoning model is unavailable."
+        ),
+        FailureKind.REASONING_TIMEOUT: (
+            "The local reasoning model did not respond in time."
+        ),
+        FailureKind.REASONING_REFUSED: (
+            "The local reasoning model refused the request."
+        ),
+        FailureKind.REASONING_MALFORMED_OUTPUT: (
+            "The local reasoning model returned an unusable response."
+        ),
+        FailureKind.REASONING_OUTPUT_TRUNCATED: (
+            "The local reasoning model returned an incomplete response."
+        ),
+        FailureKind.REASONING_INPUT_OVER_BUDGET: (
+            "The request is too large for the local reasoning model."
+        ),
+        FailureKind.REASONING_OUTPUT_OVER_BUDGET: (
+            "The local reasoning model's response was too large and was "
+            "discarded."
         ),
     }
 )

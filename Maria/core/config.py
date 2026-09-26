@@ -2,8 +2,10 @@
 
 from __future__ import annotations
 
+import os
 import re
-from dataclasses import dataclass
+import stat
+from dataclasses import dataclass, replace
 from pathlib import Path
 from typing import Any
 
@@ -27,6 +29,14 @@ from core.filesystem_roots import (
 from core.permissions import (
     MANDATORY_CONFIRMATION_ACTIONS,
     MANDATORY_DENIED_ACTIONS,
+)
+from core.reasoning import (
+    DISABLED_REASONING,
+    REASONING_DISABLED_FIELDS_MESSAGE,
+    REASONING_ENABLED_MESSAGE,
+    REASONING_TRANSPORT_MESSAGE,
+    ReasoningSettings,
+    ReasoningTransport,
 )
 
 
@@ -136,9 +146,91 @@ FILESYSTEM_PROJECT_MARIA_ENABLED_MESSAGE = (
 )
 
 
+# The exact keys a [reasoning] table accepts. The six active keys are all
+# required once reasoning is enabled and none of them has a default. There is
+# deliberately no key for a credential, a token, a header, an endpoint URL, a
+# port, or a model path, so any such key is refused as unknown.
+_REASONING_ACTIVE_KEYS = frozenset(
+    {
+        "transport",
+        "host",
+        "model",
+        "request_deadline_seconds",
+        "max_input_bytes",
+        "max_output_bytes",
+    }
+)
+_REASONING_KEYS = _REASONING_ACTIVE_KEYS | {"enabled"}
+
+_TRANSPORTS_BY_NAME = {
+    transport.value: transport for transport in ReasoningTransport
+}
+
+# The only thing the private override may hold.
+_LOCAL_OVERRIDE_SECTIONS = frozenset({"reasoning"})
+
+# The override holds a handful of short settings, so anything near this size
+# is not a reasoning block and is refused rather than read in full.
+MAXIMUM_LOCAL_OVERRIDE_BYTES = 64 * 1024
+
+# How the override is opened. Where the platform supports it, the open never
+# follows a link and never waits on a special file; the entry is checked
+# before the open and the opened descriptor is checked again after it.
+_LOCAL_OVERRIDE_OPEN_FLAGS = (
+    os.O_RDONLY
+    | getattr(os, "O_BINARY", 0)
+    | getattr(os, "O_NOFOLLOW", 0)
+    | getattr(os, "O_NONBLOCK", 0)
+)
+
+
+# Like the filesystem messages, every reasoning and override message is fixed
+# and interpolates nothing, so a refusal cannot carry the override's path, its
+# text, a configured host or model identifier, or a parser's or the operating
+# system's error text.
+REASONING_SECTION_TABLE_MESSAGE = "The [reasoning] section must be a TOML table."
+REASONING_UNKNOWN_KEY_MESSAGE = (
+    "The [reasoning] section accepts only enabled, transport, host, model, "
+    "request_deadline_seconds, max_input_bytes, and max_output_bytes."
+)
+REASONING_ENABLED_REQUIRED_MESSAGE = (
+    "The [reasoning] section must declare enabled."
+)
+REASONING_MISSING_FIELD_MESSAGE = (
+    "An enabled [reasoning] section must declare transport, host, model, "
+    "request_deadline_seconds, max_input_bytes, and max_output_bytes."
+)
+REASONING_TRACKED_ENABLED_MESSAGE = (
+    "The tracked configuration must keep reasoning disabled; active reasoning "
+    "settings belong only in the local override."
+)
+LOCAL_OVERRIDE_ENTRY_MESSAGE = (
+    "The local configuration override must be a regular file, not a link, "
+    "directory, or other special entry."
+)
+LOCAL_OVERRIDE_UNREADABLE_MESSAGE = (
+    "The local configuration override could not be read."
+)
+LOCAL_OVERRIDE_TOO_LARGE_MESSAGE = (
+    "The local configuration override must be at most "
+    f"{MAXIMUM_LOCAL_OVERRIDE_BYTES} bytes."
+)
+LOCAL_OVERRIDE_TOML_MESSAGE = (
+    "The local configuration override is not valid UTF-8 TOML."
+)
+LOCAL_OVERRIDE_SECTIONS_MESSAGE = (
+    "The local configuration override must contain exactly one [reasoning] "
+    "section and nothing else."
+)
+
+
 @dataclass(frozen=True)
 class MariaConfig:
-    """Runtime configuration loaded from config.toml."""
+    """Runtime configuration loaded from config.toml.
+
+    ``reasoning`` defaults to the disabled settings, which is what every
+    configuration without an enabled local override means.
+    """
 
     app_name: str
     version: str
@@ -151,15 +243,29 @@ class MariaConfig:
     log_level: str
     confirmation_required: frozenset[str]
     denied_actions: frozenset[str]
+    reasoning: ReasoningSettings = DISABLED_REASONING
 
 
-def load_config(config_path: Path = CONFIG_PATH) -> MariaConfig:
-    """Load Maria configuration from a TOML file.
+def load_config(
+    config_path: Path = CONFIG_PATH,
+    local_override_path: Path | None = None,
+) -> MariaConfig:
+    """Load Maria configuration from a TOML file and an optional override.
 
     Loading is side-effect free: it reads the configuration file, settles
     canonical paths, and classifies what it was given. Nothing here creates a
     directory, writes a file, or otherwise prepares a root; startup calls
     ``prepare_roots`` separately for that.
+
+    Only the tracked file is read unless a caller names an override
+    explicitly. Production startup is the one caller that does, so every
+    other caller, including every test that loads the shipped file, never
+    reads the owner's private settings. When an override path is named and
+    nothing is there, the tracked configuration applies unchanged. When
+    something is there, it must be a regular file holding exactly one
+    ``[reasoning]`` table, and that table replaces the tracked one
+    completely: nothing is merged and no missing field is borrowed. Anything
+    else stops loading with a fixed message.
     """
     if not config_path.exists():
         raise FileNotFoundError(f"Configuration file not found: {config_path}")
@@ -190,7 +296,7 @@ def load_config(config_path: Path = CONFIG_PATH) -> MariaConfig:
         paths.get("system_prompt", "prompts/system_prompt.txt")
     )
 
-    return MariaConfig(
+    config = MariaConfig(
         app_name=str(app.get("name", "Maria")),
         version=str(app.get("version", APP_VERSION)),
         environment=str(app.get("environment", "development")),
@@ -210,7 +316,19 @@ def load_config(config_path: Path = CONFIG_PATH) -> MariaConfig:
         denied_actions=frozenset(
             configured_denied_actions | MANDATORY_DENIED_ACTIONS
         ),
+        reasoning=_tracked_reasoning(raw_config),
     )
+
+    # The tracked file is settled in full before the private override is
+    # even looked at, and the override can change the reasoning settings
+    # alone: every other field comes from the tracked file whatever the
+    # override holds.
+    if local_override_path is None:
+        return config
+    overriding = _local_override_reasoning(local_override_path)
+    if overriding is None:
+        return config
+    return replace(config, reasoning=overriding)
 
 
 def _resolve_project_path(value: Any) -> Path:
@@ -370,6 +488,168 @@ def _reject_conflicting_roots(roots: tuple[FilesystemRoot, ...]) -> None:
                 raise ValueError(FILESYSTEM_DUPLICATE_PATH_MESSAGE)
             if root.contains(other.path) or other.contains(root.path):
                 raise ValueError(FILESYSTEM_OVERLAP_MESSAGE)
+
+
+def _tracked_reasoning(raw_config: dict[str, Any]) -> ReasoningSettings:
+    """Settle the tracked reasoning template, which may only be disabled.
+
+    An absent section is the disabled default, which is what every older
+    configuration means. A present one must be exactly ``enabled = false``:
+    active settings are machine-specific and belong only in the untracked
+    override, so a tracked file that enables reasoning, or names any
+    provider field at all, is refused rather than trusted.
+    """
+    if "reasoning" not in raw_config:
+        return DISABLED_REASONING
+    table = _reasoning_table(raw_config["reasoning"])
+    if table["enabled"]:
+        raise ValueError(REASONING_TRACKED_ENABLED_MESSAGE)
+    return _reasoning_settings(table)
+
+
+def _reasoning_table(value: Any) -> dict[str, Any]:
+    """Check the shape every [reasoning] table shares, wherever it came from.
+
+    Unknown keys are refused inside this table only; the ignore-unknown-keys
+    rule for Maria's older sections is unchanged.
+    """
+    if not isinstance(value, dict):
+        raise ValueError(REASONING_SECTION_TABLE_MESSAGE)
+    if not set(value) <= _REASONING_KEYS:
+        raise ValueError(REASONING_UNKNOWN_KEY_MESSAGE)
+    if "enabled" not in value:
+        raise ValueError(REASONING_ENABLED_REQUIRED_MESSAGE)
+    if type(value["enabled"]) is not bool:
+        raise ValueError(REASONING_ENABLED_MESSAGE)
+    return value
+
+
+def _reasoning_settings(table: dict[str, Any]) -> ReasoningSettings:
+    """Build settings from one checked table, with no default for any field.
+
+    A disabled table must say nothing else. An enabled one must name all six
+    active fields; a missing one is a refusal, never a gap filled from
+    anywhere. Each value's type, range, and enumeration is then settled by
+    ``ReasoningSettings`` itself.
+    """
+    if not table["enabled"]:
+        if set(table) != {"enabled"}:
+            raise ValueError(REASONING_DISABLED_FIELDS_MESSAGE)
+        return DISABLED_REASONING
+
+    if not _REASONING_ACTIVE_KEYS <= set(table):
+        raise ValueError(REASONING_MISSING_FIELD_MESSAGE)
+
+    transport_name = table["transport"]
+    if (
+        type(transport_name) is not str
+        or transport_name not in _TRANSPORTS_BY_NAME
+    ):
+        raise ValueError(REASONING_TRANSPORT_MESSAGE)
+
+    return ReasoningSettings(
+        enabled=True,
+        transport=_TRANSPORTS_BY_NAME[transport_name],
+        host=table["host"],
+        model=table["model"],
+        request_deadline_seconds=table["request_deadline_seconds"],
+        max_input_bytes=table["max_input_bytes"],
+        max_output_bytes=table["max_output_bytes"],
+    )
+
+
+def _local_override_reasoning(path: Path) -> ReasoningSettings | None:
+    """Return the private override's reasoning settings, or None when absent.
+
+    The override may hold one [reasoning] table and nothing else, so it can
+    never reach permissions, roots, logging, paths, or any other section.
+    """
+    entry = _local_override_entry(path)
+    if entry is None:
+        return None
+
+    document = _local_override_document(_local_override_bytes(path, entry))
+    if set(document) != _LOCAL_OVERRIDE_SECTIONS:
+        raise ValueError(LOCAL_OVERRIDE_SECTIONS_MESSAGE)
+    return _reasoning_settings(_reasoning_table(document["reasoning"]))
+
+
+# Each reader below settles its failure inside the handler and raises its
+# fixed refusal only after the handler has finished. A refusal therefore has
+# neither a cause nor a context: the operating system's error, which names
+# the path, and Python's TOML error, which keeps the whole document it was
+# parsing, are both gone before anything is raised.
+
+
+def _local_override_entry(path: Path) -> os.stat_result | None:
+    """Describe the override's own directory entry, or None when it is absent.
+
+    ``lstat`` does not follow a link, so a dangling link is present rather
+    than absent, and it is refused like every other link. Only the entry
+    being missing means there is no override.
+    """
+    try:
+        entry = os.lstat(path)
+    except FileNotFoundError:
+        return None
+    except OSError:
+        pass
+    else:
+        if not stat.S_ISREG(entry.st_mode):
+            raise ValueError(LOCAL_OVERRIDE_ENTRY_MESSAGE)
+        return entry
+    raise ValueError(LOCAL_OVERRIDE_UNREADABLE_MESSAGE)
+
+
+def _local_override_bytes(path: Path, entry: os.stat_result) -> bytes:
+    """Read the override, refusing any entry that changed since inspection."""
+    try:
+        return _read_regular_file(path, entry)
+    except OSError:
+        pass
+    raise ValueError(LOCAL_OVERRIDE_UNREADABLE_MESSAGE)
+
+
+def _read_regular_file(path: Path, entry: os.stat_result) -> bytes:
+    """Read at most one byte past the size bound from a verified regular file.
+
+    The opened descriptor must still be a regular file with the identity
+    ``lstat`` reported, so an entry swapped for a link, a directory, or a
+    special file between the two looks is refused rather than read.
+    """
+    descriptor = os.open(path, _LOCAL_OVERRIDE_OPEN_FLAGS)
+    try:
+        opened = os.fstat(descriptor)
+        if not stat.S_ISREG(opened.st_mode) or (
+            opened.st_dev,
+            opened.st_ino,
+        ) != (entry.st_dev, entry.st_ino):
+            raise ValueError(LOCAL_OVERRIDE_ENTRY_MESSAGE)
+
+        content = b""
+        while len(content) <= MAXIMUM_LOCAL_OVERRIDE_BYTES:
+            chunk = os.read(
+                descriptor,
+                MAXIMUM_LOCAL_OVERRIDE_BYTES + 1 - len(content),
+            )
+            if not chunk:
+                break
+            content += chunk
+    finally:
+        os.close(descriptor)
+
+    if len(content) > MAXIMUM_LOCAL_OVERRIDE_BYTES:
+        raise ValueError(LOCAL_OVERRIDE_TOO_LARGE_MESSAGE)
+    return content
+
+
+def _local_override_document(content: bytes) -> dict[str, Any]:
+    """Parse the override as UTF-8 TOML, or refuse without keeping any text."""
+    try:
+        return tomllib.loads(content.decode("utf-8"))
+    except (UnicodeDecodeError, tomllib.TOMLDecodeError):
+        pass
+    raise ValueError(LOCAL_OVERRIDE_TOML_MESSAGE)
 
 
 def _permission_action_set(

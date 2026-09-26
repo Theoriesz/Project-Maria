@@ -31,6 +31,9 @@ maria_cli_test/
 .env.*
 !.env.example
 
+# Private local configuration override
+config/config.local.toml
+
 # Temporary and backup files
 *.tmp
 *.bak

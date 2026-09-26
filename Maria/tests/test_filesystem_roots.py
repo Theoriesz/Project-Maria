@@ -596,8 +596,19 @@ class UniversalExclusionClassificationTests(unittest.TestCase):
                 self.assertTrue(is_universally_excluded(path))
 
     def test_the_reserved_local_configuration_is_excluded(self) -> None:
-        self.assertTrue(is_universally_excluded(LOCAL_CONFIG_PATH))
-        self.assertFalse(LOCAL_CONFIG_PATH.exists())
+        # The owner's private override may legitimately exist, so the
+        # exclusion is proven without asking the filesystem anything: the
+        # classification consults no metadata, so its answer cannot depend
+        # on whether the file is there.
+        self.assertEqual(
+            LOCAL_CONFIG_PATH,
+            PROJECT_ROOT / "config" / "config.local.toml",
+        )
+        with patch("os.stat", side_effect=AssertionError("stat consulted")), patch(
+            "os.lstat",
+            side_effect=AssertionError("lstat consulted"),
+        ):
+            self.assertTrue(is_universally_excluded(LOCAL_CONFIG_PATH))
 
     def test_credential_components_are_excluded_at_any_depth(self) -> None:
         for relative in (

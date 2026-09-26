@@ -23,6 +23,26 @@ DATABASE_SCHEMA_TOO_NEW_MESSAGE = (
     "cannot be opened by this one."
 )
 
+# The reasoning kinds and their exact sentences, written out rather than read
+# back from the module for the same reason.
+REASONING_FAILURE_MESSAGES = {
+    "reasoning_unavailable": "The local reasoning model is unavailable.",
+    "reasoning_timeout": "The local reasoning model did not respond in time.",
+    "reasoning_refused": "The local reasoning model refused the request.",
+    "reasoning_malformed_output": (
+        "The local reasoning model returned an unusable response."
+    ),
+    "reasoning_output_truncated": (
+        "The local reasoning model returned an incomplete response."
+    ),
+    "reasoning_input_over_budget": (
+        "The request is too large for the local reasoning model."
+    ),
+    "reasoning_output_over_budget": (
+        "The local reasoning model's response was too large and was discarded."
+    ),
+}
+
 # The exact representation, likewise written out rather than derived, so
 # a change to what a failure shows in a log line has to be deliberate.
 EXPECTED_REPR = (
@@ -290,12 +310,48 @@ class DatabaseSchemaFailureTests(unittest.TestCase):
     def test_the_kinds_stay_distinct_and_closed(self) -> None:
         self.assertEqual(
             {kind.value for kind in FailureKind},
-            {"tool_execution_failed", "database_schema_too_new"},
+            {"tool_execution_failed", "database_schema_too_new"}
+            | set(REASONING_FAILURE_MESSAGES),
         )
         self.assertNotEqual(
             Failure(FailureKind.DATABASE_SCHEMA_TOO_NEW),
             Failure(FailureKind.TOOL_EXECUTION_FAILED),
         )
+
+
+class ReasoningFailureTests(unittest.TestCase):
+    """Verify the reasoning kinds join the vocabulary on the same terms."""
+
+    def test_each_kind_carries_its_fixed_message_and_stable_code(self) -> None:
+        for code, message in REASONING_FAILURE_MESSAGES.items():
+            with self.subTest(code=code):
+                failure = Failure(FailureKind(code))
+
+                self.assertEqual(failure.code, code)
+                self.assertEqual(failure.message, message)
+
+    def test_no_message_names_a_host_model_path_or_placeholder(self) -> None:
+        for code in REASONING_FAILURE_MESSAGES:
+            message = Failure(FailureKind(code)).message
+            for forbidden in ("{", "%", "/", "\\", "http", "127.", "::"):
+                with self.subTest(code=code, forbidden=forbidden):
+                    self.assertNotIn(forbidden, message)
+
+    def test_every_reasoning_kind_is_distinct(self) -> None:
+        failures = {Failure(FailureKind(code)) for code in REASONING_FAILURE_MESSAGES}
+
+        self.assertEqual(len(failures), len(REASONING_FAILURE_MESSAGES))
+
+    def test_provider_text_never_survives_into_a_reasoning_failure(self) -> None:
+        sentinel = "private-provider-detail-61d0b9e3f4"
+        try:
+            raise RuntimeError(sentinel)
+        except RuntimeError:
+            raised = TypedFailureError(Failure(FailureKind.REASONING_TIMEOUT))
+
+        rendered = f"{raised!r} {raised} {raised.failure!r} {raised.failure.code}"
+        self.assertNotIn(sentinel, rendered)
+        self.assertNotIn("RuntimeError", rendered)
 
 
 class TypedFailureErrorTests(unittest.TestCase):

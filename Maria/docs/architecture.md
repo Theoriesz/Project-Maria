@@ -26,6 +26,9 @@ Maria is organized around a small set of modules with clear ownership.
     two-identity resolution both rely on. Startup prepares the declared roots
     once, before logging is configured and before the memory layer opens the
     database.
+13. `reasoning.py` defines the typed, provider-independent contract a later
+    local reasoning model will sit behind. Nothing in the flow above calls it
+    yet; see "Reasoning Interface and Local Override".
 
 An explicit memory request uses the same execution path as every other tool
 request:
@@ -599,6 +602,52 @@ never combined into one transaction: if the later recording fails, the mutation
 remains committed, the successful response is unchanged, and no audit row is
 guaranteed. There is no compensating rollback, retry, or replay.
 
+## Reasoning Interface and Local Override
+
+`core/reasoning.py` is the contract every later model stage builds on, and it
+deliberately contains no transport, no model, and no provider. A
+`ReasoningRequest` holds one bounded prompt and nothing else — there is no
+field through which personal context, a system prompt, or a template could
+travel — and a `ReasoningResponse` holds one bounded, untrusted string. The
+`ReasoningProvider` protocol is what the later local adapter implements.
+`request_reasoning` is the one boundary through which a provider is asked
+anything: it answers without asking when reasoning is disabled or the prompt
+is over budget, asks at most once, and returns either a fresh response holding
+inert text or a typed `Failure` from the reasoning kinds in `failures.py`. A
+provider's own exception never travels, a reply that is not exactly a bounded
+response is malformed, and an oversized reply is discarded whole rather than
+truncated. The module's own imports include no network, threading,
+asynchronous, or subprocess module and nothing from planning, permissions,
+dispatch, persistence, or tools, so a reply has no route to becoming an
+action. Prompts, replies, the host, and the model identifier are never shown by
+`repr()` or `str()`, never interpolated into an exception message, and never
+logged; the boundary logs only an outcome and a failure code.
+
+`ReasoningSettings` describes the one owner-controlled provider: a destination
+class (`loopback` or `private_lan`, which names where the host may be and
+selects no protocol, port, or runtime), one canonical IP address inside that
+class, an opaque model identifier, a hard deadline in whole seconds, and input
+and output budgets in UTF-8 bytes. Enabled settings require every field, with
+no defaults, and every value is checked by exact type, range, and enumeration.
+There is no field for a port, endpoint URL, model path, credential, token, or
+header.
+
+The tracked `config/config.toml` carries a disabled template, `[reasoning]`
+with `enabled = false` alone, and `core/config.py` refuses a tracked file that
+enables reasoning or names any provider value. Machine-specific settings live
+only in the owner's untracked `config/config.local.toml`, which
+`Maria/.gitignore` ignores, Maria never creates, and the universal permanent
+exclusion keeps out of every filesystem capability. `load_config` reads it only
+when a caller names it; `MariaBrain.from_defaults()` is the one caller that
+does. An absent override leaves the shipped disabled configuration. A present
+one must be a regular file — a link, including a dangling one, a directory, or
+a special entry is refused before anything is opened — holding exactly one
+`[reasoning]` table, which replaces the tracked table completely with nothing
+merged or borrowed. The override cannot reach any other section. Every refusal
+is a fixed message raised with no cause or context, so neither the file's text
+nor a parser's or the operating system's error text survives in it, and
+configuration loading logs nothing.
+
 ## Boundaries
 
 The brain does not run SQL or perform tool work directly. The planner does not
@@ -610,7 +659,8 @@ production accepts, and `tools/filesystem.py` adds the barrier that keeps the
 generic filesystem commands out of Maria's own repository. The action-contract
 registry declares argument shapes only: it holds no tool logic, never calls a
 tool to decide whether arguments are valid, and decides nothing about
-permission.
+permission. `core/reasoning.py` reaches nothing but the shared failures and the
+logger; no module passes a reasoning reply to the planner, Brain, or a tool.
 
 The brain has no memory-specific dispatch branch. `MemoryTool` contains no SQL;
 it receives the shared `Memory` object and calls its public persistence methods.

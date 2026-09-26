@@ -126,7 +126,8 @@ The fixed half follows from Maria's source layout:
 - `Maria/database/` and everything beneath it, including database sidecars
 - `Maria/logs/` and everything beneath it, including rotated logs
 - the repository's `.git`, whether it is a directory or a gitdir-pointer file
-- `Maria/config/config.local.toml`, which Maria never creates and never loads
+- `Maria/config/config.local.toml`, the owner's private reasoning override, which
+  Maria never creates and which only configuration loading at startup reads
 - inside the repository, at any depth: `.env` and any `.env.*` component,
   `__pycache__`, `.venv`, `venv`, `env`, `.pytest_cache`, `.mypy_cache`,
   `.ruff_cache`, `maria_cli_test`, `.claude`, and any component ending `.tmp` or
