@@ -168,9 +168,10 @@ Filesystem delete and write functionality remains intentionally unimplemented.
 ## Local Reasoning Settings
 
 Maria does not yet use a language model. Nothing in the CLI changes, and every
-command works exactly as before. What exists is the typed interface a later,
-owner-controlled local model will sit behind, and the configuration that will
-describe it.
+command works exactly as before. What exists is the typed interface an
+owner-controlled local model sits behind, the configuration that describes
+it, and one local adapter for Ollama that nothing in Maria calls yet; see
+"Local Ollama Adapter" below.
 
 The tracked `config/config.toml` keeps reasoning disabled:
 
@@ -211,6 +212,35 @@ port, endpoint URL, model path, credential, token, or header, and any
 unknown key is refused. A missing, mistyped, out-of-range, or unknown value
 stops startup with the usual sanitized failure message, and nothing about the
 file, its location, or its values is printed or logged.
+
+### Local Ollama Adapter
+
+`core/ollama_adapter.py` is Maria's one reasoning adapter and the first code in
+Maria's runtime that can use the network. It talks only to Ollama's native HTTP
+API on the same machine: one `POST /api/chat` request, with streaming off, to
+the fixed loopback address `127.0.0.1:11434`. The port and path are fixed in
+the adapter and are not settings. The adapter refuses to exist unless the
+local override names `transport = "loopback"` and `host = "127.0.0.1"`, and it
+refuses a model identifier that names an Ollama cloud model, such as one
+tagged `cloud` or ending `-cloud`. It never resolves a host name, uses a
+proxy, follows a redirect, retries, or falls back to anything else, and it
+never downloads a model, installs software, or starts a process.
+
+It sends only the model identifier and the request text as one user message,
+and takes back only the answer text. Any separate thinking text and any tool
+calls in the reply are discarded unread, and an answer is only ever text,
+never an action. One hard deadline covers connecting, sending, and receiving
+the whole reply; the reply is size-bounded before it is parsed, and the answer
+must fit within `max_output_bytes` or is discarded whole. Every failure is one
+fixed, typed message, and no request, answer, address, model identifier, or
+Ollama error text reaches Maria's log.
+
+Nothing in Maria constructs the adapter yet and reasoning stays disabled by
+default, so no command can reach Ollama. Before the adapter is ever used with a
+real model, Ollama itself must be put in local-only mode, as Ollama documents
+it, and restarted, so it cannot reach its cloud models. Maria's refusal of
+cloud-tagged model names is a second line of defense, not proof that Ollama is
+running local-only.
 
 ## Persistent Memory
 
@@ -356,10 +386,12 @@ those independent interaction rows; they can be removed separately with `delete
 interaction <id>`. As elsewhere, Maria promises no secure erasure from SQLite
 file pages, database or filesystem backups, Git history, or external copies.
 
-Maria's shipped runtime has no built-in networking or cloud integration and
-does not itself transmit this history. Configured network-mounted or
-synchronized paths and operating-system backup or sync services remain outside
-Maria's boundary.
+Maria's shipped runtime has no cloud integration and does not itself transmit
+this history. Its only network-capable code is the local Ollama adapter
+described under "Local Ollama Adapter": it can reach only `127.0.0.1:11434` on
+the same machine, it is disabled by default, and no command uses it yet.
+Configured network-mounted or synchronized paths and operating-system backup
+or sync services remain outside Maria's boundary.
 
 Avoid submitting or requesting display of passwords, API keys, access tokens,
 private keys, recovery codes, confidential credentials, or other highly
@@ -381,12 +413,15 @@ production runtime files are not required and no test creates or reads a real
 `~/MariaWorkspace`. The suite covers the CLI, configuration, permissions,
 calculator, memory, Logger, Tool Manager, notes, interaction history,
 filesystem, filesystem roots and permanent exclusions, system information,
-Brain, Planner, and clean startup wiring.
+Brain, Planner, the reasoning interface, the local Ollama adapter, and clean
+startup wiring. The adapter's tests run only against a local stub on a socket
+pair inside the test process, so the suite needs no Ollama, no model, and no
+network.
 
 ## Project Layout
 
 - `core/`: application coordination, planning, memory, permissions, logging,
-  configuration, and constants
+  configuration, constants, and the local reasoning interface and adapter
 - `tools/`: built-in tools
 - `database/`: SQLite database
 - `config/`: TOML configuration, including the named filesystem roots and the
