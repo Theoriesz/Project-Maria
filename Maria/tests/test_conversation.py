@@ -594,16 +594,26 @@ class DisabledReasoningTests(unittest.TestCase):
         self.assertEqual(session.conversation, ())
 
     def test_a_provider_with_disabled_settings_is_never_asked(self) -> None:
+        """Disabled settings keep the fallback as it was, provider or not."""
         provider = ScriptedProvider.replying(REPLY_SENTINEL)
         harness = _Harness(self, provider, settings=DISABLED_REASONING)
         session = harness.session()
 
         response = session.submit(PROMPT_SENTINEL)
 
-        self.assertEqual(response.text, UNAVAILABLE_MESSAGE)
+        self.assertEqual(
+            response,
+            BrainResponse(
+                UNSUPPORTED_RESPONSE,
+                plan=Plan(PROMPT_SENTINEL, (), UNSUPPORTED_RESPONSE),
+            ),
+        )
+        self.assertEqual(
+            harness.interactions(),
+            [(PROMPT_SENTINEL, UNSUPPORTED_RESPONSE)],
+        )
         self.assertEqual(provider.calls, 0)
         self.assertEqual(session.conversation, ())
-        self.assertEqual(harness.row_counts(), ZERO_ROWS)
 
 
 # --- Resolution order ---------------------------------------------------------

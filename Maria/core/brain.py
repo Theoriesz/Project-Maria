@@ -190,12 +190,14 @@ class MariaBrain:
     ) -> BrainResponse:
         """Plan one user request and run it unless it needs confirmation.
 
-        The deterministic planner always answers first. Only when it returns
-        its generic no-action fallback, and only when a reasoning provider
-        was supplied, is the request answered conversationally instead, in
-        the context of ``conversation``: the caller's earlier exchanges,
-        oldest first. Every other plan runs exactly as it always has and
-        never sees the conversation.
+        The deterministic planner always answers first. Only when a reasoning
+        provider was supplied, the configured reasoning settings are enabled,
+        and the planner returned its exact generic no-action fallback, is the
+        request answered conversationally instead, in the context of
+        ``conversation``: the caller's earlier exchanges, oldest first. With
+        reasoning disabled the fallback is answered and recorded exactly as
+        it always was, whether or not a provider is present. Every other plan
+        runs exactly as it always has and never sees the conversation.
         """
         cleaned_input = user_input.strip()
         if not cleaned_input:
@@ -214,7 +216,11 @@ class MariaBrain:
             context={"recent_interactions": recent_memory},
         )
 
-        if self.reasoning is not None and is_generic_fallback(plan):
+        if (
+            self.reasoning is not None
+            and self.config.reasoning.enabled
+            and is_generic_fallback(plan)
+        ):
             return self._converse(cleaned_input, conversation)
 
         return self._run_plan(plan, confirmed=False)
