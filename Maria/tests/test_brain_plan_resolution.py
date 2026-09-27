@@ -243,7 +243,7 @@ class ConfirmationResolutionTests(ResolutionTestCase):
         self.assertEqual(confirmed.text, "2\nRenamed old.txt to new.txt")
         self.assertFalse(confirmed.needs_confirmation)
         self.assertEqual(self.planner.create_plan.call_count, 1)
-        self.assertEqual(self.memory.get_recent_interactions.call_count, 1)
+        self.memory.get_recent_interactions.assert_not_called()
         self.assertEqual(
             self.events,
             [

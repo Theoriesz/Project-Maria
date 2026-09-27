@@ -178,6 +178,7 @@ class MemoryTests(unittest.TestCase):
                 "fact": ("TEXT", 1, 0),
                 "normalized_fact": ("TEXT", 1, 0),
                 "created_at": ("TEXT", 1, 0),
+                "context_enabled": ("INTEGER", 1, 0),
             },
         )
 
@@ -1352,12 +1353,13 @@ class MemoryTests(unittest.TestCase):
         memory_id, _ = self.memory.store_memory("My editor is VS Code")
         original_created_at = self._stored_memory_row(memory_id)[2]
 
-        updated, conflicting_id = self.memory.update_memory(
+        updated, conflicting_id, consent_cleared = self.memory.update_memory(
             memory_id, "My editor is Neovim"
         )
 
         self.assertTrue(updated)
         self.assertIsNone(conflicting_id)
+        self.assertFalse(consent_cleared)
         fact, normalized_fact, created_at = self._stored_memory_row(memory_id)
         self.assertEqual(fact, "My editor is Neovim")
         self.assertEqual(normalized_fact, "my editor is neovim")
@@ -1372,7 +1374,7 @@ class MemoryTests(unittest.TestCase):
 
         self.assertEqual(
             self.memory.update_memory(oldest_id, "Edited oldest fact"),
-            (True, None),
+            (True, None, False),
         )
 
         self.assertEqual(self._stored_memory_row(oldest_id)[2], original_created_at)
@@ -1392,7 +1394,7 @@ class MemoryTests(unittest.TestCase):
 
         self.assertEqual(
             self.memory.update_memory(memory_id, "My editor is VS Code"),
-            (True, None),
+            (True, None, False),
         )
 
         fact, normalized_fact, created_at = self._stored_memory_row(memory_id)
@@ -1406,7 +1408,7 @@ class MemoryTests(unittest.TestCase):
 
         self.assertEqual(
             self.memory.update_memory(memory_id, "MY EDITOR IS VS CODE"),
-            (True, None),
+            (True, None, False),
         )
 
         fact, normalized_fact, _ = self._stored_memory_row(memory_id)
@@ -1419,7 +1421,7 @@ class MemoryTests(unittest.TestCase):
 
         self.assertEqual(
             self.memory.update_memory(memory_id, "   My   edited   fact   "),
-            (True, None),
+            (True, None, False),
         )
 
         fact, normalized_fact, _ = self._stored_memory_row(memory_id)
@@ -1433,12 +1435,13 @@ class MemoryTests(unittest.TestCase):
         target_id, _ = self.memory.store_memory("My editor is VS Code")
         other_id, _ = self.memory.store_memory("Straße in Berlin")
 
-        updated, conflicting_id = self.memory.update_memory(
+        updated, conflicting_id, consent_cleared = self.memory.update_memory(
             target_id, "  STRASSE IN BERLIN  "
         )
 
         self.assertFalse(updated)
         self.assertEqual(conflicting_id, other_id)
+        self.assertFalse(consent_cleared)
         self.assertEqual(
             self._stored_memory_row(target_id)[:2],
             ("My editor is VS Code", "my editor is vs code"),
@@ -1454,7 +1457,7 @@ class MemoryTests(unittest.TestCase):
 
         self.assertEqual(
             self.memory.update_memory(memory_id + 1000, "Replacement fact"),
-            (False, None),
+            (False, None, False),
         )
         self.assertEqual(self._stored_memory_row(memory_id)[0], "Only fact")
 
@@ -1503,6 +1506,7 @@ class MemoryTests(unittest.TestCase):
         self.assertEqual(self._stored_memory_row(memory_id)[0], "Original fact")
 
     def test_update_memory_binds_values_as_parameters_and_commits(self) -> None:
+        """The fact and the consent reset share one connection and one commit."""
         self.memory.initialize()
         memory_id, _ = self.memory.store_memory("Original fact")
 
@@ -1514,9 +1518,11 @@ class MemoryTests(unittest.TestCase):
         with patch.object(self.memory, "_connect", return_value=mock_connection):
             result = self.memory.update_memory(memory_id, "  My Edited Fact  ")
 
-        self.assertEqual(result, (True, None))
-        mock_connection.execute.assert_called_once()
-        query, params = mock_connection.execute.call_args.args
+        self.assertEqual(result, (True, None, True))
+        self.assertEqual(mock_connection.execute.call_count, 2)
+        (query, params), (consent_query, consent_params) = (
+            call.args for call in mock_connection.execute.call_args_list
+        )
         self.assertIn("UPDATE memories", query)
         self.assertIn("SET fact = ?, normalized_fact = ?", query)
         self.assertIn("WHERE id = ?", query)
@@ -1524,6 +1530,10 @@ class MemoryTests(unittest.TestCase):
         self.assertNotIn("My Edited Fact", query)
         self.assertNotIn(str(memory_id), query)
         self.assertEqual(params, ("My Edited Fact", "my edited fact", memory_id))
+        self.assertIn("SET context_enabled = 0", consent_query)
+        self.assertIn("WHERE id = ? AND context_enabled = 1", consent_query)
+        self.assertNotIn("SELECT", consent_query)
+        self.assertEqual(consent_params, (memory_id,))
         mock_connection.commit.assert_called_once()
         mock_connection.rollback.assert_not_called()
         mock_connection.close.assert_called_once()
@@ -1539,7 +1549,7 @@ class MemoryTests(unittest.TestCase):
         with patch.object(self.memory, "_connect", return_value=mock_connection):
             result = self.memory.update_memory(7, "Replacement fact")
 
-        self.assertEqual(result, (False, None))
+        self.assertEqual(result, (False, None, False))
         mock_connection.execute.assert_called_once()
         mock_connection.commit.assert_called_once()
         mock_connection.close.assert_called_once()
@@ -1560,7 +1570,7 @@ class MemoryTests(unittest.TestCase):
         with patch.object(self.memory, "_connect", return_value=mock_connection):
             result = self.memory.update_memory(4, "Duplicate Fact")
 
-        self.assertEqual(result, (False, 9))
+        self.assertEqual(result, (False, 9, False))
         lookup_query, lookup_params = mock_connection.execute.call_args.args
         self.assertIn("SELECT id", lookup_query)
         self.assertIn("WHERE normalized_fact = ?", lookup_query)
@@ -1768,10 +1778,10 @@ class MemoryTests(unittest.TestCase):
         missing_update = memory.update_memory(memory_id, "secret missing fact")
         missing_forget = memory.forget_memory(memory_id)
 
-        self.assertEqual(updated, (True, None))
-        self.assertEqual(conflicted, (False, other_id))
+        self.assertEqual(updated, (True, None, False))
+        self.assertEqual(conflicted, (False, other_id, False))
         self.assertTrue(forgotten)
-        self.assertEqual(missing_update, (False, None))
+        self.assertEqual(missing_update, (False, None, False))
         self.assertFalse(missing_forget)
         for logger_call in mock_logger.method_calls:
             call_text = " ".join(str(arg) for arg in logger_call.args)
@@ -1779,6 +1789,165 @@ class MemoryTests(unittest.TestCase):
             self.assertNotIn("secret other fact", call_text)
             self.assertNotIn("secret new fact", call_text)
             self.assertNotIn("secret missing fact", call_text)
+
+
+class MemoryContextConsentTests(unittest.TestCase):
+    """Exercise the per-memory consent toggle and the bounded Tier A read."""
+
+    def setUp(self) -> None:
+        self.temp_dir = TemporaryDirectory()
+        self.addCleanup(self.temp_dir.cleanup)
+        self.database_path = Path(self.temp_dir.name) / "database" / "maria.db"
+        self.memory = Memory(self.database_path, logger=TEST_LOGGER)
+        self.memory.initialize()
+
+    def _flags(self) -> list[tuple[int, int]]:
+        """Read every memory's consent flag straight from the temporary database."""
+        with closing(sqlite3.connect(self.database_path)) as connection:
+            return [
+                (int(row[0]), int(row[1]))
+                for row in connection.execute(
+                    "SELECT id, context_enabled FROM memories ORDER BY id"
+                )
+            ]
+
+    def _store(self, *facts: str) -> list[int]:
+        return [self.memory.store_memory(fact)[0] for fact in facts]
+
+    def test_new_memories_start_with_consent_off(self) -> None:
+        self._store("first fact", "second fact")
+
+        self.assertEqual(self._flags(), [(1, 0), (2, 0)])
+        self.assertEqual(self.memory.list_context_memories(limit=100), [])
+
+    def test_the_toggle_changes_exactly_one_row(self) -> None:
+        self._store("first fact", "second fact", "third fact")
+
+        self.assertTrue(self.memory.set_memory_context(2, True))
+        self.assertEqual(self._flags(), [(1, 0), (2, 1), (3, 0)])
+        self.assertTrue(self.memory.set_memory_context(2, True))
+        self.assertEqual(self._flags(), [(1, 0), (2, 1), (3, 0)])
+        self.assertTrue(self.memory.set_memory_context(2, False))
+        self.assertEqual(self._flags(), [(1, 0), (2, 0), (3, 0)])
+
+    def test_a_missing_id_matches_nothing_and_changes_nothing(self) -> None:
+        self._store("only fact")
+
+        self.assertFalse(self.memory.set_memory_context(99, True))
+        self.assertEqual(self._flags(), [(1, 0)])
+
+    def test_invalid_arguments_are_refused_without_connecting(self) -> None:
+        cases = (
+            *((invalid_id, True) for invalid_id in (0, -1, "1", 1.0, True, False, None)),
+            *((1, invalid) for invalid in (1, 0, "yes", None)),
+        )
+        for memory_id, enabled in cases:
+            with self.subTest(memory_id=memory_id, enabled=enabled):
+                with patch.object(self.memory, "_connect") as connect_mock:
+                    with self.assertRaises(ValueError):
+                        self.memory.set_memory_context(memory_id, enabled)
+                    connect_mock.assert_not_called()
+
+    def test_the_read_returns_only_enabled_memories_by_ascending_id(self) -> None:
+        identifiers = self._store(*(f"fact {index}" for index in range(1, 21)))
+        for memory_id in reversed(identifiers[2:]):
+            self.memory.set_memory_context(memory_id, True)
+
+        rows = self.memory.list_context_memories(limit=17)
+
+        self.assertEqual([row["id"] for row in rows], list(range(3, 20)))
+        self.assertEqual(rows[0], {"id": 3, "fact": "fact 3"})
+        self.assertEqual({key for row in rows for key in row}, {"id", "fact"})
+        self.assertEqual(len(self.memory.list_context_memories(limit=0)), 1)
+        self.assertEqual(len(self.memory.list_context_memories(limit=500)), 18)
+
+    def test_existing_read_shapes_are_unchanged_for_an_enabled_memory(self) -> None:
+        (memory_id,) = self._store("My editor is VS Code")
+        self.memory.set_memory_context(memory_id, True)
+
+        for row in (
+            self.memory.get_memory(memory_id),
+            *self.memory.list_memories(),
+            *self.memory.search_memories("editor"),
+        ):
+            self.assertEqual(set(row), {"id", "fact", "created_at"})
+
+    def test_an_update_turns_consent_off_and_reports_it_only_when_it_was_on(
+        self,
+    ) -> None:
+        first, second = self._store("first fact", "second fact")
+        self.memory.set_memory_context(first, True)
+        self.memory.set_memory_context(second, True)
+
+        self.assertEqual(
+            self.memory.update_memory(first, "first fact, revised"),
+            (True, None, True),
+        )
+        self.assertEqual(self._flags(), [(1, 0), (2, 1)])
+        self.assertEqual(
+            self.memory.update_memory(first, "first fact, revised again"),
+            (True, None, False),
+        )
+
+    def test_a_conflicting_update_leaves_consent_untouched(self) -> None:
+        first, second = self._store("first fact", "second fact")
+        self.memory.set_memory_context(first, True)
+
+        self.assertEqual(
+            self.memory.update_memory(first, "SECOND FACT"),
+            (False, second, False),
+        )
+        self.assertEqual(self._flags(), [(1, 1), (2, 0)])
+
+    def test_a_failed_consent_reset_rolls_the_new_fact_back(self) -> None:
+        io_error = sqlite3.OperationalError("disk I/O error")
+        io_error.sqlite_errorcode = 10
+        updated_cursor = MagicMock()
+        updated_cursor.rowcount = 1
+        mock_connection = MagicMock(spec=sqlite3.Connection)
+        mock_connection.execute.side_effect = [updated_cursor, io_error]
+
+        with patch.object(self.memory, "_connect", return_value=mock_connection):
+            with self.assertRaisesRegex(RuntimeError, r"^Unable to update memory\.$"):
+                self.memory.update_memory(1, "Replacement fact")
+
+        mock_connection.rollback.assert_called_once()
+        mock_connection.commit.assert_not_called()
+        mock_connection.close.assert_called_once()
+
+    def test_consent_operations_log_ids_and_never_facts(self) -> None:
+        mock_logger = Mock(spec=logging.Logger)
+        memory = Memory(self.database_path, logger=mock_logger)
+        memory_id, _ = memory.store_memory("secret consent fact")
+        mock_logger.reset_mock()
+
+        memory.set_memory_context(memory_id, True)
+        memory.list_context_memories(limit=17)
+        memory.update_memory(memory_id, "secret revised fact")
+        memory.set_memory_context(memory_id, False)
+
+        logged = [
+            logger_call.args[0] % logger_call.args[1:]
+            for logger_call in mock_logger.method_calls
+        ]
+        self.assertIn("Enabled context consent for memory 1.", logged)
+        self.assertIn("Turned off context consent for updated memory 1.", logged)
+        for line in logged:
+            self.assertNotIn("secret consent fact", line)
+            self.assertNotIn("secret revised fact", line)
+
+    def test_a_failed_read_raises_a_fixed_message(self) -> None:
+        io_error = sqlite3.OperationalError("disk I/O error secret consent fact")
+        io_error.sqlite_errorcode = 10
+        mock_connection = MagicMock(spec=sqlite3.Connection)
+        mock_connection.execute.side_effect = io_error
+
+        with patch.object(self.memory, "_connect", return_value=mock_connection):
+            with self.assertRaisesRegex(
+                RuntimeError,
+                r"^Unable to read memory context\.$",
+            ):
+                self.memory.list_context_memories(limit=17)
 
 
 class UniqueViolationClassificationTests(unittest.TestCase):

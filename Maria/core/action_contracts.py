@@ -656,7 +656,7 @@ class ActionContractRegistry:
 
 
 def _identifier(required: bool = True) -> ArgumentContract:
-    """Declare the positive row identifier shared by seven lifecycle actions.
+    """Declare the positive row identifier shared by nine lifecycle actions.
 
     Every tool that takes an ``id`` rejects a bool, a non-int, and anything
     below 1, and none imposes a ceiling.
@@ -820,6 +820,8 @@ BUILT_IN_ACTION_CONTRACTS = ActionContractRegistry(
             ),
         ),
         ActionContract("memory", "forget", (_identifier(),)),
+        ActionContract("memory", "enable_context", (_identifier(),)),
+        ActionContract("memory", "disable_context", (_identifier(),)),
         ActionContract(
             "notes",
             "create",

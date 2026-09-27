@@ -110,20 +110,17 @@ class PlanBindingTests(SessionTestCase):
 
         self.assertEqual(confirmed.text, "Renamed old.txt to new.txt")
         self.assertFalse(confirmed.needs_confirmation)
-        self.planner.create_plan.assert_called_once_with(
-            RENAME_REQUEST,
-            context={"recent_interactions": []},
-        )
+        self.planner.create_plan.assert_called_once_with(RENAME_REQUEST)
         self.assertIs(confirmed.plan, plan)
 
-    def test_recent_context_is_retrieved_exactly_once_per_approved_request(
+    def test_no_interaction_history_is_read_for_an_approved_request(
         self,
     ) -> None:
         self._pend()
 
         self.session.confirm()
 
-        self.memory.get_recent_interactions.assert_called_once_with(limit=3)
+        self.memory.get_recent_interactions.assert_not_called()
 
     def test_confirmation_adds_no_further_planning_call(self) -> None:
         self._pend()

@@ -75,6 +75,8 @@ HELP_TEXT = (
     "- memories\n"
     "- update memory <id>: <new fact>\n"
     "- forget memory <id>\n"
+    "- enable memory context <id>\n"
+    "- disable memory context <id>\n"
     "- system\n"
     "- time\n"
     "- history\n"
@@ -256,6 +258,40 @@ COMMAND_CORPUS: tuple[CorpusEntry, ...] = (
     _records("time", TIME_REPORT),
     _records("current time", TIME_REPORT),
     _records("time now", TIME_REPORT),
+    # V1-15's consent commands run last, so every id listed above is
+    # unchanged. The earlier duplicate remember consumed an id, so this
+    # memory is 3. Every recorded consent row names the id, never the fact.
+    _records(
+        "remember My shell is PowerShell",
+        "Remembered memory 3: My shell is PowerShell",
+    ),
+    _records("enable memory context", "Use: enable memory context <id>"),
+    _records(
+        "enable memory context x",
+        "Memory id must be a positive whole number.",
+    ),
+    _records_nothing("enable memory context 3", CANCEL),
+    _records("enable memory context 3", "Enabled context for memory 3.", CONFIRM),
+    _records("enable memory context 99", "Memory not found: 99.", CONFIRM),
+    _records(
+        "update memory 3: My shell is Bash",
+        "Updated memory 3. Context consent for memory 3 was turned off because "
+        "its text changed.",
+        CONFIRM,
+    ),
+    _records("update memory 3: My shell is Zsh", "Updated memory 3.", CONFIRM),
+    _records("disable memory context", "Use: disable memory context <id>"),
+    _records(
+        "disable memory context 0",
+        "Memory id must be a positive whole number.",
+    ),
+    _records("enable memory context 3", "Enabled context for memory 3.", CONFIRM),
+    _records(
+        "disable memory context 3",
+        "Disabled context for memory 3.",
+        CONFIRM,
+    ),
+    _records("disable memory context 99", "Memory not found: 99.", CONFIRM),
     _records_nothing("   ", RUN),
     _records_nothing("", REFUSE),
 )
@@ -713,13 +749,9 @@ class _PolicyPlanner:
         self.inner = Planner(logger=_quiet_logger("tests.recording_policy.planner"))
         self.policy = policy
 
-    def create_plan(
-        self,
-        user_input: str,
-        context: dict[str, Any] | None = None,
-    ) -> Plan:
+    def create_plan(self, user_input: str) -> Plan:
         """Return the real plan, rebuilt with the chosen policy if one is set."""
-        plan = self.inner.create_plan(user_input, context=context)
+        plan = self.inner.create_plan(user_input)
         if self.policy is None:
             return plan
         return dataclasses.replace(plan, recording=self.policy)

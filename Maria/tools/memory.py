@@ -35,10 +35,18 @@ def _split_visible_rows(
 
 
 class MemoryTool:
-    """Store, retrieve, update, and forget explicit memories through the memory layer."""
+    """Store, retrieve, update, and forget explicit memories through the memory layer.
+
+    It also turns one memory's context consent on or off. Those results name
+    the memory's id and never its fact, so the interaction row a consent
+    change records carries no stored text.
+    """
 
     name = "memory"
-    description = "Stores, searches, lists, updates, and forgets explicit memories."
+    description = (
+        "Stores, searches, lists, updates, and forgets explicit memories, "
+        "and turns one memory's context consent on or off."
+    )
     actions = frozenset(
         {
             "store",
@@ -46,6 +54,8 @@ class MemoryTool:
             "list",
             "update",
             "forget",
+            "enable_context",
+            "disable_context",
         }
     )
 
@@ -69,6 +79,10 @@ class MemoryTool:
             return self._update(arguments)
         if action == "forget":
             return self._forget(arguments)
+        if action == "enable_context":
+            return self._set_context(arguments, enabled=True)
+        if action == "disable_context":
+            return self._set_context(arguments, enabled=False)
         return ToolExecutionResult(False, f"Unsupported memory action: {action}")
 
     def _store(self, arguments: Mapping[str, Any]) -> ToolExecutionResult:
@@ -193,7 +207,7 @@ class MemoryTool:
             return ToolExecutionResult(False, "New memory fact is required.")
 
         try:
-            updated, conflicting_id = self.memory.update_memory(
+            updated, conflicting_id, consent_cleared = self.memory.update_memory(
                 memory_id,
                 new_fact.strip(),
             )
@@ -203,9 +217,17 @@ class MemoryTool:
 
         if updated:
             self.logger.info("Updated memory %s through memory tool.", memory_id)
+            message = f"Updated memory {memory_id}."
+            if consent_cleared:
+                # Consent covered the text the owner approved, which this
+                # update replaced, so it is off now and the owner is told.
+                message = (
+                    f"{message} Context consent for memory {memory_id} was "
+                    "turned off because its text changed."
+                )
             return ToolExecutionResult(
                 True,
-                f"Updated memory {memory_id}.",
+                message,
                 {"id": memory_id},
             )
 
@@ -245,6 +267,48 @@ class MemoryTool:
             True,
             f"Forgot memory {memory_id}.",
             {"id": memory_id},
+        )
+
+    def _set_context(
+        self,
+        arguments: Mapping[str, Any],
+        *,
+        enabled: bool,
+    ) -> ToolExecutionResult:
+        """Turn one memory's context consent on or off by id."""
+        memory_id = arguments.get("id")
+        if (
+            not isinstance(memory_id, int)
+            or isinstance(memory_id, bool)
+            or memory_id < 1
+        ):
+            return ToolExecutionResult(
+                False,
+                "Memory id must be a positive whole number.",
+            )
+
+        try:
+            matched = self.memory.set_memory_context(memory_id, enabled)
+        except (RuntimeError, ValueError) as exc:
+            self.logger.warning("Memory context change failed: %s", exc)
+            return ToolExecutionResult(
+                False,
+                f"Memory context change failed: {exc}",
+            )
+
+        if not matched:
+            return ToolExecutionResult(False, f"Memory not found: {memory_id}.")
+
+        verb = "Enabled" if enabled else "Disabled"
+        self.logger.info(
+            "%s context consent for memory %s through memory tool.",
+            verb,
+            memory_id,
+        )
+        return ToolExecutionResult(
+            True,
+            f"{verb} context for memory {memory_id}.",
+            {"id": memory_id, "context_enabled": enabled},
         )
 
 

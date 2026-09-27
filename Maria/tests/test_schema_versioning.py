@@ -51,9 +51,11 @@ TEST_LOGGER.propagate = False
 PROJECT_ROOT = Path(__file__).resolve().parents[1]
 TESTS_DIR = PROJECT_ROOT / "tests"
 
-# The version the baseline stamp must use, written out rather than imported,
-# so the number itself is pinned by the test instead of agreed with.
-EXPECTED_SCHEMA_VERSION = 2
+# The versions written out rather than imported, so each number is pinned by
+# the test instead of agreed with: the stamp the v0.2.0 baseline receives when
+# it is classified, and the current schema every database ends at.
+BASELINE_SCHEMA_VERSION = 2
+EXPECTED_SCHEMA_VERSION = 3
 UNVERSIONED = 0
 PRE_MEMORIES_VERSION = 1
 
@@ -82,6 +84,22 @@ NORMALIZED_FACT_CHECK = (
     ("number", "0"),
 )
 REQUIRED_MEMORY_CHECKS = (FACT_CHECK, NORMALIZED_FACT_CHECK)
+
+# The consent column's rule, added by version 3: nothing but 0 or 1. With it
+# the current ``memories`` table carries three checks, in the sorted order the
+# fingerprint keeps them.
+CONTEXT_CONSENT_CHECK = (
+    ("identifier", "context_enabled"),
+    ("keyword", "in"),
+    ("operator", "("),
+    ("number", "0"),
+    ("operator", ","),
+    ("number", "1"),
+    ("operator", ")"),
+)
+CURRENT_MEMORY_CHECKS = tuple(
+    sorted((*REQUIRED_MEMORY_CHECKS, CONTEXT_CONSENT_CHECK))
+)
 
 # The same v0.2.0 schema spelled as differently as SQL allows while stating
 # exactly the same thing: uppercase keywords, no spacing, every identifier
@@ -280,18 +298,37 @@ class BaselineClassificationTests(_TemporaryDatabaseTestCase):
         self.assertEqual(
             self.describe(),
             memory_module._reference_schema(
-                memory_module._frozen_schema(EXPECTED_SCHEMA_VERSION)
+                memory_module._frozen_schema(BASELINE_SCHEMA_VERSION)
             ),
         )
 
-    def test_a_valid_unversioned_baseline_is_stamped_without_migrating(self) -> None:
+    def test_a_valid_unversioned_baseline_is_stamped_then_migrated_once(self) -> None:
+        """Classified as the baseline, it runs only the consent step."""
         create_v0_2_0_baseline(self.database_path)
-        before = self.describe()
+        recording_logger = Mock(spec=logging.Logger)
 
-        self.memory.initialize()
+        Memory(self.database_path, logger=recording_logger).initialize()
 
         self.assertEqual(read_schema_version(self.database_path), EXPECTED_SCHEMA_VERSION)
-        self.assertEqual(self.describe(), before)
+        self.assertEqual(
+            self.describe(),
+            memory_module._reference_schema(
+                memory_module._frozen_schema(EXPECTED_SCHEMA_VERSION)
+            ),
+        )
+        logged = [call.args for call in recording_logger.info.call_args_list]
+        self.assertIn(
+            (
+                "Classified an unversioned database as schema version %s "
+                "and stamped it.",
+                BASELINE_SCHEMA_VERSION,
+            ),
+            logged,
+        )
+        self.assertEqual(
+            [args[1] for args in logged if "Applied migration" in args[0]],
+            ["add_memory_context_consent"],
+        )
 
     def test_baseline_rows_survive_initialization_unchanged(self) -> None:
         create_v0_2_0_baseline(self.database_path)
@@ -705,7 +742,7 @@ class MigrationRunnerTests(_TemporaryDatabaseTestCase):
             memory_module._Migration(
                 version=2,
                 name="create_memories",
-                statements=(memory_module._CREATE_MEMORIES_TABLE,),
+                statements=(memory_module._HISTORICAL_MEMORIES_TABLE,),
             ),
             memory_module._Migration(
                 version=3,
@@ -809,10 +846,11 @@ class MigrationRunnerTests(_TemporaryDatabaseTestCase):
                 version=2,
                 name="create_memories",
                 statements=(
-                    memory_module._CREATE_MEMORIES_TABLE,
+                    memory_module._HISTORICAL_MEMORIES_TABLE,
                     "CREATE TABLE never_committed (INVALID",
                 ),
             ),
+            *memory_module._MIGRATIONS[1:],
         )
 
         with patch.object(memory_module, "_MIGRATIONS", broken):
@@ -838,10 +876,11 @@ class MigrationRunnerTests(_TemporaryDatabaseTestCase):
                 version=2,
                 name="create_memories",
                 statements=(
-                    memory_module._CREATE_MEMORIES_TABLE,
+                    memory_module._HISTORICAL_MEMORIES_TABLE,
                     "CREATE TABLE never_committed (INVALID",
                 ),
             ),
+            *memory_module._MIGRATIONS[1:],
         )
         recording_logger = Mock(spec=logging.Logger)
         retrying = Memory(self.database_path, logger=recording_logger)
@@ -861,7 +900,7 @@ class MigrationRunnerTests(_TemporaryDatabaseTestCase):
                 for call in recording_logger.info.call_args_list
                 if "Applied migration" in call.args[0]
             ],
-            ["create_memories"],
+            ["create_memories", "add_memory_context_consent"],
         )
         for identifier, request, response, created_at in BASELINE_INTERACTIONS:
             self.assertEqual(
@@ -906,7 +945,7 @@ class MigrationRunnerTests(_TemporaryDatabaseTestCase):
                 contended.initialize()
 
         self.assertIs(raised.exception.__cause__, busy)
-        self.assertEqual(calls, [PRE_MEMORIES_VERSION, EXPECTED_SCHEMA_VERSION])
+        self.assertEqual(calls, [PRE_MEMORIES_VERSION, BASELINE_SCHEMA_VERSION])
         self.assertEqual(read_schema_version(self.database_path), PRE_MEMORIES_VERSION)
         self.assertEqual(
             table_names(self.database_path),
@@ -979,6 +1018,8 @@ class MigrationLoggingTests(unittest.TestCase):
         logged = self.log_file.read_text(encoding="utf-8")
         self.assertIn("create_memories", logged)
         self.assertIn("schema version is now 2", logged)
+        self.assertIn("add_memory_context_consent", logged)
+        self.assertIn("schema version is now 3", logged)
 
         sentinels = [str(self.database_path), str(self.database_path.parent)]
         for _identifier, request, response, _created_at in BASELINE_INTERACTIONS:
@@ -998,10 +1039,11 @@ class MigrationLoggingTests(unittest.TestCase):
                 version=2,
                 name="create_memories",
                 statements=(
-                    memory_module._CREATE_MEMORIES_TABLE,
+                    memory_module._HISTORICAL_MEMORIES_TABLE,
                     "CREATE TABLE never_committed (INVALID",
                 ),
             ),
+            *memory_module._MIGRATIONS[1:],
         )
 
         with patch.object(memory_module, "_MIGRATIONS", broken):
@@ -1122,7 +1164,7 @@ class FixtureIndependenceTests(unittest.TestCase):
 
         self.assertEqual(
             memory_module._reference_schema(V0_2_0_BASELINE_SCHEMA),
-            memory_module._reference_schema(declared[EXPECTED_SCHEMA_VERSION]),
+            memory_module._reference_schema(declared[BASELINE_SCHEMA_VERSION]),
         )
         self.assertEqual(
             memory_module._reference_schema(PRE_MEMORIES_SCHEMA),
@@ -1135,14 +1177,24 @@ class FixtureIndependenceTests(unittest.TestCase):
             list(range(PRE_MEMORIES_VERSION, DATABASE_SCHEMA_VERSION + 1)),
         )
 
-    def test_the_frozen_baseline_still_describes_the_current_schema(self) -> None:
-        # True only while DATABASE_SCHEMA_VERSION is the baseline version. A
-        # later stage that advances the schema replaces this with its own
-        # migration test rather than editing the frozen fixture.
+    def test_the_current_schema_is_its_own_frozen_entry_not_the_baseline(
+        self,
+    ) -> None:
+        # V1-15 advanced the schema past the baseline. The fixture stays
+        # frozen exactly as it was; the current schema is instead pinned to
+        # its own frozen entry, which a newly created database must match.
         self.assertEqual(DATABASE_SCHEMA_VERSION, EXPECTED_SCHEMA_VERSION)
+        declared = dict(memory_module._FROZEN_SCHEMAS)
+        current = memory_module._reference_schema(
+            memory_module._CURRENT_SCHEMA_STATEMENTS
+        )
         self.assertEqual(
+            memory_module._reference_schema(declared[EXPECTED_SCHEMA_VERSION]),
+            current,
+        )
+        self.assertNotEqual(
             memory_module._reference_schema(V0_2_0_BASELINE_SCHEMA),
-            memory_module._reference_schema(memory_module._CURRENT_SCHEMA_STATEMENTS),
+            current,
         )
 
 
@@ -1180,7 +1232,7 @@ class CheckConstraintTests(_TemporaryDatabaseTestCase):
         self.assertEqual(read_schema_version(self.database_path), EXPECTED_SCHEMA_VERSION)
         self.assertEqual(
             self._memories_shape(self.describe()).checks,
-            REQUIRED_MEMORY_CHECKS,
+            CURRENT_MEMORY_CHECKS,
         )
 
     def test_formatting_equivalent_checks_are_accepted(self) -> None:
@@ -1201,7 +1253,7 @@ class CheckConstraintTests(_TemporaryDatabaseTestCase):
         self.assertEqual(read_schema_version(self.database_path), EXPECTED_SCHEMA_VERSION)
         self.assertEqual(
             self._memories_shape(self.describe()).checks,
-            REQUIRED_MEMORY_CHECKS,
+            CURRENT_MEMORY_CHECKS,
         )
         for identifier, fact, _normalized, created_at in BASELINE_MEMORIES:
             self.assertEqual(
@@ -2024,9 +2076,9 @@ class StampedSchemaValidationTests(_TemporaryDatabaseTestCase):
             if "notes" not in statement
         )
         create_schema(self.database_path, without_notes)
-        stamp_schema_version(self.database_path, EXPECTED_SCHEMA_VERSION)
+        stamp_schema_version(self.database_path, BASELINE_SCHEMA_VERSION)
 
-        self._assert_refused_untouched(marker=EXPECTED_SCHEMA_VERSION)
+        self._assert_refused_untouched(marker=BASELINE_SCHEMA_VERSION)
 
     def test_a_version_two_marker_with_a_changed_constraint_is_refused(
         self,
@@ -2045,9 +2097,9 @@ class StampedSchemaValidationTests(_TemporaryDatabaseTestCase):
             with_rows=True,
             with_memories=True,
         )
-        stamp_schema_version(self.database_path, EXPECTED_SCHEMA_VERSION)
+        stamp_schema_version(self.database_path, BASELINE_SCHEMA_VERSION)
 
-        self._assert_refused_untouched(marker=EXPECTED_SCHEMA_VERSION)
+        self._assert_refused_untouched(marker=BASELINE_SCHEMA_VERSION)
 
     def test_a_valid_version_one_marker_migrates_successfully(self) -> None:
         create_pre_memories_baseline(self.database_path)
@@ -2068,29 +2120,32 @@ class StampedSchemaValidationTests(_TemporaryDatabaseTestCase):
                 },
             )
 
-    def test_a_valid_version_two_marker_is_left_byte_for_byte_unchanged(
+    def test_a_valid_version_two_marker_migrates_once_then_stays_unchanged(
         self,
     ) -> None:
         create_v0_2_0_baseline(self.database_path)
-        stamp_schema_version(self.database_path, EXPECTED_SCHEMA_VERSION)
-        before = self.database_path.read_bytes()
+        stamp_schema_version(self.database_path, BASELINE_SCHEMA_VERSION)
 
+        self.memory.initialize()
+        migrated = self.database_path.read_bytes()
         self.memory.initialize()
         self.memory.initialize()
 
-        self.assertEqual(self.database_path.read_bytes(), before)
+        self.assertEqual(self.database_path.read_bytes(), migrated)
         self.assertEqual(read_schema_version(self.database_path), EXPECTED_SCHEMA_VERSION)
         for identifier, fact, _normalized, created_at in BASELINE_MEMORIES:
             self.assertEqual(
                 self.memory.get_memory(identifier),
                 {"id": identifier, "fact": fact, "created_at": created_at},
             )
+        self.assertEqual(self.memory.list_context_memories(limit=100), [])
 
     def test_validating_a_current_database_reads_and_writes_nothing(
         self,
     ) -> None:
         create_v0_2_0_baseline(self.database_path)
-        stamp_schema_version(self.database_path, EXPECTED_SCHEMA_VERSION)
+        self.memory.initialize()
+        self.assertEqual(read_schema_version(self.database_path), EXPECTED_SCHEMA_VERSION)
 
         with patch.object(
             memory_module,
@@ -2118,6 +2173,240 @@ class StampedSchemaValidationTests(_TemporaryDatabaseTestCase):
 
         self.assertEqual(self.database_path.read_bytes(), before)
         self.assertEqual(read_schema_version(self.database_path), UNVERSIONED)
+
+
+# The version 3 ``memories`` table, written out here rather than read from the
+# memory layer, so the migration and drift cases start from a pinned shape.
+V3_MEMORIES_TABLE = """
+    CREATE TABLE memories (
+        id INTEGER PRIMARY KEY AUTOINCREMENT,
+        fact TEXT NOT NULL CHECK (length(fact) > 0),
+        normalized_fact TEXT NOT NULL UNIQUE
+            CHECK (length(normalized_fact) > 0),
+        created_at TEXT NOT NULL,
+        context_enabled INTEGER NOT NULL DEFAULT 0
+            CHECK (context_enabled IN (0, 1))
+    )
+    """
+V3_SCHEMA = tuple(
+    V3_MEMORIES_TABLE if "CREATE TABLE memories" in statement else statement
+    for statement in V0_2_0_BASELINE_SCHEMA
+)
+
+
+class MemoryContextConsentMigrationTests(_TemporaryDatabaseTestCase):
+    """Verify V1-15's consent column arrives through the V1-09 runner.
+
+    Every case starts from the frozen fixtures, reused unchanged, and ends at
+    version 3 with each existing memory's consent off.
+    """
+
+    def _raw_memories(self, database_path: Path | None = None) -> list[tuple]:
+        """Read every memory row, consent included, from a temporary database."""
+        target = self.database_path if database_path is None else database_path
+        connection = sqlite3.connect(target)
+        try:
+            return [
+                tuple(row)
+                for row in connection.execute(
+                    """
+                    SELECT id, fact, normalized_fact, created_at, context_enabled
+                    FROM memories
+                    ORDER BY id
+                    """
+                )
+            ]
+        finally:
+            connection.close()
+
+    def test_the_pinned_version_three_schema_is_the_frozen_one(self) -> None:
+        self.assertEqual(
+            memory_module._reference_schema(V3_SCHEMA),
+            memory_module._reference_schema(
+                memory_module._frozen_schema(EXPECTED_SCHEMA_VERSION)
+            ),
+        )
+
+    def test_every_step_turns_its_frozen_predecessor_into_its_frozen_successor(
+        self,
+    ) -> None:
+        """The general form of the V1-15 trap: no step may run live statements.
+
+        Had the version 2 step kept the live ``memories`` statement, applying
+        it to the frozen version 1 schema would already produce version 3's
+        table, and this comparison would fail.
+        """
+        for migration in memory_module._MIGRATIONS:
+            with self.subTest(step=migration.name):
+                predecessor = memory_module._frozen_schema(migration.version - 1)
+                self.assertEqual(
+                    memory_module._reference_schema(
+                        predecessor + migration.statements
+                    ),
+                    memory_module._reference_schema(
+                        memory_module._frozen_schema(migration.version)
+                    ),
+                )
+
+    def test_the_v0_2_0_fixture_keeps_every_row_and_turns_consent_off(self) -> None:
+        create_v0_2_0_baseline(self.database_path)
+
+        self.memory.initialize()
+
+        self.assertEqual(read_schema_version(self.database_path), EXPECTED_SCHEMA_VERSION)
+        self.assertEqual(self.describe(), memory_module._reference_schema(V3_SCHEMA))
+        self.assertEqual(
+            self._raw_memories(),
+            [(*row, 0) for row in BASELINE_MEMORIES],
+        )
+        for identifier, request, response, created_at in BASELINE_INTERACTIONS:
+            self.assertEqual(
+                self.memory.get_interaction(identifier),
+                {
+                    "id": identifier,
+                    "user_input": request,
+                    "response": response,
+                    "created_at": created_at,
+                },
+            )
+        for identifier, title, body, created_at, updated_at in BASELINE_NOTES:
+            self.assertEqual(
+                self.memory.get_note(identifier),
+                {
+                    "id": identifier,
+                    "title": title,
+                    "body": body,
+                    "created_at": created_at,
+                    "updated_at": updated_at,
+                },
+            )
+        self.assertEqual(self.memory.list_context_memories(limit=100), [])
+
+    def test_version_one_reaches_version_three_and_reopens_cleanly(self) -> None:
+        create_pre_memories_baseline(self.database_path)
+        fresh_path = self.root / "fresh" / "maria-test.db"
+        recording_logger = Mock(spec=logging.Logger)
+
+        Memory(self.database_path, logger=recording_logger).initialize()
+        Memory(fresh_path, logger=TEST_LOGGER).initialize()
+
+        self.assertEqual(
+            [
+                call.args[1]
+                for call in recording_logger.info.call_args_list
+                if "Applied migration" in call.args[0]
+            ],
+            ["create_memories", "add_memory_context_consent"],
+        )
+        self.assertEqual(read_schema_version(self.database_path), EXPECTED_SCHEMA_VERSION)
+        self.assertEqual(self.describe(), self.describe(fresh_path))
+
+        # A later start validates the stamped version 3 against its frozen
+        # schema, which a database caught by the trap could never pass.
+        before = self.database_path.read_bytes()
+        Memory(self.database_path, logger=TEST_LOGGER).initialize()
+        self.assertEqual(self.database_path.read_bytes(), before)
+
+    def test_the_formatting_equivalent_baseline_migrates_and_reopens(self) -> None:
+        create_schema(
+            self.database_path,
+            FORMATTING_EQUIVALENT_BASELINE,
+            with_rows=True,
+            with_memories=True,
+        )
+
+        self.memory.initialize()
+        Memory(self.database_path, logger=TEST_LOGGER).initialize()
+
+        self.assertEqual(read_schema_version(self.database_path), EXPECTED_SCHEMA_VERSION)
+        self.assertEqual(
+            [row[-1] for row in self._raw_memories()],
+            [0] * len(BASELINE_MEMORIES),
+        )
+
+    def test_a_failed_consent_step_leaves_version_two_whole_then_applies_once(
+        self,
+    ) -> None:
+        create_v0_2_0_baseline(self.database_path)
+        broken = (
+            memory_module._MIGRATIONS[0],
+            memory_module._Migration(
+                version=EXPECTED_SCHEMA_VERSION,
+                name="add_memory_context_consent",
+                statements=(
+                    memory_module._ADD_MEMORY_CONTEXT_CONSENT_COLUMN,
+                    "CREATE TABLE never_committed (INVALID",
+                ),
+            ),
+        )
+
+        with patch.object(memory_module, "_MIGRATIONS", broken):
+            with self.assertRaisesRegex(
+                RuntimeError,
+                r"^Unable to initialize Maria database\.$",
+            ) as raised:
+                self.memory.initialize()
+
+        self.assertIsInstance(raised.exception.__cause__, sqlite3.Error)
+        self.assertEqual(read_schema_version(self.database_path), BASELINE_SCHEMA_VERSION)
+        self.assertEqual(
+            self.describe(),
+            memory_module._reference_schema(V0_2_0_BASELINE_SCHEMA),
+        )
+
+        recording_logger = Mock(spec=logging.Logger)
+        retrying = Memory(self.database_path, logger=recording_logger)
+        retrying.initialize()
+        retrying.initialize()
+
+        self.assertEqual(read_schema_version(self.database_path), EXPECTED_SCHEMA_VERSION)
+        self.assertEqual(
+            [
+                call.args[1]
+                for call in recording_logger.info.call_args_list
+                if "Applied migration" in call.args[0]
+            ],
+            ["add_memory_context_consent"],
+        )
+        self.assertEqual(
+            self._raw_memories(),
+            [(*row, 0) for row in BASELINE_MEMORIES],
+        )
+
+    def test_a_drifted_version_three_database_is_refused_untouched(self) -> None:
+        column = (
+            "context_enabled INTEGER NOT NULL DEFAULT 0\n"
+            "            CHECK (context_enabled IN (0, 1))"
+        )
+        drifts = {
+            "missing column": V0_2_0_BASELINE_SCHEMA,
+            "no default": "context_enabled INTEGER NOT NULL\n"
+            "            CHECK (context_enabled IN (0, 1))",
+            "nullable": "context_enabled INTEGER DEFAULT 0\n"
+            "            CHECK (context_enabled IN (0, 1))",
+            "on by default": "context_enabled INTEGER NOT NULL DEFAULT 1\n"
+            "            CHECK (context_enabled IN (0, 1))",
+            "wider check": "context_enabled INTEGER NOT NULL DEFAULT 0\n"
+            "            CHECK (context_enabled IN (0, 1, 2))",
+            "no check": "context_enabled INTEGER NOT NULL DEFAULT 0",
+            "text column": "context_enabled TEXT NOT NULL DEFAULT 0\n"
+            "            CHECK (context_enabled IN (0, 1))",
+        }
+        for label, drift in drifts.items():
+            with self.subTest(drift=label):
+                if isinstance(drift, tuple):
+                    schema = drift
+                else:
+                    schema = tuple(
+                        statement.replace(column, drift) for statement in V3_SCHEMA
+                    )
+                    self.assertNotEqual(schema, V3_SCHEMA)
+                self.database_path = self.root / label / "maria-test.db"
+                self.memory = Memory(self.database_path, logger=TEST_LOGGER)
+                create_schema(self.database_path, schema)
+                stamp_schema_version(self.database_path, EXPECTED_SCHEMA_VERSION)
+
+                self._assert_refused_untouched(marker=EXPECTED_SCHEMA_VERSION)
 
 
 def _object_names(database_path: Path) -> tuple[str, ...]:

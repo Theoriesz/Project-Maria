@@ -137,10 +137,7 @@ class PlannerMemoryTests(unittest.TestCase):
 
         for request in requests:
             with self.subTest(request=request):
-                plan = self.planner.create_plan(
-                    request,
-                    context={"recent_interactions": [{"user_input": "remember editor"}]},
-                )
+                plan = self.planner.create_plan(request)
                 self.assertEqual(plan.steps, ())
                 self.assertEqual(plan.response_if_no_action, UNSUPPORTED_RESPONSE)
 
@@ -200,6 +197,8 @@ class PlannerMemoryTests(unittest.TestCase):
             "- memories",
             "- update memory <id>: <new fact>",
             "- forget memory <id>",
+            "- enable memory context <id>",
+            "- disable memory context <id>",
             "- system",
             "- time",
             "- history",
@@ -392,6 +391,63 @@ class PlannerMemoryTests(unittest.TestCase):
         for request in requests:
             with self.subTest(request=request):
                 self._assert_unsupported(request)
+
+    def test_consent_commands_map_to_one_step_with_one_id(self) -> None:
+        cases = (
+            ("enable memory context 3", "enable_context", 3),
+            ("ENABLE Memory Context 12", "enable_context", 12),
+            ("enable memory context   007  ", "enable_context", 7),
+            ("disable memory context 3", "disable_context", 3),
+            ("Disable MEMORY context 41", "disable_context", 41),
+        )
+        for request, action, memory_id in cases:
+            with self.subTest(request=request):
+                plan = self.planner.create_plan(request)
+
+                self.assertEqual(
+                    plan.steps,
+                    (PlanStep("memory", action, {"id": memory_id}),),
+                )
+                self.assertIs(type(plan.steps[0].arguments["id"]), int)
+
+    def test_consent_commands_without_an_id_answer_with_their_usage(self) -> None:
+        for verb in ("enable", "disable"):
+            with self.subTest(verb=verb):
+                plan = self.planner.create_plan(f"{verb} memory context")
+
+                self.assertEqual(plan.steps, ())
+                self.assertEqual(
+                    plan.response_if_no_action,
+                    f"Use: {verb} memory context <id>",
+                )
+
+    def test_consent_commands_refuse_anything_but_a_positive_ascii_id(self) -> None:
+        for verb in ("enable", "disable"):
+            for operand in ("0", "-1", "+1", "1.0", "abc", "1 2", "٣", "１"):
+                request = f"{verb} memory context {operand}"
+                with self.subTest(request=request):
+                    plan = self.planner.create_plan(request)
+
+                    self.assertEqual(plan.steps, ())
+                    self.assertEqual(
+                        plan.response_if_no_action,
+                        "Memory id must be a positive whole number.",
+                    )
+
+    def test_near_miss_consent_phrasings_remain_unsupported(self) -> None:
+        for request in (
+            "enable context for memory 3",
+            "enable memory 3",
+            "enable memory contexts 3",
+            "please enable memory context 3",
+            "turn on memory context 3",
+        ):
+            with self.subTest(request=request):
+                self._assert_unsupported(request)
+
+    def test_create_plan_accepts_the_request_text_and_nothing_else(self) -> None:
+        with self.assertRaises(TypeError):
+            self.planner.create_plan("help", context={"recent_interactions": []})
 
     def _assert_unsupported(self, request: str) -> None:
         """Assert that a request receives the unchanged fallback."""

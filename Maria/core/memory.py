@@ -53,10 +53,12 @@ _UNVERSIONED_SCHEMA = 0
 
 # Maria's schema history, as a plain counter. Version 1 is the earliest shape
 # Maria ever created, before explicit memories existed. Version 2 adds the
-# ``memories`` table and is the published v0.2.0 baseline. The current version
-# lives in ``core.constants`` as ``DATABASE_SCHEMA_VERSION``.
+# ``memories`` table and is the published v0.2.0 baseline. Version 3 adds the
+# per-memory context-consent column. The current version lives in
+# ``core.constants`` as ``DATABASE_SCHEMA_VERSION``.
 _SCHEMA_BEFORE_EXPLICIT_MEMORIES = 1
 _SCHEMA_V0_2_BASELINE = 2
+_SCHEMA_MEMORY_CONTEXT_CONSENT = 3
 
 # The live schema. These statements describe the database this build expects
 # and are what a brand-new database is created from, so they move whenever the
@@ -82,13 +84,18 @@ _CREATE_NOTES_TABLE = """
     )
 """
 
+# ``context_enabled`` is the owner's per-memory consent to supply that memory
+# to the local reasoning model. It is off for every row unless the owner turns
+# it on for one memory at a time, and the CHECK admits nothing but 0 and 1.
 _CREATE_MEMORIES_TABLE = """
     CREATE TABLE IF NOT EXISTS memories (
         id INTEGER PRIMARY KEY AUTOINCREMENT,
         fact TEXT NOT NULL CHECK (length(fact) > 0),
         normalized_fact TEXT NOT NULL UNIQUE
             CHECK (length(normalized_fact) > 0),
-        created_at TEXT NOT NULL
+        created_at TEXT NOT NULL,
+        context_enabled INTEGER NOT NULL DEFAULT 0
+            CHECK (context_enabled IN (0, 1))
     )
 """
 
@@ -152,6 +159,18 @@ _HISTORICAL_MEMORIES_TABLE = """
     )
 """
 
+_HISTORICAL_MEMORIES_TABLE_WITH_CONTEXT_CONSENT = """
+    CREATE TABLE memories (
+        id INTEGER PRIMARY KEY AUTOINCREMENT,
+        fact TEXT NOT NULL CHECK (length(fact) > 0),
+        normalized_fact TEXT NOT NULL UNIQUE
+            CHECK (length(normalized_fact) > 0),
+        created_at TEXT NOT NULL,
+        context_enabled INTEGER NOT NULL DEFAULT 0
+            CHECK (context_enabled IN (0, 1))
+    )
+"""
+
 _HISTORICAL_INTERACTIONS_INDEX = """
     CREATE INDEX idx_interactions_created_at
         ON interactions (created_at)
@@ -162,6 +181,16 @@ _HISTORICAL_NOTES_INDEX = """
         ON notes (title)
 """
 
+# The one statement the version 3 step runs. SQLite records an added column in
+# the table's stored definition, and that definition fingerprints exactly as
+# the frozen version 3 table above does, so a migrated database and a newly
+# created one are the same schema. The DEFAULT is what turns consent off for
+# every row that already exists; the statement rewrites no row.
+_ADD_MEMORY_CONTEXT_CONSENT_COLUMN = """
+    ALTER TABLE memories ADD COLUMN context_enabled INTEGER NOT NULL DEFAULT 0
+        CHECK (context_enabled IN (0, 1))
+"""
+
 # Every version's complete schema, newest first. A marker is never taken at
 # its word: whatever version a database claims, its structure is checked
 # against the entry for that version before anything is migrated, so a file
@@ -170,6 +199,16 @@ _HISTORICAL_NOTES_INDEX = """
 # one up to DATABASE_SCHEMA_VERSION therefore needs an entry here, and the
 # migration ladder refuses to run if one is missing.
 _FROZEN_SCHEMAS: tuple[tuple[int, tuple[str, ...]], ...] = (
+    (
+        _SCHEMA_MEMORY_CONTEXT_CONSENT,
+        (
+            _HISTORICAL_INTERACTIONS_TABLE,
+            _HISTORICAL_NOTES_TABLE,
+            _HISTORICAL_MEMORIES_TABLE_WITH_CONTEXT_CONSENT,
+            _HISTORICAL_INTERACTIONS_INDEX,
+            _HISTORICAL_NOTES_INDEX,
+        ),
+    ),
     (
         _SCHEMA_V0_2_BASELINE,
         (
@@ -225,11 +264,22 @@ class _Migration:
 
 # Every forward step, in ascending version order. A step is appended, never
 # edited or reordered, and there is deliberately no downgrade direction.
+#
+# A step runs frozen statements, never the live ones at the top of this module.
+# The live ``memories`` statement now describes version 3; had the version 2
+# step kept using it, a version 1 database would receive a version 3 table
+# stamped as version 2, the version 3 step would then fail on the column that
+# already exists, and the database would be refused at every later start.
 _MIGRATIONS: tuple[_Migration, ...] = (
     _Migration(
         version=_SCHEMA_V0_2_BASELINE,
         name="create_memories",
-        statements=(_CREATE_MEMORIES_TABLE,),
+        statements=(_HISTORICAL_MEMORIES_TABLE,),
+    ),
+    _Migration(
+        version=_SCHEMA_MEMORY_CONTEXT_CONSENT,
+        name="add_memory_context_consent",
+        statements=(_ADD_MEMORY_CONTEXT_CONSENT_COLUMN,),
     ),
 )
 
@@ -734,17 +784,25 @@ class Memory:
         self,
         memory_id: int,
         new_fact: str,
-    ) -> tuple[bool, int | None]:
+    ) -> tuple[bool, int | None, bool]:
         """Replace one memory's fact, keeping its created_at.
 
-        Returns (True, None) when the row was updated, (False, None) when no
-        row matched memory_id, and (False, conflicting_id) when another
-        memory already stores the same casefolded fact. Raises ValueError for
-        a non-positive-integer id or a blank fact, since this persistent
-        mutation is validated independently of its callers. created_at is
-        never refreshed and no updated_at exists, so an updated memory keeps
-        its place in newest-first results; a fact matching the stored one, or
-        differing from it only by casing, still counts as a successful update.
+        Returns (True, None, consent_cleared) when the row was updated,
+        (False, None, False) when no row matched memory_id, and
+        (False, conflicting_id, False) when another memory already stores the
+        same casefolded fact. Raises ValueError for a non-positive-integer id
+        or a blank fact, since this persistent mutation is validated
+        independently of its callers. created_at is never refreshed and no
+        updated_at exists, so an updated memory keeps its place in
+        newest-first results; a fact matching the stored one, or differing
+        from it only by casing, still counts as a successful update.
+
+        Context consent belongs to the exact text the owner approved, so an
+        update always leaves the memory's consent off. It is turned off in
+        the same transaction as the new fact is written, and
+        ``consent_cleared`` reports whether it had been on, which is the one
+        case the owner needs to be told about. A conflicting or missing row
+        changes nothing, consent included.
         """
         if (
             not isinstance(memory_id, int)
@@ -758,6 +816,7 @@ class Memory:
         clean_fact = new_fact.strip()
         normalized_fact = clean_fact.casefold()
         updated = False
+        consent_cleared = False
         conflicting_id: int | None = None
         try:
             with self._connection() as connection:
@@ -771,6 +830,20 @@ class Memory:
                         (clean_fact, normalized_fact, memory_id),
                     )
                     updated = cursor.rowcount == 1
+                    if updated:
+                        # Same transaction as the fact: the first UPDATE
+                        # already holds the write lock, so no other
+                        # connection can enable consent in between, and a
+                        # failure here rolls the new fact back with it.
+                        consent_cursor = connection.execute(
+                            """
+                            UPDATE memories
+                            SET context_enabled = 0
+                            WHERE id = ? AND context_enabled = 1
+                            """,
+                            (memory_id,),
+                        )
+                        consent_cleared = consent_cursor.rowcount == 1
                 except sqlite3.IntegrityError as exc:
                     if not _is_unique_violation(exc):
                         raise
@@ -789,10 +862,82 @@ class Memory:
                     conflicting_id = int(row["id"])
             if updated:
                 self.logger.info("Updated memory %s.", memory_id)
-            return updated, conflicting_id
+            if consent_cleared:
+                self.logger.info(
+                    "Turned off context consent for updated memory %s.",
+                    memory_id,
+                )
+            return updated, conflicting_id, consent_cleared
         except sqlite3.Error as exc:
             self.logger.exception("Failed to update memory.")
             raise RuntimeError("Unable to update memory.") from exc
+
+    def set_memory_context(self, memory_id: int, enabled: bool) -> bool:
+        """Turn one memory's context consent on or off by its database id.
+
+        Returns True when a row matched memory_id, including when its consent
+        was already in the requested state, and False when none did. At most
+        one row can change, because the id is the primary key. Raises
+        ValueError for a non-positive-integer id or a non-bool ``enabled``,
+        since this persistent mutation is validated independently of its
+        callers. The memory's fact is never read, logged, or returned.
+        """
+        if (
+            not isinstance(memory_id, int)
+            or isinstance(memory_id, bool)
+            or memory_id < 1
+        ):
+            raise ValueError("Memory id must be a positive whole number.")
+        if type(enabled) is not bool:
+            raise ValueError("Memory context consent must be True or False.")
+
+        try:
+            with self._connection() as connection:
+                cursor = connection.execute(
+                    """
+                    UPDATE memories
+                    SET context_enabled = ?
+                    WHERE id = ?
+                    """,
+                    (1 if enabled else 0, memory_id),
+                )
+                matched = cursor.rowcount == 1
+            if matched:
+                self.logger.info(
+                    "%s context consent for memory %s.",
+                    "Enabled" if enabled else "Disabled",
+                    memory_id,
+                )
+            return matched
+        except sqlite3.Error as exc:
+            self.logger.exception("Failed to change memory context consent.")
+            raise RuntimeError("Unable to change memory context consent.") from exc
+
+    def list_context_memories(self, limit: int) -> list[dict[str, Any]]:
+        """Return context-enabled memories in ascending id order, bounded.
+
+        This is the only read of Tier A context. At most ``limit`` rows come
+        back, clamped to 1 through 100, each holding only ``id`` and
+        ``fact``: a caller that wants to know whether more exist asks for one
+        more row than it will use, rather than counting them all.
+        """
+        safe_limit = max(1, min(limit, 100))
+        try:
+            with self._connection() as connection:
+                rows = connection.execute(
+                    """
+                    SELECT id, fact
+                    FROM memories
+                    WHERE context_enabled = 1
+                    ORDER BY id ASC
+                    LIMIT ?
+                    """,
+                    (safe_limit,),
+                ).fetchall()
+            return [dict(row) for row in rows]
+        except sqlite3.Error as exc:
+            self.logger.exception("Failed to read memory context.")
+            raise RuntimeError("Unable to read memory context.") from exc
 
     def forget_memory(self, memory_id: int) -> bool:
         """Delete one explicit memory by its database id.

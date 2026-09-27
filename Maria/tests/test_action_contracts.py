@@ -51,6 +51,8 @@ EXPECTED_ACTION_IDENTIFIERS = frozenset(
         "memory.list",
         "memory.update",
         "memory.forget",
+        "memory.enable_context",
+        "memory.disable_context",
         "notes.create",
         "notes.list",
         "notes.read",
@@ -376,7 +378,7 @@ class RegistryCompletenessTests(unittest.TestCase):
             BUILT_IN_ACTION_CONTRACTS.action_identifiers,
             EXPECTED_ACTION_IDENTIFIERS,
         )
-        self.assertEqual(len(EXPECTED_ACTION_IDENTIFIERS), 22)
+        self.assertEqual(len(EXPECTED_ACTION_IDENTIFIERS), 24)
 
     def test_registry_and_loaded_tool_inventory_agree_in_both_directions(self) -> None:
         with TemporaryDirectory() as name:
@@ -414,7 +416,7 @@ class RegistryCompletenessTests(unittest.TestCase):
         ]
 
         self.assertEqual(len(identifiers), len(set(identifiers)))
-        self.assertEqual(len(identifiers), 22)
+        self.assertEqual(len(identifiers), 24)
 
     def test_no_contract_exists_for_a_mandatorily_denied_filesystem_action(
         self,
@@ -528,6 +530,8 @@ class RegistryCompletenessTests(unittest.TestCase):
             ("history", "delete"),
             ("memory", "update"),
             ("memory", "forget"),
+            ("memory", "enable_context"),
+            ("memory", "disable_context"),
             ("notes", "retitle"),
             ("notes", "edit"),
             ("notes", "delete"),
@@ -685,7 +689,7 @@ class RegistryConstructionTests(unittest.TestCase):
                 "sample", "run"
             )
 
-        self.assertEqual(len(BUILT_IN_ACTION_CONTRACTS.action_identifiers), 22)
+        self.assertEqual(len(BUILT_IN_ACTION_CONTRACTS.action_identifiers), 24)
 
     def test_unsupported_declared_type_is_rejected(self) -> None:
         with self.assertRaises(ValueError):
