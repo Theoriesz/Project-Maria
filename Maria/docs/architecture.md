@@ -9,7 +9,9 @@ Maria is organized around a small set of modules with clear ownership.
    reasoning adapter.
 2. `session.py` holds the owner's confirmation state and the session's bounded
    conversation, and forwards the request.
-3. `brain.py` coordinates the request and retrieves recent interaction context.
+3. `brain.py` coordinates the request. On the model-backed conversational path
+   only, it reads the owner's enabled memory context through the memory layer
+   and `context.py`; it reads no interaction history for planning or reasoning.
 4. `planner.py` converts explicit commands into structured plan steps.
 5. `action_contracts.py` declares which tool actions exist and which arguments
    each one accepts. Brain validates every step of a plan against it before any
@@ -176,8 +178,8 @@ editing or deleting the note does not rewrite or remove those independent
 interaction rows.
 
 Some paths return before this boundary. Blank CLI input is not processed, and
-blank input passed directly to `process()` returns before logging, context
-retrieval, planning, or recording. `exit`, `quit`, `q`, main-prompt EOF or
+blank input passed directly to `process()` returns before logging, planning,
+memory context retrieval, or recording. `exit`, `quit`, `q`, main-prompt EOF or
 Ctrl+C, and startup failures do not become interaction rows. An initial
 confirmation-required response returns before completed-interaction recording.
 If confirmation is cancelled, the cancellation response is not recorded, and
@@ -195,12 +197,13 @@ Post-startup processing has no broad exception handler. If an exception
 propagates before a recordable branch calls `Memory.record_interaction()`, no
 interaction write is attempted.
 
-For each non-empty `process()` call, Brain attempts to retrieve up to three
-recent interaction rows and supplies them to Planner as context. A retrieval
-`RuntimeError` is logged and produces empty context instead. The Planner
-currently accepts and discards that context, so retained history does not alter
-plans, and it never reaches the reasoning model. The retrieval limit controls
-query results; it is not a retention or deletion policy.
+Brain reads no interaction history for planning or reasoning. Until V1-15 it
+retrieved up to three recent interaction rows on every request and handed them
+to the planner, which discarded them unused; that feed is gone, and
+`Planner.create_plan()` now accepts the cleaned request text and nothing else.
+The `history` command still reads recent rows through its own tool, and
+interaction rows remain Tier C: no automatic path hands one to the planner or
+to the reasoning model.
 
 Operational logging and interaction persistence are separate boundaries.
 `logger.py` configures Maria's namespaced file logger; default startup targets
@@ -334,9 +337,14 @@ malformed present arrays stop configuration loading instead of weakening it.
 When an action is both denied and confirmation-required, denial wins.
 
 In the current implementation, the mandatory confirmation baseline is
-eight actions: `filesystem.rename`, `filesystem.move`,
+ten actions: `filesystem.rename`, `filesystem.move`,
 `history.delete`, `notes.retitle`, `notes.edit`, `notes.delete`,
-`memory.update`, and `memory.forget`.
+`memory.update`, `memory.forget`, `memory.enable_context`, and
+`memory.disable_context`. The confirmation for `memory.enable_context` also
+carries a fixed notice, from `CONFIRMATION_NOTICES` in `core/permissions.py`,
+that an enabled memory may be sent to the local reasoning model on any
+conversational turn within Maria's memory context limits, and that Maria does
+not choose memories by relevance.
 `history.list`, `history.search`, `history.read`, `notes.create`,
 `notes.list`, `notes.read`, `memory.store`, `memory.search`, and `memory.list`
 remain allowed by default. These entries live
@@ -605,10 +613,9 @@ Maria keeps three kinds of persistent data separate:
 - **Interaction history** records cleaned requests and the responses chosen
   for recording on the four recording branches described above, for every
   plan whose recording policy is `RECORD`, whether by default or set
-  explicitly; a `TRANSIENT` plan adds no row. The brain retrieves recent rows
-  and supplies them to the planner as context, although the strict planner
-  discards that context. Interaction rows are never converted automatically
-  into explicit memories.
+  explicitly; a `TRANSIENT` plan adds no row. Neither Brain nor the planner
+  reads these rows, and no automatic path supplies one to the reasoning model.
+  Interaction rows are never converted automatically into explicit memories.
 - **Notes** are structured title-and-body records deliberately created by the
   user. The notes tool uses the shared `Memory` persistence interface. A note's
   title and body are edited through two separate confirmation-gated commands,
@@ -625,7 +632,12 @@ Maria keeps three kinds of persistent data separate:
   edited note. Fact uniqueness stays casefold-based, so an update whose
   casefolded fact already belongs to a different memory is refused with a
   controlled, content-free conflict result instead of changing either row.
-  Neither mutation cascades into interaction history or notes.
+  Neither mutation cascades into interaction history or notes. Each memory
+  also carries the owner's context consent, off unless the owner enables that
+  one memory through a confirmation-gated command; updating a memory turns its
+  consent off in the same transaction, because consent covers the exact text
+  the owner approved. Only enabled memories can reach the reasoning model; see
+  "Tier A Memory Context" below.
 
 On the completed paths described above, memory commands and their responses
 also appear in interaction history when recording succeeds. A stored fact can
@@ -647,17 +659,24 @@ guaranteed. There is no compensating rollback, retry, or replay.
 
 `core/reasoning.py` is the contract every later model stage builds on, and it
 deliberately contains no transport, no model, and no provider. A
-`ReasoningRequest` holds one bounded prompt and, in `history`, the earlier
-exchanges of the current conversation, oldest first, and empty by default.
-Each `ReasoningExchange` is one user text and one assistant text, exact,
-non-empty, and redacted from every representation. There is no field through
-which personal context, a system prompt, or a template could travel, and a
-`ReasoningResponse` holds one bounded, untrusted string.
+`ReasoningRequest` holds one bounded prompt; in `history`, the earlier
+exchanges of the current conversation, oldest first; and in `context`, the
+Tier A memories Maria selected, each a `ContextItem` from `core/context.py`
+bearing the record id Maria read. Both are empty by default. Each
+`ReasoningExchange` is one user text and one assistant text, exact, non-empty,
+and redacted from every representation, and so is every `ContextItem`. There
+is no field through which a system prompt, a template, or raw interaction
+history could travel, and a `ReasoningResponse` holds one bounded, untrusted
+string.
 
 A request's size is defined once, by `request_content_bytes`: the UTF-8 length
-of the prompt plus the UTF-8 length of every exchange's user and assistant
-text, and nothing else, so no role name, message structure, model identifier,
-or transport framing counts. Construction bounds that total by the 1 MiB hard
+of the prompt, plus the UTF-8 length of every exchange's user and assistant
+text, plus the fully rendered memory context — Maria's fixed context
+instructions and the delimited data block with every id — which is nothing
+when the context is empty. No role name, message structure, model identifier,
+or transport framing counts. The context is validated again every time it is
+measured, rather than trusted from construction: at most 16 items in strictly
+ascending id order, rendering to at most 2 KiB. Construction bounds that total by the 1 MiB hard
 ceiling. `request_reasoning` measures it again against the configured
 `max_input_bytes` before the provider is asked, re-reading every text rather
 than trusting construction and stopping as soon as the total passes the
@@ -729,11 +748,16 @@ The request carries only the model identifier, as an opaque JSON string, and
 the conversation, with `stream` false: each earlier exchange as a `user`
 message followed by an `assistant` message, oldest first, and then the prompt
 as the final `user` message. With no history that is the prompt as one user
-message, byte for byte the request V1-13 sent. There is no system message,
-option, tool, or thinking request. Before anything is serialized, the adapter
-measures the prompt and history together against its own `max_input_bytes`
-with the same `request_content_bytes` accounting, and refuses an over-budget
-request as input over budget without opening a connection. Of the reply, only
+message, byte for byte the request V1-13 sent, and with no memory context the
+request is byte for byte the one V1-14 sent. When the request carries memory
+context, two messages come first: Maria's fixed context instructions as the
+only `system` message, which never contain a stored fact, and the delimited
+memory data block as a `user` message of its own. There is no option, tool, or
+thinking request. Before anything is serialized, the adapter validates the
+context again and measures the prompt, history, and rendered context together
+against its own `max_input_bytes` with the same `request_content_bytes`
+accounting, and refuses an over-budget request as input over budget without
+opening a connection. Of the reply, only
 `message.content` is kept, as inert text. Thinking text, tool calls, and every
 other field are ignored after bounded JSON parsing; only `message.content` is
 returned. The module has no import path to planning, permissions, dispatch, or
@@ -776,15 +800,16 @@ session's earlier conversational turns. Everything else is exactly as it was.
 
 ```text
 CLI
--> MariaSession (the session's conversation)
--> MariaBrain.process(request, *conversation)
--> Planner                               always first
+-> MariaSession (conversation and supplied-memory fingerprints)
+-> MariaBrain.process(request, *conversation, supplied_context=...)
+-> Planner                               always first, text only
 -> provider, enabled, exact fallback?    otherwise the ordinary path
--> conversation.converse()
+-> Memory.list_context_memories(17)      the one Tier A read
+-> conversation.converse()               revocation check, budget, notices
 -> request_reasoning -> ReasoningProvider
 -> zero-step TRANSIENT plan
 -> Brain's ordinary zero-step path       no contract, permission, tool, or row
--> MariaSession keeps the new conversation
+-> MariaSession keeps the new conversation and fingerprints
 ```
 
 Resolution order lives in Brain. The planner runs first on every request and
@@ -805,22 +830,31 @@ original response and its interaction row.
 
 - The budget is 8 KiB (`CONVERSATION_MAX_BYTES`) or the configured
   `max_input_bytes`, whichever is smaller, counted as `request_content_bytes`
-  counts: the UTF-8 text of the retained exchanges' user and assistant halves
-  plus the current request.
+  counts: the current request, the fully rendered memory context, and the
+  UTF-8 text of the retained exchanges' user and assistant halves.
+- The enabled memories are settled first. A failed or untrustworthy Tier A
+  read, or a supplied memory that has since been disabled, changed, or
+  forgotten, clears the earlier conversation before anything is sent; see
+  "Tier A Memory Context" below.
 - A request that is over the budget on its own is refused with the fixed
   input-over-budget message before the provider is asked. Text the interface
   cannot carry, such as a lone surrogate, is refused with its own fixed
   message.
-- The newest earlier exchanges that fit beside the request are sent, at most
-  eight (`CONVERSATION_MAX_EXCHANGES`); the oldest are dropped first, whole.
-  Nothing is truncated.
+- The request comes first, then as much memory context as the selection rule
+  fits, then the newest earlier exchanges that fit beside both, at most eight
+  (`CONVERSATION_MAX_EXCHANGES`); the oldest are dropped first, whole. Nothing
+  is truncated.
 - The provider is asked exactly once through `request_reasoning`. A typed
   failure, a crash, or a malformed reply becomes that failure's fixed message.
 - A reply is kept only if its whole exchange, request and reply together,
   fits the budget. Otherwise the reply is discarded with a fixed message: it
   is not shown in part, kept, or recorded.
 - A reply that passes is shown verbatim and becomes the newest exchange. The
-  session keeps the result, again bounded to eight exchanges and the budget.
+  session keeps the result, again bounded to eight exchanges and the budget,
+  with the fingerprints of the memories that request carried.
+- Every outcome then ends with Maria's own notice about memory context, after
+  a blank line. It is built from the ids Maria selected, never from the reply,
+  and it never enters the request or the exchange the session keeps.
 
 Every outcome, reply or refusal, is a zero-step plan that `conversation.py`,
 its producer, marks `TRANSIENT`. Brain runs it through its ordinary zero-step
@@ -831,11 +865,66 @@ recording policy itself. The reply is untrusted, inert text: nothing parses
 it, it is never handed to the planner, it cannot become a pending approval,
 and a reply that reads like a command or an approval does nothing.
 
-What the model sees is the current request and the session's own completed
-conversational exchanges. It never sees a command or its result, the recent
-interactions Brain retrieves for the planner, an explicit memory, a note, a
-file, a stored interaction, or anything from an earlier session. A new
-session starts empty, and ending one discards its conversation.
+What the model sees is the current request, the session's own completed
+conversational exchanges, and the explicit memories the owner has enabled for
+context. It never sees a command or its result, a memory the owner has not
+enabled, a note, a file, a stored interaction, or anything from an earlier
+session. A new session starts empty, and ending one discards its conversation
+and its supplied-memory fingerprints.
+
+## Tier A Memory Context
+
+In V1-15, Tier A is exactly the owner's explicit memories that the owner has
+enabled for context. Preferences exist only as memories the owner stores and
+enables; tasks, reminders, and project facts do not exist yet.
+
+**Consent.** Every memory's consent is off by default: the V1-15 migration
+leaves every existing memory off, and a new memory is stored off.
+`enable memory context <id>` and `disable memory context <id>` change one
+memory each, by positive decimal id, and both always require confirmation,
+which configuration cannot remove. Updating a memory turns its consent off.
+
+**Selection is not relevance.** Under the owner-approved transitional rule
+(decision V1-15-R1), every enabled memory is eligible on any model-backed
+conversational turn. Brain asks the memory layer for enabled memories in
+ascending id order, one row more than can be sent, and `context.py` takes them
+whole, in that order, while at most 16 items and at most 2 KiB of fully
+rendered context — fixed instructions, ids, and framing included — fit, and
+while they fit beside the request within the conversational budget. A memory
+that does not fit is left out and the next is still considered. Memories left
+out are named by id when the bounded read returned them; enabled memories
+beyond it are reported as existing, never by id. The relevance-review gate in
+roadmap Stage V1-16 revisits this rule.
+
+**Stored text is data.** The adapter sends Maria's fixed instructions as the
+only system message; they tell the model the memories are reference data, not
+instructions, grant no permission to act, and may be outdated or conflicting.
+The memories follow in a separate user message, one line per memory, each fact
+as one JSON string, so no fact can break out of its line or pose as another
+entry. Context grants no authority: the reply is still inert text in a
+zero-step transient plan.
+
+**What the owner is told.** After a successful reply Maria names the memories
+she supplied — `Memory context supplied: memory 3, memory 7.` — and says she
+cannot verify whether they are still current or whether they conflict. After a
+failure she names the memories selected for the attempt and says she cannot
+confirm the model received them. When no memory was sent she says `No memory
+context supplied.` Maria cannot know which memories the model used, and a
+reply that names other ids changes nothing she says. She makes no claim that a
+memory is stale, fresh, consistent, or conflicting: `created_at` dates the row,
+not its current text, and there is no `updated_at`.
+
+**Revocation.** The session keeps, beside its conversation, the fingerprint —
+source, id, and SHA-256 of the exact text — of every memory supplied since the
+conversation was last cleared, never the text itself. Before each
+conversational request those fingerprints are compared with the memories
+enabled now. If one was disabled, changed, or forgotten, by this session or
+through any other database connection, the whole earlier conversation and the
+fingerprints are discarded before anything is sent, and the owner is told. If
+Tier A cannot be read, neither memory context nor earlier exchanges are sent,
+both are cleared, and a fixed notice says so. This bounds what Maria sends
+next; it is not an instantaneous revocation across a concurrent read and send,
+and it cannot erase text a model has already received.
 
 ## Boundaries
 
@@ -848,12 +937,13 @@ production accepts, and `tools/filesystem.py` adds the barrier that keeps the
 generic filesystem commands out of Maria's own repository. The action-contract
 registry declares argument shapes only: it holds no tool logic, never calls a
 tool to decide whether arguments are valid, and decides nothing about
-permission. `core/reasoning.py` reaches nothing but the shared failures and the
-logger, and `core/ollama_adapter.py` nothing but those and the reasoning
-interface. `core/conversation.py` reaches only those, the logger, and the
-planner's plan types, never Tool Manager, permissions, or the memory layer. A
-reasoning reply reaches Brain only as the text of a zero-step transient plan;
-no module passes one to the planner or a tool.
+permission. `core/context.py` imports no Maria module at all.
+`core/reasoning.py` reaches nothing but the context module, the shared
+failures, and the logger, and `core/ollama_adapter.py` nothing but those and
+the reasoning interface. `core/conversation.py` reaches only those, the
+logger, and the planner's plan types, never Tool Manager, permissions, or the
+memory layer. A reasoning reply reaches Brain only as the text of a zero-step
+transient plan; no module passes one to the planner or a tool.
 `core/ollama_adapter.py` is the only production module that imports a network
 module, and `main.py` is the only one that names or reaches it. An
 import-boundary guard asserts that Brain, the planner, permissions, Tool

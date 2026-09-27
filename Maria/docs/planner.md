@@ -23,7 +23,7 @@ response:
 I do not have an executable plan for that yet. Type 'help' to see supported commands.
 ```
 
-The planner is unchanged by conversation and knows nothing about it. When
+The planner knows nothing about conversation or memory context. When
 reasoning is enabled, Brain answers exactly that generic fallback with a
 text-only reply from the local model instead of showing it, and records
 nothing; help, every usage response, and every command are unaffected. See
@@ -74,10 +74,12 @@ Use: remember <fact>
 Use: recall <query>
 ```
 
-The planner does not infer commands from recent interaction context. Requests
-such as `please remember ...`, `what do you remember about ...`, and
-`memories extra` remain unsupported. With reasoning enabled they receive a
-conversational reply, which stores and retrieves nothing.
+The planner receives the request text and nothing else: no interaction
+history, stored record, or memory context. Requests such as `please remember
+...`, `what do you remember about ...`, and `memories extra` remain
+unsupported. With reasoning enabled they receive a conversational reply, which
+stores nothing and can draw only on memories the owner has enabled for
+context.
 
 ## Memory Lifecycle Grammar
 
@@ -159,6 +161,39 @@ memories <id>`, `forget memory1`, `delete memory <id>`, `clear memories`, and
 `purge memory <id>` remain unsupported and receive the planner's existing
 generic unsupported-command response. The exact command `memories` continues to
 list stored facts.
+
+## Memory Context Consent Grammar
+
+`enable memory context <id>` and `disable memory context <id>` each create one
+step addressed by id alone:
+
+```text
+PlanStep(
+    tool_name="memory",
+    action="enable_context",   # or "disable_context"
+    arguments={"id": memory_id},
+)
+```
+
+They reuse the same `id` grammar and validation as `forget memory`: one or more
+ASCII digits with a value of at least 1, leading zeroes accepted, and every
+Unicode digit lookalike, sign, decimal, embedded token, or other character
+rejected with `Memory id must be a positive whole number.` A bare command
+returns its usage response:
+
+```text
+Use: enable memory context <id>
+Use: disable memory context <id>
+```
+
+Keywords are case-insensitive and only a literal ASCII space separates the
+prefix from the id. Near misses such as `enable memory <id>`, `enable context
+for memory <id>`, `enable memory contexts <id>`, and `turn on memory context
+<id>` remain unsupported. Both actions require mandatory explicit
+confirmation. The enable confirmation also states the V1-15 rule: an enabled
+memory may be sent to the local reasoning model on any conversational turn,
+within Maria's memory context limits, and Maria does not choose memories by
+relevance.
 
 ## Note Creation Grammar
 

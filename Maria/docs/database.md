@@ -23,7 +23,8 @@ counter over Maria's schema history rather than a release number:
 | --- | --- |
 | 0 | SQLite's default. No marker was ever written; the database has to be classified by its structure. |
 | 1 | The earliest schema Maria created: `interactions`, `notes`, and the two secondary indexes. |
-| 2 | The published v0.2.0 baseline, which adds `memories`. This is the current schema. |
+| 2 | The published v0.2.0 baseline, which adds `memories`. |
+| 3 | Adds the per-memory `context_enabled` consent column to `memories`, off for every row. This is the current schema. |
 
 Versions 1 and 2 are the only shapes that can exist without a marker, because
 every database Maria creates or migrates from this build onwards is stamped.
@@ -207,18 +208,37 @@ database. Both boundaries classify contention themselves rather than
 inheriting the shared conversion, because that conversion logs the exception
 on its way past and these record a fixed event code instead.
 
-There is currently one migration, `create_memories`, which brings a version 1
-database to version 2 by adding the `memories` table. It adds no column to an
-existing table, rewrites no row, and deletes nothing. Maria does not copy or
-infer explicit memories from existing interaction rows.
+There are two migrations. `create_memories` brings a version 1 database to
+version 2 by adding the `memories` table; Maria does not copy or infer explicit
+memories from existing interaction rows. `add_memory_context_consent` brings a
+version 2 database to version 3 with one statement:
+
+```sql
+ALTER TABLE memories ADD COLUMN context_enabled INTEGER NOT NULL DEFAULT 0
+    CHECK (context_enabled IN (0, 1));
+```
+
+The `DEFAULT 0` is what turns consent off for every memory that already exists;
+SQLite records the added column in the table's definition without rewriting any
+row, and the resulting definition fingerprints exactly as a newly created
+version 3 table does. Neither step rewrites a row or deletes anything.
+
+Every step runs its own frozen historical statements, never the live schema
+statements a new database is created from. The version 2 step therefore creates
+the version 2 `memories` table exactly as v0.2.0 did. Had it kept the live
+statement once that statement described version 3, a version 1 database would
+have received a version 3 table stamped as version 2, the version 3 step would
+then have failed on a column that already existed, and every later start would
+have refused the database. A test applies each step to its frozen predecessor
+and requires the frozen successor, so no step can drift that way again.
 
 ### No pre-migration backup
 
 V1-09 writes no backup copy before migrating, and that is a decision rather
-than an omission. Every step it defines is additive schema creation plus the
-version stamp, committed in a single transaction that SQLite rolls back in
-full on any failure, so the failure a backup would protect against — a
-half-applied migration — cannot be reached. No step reads, rewrites,
+than an omission; V1-15's step keeps it true. Every step is additive schema
+change plus the version stamp, committed in a single transaction that SQLite
+rolls back in full on any failure, so the failure a backup would protect
+against — a half-applied migration — cannot be reached. No step reads, rewrites,
 transforms, or removes an owner record, so there is nothing for a copy to
 preserve that the original does not still hold. Writing one anyway would place
 a second complete copy of every interaction, note, and memory beside the live
@@ -383,7 +403,9 @@ CREATE TABLE IF NOT EXISTS memories (
     fact TEXT NOT NULL CHECK (length(fact) > 0),
     normalized_fact TEXT NOT NULL UNIQUE
         CHECK (length(normalized_fact) > 0),
-    created_at TEXT NOT NULL
+    created_at TEXT NOT NULL,
+    context_enabled INTEGER NOT NULL DEFAULT 0
+        CHECK (context_enabled IN (0, 1))
 );
 ```
 
@@ -393,6 +415,7 @@ CREATE TABLE IF NOT EXISTS memories (
 | fact | TEXT NOT NULL, non-empty check | Stripped original text retained for display |
 | normalized_fact | TEXT NOT NULL, UNIQUE, non-empty check | `fact.casefold()` value used for exact duplicate prevention and search |
 | created_at | TEXT NOT NULL | UTC ISO 8601 timestamp produced by Maria's timestamp helper |
+| context_enabled | INTEGER NOT NULL, DEFAULT 0, only 0 or 1 | The owner's consent to supply this memory to the local reasoning model; see "Memory Context Consent" below |
 
 The unique `normalized_fact` constraint makes case-insensitive exact duplicates
 idempotent. Storing a duplicate returns the existing ID and keeps the original
@@ -400,10 +423,16 @@ display casing and creation timestamp; it does not add or update a row.
 
 `update memory <id>: <new fact>` and `forget memory <id>` each change at most
 one row by primary-key ID, after mandatory explicit confirmation and with no
-preview of stored content beforehand. Update runs a single parameterized
+preview of stored content beforehand. Update runs a parameterized
 `UPDATE memories SET fact = ?, normalized_fact = ? WHERE id = ?`, writing the
 stripped fact and its `casefold()` form together so display text and search
-text can never drift apart. It does not read the row first. `created_at` is
+text can never drift apart. It does not read the row first. When that row
+matched, the same transaction then runs `UPDATE memories SET context_enabled =
+0 WHERE id = ? AND context_enabled = 1`, because consent covers the exact text
+the owner approved; the first statement already holds the write lock, so no
+other connection can enable consent in between, and a failure rolls the new
+fact back too. The update reports whether consent had been on, and only then
+does the owner see an extra sentence saying it was turned off. `created_at` is
 always preserved and no `updated_at` column was added, so — unlike a retitled
 or edited note — an updated memory keeps its existing position in the
 `created_at DESC, id DESC` ordering used by `memories` and `recall` rather than
@@ -494,6 +523,34 @@ the deletion remains committed and no audit row is guaranteed. There is no
 bulk, wildcard, range, or automatic deletion, and no guarantee of secure
 erasure from SQLite file pages, backups, database copies, or external
 storage.
+
+## Memory Context Consent
+
+`context_enabled` is off for every memory unless the owner turns it on, one
+memory at a time. The migration leaves every pre-existing memory off, and a
+newly stored memory is off because its insert never names the column.
+
+`enable memory context <id>` and `disable memory context <id>` each run one
+parameterized `UPDATE memories SET context_enabled = ? WHERE id = ?`, so at
+most one row can change, after mandatory explicit confirmation. The fact is
+never read, logged, or returned, and the recorded interaction names only the
+id. A missing id changes nothing and reports `Memory not found: <id>.`
+Re-enabling an enabled memory, or disabling a disabled one, matches its row and
+succeeds without changing anything.
+
+`list_context_memories(limit)` is the only read of Tier A context. It returns
+`id` and `fact` for enabled memories only, in ascending `id` order, with the
+limit clamped to 1 through 100. Brain asks it for 17 rows — one more than a
+request may carry — only on the model-backed conversational path, so Maria
+learns whether more enabled memories exist without counting all of them.
+Existing reads (`get_memory`, `list_memories`, `search_memories`) still return
+exactly `id`, `fact`, and `created_at`; the consent flag never appears in
+`memories` or `recall` output.
+
+The flag is not evidence of anything but consent. `created_at` records when a
+memory row was first stored, not when its text last changed, and no
+`updated_at` column exists, so Maria makes no claim that an enabled memory is
+current, stale, consistent, or conflicting.
 
 ## Memory Retrieval
 
