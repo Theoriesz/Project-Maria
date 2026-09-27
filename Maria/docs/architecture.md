@@ -32,9 +32,11 @@ Maria is organized around a small set of modules with clear ownership.
 13. `reasoning.py` defines the typed, provider-independent contract a local
     reasoning model sits behind, and `ollama_adapter.py` is the one provider
     that implements it. `conversation.py` uses them to answer, as text only,
-    the one kind of request the planner has no command for, when reasoning is
-    enabled; see "Deterministic-First Conversation", "Reasoning Interface and
-    Local Override", and "Local Ollama Adapter".
+    the one kind of request the planner has no command for, only when a
+    provider is present, `config.reasoning.enabled` is true, and the planner
+    returned its exact generic fallback; see "Deterministic-First
+    Conversation", "Reasoning Interface and Local Override", and "Local Ollama
+    Adapter".
 
 An explicit memory request uses the same execution path as every other tool
 request:
@@ -85,10 +87,14 @@ below), Brain passes that cleaned request and the response chosen for
 recording to `Memory.record_interaction()`. That response normally matches the
 displayed response, but a completed tool result may supply a
 `recorded_message`, including an explicit empty string, to record in place of
-its displayed text. Recording covers help, unsupported commands while reasoning
-is disabled, malformed-command usage responses, contract refusals, denials,
-successful tool results, and returned unsuccessful `ToolExecutionResult`
-values. The recording
+its displayed text. Recording covers help, unsupported commands not answered
+conversationally, malformed-command usage responses, contract refusals,
+denials, successful tool results, and returned unsuccessful
+`ToolExecutionResult` values. An unsupported command is answered
+conversationally, and so not recorded, only when a reasoning provider is
+present, `config.reasoning.enabled` is true, and the planner returned its exact
+generic fallback; with disabled settings it keeps its original response and
+interaction row even if a provider was injected. The recording
 layer stores the supplied text rather than summaries or only metadata, subject
 to existing command and tool output limits. A recording `RuntimeError` is
 logged without replacing the primary response, so recording is attempted but a
@@ -763,17 +769,17 @@ and cannot prove the runtime will not reach a cloud model.
 
 ## Deterministic-First Conversation
 
-With reasoning enabled, Maria answers the one kind of request its planner has
-no command for with a text reply from the owner's local model, in the context
-of the current session's earlier conversational turns. Everything else is
-exactly as it was.
+With a reasoning provider present and reasoning enabled, Maria answers the one
+kind of request its planner has no command for, its exact generic fallback,
+with a text reply from the owner's local model, in the context of the current
+session's earlier conversational turns. Everything else is exactly as it was.
 
 ```text
 CLI
 -> MariaSession (the session's conversation)
 -> MariaBrain.process(request, *conversation)
 -> Planner                               always first
--> generic no-action fallback?           otherwise the ordinary path
+-> provider, enabled, exact fallback?    otherwise the ordinary path
 -> conversation.converse()
 -> request_reasoning -> ReasoningProvider
 -> zero-step TRANSIENT plan
@@ -782,16 +788,18 @@ CLI
 ```
 
 Resolution order lives in Brain. The planner runs first on every request and
-is unchanged. Brain consults the model only when a reasoning provider was
-injected and the planner's plan is exactly its generic no-action fallback,
-recognised by `conversation.is_generic_fallback()`: a default-recorded plan
-with no steps whose response is exactly `GENERIC_FALLBACK_RESPONSE`, a named
-copy of the planner's text that a test holds to the planner's real output.
-Help, `commands`, and every usage error are zero-step plans with other text,
-so they never reach the model; blank input returns before planning; and the
+is unchanged. Brain consults the model only when all three hold: a reasoning
+provider was injected, `config.reasoning.enabled` is true, and the planner's
+plan is exactly its generic no-action fallback, recognised by
+`conversation.is_generic_fallback()`: a default-recorded plan with no steps
+whose response is exactly `GENERIC_FALLBACK_RESPONSE`, a named copy of the
+planner's text that a test holds to the planner's real output. Help,
+`commands`, and every usage error are zero-step plans with other text, so they
+never reach the model; blank input returns before planning; and the
 confirmation path never plans at all. With no provider, which is what the
-shipped configuration produces, the fallback is answered and recorded exactly
-as before.
+shipped configuration produces, or with disabled settings even when a provider
+was injected, the fallback is answered and recorded exactly as before: its
+original response and its interaction row.
 
 `conversation.converse()` settles the whole turn:
 

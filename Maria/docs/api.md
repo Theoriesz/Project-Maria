@@ -27,11 +27,14 @@ BrainResponse`
 Plans one request and coordinates it from input to plan, whole-plan permission
 resolution, tool execution, and interaction-history recording. A plan holding a
 step that requires confirmation returns before execution, carrying its `Plan` on
-the response. The deterministic planner always runs first. Only when a
-reasoning provider was supplied and the plan is exactly the planner's generic
-no-action fallback is the request answered conversationally instead, in the
+the response. The deterministic planner always runs first. The request is
+answered conversationally instead only when all three hold: a reasoning
+provider was supplied, `config.reasoning.enabled` is true, and the plan is
+exactly the planner's generic no-action fallback. It is then answered in the
 context of `conversation`, the caller's earlier exchanges passed positionally,
-oldest first (see "Conversation"). No keyword of any name is accepted.
+oldest first (see "Conversation"). With disabled settings the fallback keeps
+its original response and interaction row even if a provider was supplied. No
+keyword of any name is accepted.
 
 `BrainResponse(text, needs_confirmation=False, plan=None, conversation=None)`
 
