@@ -4,8 +4,11 @@ Maria is organized around a small set of modules with clear ownership.
 
 ## Core Flow
 
-1. `main.py` receives user input from the command line.
-2. `session.py` holds the owner's confirmation state and forwards the request.
+1. `main.py` receives user input from the command line. It is also the
+   runtime composition point, the one production module that names the local
+   reasoning adapter.
+2. `session.py` holds the owner's confirmation state and the session's bounded
+   conversation, and forwards the request.
 3. `brain.py` coordinates the request and retrieves recent interaction context.
 4. `planner.py` converts explicit commands into structured plan steps.
 5. `action_contracts.py` declares which tool actions exist and which arguments
@@ -28,8 +31,12 @@ Maria is organized around a small set of modules with clear ownership.
     database.
 13. `reasoning.py` defines the typed, provider-independent contract a local
     reasoning model sits behind, and `ollama_adapter.py` is the one provider
-    that implements it. Nothing in the flow above calls either yet; see
-    "Reasoning Interface and Local Override" and "Local Ollama Adapter".
+    that implements it. `conversation.py` uses them to answer, as text only,
+    the one kind of request the planner has no command for, only when a
+    provider is present, `config.reasoning.enabled` is true, and the planner
+    returned its exact generic fallback; see "Deterministic-First
+    Conversation", "Reasoning Interface and Local Override", and "Local Ollama
+    Adapter".
 
 An explicit memory request uses the same execution path as every other tool
 request:
@@ -80,9 +87,14 @@ below), Brain passes that cleaned request and the response chosen for
 recording to `Memory.record_interaction()`. That response normally matches the
 displayed response, but a completed tool result may supply a
 `recorded_message`, including an explicit empty string, to record in place of
-its displayed text. Recording covers help, unsupported commands,
-malformed-command usage responses, contract refusals, denials, successful tool
-results, and returned unsuccessful `ToolExecutionResult` values. The recording
+its displayed text. Recording covers help, unsupported commands not answered
+conversationally, malformed-command usage responses, contract refusals,
+denials, successful tool results, and returned unsuccessful
+`ToolExecutionResult` values. An unsupported command is answered
+conversationally, and so not recorded, only when a reasoning provider is
+present, `config.reasoning.enabled` is true, and the planner returned its exact
+generic fallback; with disabled settings it keeps its original response and
+interaction row even if a provider was injected. The recording
 layer stores the supplied text rather than summaries or only metadata, subject
 to existing command and tool output limits. A recording `RuntimeError` is
 logged without replacing the primary response, so recording is attempted but a
@@ -112,7 +124,11 @@ request-specific recording decisions in the Brain methods that lead to the gate
 and in the helpers that produce recorded text; it does not analyze aliasing or
 data flow in general. No command Maria currently understands
 produces a transient plan: every deterministic command keeps the default and
-records exactly what it recorded before the policy existed.
+records exactly what it recorded before the policy existed. The one producer of
+transient plans is `conversation.py`: every conversational turn, a reply or a
+controlled failure, is a zero-step transient plan, so conversation writes no
+interaction row. Brain itself never chooses a policy; it only runs the plan it
+was given.
 
 `ToolExecutionResult` carries an optional `recorded_message` field. It
 defaults to `None`, and any result that does not opt in leaves it as `None`;
@@ -183,8 +199,8 @@ For each non-empty `process()` call, Brain attempts to retrieve up to three
 recent interaction rows and supplies them to Planner as context. A retrieval
 `RuntimeError` is logged and produces empty context instead. The Planner
 currently accepts and discards that context, so retained history does not alter
-plans. The retrieval limit controls query results; it is not a retention or
-deletion policy.
+plans, and it never reaches the reasoning model. The retrieval limit controls
+query results; it is not a retention or deletion policy.
 
 Operational logging and interaction persistence are separate boundaries.
 `logger.py` configures Maria's namespaced file logger; default startup targets
@@ -247,11 +263,24 @@ immediately without executing it, even if it occurs after one or more invalid
 answers. This boundary intentionally does not add a broad exception handler
 around Brain processing after startup.
 
-`main.py` owns terminal concerns only: reading input, printing output, showing
+`main.py` owns terminal concerns: reading input, printing output, showing
 the confirmation prompt, accepting its aliases, and mapping the owner's answer
 to the session's confirm or cancel operation. It never calls Planner, builds or
 copies a plan, compares fingerprints, evaluates permission, holds the pending
-plan, or re-sends the original request after approval.
+plan, or re-sends the original request after approval. Every way out of the
+main loop, including an exception it lets propagate, ends the session, which
+discards the session's conversation and any pending approval.
+
+`main.py` is also the runtime composition point. Its default startup is
+`build_runtime_brain()`, which calls `MariaBrain.from_defaults()` with
+`build_reasoning_provider` as the reasoning factory. That factory constructs
+`OllamaReasoningProvider` only when the settled reasoning settings are enabled,
+and returns `None` otherwise; Brain receives the result only through the
+`ReasoningProvider` interface. `main.py` is the one production module that
+names the adapter, and a guard test holds every other production module,
+Brain included, to neither naming nor reaching it. Enabled settings the
+adapter refuses, such as the `private_lan` transport, stop startup through
+the ordinary sanitized failure before anything is created.
 
 ## Session Boundary
 
@@ -282,6 +311,17 @@ resolves every step of a plan before dispatching any of them. The session
 stores no permission resolution alongside the pending plan, because
 confirmation re-resolves the plan's current permissions rather than replaying
 the decisions that were current when it was shown.
+
+A session also owns its conversation: the completed conversational exchanges
+of this session alone, held as a tuple of `ReasoningExchange` values in process
+memory. `submit()` hands them to `MariaBrain.process()` with the request, and
+only a completed conversational reply replaces them; a command, its result, a
+refusal, or a failed turn never does. Whatever comes back is held to the
+retention limits again in the session itself, at most eight exchanges and at
+most 8 KiB of content. `end()` discards the conversation and any pending
+approval, writes nothing, and is idempotent. Brain keeps no state between
+requests, so a new session always starts with an empty conversation and can
+never observe another session's turns.
 
 ## Permission Policy
 
@@ -607,9 +647,22 @@ guaranteed. There is no compensating rollback, retry, or replay.
 
 `core/reasoning.py` is the contract every later model stage builds on, and it
 deliberately contains no transport, no model, and no provider. A
-`ReasoningRequest` holds one bounded prompt and nothing else — there is no
-field through which personal context, a system prompt, or a template could
-travel — and a `ReasoningResponse` holds one bounded, untrusted string. The
+`ReasoningRequest` holds one bounded prompt and, in `history`, the earlier
+exchanges of the current conversation, oldest first, and empty by default.
+Each `ReasoningExchange` is one user text and one assistant text, exact,
+non-empty, and redacted from every representation. There is no field through
+which personal context, a system prompt, or a template could travel, and a
+`ReasoningResponse` holds one bounded, untrusted string.
+
+A request's size is defined once, by `request_content_bytes`: the UTF-8 length
+of the prompt plus the UTF-8 length of every exchange's user and assistant
+text, and nothing else, so no role name, message structure, model identifier,
+or transport framing counts. Construction bounds that total by the 1 MiB hard
+ceiling. `request_reasoning` measures it again against the configured
+`max_input_bytes` before the provider is asked, re-reading every text rather
+than trusting construction and stopping as soon as the total passes the
+bound, so a request tampered into holding far more is never copied to be
+measured. The
 `ReasoningProvider` protocol is what the local adapter,
 `core/ollama_adapter.py`, implements.
 `request_reasoning` is the one boundary through which a provider is asked
@@ -658,9 +711,9 @@ configuration loading logs nothing.
 specific to Ollama — the destination, the request and reply shapes, and the
 HTTP framing — is confined to that module. It is the only production module
 that imports a network module, and it imports only `socket`: no HTTP library,
-so no proxy, redirect, or URL handling exists to be reached. Nothing
-constructs it yet. Brain, the CLI, the planner, memory, and tools cannot reach
-it, so every command behaves exactly as before.
+so no proxy, redirect, or URL handling exists to be reached. Only `main.py`
+constructs it, and only for enabled settings; Brain, the planner, memory, and
+tools never import or reach it.
 
 The destination is fixed in the module and is not configuration: the IPv4
 loopback address `127.0.0.1`, port `11434`, and path `/api/chat`. Construction
@@ -673,8 +726,14 @@ numeric address, with no name resolution, no proxy, no redirect, no retry,
 and no fallback of any kind.
 
 The request carries only the model identifier, as an opaque JSON string, and
-the prompt as one user message, with `stream` false; there is no system
-message, option, tool, or thinking request. Of the reply, only
+the conversation, with `stream` false: each earlier exchange as a `user`
+message followed by an `assistant` message, oldest first, and then the prompt
+as the final `user` message. With no history that is the prompt as one user
+message, byte for byte the request V1-13 sent. There is no system message,
+option, tool, or thinking request. Before anything is serialized, the adapter
+measures the prompt and history together against its own `max_input_bytes`
+with the same `request_content_bytes` accounting, and refuses an over-budget
+request as input over budget without opening a connection. Of the reply, only
 `message.content` is kept, as inert text. Thinking text, tool calls, and every
 other field are ignored after bounded JSON parsing; only `message.content` is
 returned. The module has no import path to planning, permissions, dispatch, or
@@ -708,6 +767,76 @@ Ollama's own local-only setting is separate and is the owner's to configure.
 The adapter's refusal of cloud-tagged model identifiers is defense in depth
 and cannot prove the runtime will not reach a cloud model.
 
+## Deterministic-First Conversation
+
+With a reasoning provider present and reasoning enabled, Maria answers the one
+kind of request its planner has no command for, its exact generic fallback,
+with a text reply from the owner's local model, in the context of the current
+session's earlier conversational turns. Everything else is exactly as it was.
+
+```text
+CLI
+-> MariaSession (the session's conversation)
+-> MariaBrain.process(request, *conversation)
+-> Planner                               always first
+-> provider, enabled, exact fallback?    otherwise the ordinary path
+-> conversation.converse()
+-> request_reasoning -> ReasoningProvider
+-> zero-step TRANSIENT plan
+-> Brain's ordinary zero-step path       no contract, permission, tool, or row
+-> MariaSession keeps the new conversation
+```
+
+Resolution order lives in Brain. The planner runs first on every request and
+is unchanged. Brain consults the model only when all three hold: a reasoning
+provider was injected, `config.reasoning.enabled` is true, and the planner's
+plan is exactly its generic no-action fallback, recognised by
+`conversation.is_generic_fallback()`: a default-recorded plan with no steps
+whose response is exactly `GENERIC_FALLBACK_RESPONSE`, a named copy of the
+planner's text that a test holds to the planner's real output. Help,
+`commands`, and every usage error are zero-step plans with other text, so they
+never reach the model; blank input returns before planning; and the
+confirmation path never plans at all. With no provider, which is what the
+shipped configuration produces, or with disabled settings even when a provider
+was injected, the fallback is answered and recorded exactly as before: its
+original response and its interaction row.
+
+`conversation.converse()` settles the whole turn:
+
+- The budget is 8 KiB (`CONVERSATION_MAX_BYTES`) or the configured
+  `max_input_bytes`, whichever is smaller, counted as `request_content_bytes`
+  counts: the UTF-8 text of the retained exchanges' user and assistant halves
+  plus the current request.
+- A request that is over the budget on its own is refused with the fixed
+  input-over-budget message before the provider is asked. Text the interface
+  cannot carry, such as a lone surrogate, is refused with its own fixed
+  message.
+- The newest earlier exchanges that fit beside the request are sent, at most
+  eight (`CONVERSATION_MAX_EXCHANGES`); the oldest are dropped first, whole.
+  Nothing is truncated.
+- The provider is asked exactly once through `request_reasoning`. A typed
+  failure, a crash, or a malformed reply becomes that failure's fixed message.
+- A reply is kept only if its whole exchange, request and reply together,
+  fits the budget. Otherwise the reply is discarded with a fixed message: it
+  is not shown in part, kept, or recorded.
+- A reply that passes is shown verbatim and becomes the newest exchange. The
+  session keeps the result, again bounded to eight exchanges and the budget.
+
+Every outcome, reply or refusal, is a zero-step plan that `conversation.py`,
+its producer, marks `TRANSIENT`. Brain runs it through its ordinary zero-step
+path, which returns before contract validation, permission resolution, or tool
+dispatch, and whose recording gate writes nothing for a transient plan. No
+conversational request or reply is ever recorded, and Brain never chooses a
+recording policy itself. The reply is untrusted, inert text: nothing parses
+it, it is never handed to the planner, it cannot become a pending approval,
+and a reply that reads like a command or an approval does nothing.
+
+What the model sees is the current request and the session's own completed
+conversational exchanges. It never sees a command or its result, the recent
+interactions Brain retrieves for the planner, an explicit memory, a note, a
+file, a stored interaction, or anything from an earlier session. A new
+session starts empty, and ending one discards its conversation.
+
 ## Boundaries
 
 The brain does not run SQL or perform tool work directly. The planner does not
@@ -721,12 +850,16 @@ registry declares argument shapes only: it holds no tool logic, never calls a
 tool to decide whether arguments are valid, and decides nothing about
 permission. `core/reasoning.py` reaches nothing but the shared failures and the
 logger, and `core/ollama_adapter.py` nothing but those and the reasoning
-interface; no module passes a reasoning reply to the planner, Brain, or a tool.
+interface. `core/conversation.py` reaches only those, the logger, and the
+planner's plan types, never Tool Manager, permissions, or the memory layer. A
+reasoning reply reaches Brain only as the text of a zero-step transient plan;
+no module passes one to the planner or a tool.
 `core/ollama_adapter.py` is the only production module that imports a network
-module. An import-boundary guard asserts that Brain, the planner, permissions,
-Tool Manager, the memory layer, configuration, and every tool import no
-network or threading module, directly or through any Maria module they
-import, and that none of them reaches the adapter.
+module, and `main.py` is the only one that names or reaches it. An
+import-boundary guard asserts that Brain, the planner, permissions, Tool
+Manager, the memory layer, configuration, and every tool import no network or
+threading module, directly or through any Maria module they import, and that
+none of them reaches the adapter.
 
 The brain has no memory-specific dispatch branch. `MemoryTool` contains no SQL;
 it receives the shared `Memory` object and calls its public persistence methods.

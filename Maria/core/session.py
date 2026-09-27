@@ -4,6 +4,12 @@ A session owns the confirmation lifecycle. It plans a request exactly once,
 holds the single plan awaiting approval, and later executes that same plan
 rather than the words that produced it. It performs no terminal work, so the
 command line and any future interface share one contract.
+
+A session also owns its conversation: the completed conversational exchanges
+of this session alone, bounded in count and size, held in process memory, and
+discarded when the session ends. Brain keeps nothing between requests, so a
+new session always starts with no conversation and can never observe
+another's.
 """
 
 from __future__ import annotations
@@ -12,8 +18,10 @@ from dataclasses import dataclass
 from logging import Logger
 
 from core.brain import BrainResponse, MariaBrain
+from core.conversation import bounded_conversation
 from core.logger import get_logger
 from core.planner import Plan
+from core.reasoning import ReasoningExchange
 
 
 CONFIRMATION_REFUSED_MESSAGE = (
@@ -44,11 +52,17 @@ class MariaSession:
         self.brain = brain
         self.logger = logger or get_logger(__name__)
         self._pending: PendingApproval | None = None
+        self._conversation: tuple[ReasoningExchange, ...] = ()
 
     @property
     def pending_approval(self) -> PendingApproval | None:
         """Return the plan awaiting approval, or None when none is pending."""
         return self._pending
+
+    @property
+    def conversation(self) -> tuple[ReasoningExchange, ...]:
+        """Return this session's completed conversational exchanges."""
+        return self._conversation
 
     def submit(self, user_input: str) -> BrainResponse:
         """Plan one request, discarding any approval still pending.
@@ -56,9 +70,17 @@ class MariaSession:
         A new request always invalidates the previous pending plan, so an
         approval can never be transferred to, or replayed against, a plan the
         owner was not shown.
+
+        The session's conversation goes with the request, and only a
+        completed conversational reply replaces it. Whatever comes back is
+        held to the retention limits again here, so the session never keeps
+        more than they allow, whoever computed it.
         """
         self._pending = None
-        response = self.brain.process(user_input)
+        response = self.brain.process(user_input, *self._conversation)
+
+        if response.conversation is not None:
+            self._conversation = bounded_conversation(response.conversation)
 
         if not response.needs_confirmation:
             return response
@@ -102,3 +124,13 @@ class MariaSession:
             self.logger.info("Pending approval cancelled.")
 
         return had_pending
+
+    def end(self) -> None:
+        """End the session, discarding its conversation and pending approval.
+
+        Nothing the session held survives it or is written anywhere. Ending
+        an already-ended session changes nothing.
+        """
+        self._conversation = ()
+        self._pending = None
+        self.logger.info("Session ended.")

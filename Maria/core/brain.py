@@ -1,18 +1,21 @@
 """Main application controller for Maria.
 
 The brain coordinates the configured planner, memory layer, permission
-manager, and tool manager. It does not directly perform database work or tool
-logic.
+manager, and tool manager, and, when a reasoning provider was supplied, the
+conversation module. It does not directly perform database work, tool logic,
+or any provider-specific work, and it never imports a reasoning adapter.
 """
 
 from __future__ import annotations
 
-from dataclasses import dataclass
+from collections.abc import Callable
+from dataclasses import dataclass, replace
 from logging import Logger
 
 from core.action_contracts import ContractViolation
 from core.config import MariaConfig, load_config
 from core.constants import LOCAL_CONFIG_PATH
+from core.conversation import converse, is_generic_fallback
 from core.filesystem_roots import prepare_roots
 from core.logger import configure_logging, get_logger
 from core.memory import Memory
@@ -22,16 +25,28 @@ from core.permissions import (
     PermissionResult,
 )
 from core.planner import Plan, Planner, PlanStep, RecordingPolicy
+from core.reasoning import (
+    ReasoningExchange,
+    ReasoningProvider,
+    ReasoningSettings,
+)
 from core.tool_manager import ToolExecutionResult, ToolManager
 
 
 @dataclass(frozen=True)
 class BrainResponse:
-    """Response returned by Maria's controller."""
+    """Response returned by Maria's controller.
+
+    ``conversation`` is set only by a completed conversational reply: it is
+    the session's conversation as it stands after that reply, for the
+    session to keep. Every other response leaves it None, so no command, its
+    result, or a failed conversational turn ever becomes conversation.
+    """
 
     text: str
     needs_confirmation: bool = False
     plan: Plan | None = None
+    conversation: tuple[ReasoningExchange, ...] | None = None
 
 
 @dataclass(frozen=True)
@@ -90,6 +105,7 @@ class MariaBrain:
         tool_manager: ToolManager,
         permissions: PermissionManager,
         logger: Logger | None = None,
+        reasoning: ReasoningProvider | None = None,
     ) -> None:
         self.config = config
         self.planner = planner
@@ -97,15 +113,34 @@ class MariaBrain:
         self.tool_manager = tool_manager
         self.permissions = permissions
         self.logger = logger or get_logger(__name__)
+        self.reasoning = reasoning
 
     @classmethod
-    def from_defaults(cls) -> "MariaBrain":
-        """Create a fully wired MariaBrain from config.toml."""
+    def from_defaults(
+        cls,
+        reasoning_factory: (
+            Callable[[ReasoningSettings], ReasoningProvider | None] | None
+        ) = None,
+    ) -> "MariaBrain":
+        """Create a fully wired MariaBrain from config.toml.
+
+        ``reasoning_factory`` is how the runtime composition point supplies
+        the owner's reasoning provider without Brain naming or importing any
+        adapter. It is handed the settled reasoning settings once and returns
+        a provider, or None to leave Maria deterministic only, which is also
+        what happens without a factory.
+        """
         # Startup is the one caller that names the owner's private override,
         # so every other caller of load_config reads the tracked file alone.
-        # The override can only change the reasoning settings, and nothing
-        # here consults them yet.
+        # The override can only change the reasoning settings.
         config = load_config(local_override_path=LOCAL_CONFIG_PATH)
+
+        # The provider is settled before anything is created, so settings a
+        # provider refuses stop startup the same way a refused configuration
+        # does: with nothing prepared, logged, or opened.
+        reasoning = None
+        if reasoning_factory is not None:
+            reasoning = reasoning_factory(config.reasoning)
 
         # Loading settles what the roots are; this is the one boundary that
         # makes them usable. It runs before logging is configured because
@@ -145,10 +180,25 @@ class MariaBrain:
             tool_manager=tool_manager,
             permissions=permissions,
             logger=logger,
+            reasoning=reasoning,
         )
 
-    def process(self, user_input: str) -> BrainResponse:
-        """Plan one user request and run it unless it needs confirmation."""
+    def process(
+        self,
+        user_input: str,
+        *conversation: ReasoningExchange,
+    ) -> BrainResponse:
+        """Plan one user request and run it unless it needs confirmation.
+
+        The deterministic planner always answers first. Only when a reasoning
+        provider was supplied, the configured reasoning settings are enabled,
+        and the planner returned its exact generic no-action fallback, is the
+        request answered conversationally instead, in the context of
+        ``conversation``: the caller's earlier exchanges, oldest first. With
+        reasoning disabled the fallback is answered and recorded exactly as
+        it always was, whether or not a provider is present. Every other plan
+        runs exactly as it always has and never sees the conversation.
+        """
         cleaned_input = user_input.strip()
         if not cleaned_input:
             return BrainResponse("Please enter a request.")
@@ -166,7 +216,40 @@ class MariaBrain:
             context={"recent_interactions": recent_memory},
         )
 
+        if (
+            self.reasoning is not None
+            and self.config.reasoning.enabled
+            and is_generic_fallback(plan)
+        ):
+            return self._converse(cleaned_input, conversation)
+
         return self._run_plan(plan, confirmed=False)
+
+    def _converse(
+        self,
+        request: str,
+        conversation: tuple[ReasoningExchange, ...],
+    ) -> BrainResponse:
+        """Answer one unrecognised request with the local model, as text.
+
+        The conversation module settles the whole turn and produces a
+        zero-step plan that it, as the plan's producer, made transient. That
+        plan takes the ordinary zero-step path, which returns before any
+        contract, permission, or tool is consulted and records nothing. The
+        conversation it returns is handed back for the session to keep, and
+        nothing else is: no retrieved context, no stored record, and no
+        earlier command reaches the model through here.
+        """
+        self.logger.info("Answering request conversationally.")
+        turn = converse(
+            self.reasoning,
+            self.config.reasoning,
+            request,
+            conversation,
+            self.logger,
+        )
+        response = self._run_plan(turn.plan, confirmed=False)
+        return replace(response, conversation=turn.conversation)
 
     def execute_confirmed_plan(self, plan: Plan) -> BrainResponse:
         """Run an already-approved plan without planning the request again.

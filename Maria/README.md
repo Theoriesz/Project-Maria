@@ -167,11 +167,11 @@ Filesystem delete and write functionality remains intentionally unimplemented.
 
 ## Local Reasoning Settings
 
-Maria does not yet use a language model. Nothing in the CLI changes, and every
-command works exactly as before. What exists is the typed interface an
-owner-controlled local model sits behind, the configuration that describes
-it, and one local adapter for Ollama that nothing in Maria calls yet; see
-"Local Ollama Adapter" below.
+With the shipped configuration Maria uses no language model, and every command
+works exactly as it always has. Reasoning is off until the owner enables it in
+a private local override. Maria then answers input that matches no command with
+a conversational reply from the owner's local Ollama model; see "Conversation"
+and "Local Ollama Adapter" below.
 
 The tracked `config/config.toml` keeps reasoning disabled:
 
@@ -226,8 +226,10 @@ tagged `cloud` or ending `-cloud`. It never resolves a host name, uses a
 proxy, follows a redirect, retries, or falls back to anything else, and it
 never downloads a model, installs software, or starts a process.
 
-It sends only the model identifier and the request text as one user message,
-and takes back only the answer text. Any separate thinking text and any tool
+It sends only the model identifier and the conversation: the current session's
+earlier conversational exchanges as alternating user and assistant messages,
+then the request as the final user message. It takes back only the answer
+text. Any separate thinking text and any tool
 calls in the reply are ignored after bounded JSON parsing; only
 `message.content` is returned, and an answer is only ever text, never an
 action. One hard deadline covers connecting, sending, and receiving
@@ -236,12 +238,44 @@ must fit within `max_output_bytes` or is discarded whole. Every failure is one
 fixed, typed message, and no request, answer, address, model identifier, or
 Ollama error text reaches Maria's log.
 
-Nothing in Maria constructs the adapter yet and reasoning stays disabled by
-default, so no command can reach Ollama. Before the adapter is ever used with a
+Maria constructs the adapter only when the private override enables reasoning,
+and reasoning stays disabled by default. Before the adapter is ever used with a
 real model, Ollama itself must be put in local-only mode, as Ollama documents
 it, and restarted, so it cannot reach its cloud models. Maria's refusal of
 cloud-tagged model names is a second line of defense, not proof that Ollama is
 running local-only.
+
+### Conversation
+
+With reasoning enabled, Maria still tries every request as a command first,
+exactly as before. Only input that matches no command, the input that would
+otherwise get `I do not have an executable plan for that yet.`, goes to the
+local model instead. Help, usage messages, and every command are unchanged.
+Input that begins like a command is always that command, even when phrased
+conversationally: `remember when we ...` stores a memory, and
+`move on to ...` is read as a file move and asks for confirmation.
+
+A reply is text only. Maria never treats it as a command, an approval, or an
+action, and it cannot run a tool, change a record, or confirm anything,
+whatever it says. That includes claims to have done something: a reply saying
+"I saved that" saves nothing. Use the commands above to act.
+
+Within one session the model sees the current request and the earlier
+conversational turns of that session, so a follow-up question is understood.
+It never sees a command or its result, an explicit memory, a note, a file, the
+interaction history, or anything from an earlier session. Maria keeps at most
+the last eight exchanges, and at most 8 KiB of their text together with the
+current request, or `max_input_bytes` if that is smaller. The oldest exchanges
+are dropped first, whole. A request too large on its own, or a reply too large
+to keep beside its request, is refused with a fixed message rather than cut
+short. The conversation lives only in memory and is discarded when the session
+ends, on `exit`, end of input, Ctrl+C at the prompt, or any other way the CLI
+stops.
+
+Conversation is never recorded: no conversational request or reply is written
+to interaction history or anywhere else. When the model is unavailable, too
+slow, or answers with something unusable, Maria shows a fixed message such as
+`The local reasoning model is unavailable.`, and every command keeps working.
 
 ## Persistent Memory
 
@@ -280,7 +314,9 @@ There is no way to update or forget a memory by its text, no fuzzy or
 contextual selection, no bulk, wildcard, or clear-all deletion, no automatic
 pruning, and no undo, recovery, or memory revision history. Neither command
 cascades into interaction history or notes, and remaining memory IDs are never
-renumbered. Conversational forms such as `please remember ...` are not supported.
+renumbered. Conversational forms such as `please remember ...` are not memory
+commands. With reasoning enabled they receive a conversational reply instead,
+and that reply stores nothing, whatever it says.
 
 ```text
 remember My editor is VS Code
@@ -310,7 +346,9 @@ behavior described below, so a fact can appear in both places.
 
 Maria stores most non-empty requests it processes and their final response
 text as persistent interaction history in its configured SQLite database,
-located inside the project directory by default. This can retain file contents
+located inside the project directory by default. Conversational requests and
+replies, when reasoning is enabled, are the exception: they are never stored,
+and the conversation is discarded when the session ends. This can retain file contents
 returned by `read file`, note titles and bodies, note creation, retitle, and
 edit requests,
 calculator expressions and results, explicit memory facts from both `remember`
@@ -390,7 +428,9 @@ file pages, database or filesystem backups, Git history, or external copies.
 Maria's shipped runtime has no cloud integration and does not itself transmit
 this history. Its only network-capable code is the local Ollama adapter
 described under "Local Ollama Adapter": it can reach only `127.0.0.1:11434` on
-the same machine, it is disabled by default, and no command uses it yet.
+the same machine, it is disabled by default, and when enabled it receives only
+the current session's conversation, never stored history, notes, memories, or
+files.
 Configured network-mounted or synchronized paths and operating-system backup
 or sync services remain outside Maria's boundary.
 

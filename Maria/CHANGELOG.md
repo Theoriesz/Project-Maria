@@ -2,6 +2,39 @@
 
 ## Unreleased
 
+- Added transient, text-only conversational responses with a bounded
+  in-memory view of the current session, so follow-up turns are understood,
+  using the owner's local model. Model output cannot select or execute any
+  action, conversation is not recorded, and the session context is discarded
+  when the session ends. With reasoning enabled in the private override, input
+  that previously received `I do not have an executable plan for that yet.`
+  now receives a reply from the local Ollama model instead; the planner still
+  runs first on every request and is unchanged, so help, every usage message,
+  and every command behave and record exactly as before, and input that begins
+  like a command is still that command. With reasoning disabled, which remains
+  the shipped default, every response and recorded row is byte-for-byte what
+  it was. The model sees the current request and the earlier conversational
+  turns of the same session, sent to Ollama as ordered user and assistant
+  messages, and never a command or its result, an explicit memory, a note, a
+  file, interaction history, or anything from an earlier session. The session
+  keeps at most eight exchanges and at most 8 KiB of their text together with
+  the current request, or `max_input_bytes` if smaller, dropping the oldest
+  whole exchanges first; a request too large on its own is refused before the
+  model is asked, a reply too large to keep beside its request is discarded
+  whole with a fixed message, and nothing is ever truncated. The prompt and
+  history are measured again, with one shared byte accounting, at the
+  reasoning boundary and inside the adapter before anything is sent. Every
+  reply is inert text shown verbatim: it is never parsed into a tool, action,
+  argument, command, or approval, and it cannot reach permissions or a tool.
+  A model that is unavailable, too slow, or unusable yields a fixed message,
+  and every command keeps working in the same session. No conversational
+  request, reply, or failure is written to interaction history, and ending the
+  session, by `exit`, end of input, Ctrl+C at the prompt, or an error, discards
+  the conversation. `main.py` is now the one place that constructs the Ollama
+  adapter, and only when reasoning is enabled; Brain receives it only through
+  the provider interface and still imports no adapter or network module. No
+  dependency, schema, permission, command, configuration field, or version
+  change was introduced.
 - Added one owner-controlled local reasoning adapter with an enforced
   transport class, hard request deadline, bounded input and output, and typed
   failures. This is the first network-capable code in Maria's runtime; it is

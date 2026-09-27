@@ -5,8 +5,8 @@ answer, which settings describe the one owner-controlled provider, and the one
 boundary that turns whatever a provider does into either a validated reply or
 a typed failure. It contains no transport and no model: nothing here opens a
 socket, resolves a name, starts a process or a thread, or waits on a clock.
-The later local adapter implements ``ReasoningProvider``; nothing in Maria
-calls a provider yet.
+The local adapter implements ``ReasoningProvider``, and the conversation
+module is the one caller that asks it anything.
 
 Model output is untrusted. The boundary hands a reply back as one inert string
 and never parses, interprets, repairs, or acts on it, and this module has no
@@ -20,7 +20,10 @@ failure is reported as a ``Failure`` whose kind is the whole of what it says,
 so no provider exception, and none of its text, can travel with it.
 
 There is deliberately no field for personal context, a system prompt, a
-template, a credential, a header, an endpoint URL, a port, or a model path.
+template, a credential, a header, an endpoint URL, a port, or a model path. A
+request may carry the earlier exchanges of the owner's current conversation,
+and nothing else: each is text the owner typed and text the model already
+replied.
 """
 
 from __future__ import annotations
@@ -143,6 +146,16 @@ REASONING_TEXT_MESSAGE = (
     "A reasoning response text must be non-empty text of at most "
     f"{REASONING_MAXIMUM_OUTPUT_BYTES} UTF-8 bytes."
 )
+REASONING_EXCHANGE_MESSAGE = (
+    "A reasoning exchange must hold non-empty user text of at most "
+    f"{REASONING_MAXIMUM_INPUT_BYTES} UTF-8 bytes and non-empty assistant "
+    f"text of at most {REASONING_MAXIMUM_OUTPUT_BYTES} UTF-8 bytes."
+)
+REASONING_HISTORY_MESSAGE = (
+    "A reasoning request history must be a tuple of ReasoningExchange values "
+    "whose text, with the prompt, is at most "
+    f"{REASONING_MAXIMUM_INPUT_BYTES} UTF-8 bytes."
+)
 REASONING_REQUEST_TYPE_MESSAGE = "A reasoning request must be a ReasoningRequest."
 REASONING_SETTINGS_TYPE_MESSAGE = (
     "Reasoning settings must be a ReasoningSettings."
@@ -166,26 +179,67 @@ REASONING_FAILURE_KINDS = frozenset(
 
 
 @dataclass(frozen=True, repr=False)
-class ReasoningRequest:
-    """One bounded, context-free question for the owner's local model.
+class ReasoningExchange:
+    """One completed turn of the owner's current conversation, as inert text.
 
-    The prompt is the whole request: there is no field for personal context,
-    a system prompt, a template, or anything retrieved on the owner's behalf.
-    It is exact, non-empty text of at most ``REASONING_MAXIMUM_INPUT_BYTES``
-    UTF-8 bytes; the configured input budget is narrower and is applied by
-    ``request_reasoning`` before any provider is asked.
+    ``user`` is exactly what the owner asked and ``assistant`` is exactly the
+    reply the model gave to it. Both are exact, non-empty, encodable text:
+    the user text within ``REASONING_MAXIMUM_INPUT_BYTES`` and the assistant
+    text within ``REASONING_MAXIMUM_OUTPUT_BYTES`` UTF-8 bytes. An exchange is
+    a pair of strings and nothing more; nothing here parses or acts on it.
     """
 
-    prompt: str
+    user: str
+    assistant: str
 
     def __post_init__(self) -> None:
         """Refuse anything but bounded, encodable, non-empty text."""
-        if not _is_bounded_text(self.prompt, REASONING_MAXIMUM_INPUT_BYTES):
-            raise ValueError(REASONING_PROMPT_MESSAGE)
+        if not (
+            _is_bounded_text(self.user, REASONING_MAXIMUM_INPUT_BYTES)
+            and _is_bounded_text(self.assistant, REASONING_MAXIMUM_OUTPUT_BYTES)
+        ):
+            raise ValueError(REASONING_EXCHANGE_MESSAGE)
 
     def __repr__(self) -> str:
-        """Name the type without ever showing the prompt."""
-        return "ReasoningRequest(prompt=<redacted>)"
+        """Name the type without ever showing either text."""
+        return "ReasoningExchange(user=<redacted>, assistant=<redacted>)"
+
+
+@dataclass(frozen=True, repr=False)
+class ReasoningRequest:
+    """One bounded question for the owner's local model, in its conversation.
+
+    ``prompt`` is the question asked now. ``history`` holds the earlier
+    exchanges of the same active conversation, oldest first, and is empty by
+    default, which is exactly the single context-free question a request has
+    always been. There is still no field for personal context, a system
+    prompt, a template, or anything retrieved on the owner's behalf.
+
+    The prompt is exact, non-empty text, and the prompt with every exchange's
+    text is at most ``REASONING_MAXIMUM_INPUT_BYTES`` UTF-8 bytes, counted as
+    ``request_content_bytes`` counts them. The configured input budget is
+    narrower and is applied by ``request_reasoning`` before any provider is
+    asked.
+    """
+
+    prompt: str
+    history: tuple[ReasoningExchange, ...] = ()
+
+    def __post_init__(self) -> None:
+        """Refuse anything but bounded text and an exact, bounded history."""
+        if not _is_bounded_text(self.prompt, REASONING_MAXIMUM_INPUT_BYTES):
+            raise ValueError(REASONING_PROMPT_MESSAGE)
+        size = request_content_bytes(
+            self.prompt,
+            self.history,
+            REASONING_MAXIMUM_INPUT_BYTES,
+        )
+        if size > REASONING_MAXIMUM_INPUT_BYTES:
+            raise ValueError(REASONING_HISTORY_MESSAGE)
+
+    def __repr__(self) -> str:
+        """Name the type without ever showing the prompt or the history."""
+        return "ReasoningRequest(prompt=<redacted>, history=<redacted>)"
 
 
 @dataclass(frozen=True, repr=False)
@@ -307,8 +361,10 @@ def request_reasoning(
 ) -> ReasoningResponse | Failure:
     """Ask a provider one question and settle the outcome as a value.
 
-    Disabled settings answer unavailable, and a prompt over the configured
-    input budget answers over-budget, both without the provider being asked.
+    Disabled settings answer unavailable, and a request whose prompt and
+    history together are over the configured input budget answers
+    over-budget, both without the provider being asked. The request's size is
+    measured again here, whatever its construction checked.
     Otherwise the provider is asked exactly once. A typed reasoning failure
     it raises is returned as that failure; any other exception is contained
     as unavailable without being bound to a name, so neither it nor its text
@@ -336,6 +392,65 @@ def request_reasoning(
     return outcome
 
 
+def request_content_bytes(
+    prompt: object,
+    history: object,
+    maximum_bytes: int,
+) -> int:
+    """Measure the text a request carries, in UTF-8 bytes, against a bound.
+
+    This is the one definition of a request's size: the UTF-8 length of the
+    prompt plus the UTF-8 length of every earlier exchange's user text and
+    assistant text. Nothing else counts, so no role name, message structure,
+    separator, model identifier, or framing a provider adds to carry the
+    text is included.
+
+    Every text is read again rather than trusted from construction, and the
+    count stops as soon as it passes ``maximum_bytes``, so a request
+    tampered into holding far more is never copied to be measured. The
+    result is then only some value above the bound, which callers compare
+    with the bound and nothing else. A prompt that is not exact, encodable,
+    non-empty text raises ``ValueError`` with the prompt message, and a
+    history ``history_content_bytes`` refuses raises it with the history
+    message.
+    """
+    size = _bounded_utf8_size(prompt, maximum_bytes)
+    if size is None or size == 0:
+        raise ValueError(REASONING_PROMPT_MESSAGE)
+    if size > maximum_bytes:
+        return size
+    return size + history_content_bytes(history, maximum_bytes - size)
+
+
+def history_content_bytes(history: object, maximum_bytes: int) -> int:
+    """Measure earlier exchanges' text, in UTF-8 bytes, against a bound.
+
+    The size is the UTF-8 length of every exchange's user text plus its
+    assistant text, the accounting ``request_content_bytes`` applies, and
+    the count likewise stops as soon as it passes ``maximum_bytes``. The
+    history must be an exact tuple of exact ``ReasoningExchange`` values,
+    each still holding exact, encodable, non-empty text, or ``ValueError``
+    is raised with the history message.
+    """
+    if type(history) is not tuple:
+        raise ValueError(REASONING_HISTORY_MESSAGE)
+    total = 0
+    for exchange in history:
+        if type(exchange) is not ReasoningExchange:
+            raise ValueError(REASONING_HISTORY_MESSAGE)
+        for text in (
+            getattr(exchange, "user", None),
+            getattr(exchange, "assistant", None),
+        ):
+            size = _bounded_utf8_size(text, maximum_bytes - total)
+            if size is None or size == 0:
+                raise ValueError(REASONING_HISTORY_MESSAGE)
+            total += size
+            if total > maximum_bytes:
+                return total
+    return total
+
+
 def _settle(
     provider: ReasoningProvider,
     request: ReasoningRequest,
@@ -345,13 +460,12 @@ def _settle(
     if not settings.enabled:
         return Failure(FailureKind.REASONING_UNAVAILABLE)
 
-    prompt_size = _bounded_utf8_size(
+    size = request_content_bytes(
         getattr(request, "prompt", None),
+        getattr(request, "history", None),
         settings.max_input_bytes,
     )
-    if prompt_size is None or prompt_size == 0:
-        raise ValueError(REASONING_PROMPT_MESSAGE)
-    if prompt_size > settings.max_input_bytes:
+    if size > settings.max_input_bytes:
         return Failure(FailureKind.REASONING_INPUT_OVER_BUDGET)
 
     try:
