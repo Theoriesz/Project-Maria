@@ -5,7 +5,6 @@ from __future__ import annotations
 from dataclasses import dataclass
 from enum import Enum
 from logging import Logger
-from types import MappingProxyType
 
 from core.logger import get_logger
 
@@ -20,21 +19,6 @@ MANDATORY_CONFIRMATION_ACTIONS = frozenset(
         "notes.delete",
         "memory.update",
         "memory.forget",
-        "memory.enable_context",
-        "memory.disable_context",
-    }
-)
-
-# What the owner is told, beyond the standard sentence, before approving an
-# action whose consequence is not obvious from its name. Each notice is fixed
-# text and interpolates nothing, so no stored content can reach it.
-CONFIRMATION_NOTICES = MappingProxyType(
-    {
-        "memory.enable_context": (
-            "Once enabled, this memory may be sent to your local reasoning "
-            "model on any conversational turn, within Maria's memory context "
-            "limits. Maria does not choose memories by relevance."
-        ),
     }
 )
 
@@ -92,13 +76,9 @@ class PermissionManager:
 
         if action_id in self.confirmation_required:
             self.logger.info("Action %s requires confirmation.", action_id)
-            reason = f"{action_id} requires explicit confirmation."
-            notice = CONFIRMATION_NOTICES.get(action_id)
-            if notice is not None:
-                reason = f"{reason} {notice}"
             return PermissionResult(
                 PermissionDecision.REQUIRES_CONFIRMATION,
-                reason,
+                f"{action_id} requires explicit confirmation.",
             )
 
         self.logger.info("Allowed action %s.", action_id)

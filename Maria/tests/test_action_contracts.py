@@ -13,7 +13,6 @@ from unittest.mock import Mock, patch
 
 from core.action_contracts import (
     BUILT_IN_ACTION_CONTRACTS,
-    FACT_DIGEST_LENGTH,
     MAXIMUM_EXPRESSION_LENGTH,
     MAXIMUM_LIST_LIMIT,
     MINIMUM_LIST_LIMIT,
@@ -52,8 +51,6 @@ EXPECTED_ACTION_IDENTIFIERS = frozenset(
         "memory.list",
         "memory.update",
         "memory.forget",
-        "memory.enable_context",
-        "memory.disable_context",
         "notes.create",
         "notes.list",
         "notes.read",
@@ -379,7 +376,7 @@ class RegistryCompletenessTests(unittest.TestCase):
             BUILT_IN_ACTION_CONTRACTS.action_identifiers,
             EXPECTED_ACTION_IDENTIFIERS,
         )
-        self.assertEqual(len(EXPECTED_ACTION_IDENTIFIERS), 24)
+        self.assertEqual(len(EXPECTED_ACTION_IDENTIFIERS), 22)
 
     def test_registry_and_loaded_tool_inventory_agree_in_both_directions(self) -> None:
         with TemporaryDirectory() as name:
@@ -417,7 +414,7 @@ class RegistryCompletenessTests(unittest.TestCase):
         ]
 
         self.assertEqual(len(identifiers), len(set(identifiers)))
-        self.assertEqual(len(identifiers), 24)
+        self.assertEqual(len(identifiers), 22)
 
     def test_no_contract_exists_for_a_mandatorily_denied_filesystem_action(
         self,
@@ -455,7 +452,7 @@ class RegistryCompletenessTests(unittest.TestCase):
             if argument.value_type is str
         ]
 
-        self.assertEqual(len(text_fields), 17)
+        self.assertEqual(len(text_fields), 16)
         for contract, argument in text_fields:
             with self.subTest(field=f"{contract.identifier}.{argument.name}"):
                 self.assertIsInstance(argument.allow_blank, bool)
@@ -474,7 +471,7 @@ class RegistryCompletenessTests(unittest.TestCase):
 
         self.assertEqual(accepting_blank, set())
 
-    def test_only_the_expression_and_the_fact_identity_declare_text_bounds(
+    def test_the_calculator_expression_is_the_only_declared_text_maximum(
         self,
     ) -> None:
         bounded = {
@@ -492,21 +489,10 @@ class RegistryCompletenessTests(unittest.TestCase):
 
         self.assertEqual(
             bounded,
-            {
-                "calculator.calculate.expression": MAXIMUM_EXPRESSION_LENGTH,
-                "memory.enable_context.fact_digest": FACT_DIGEST_LENGTH,
-            },
+            {"calculator.calculate.expression": MAXIMUM_EXPRESSION_LENGTH},
         )
         self.assertEqual(MAXIMUM_EXPRESSION_LENGTH, 200)
-        self.assertEqual(FACT_DIGEST_LENGTH, 64)
-        self.assertEqual(minimums, {"memory.enable_context.fact_digest"})
-        digest = BUILT_IN_ACTION_CONTRACTS.contract_for(
-            "memory",
-            "enable_context",
-        ).arguments[1]
-        self.assertEqual(digest.minimum_length, FACT_DIGEST_LENGTH)
-        self.assertFalse(digest.required)
-        self.assertFalse(digest.allow_blank)
+        self.assertEqual(minimums, set())
 
     def test_every_filesystem_path_field_declares_the_safe_root_class(self) -> None:
         declared_paths = {
@@ -542,8 +528,6 @@ class RegistryCompletenessTests(unittest.TestCase):
             ("history", "delete"),
             ("memory", "update"),
             ("memory", "forget"),
-            ("memory", "enable_context"),
-            ("memory", "disable_context"),
             ("notes", "retitle"),
             ("notes", "edit"),
             ("notes", "delete"),
@@ -590,9 +574,6 @@ class RegistryCompletenessTests(unittest.TestCase):
                 ("memory", "list", "limit"),
                 ("notes", "list", "limit"),
                 ("notes", "create", "title"),
-                # Absent from the planner's plan and pinned when confirmation
-                # is offered, so an approval names the exact fact text.
-                ("memory", "enable_context", "fact_digest"),
             },
         )
 
@@ -704,7 +685,7 @@ class RegistryConstructionTests(unittest.TestCase):
                 "sample", "run"
             )
 
-        self.assertEqual(len(BUILT_IN_ACTION_CONTRACTS.action_identifiers), 24)
+        self.assertEqual(len(BUILT_IN_ACTION_CONTRACTS.action_identifiers), 22)
 
     def test_unsupported_declared_type_is_rejected(self) -> None:
         with self.assertRaises(ValueError):

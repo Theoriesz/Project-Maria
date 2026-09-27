@@ -19,14 +19,11 @@ interpolated into an exception message, and never handed to the logger. A
 failure is reported as a ``Failure`` whose kind is the whole of what it says,
 so no provider exception, and none of its text, can travel with it.
 
-There is deliberately no field for a system prompt, a template, a
-credential, a header, an endpoint URL, a port, or a model path. A request may
-carry the earlier exchanges of the owner's current conversation, each text
-the owner typed and text the model already replied, and one typed field of
-Tier A memory context: ``ContextItem`` values from ``core/context.py``, each
-bearing the record id Maria read, empty by default and validated again here
-rather than trusted. Nothing else personal can be carried, and raw
-interaction history has no field at all.
+There is deliberately no field for personal context, a system prompt, a
+template, a credential, a header, an endpoint URL, a port, or a model path. A
+request may carry the earlier exchanges of the owner's current conversation,
+and nothing else: each is text the owner typed and text the model already
+replied.
 """
 
 from __future__ import annotations
@@ -39,7 +36,6 @@ from logging import Logger
 from types import MappingProxyType
 from typing import Protocol
 
-from core.context import ContextItem, context_content_bytes
 from core.failures import Failure, FailureKind, TypedFailureError
 from core.logger import get_logger
 
@@ -214,17 +210,13 @@ class ReasoningRequest:
     """One bounded question for the owner's local model, in its conversation.
 
     ``prompt`` is the question asked now. ``history`` holds the earlier
-    exchanges of the same active conversation, oldest first. ``context``
-    holds the Tier A memories Maria selected for this request, each a
-    ``ContextItem`` bearing the record id Maria read, in ascending id order.
-    Both are empty by default, which is exactly the single context-free
-    question a request has always been. There is no field for a system
-    prompt, a template, or raw interaction history.
+    exchanges of the same active conversation, oldest first, and is empty by
+    default, which is exactly the single context-free question a request has
+    always been. There is still no field for personal context, a system
+    prompt, a template, or anything retrieved on the owner's behalf.
 
-    The prompt is exact, non-empty text; the context is at most
-    ``CONTEXT_MAX_ITEMS`` items rendering to at most ``CONTEXT_MAX_BYTES``;
-    and the prompt, every exchange's text, and the rendered context together
-    are at most ``REASONING_MAXIMUM_INPUT_BYTES`` UTF-8 bytes, counted as
+    The prompt is exact, non-empty text, and the prompt with every exchange's
+    text is at most ``REASONING_MAXIMUM_INPUT_BYTES`` UTF-8 bytes, counted as
     ``request_content_bytes`` counts them. The configured input budget is
     narrower and is applied by ``request_reasoning`` before any provider is
     asked.
@@ -232,27 +224,22 @@ class ReasoningRequest:
 
     prompt: str
     history: tuple[ReasoningExchange, ...] = ()
-    context: tuple[ContextItem, ...] = ()
 
     def __post_init__(self) -> None:
-        """Refuse anything but bounded text, history, and context."""
+        """Refuse anything but bounded text and an exact, bounded history."""
         if not _is_bounded_text(self.prompt, REASONING_MAXIMUM_INPUT_BYTES):
             raise ValueError(REASONING_PROMPT_MESSAGE)
         size = request_content_bytes(
             self.prompt,
             self.history,
             REASONING_MAXIMUM_INPUT_BYTES,
-            self.context,
         )
         if size > REASONING_MAXIMUM_INPUT_BYTES:
             raise ValueError(REASONING_HISTORY_MESSAGE)
 
     def __repr__(self) -> str:
-        """Name the type without ever showing any text it carries."""
-        return (
-            "ReasoningRequest(prompt=<redacted>, history=<redacted>, "
-            "context=<redacted>)"
-        )
+        """Name the type without ever showing the prompt or the history."""
+        return "ReasoningRequest(prompt=<redacted>, history=<redacted>)"
 
 
 @dataclass(frozen=True, repr=False)
@@ -409,34 +396,27 @@ def request_content_bytes(
     prompt: object,
     history: object,
     maximum_bytes: int,
-    context: object = (),
 ) -> int:
     """Measure the text a request carries, in UTF-8 bytes, against a bound.
 
     This is the one definition of a request's size: the UTF-8 length of the
-    prompt, plus the UTF-8 length of every earlier exchange's user text and
-    assistant text, plus the fully rendered memory context, which is Maria's
-    fixed context instructions and the delimited data block with every id,
-    and nothing when the context is empty. Nothing else counts, so no role
-    name, message structure, separator, or model identifier a provider adds
-    to carry the text is included.
+    prompt plus the UTF-8 length of every earlier exchange's user text and
+    assistant text. Nothing else counts, so no role name, message structure,
+    separator, model identifier, or framing a provider adds to carry the
+    text is included.
 
     Every text is read again rather than trusted from construction, and the
     count stops as soon as it passes ``maximum_bytes``, so a request
     tampered into holding far more is never copied to be measured. The
     result is then only some value above the bound, which callers compare
     with the bound and nothing else. A prompt that is not exact, encodable,
-    non-empty text raises ``ValueError`` with the prompt message, a history
-    ``history_content_bytes`` refuses raises it with the history message,
-    and a context ``context_content_bytes`` refuses raises it with the
-    context message.
+    non-empty text raises ``ValueError`` with the prompt message, and a
+    history ``history_content_bytes`` refuses raises it with the history
+    message.
     """
     size = _bounded_utf8_size(prompt, maximum_bytes)
     if size is None or size == 0:
         raise ValueError(REASONING_PROMPT_MESSAGE)
-    # The context is validated whatever the prompt's size, and it is bounded
-    # on its own, so measuring it never copies anything large.
-    size += context_content_bytes(context)
     if size > maximum_bytes:
         return size
     return size + history_content_bytes(history, maximum_bytes - size)
@@ -484,7 +464,6 @@ def _settle(
         getattr(request, "prompt", None),
         getattr(request, "history", None),
         settings.max_input_bytes,
-        getattr(request, "context", None),
     )
     if size > settings.max_input_bytes:
         return Failure(FailureKind.REASONING_INPUT_OVER_BUDGET)

@@ -159,9 +159,6 @@ class PipelineTestCase(unittest.TestCase):
         self.planner = Mock(spec=Planner)
         self.memory = Mock(spec=Memory)
         self.tool_manager = Mock(spec=ToolManager)
-        # No mocked tool pins confirmation state, so the plan offered
-        # for approval is the plan itself.
-        self.tool_manager.bind_for_confirmation.side_effect = lambda plan: plan
         self.permissions = Mock(spec=PermissionManager)
         self.logger = Mock(spec=logging.Logger)
 
@@ -561,9 +558,6 @@ class ContractPrivacyTests(unittest.TestCase):
         planner = Mock(spec=Planner)
         memory = Mock(spec=Memory)
         tool_manager = Mock(spec=ToolManager)
-        # No mocked tool pins confirmation state, so the plan offered
-        # for approval is the plan itself.
-        tool_manager.bind_for_confirmation.side_effect = lambda plan: plan
         tool_manager.validate_action.side_effect = (
             BUILT_IN_ACTION_CONTRACTS.validate
         )
@@ -1150,9 +1144,6 @@ class UnsafeMetadataTests(unittest.TestCase):
         planner = Mock(spec=Planner)
         memory = Mock(spec=Memory)
         tool_manager = Mock(spec=ToolManager)
-        # No mocked tool pins confirmation state, so the plan offered
-        # for approval is the plan itself.
-        tool_manager.bind_for_confirmation.side_effect = lambda plan: plan
         permissions = Mock(spec=PermissionManager)
         memory.get_recent_interactions.return_value = []
         tool_manager.validate_action.side_effect = (
@@ -1332,9 +1323,6 @@ class MalformedIdentifierPipelineTests(unittest.TestCase):
         self.planner = Mock(spec=Planner)
         self.memory = Mock(spec=Memory)
         self.tool_manager = Mock(spec=ToolManager)
-        # No mocked tool pins confirmation state, so the plan offered
-        # for approval is the plan itself.
-        self.tool_manager.bind_for_confirmation.side_effect = lambda plan: plan
         self.permissions = Mock(spec=PermissionManager)
         self.memory.get_recent_interactions.return_value = []
         self.tool_manager.validate_action.side_effect = (

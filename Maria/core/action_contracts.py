@@ -38,10 +38,6 @@ MAXIMUM_LIST_LIMIT = 100
 # to evaluate_expression, which rejects a stripped length above this value.
 MAXIMUM_EXPRESSION_LENGTH = 200
 
-# The length of a hexadecimal SHA-256, the fact identity an enable approval
-# carries.
-FACT_DIGEST_LENGTH = 64
-
 
 # The longest metadata name Maria will repeat back. Every declared tool,
 # action, and field name is far shorter, so anything longer is a caller's
@@ -660,7 +656,7 @@ class ActionContractRegistry:
 
 
 def _identifier(required: bool = True) -> ArgumentContract:
-    """Declare the positive row identifier shared by nine lifecycle actions.
+    """Declare the positive row identifier shared by seven lifecycle actions.
 
     Every tool that takes an ``id`` rejects a bool, a non-int, and anything
     below 1, and none imposes a ceiling.
@@ -824,23 +820,6 @@ BUILT_IN_ACTION_CONTRACTS = ActionContractRegistry(
             ),
         ),
         ActionContract("memory", "forget", (_identifier(),)),
-        ActionContract(
-            "memory",
-            "enable_context",
-            (
-                _identifier(),
-                # Absent from the planner's plan; pinned when confirmation is
-                # offered, so the approved plan names the exact fact text.
-                _text(
-                    "fact_digest",
-                    required=False,
-                    allow_blank=False,
-                    minimum_length=FACT_DIGEST_LENGTH,
-                    maximum_length=FACT_DIGEST_LENGTH,
-                ),
-            ),
-        ),
-        ActionContract("memory", "disable_context", (_identifier(),)),
         ActionContract(
             "notes",
             "create",

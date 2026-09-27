@@ -7,7 +7,6 @@ from logging import Logger
 from typing import Any
 
 from core.action_contracts import MAXIMUM_LIST_LIMIT, MINIMUM_LIST_LIMIT
-from core.context import ContextConsentOutcome
 from core.logger import get_logger
 from core.memory import Memory
 from core.tool_manager import ToolExecutionResult
@@ -36,18 +35,10 @@ def _split_visible_rows(
 
 
 class MemoryTool:
-    """Store, retrieve, update, and forget explicit memories through the memory layer.
-
-    It also turns one memory's context consent on or off. Those results name
-    the memory's id and never its fact, so the interaction row a consent
-    change records carries no stored text.
-    """
+    """Store, retrieve, update, and forget explicit memories through the memory layer."""
 
     name = "memory"
-    description = (
-        "Stores, searches, lists, updates, and forgets explicit memories, "
-        "and turns one memory's context consent on or off."
-    )
+    description = "Stores, searches, lists, updates, and forgets explicit memories."
     actions = frozenset(
         {
             "store",
@@ -55,51 +46,12 @@ class MemoryTool:
             "list",
             "update",
             "forget",
-            "enable_context",
-            "disable_context",
         }
     )
 
     def __init__(self, memory: Memory, logger: Logger | None = None) -> None:
         self.memory = memory
         self.logger = logger or get_logger(__name__)
-
-    def confirmation_binding(
-        self,
-        action: str,
-        arguments: Mapping[str, Any],
-    ) -> Mapping[str, Any]:
-        """Pin an enable approval to the exact fact stored when it is offered.
-
-        Consent covers exact text, so the plan the owner approves for
-        ``enable_context`` carries the identity of the memory's fact at that
-        moment as ``fact_digest``. At execution the memory layer enables
-        consent only while the fact is still exactly that text. Nothing is
-        added for any other action, for an id that is not valid, for a memory
-        that does not exist, or when the fact cannot be read; an enable
-        carrying no identity can never turn consent on for an existing
-        memory, so each of those still ends safely.
-        """
-        if action != "enable_context":
-            return {}
-        memory_id = arguments.get("id")
-        if (
-            not isinstance(memory_id, int)
-            or isinstance(memory_id, bool)
-            or memory_id < 1
-        ):
-            return {}
-        try:
-            fact_digest = self.memory.memory_fact_digest(memory_id)
-        except RuntimeError:
-            self.logger.warning(
-                "Could not bind context approval for memory %s.",
-                memory_id,
-            )
-            return {}
-        if fact_digest is None:
-            return {}
-        return {"fact_digest": fact_digest}
 
     def execute(
         self,
@@ -117,10 +69,6 @@ class MemoryTool:
             return self._update(arguments)
         if action == "forget":
             return self._forget(arguments)
-        if action == "enable_context":
-            return self._set_context(arguments, enabled=True)
-        if action == "disable_context":
-            return self._set_context(arguments, enabled=False)
         return ToolExecutionResult(False, f"Unsupported memory action: {action}")
 
     def _store(self, arguments: Mapping[str, Any]) -> ToolExecutionResult:
@@ -245,7 +193,7 @@ class MemoryTool:
             return ToolExecutionResult(False, "New memory fact is required.")
 
         try:
-            result = self.memory.update_memory_reporting_consent(
+            updated, conflicting_id = self.memory.update_memory(
                 memory_id,
                 new_fact.strip(),
             )
@@ -253,20 +201,11 @@ class MemoryTool:
             self.logger.warning("Memory update failed: %s", exc)
             return ToolExecutionResult(False, f"Memory update failed: {exc}")
 
-        updated, conflicting_id = result.updated, result.conflicting_id
         if updated:
             self.logger.info("Updated memory %s through memory tool.", memory_id)
-            message = f"Updated memory {memory_id}."
-            if result.context_consent_cleared:
-                # Consent covered the text the owner approved, which this
-                # update replaced, so it is off now and the owner is told.
-                message = (
-                    f"{message} Context consent for memory {memory_id} was "
-                    "turned off because its text changed."
-                )
             return ToolExecutionResult(
                 True,
-                message,
+                f"Updated memory {memory_id}.",
                 {"id": memory_id},
             )
 
@@ -306,73 +245,6 @@ class MemoryTool:
             True,
             f"Forgot memory {memory_id}.",
             {"id": memory_id},
-        )
-
-    def _set_context(
-        self,
-        arguments: Mapping[str, Any],
-        *,
-        enabled: bool,
-    ) -> ToolExecutionResult:
-        """Turn one memory's context consent on or off by id.
-
-        Enabling is bound to the fact identity pinned when confirmation was
-        offered, carried as ``fact_digest``. If the memory's text is no longer
-        exactly that text, or no identity was pinned for an existing memory,
-        nothing changes and the owner is told to ask again; an approval is
-        never carried over to text the owner was not asked about. Disabling
-        only narrows what can be sent and needs no identity.
-        """
-        memory_id = arguments.get("id")
-        if (
-            not isinstance(memory_id, int)
-            or isinstance(memory_id, bool)
-            or memory_id < 1
-        ):
-            return ToolExecutionResult(
-                False,
-                "Memory id must be a positive whole number.",
-            )
-
-        try:
-            if enabled:
-                outcome = self.memory.enable_memory_context(
-                    memory_id,
-                    arguments.get("fact_digest"),
-                )
-                matched = outcome is not ContextConsentOutcome.NOT_FOUND
-            else:
-                outcome = None
-                matched = self.memory.disable_memory_context(memory_id)
-        except (RuntimeError, ValueError) as exc:
-            self.logger.warning("Memory context change failed: %s", exc)
-            return ToolExecutionResult(
-                False,
-                f"Memory context change failed: {exc}",
-            )
-
-        if not matched:
-            return ToolExecutionResult(False, f"Memory not found: {memory_id}.")
-
-        if outcome is ContextConsentOutcome.TARGET_CHANGED:
-            return ToolExecutionResult(
-                False,
-                f"Context was not enabled for memory {memory_id} because it "
-                "could not be confirmed unchanged since confirmation was "
-                "requested. Request confirmation again with: enable memory "
-                f"context {memory_id}",
-            )
-
-        verb = "Enabled" if enabled else "Disabled"
-        self.logger.info(
-            "%s context consent for memory %s through memory tool.",
-            verb,
-            memory_id,
-        )
-        return ToolExecutionResult(
-            True,
-            f"{verb} context for memory {memory_id}.",
-            {"id": memory_id, "context_enabled": enabled},
         )
 
 

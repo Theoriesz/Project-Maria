@@ -50,8 +50,7 @@ use temporary resources instead.
 - `MANDATORY_DENIED_ACTIONS` — `filesystem.delete` and `filesystem.write`
 - `MANDATORY_CONFIRMATION_ACTIONS` — `filesystem.rename`, `filesystem.move`,
   `history.delete`, `notes.retitle`, `notes.edit`, `notes.delete`,
-  `memory.update`, `memory.forget`, `memory.enable_context`, and
-  `memory.disable_context`
+  `memory.update`, and `memory.forget`
 
 `PermissionManager.__init__` and `Maria/core/config.py` union these into whatever
 configuration supplies, so **configuration can extend the mandatory baseline but can never
@@ -83,21 +82,14 @@ interaction, the cleaned `user_input` is preserved unchanged. `history.read` is 
 current action that sets this field, using a fixed content-free summary. Brain applies
 the field generically, with no history-specific branch.
 
-Eight lifecycle actions can update or remove an existing stored record: `history.delete`,
-`notes.retitle`, `notes.edit`, `notes.delete`, `memory.update`, `memory.forget`,
-`memory.enable_context`, and `memory.disable_context`.
+Six lifecycle actions can update or remove an existing stored record: `history.delete`,
+`notes.retitle`, `notes.edit`, `notes.delete`, `memory.update`, and `memory.forget`.
 Each requires explicit confirmation and targets at most one row selected by id. There is
 no bulk, wildcard, clear-all, or date-range deletion; no automatic retention or pruning;
 no cascade between the three record types; no undo or revision history; and no guarantee
 of secure erasure. Be careful not to leak sensitive content into any of them when adding
 features. See `Maria/docs/architecture.md` ("Persistence Models"), `Maria/docs/database.md`,
 and the "Data Retention and Privacy" section of `Maria/README.md`.
-
-A memory's `context_enabled` consent is the only thing that lets stored text reach the
-reasoning model automatically. It is off by default, changes only through the two
-confirmed consent actions, and is turned off by `memory.update`. Interaction history is
-never read for planning or reasoning. See "Tier A Memory Context" in
-`Maria/docs/architecture.md`.
 
 ## Philosophy (in priority order)
 

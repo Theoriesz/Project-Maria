@@ -29,9 +29,6 @@ class MariaBrainTests(unittest.TestCase):
         self.planner = Mock(spec=Planner)
         self.memory = Mock(spec=Memory)
         self.tool_manager = Mock(spec=ToolManager)
-        # No mocked tool pins confirmation state, so the plan offered
-        # for approval is the plan itself.
-        self.tool_manager.bind_for_confirmation.side_effect = lambda plan: plan
         self.tool_manager.validate_action.return_value = None
         self.permissions = Mock(spec=PermissionManager)
         self.logger = Mock(spec=logging.Logger)
@@ -75,42 +72,52 @@ class MariaBrainTests(unittest.TestCase):
         response = self.brain.process("  calculate 2 + 2 \n")
 
         self.assertEqual(response.text, "4")
-        self.planner.create_plan.assert_called_once_with("calculate 2 + 2")
+        self.planner.create_plan.assert_called_once_with(
+            "calculate 2 + 2",
+            context={"recent_interactions": []},
+        )
         self.memory.record_interaction.assert_called_once_with(
             "calculate 2 + 2",
             "4",
         )
 
-    def test_planning_receives_only_the_text_and_reads_no_stored_record(
-        self,
-    ) -> None:
-        """V1-15 retired the recent-interaction feed the planner discarded."""
+    def test_recent_interactions_are_passed_to_planner_as_context(self) -> None:
+        interactions = [
+            {"user_input": "help", "response": "commands"},
+            {"user_input": "time", "response": "mock time"},
+        ]
         plan = Plan("help", (), "available commands")
+        self.memory.get_recent_interactions.return_value = interactions
         self.planner.create_plan.return_value = plan
 
         response = self.brain.process("help")
 
         self.assertEqual(response.text, "available commands")
-        self.planner.create_plan.assert_called_once_with("help")
-        for method in (
-            "get_recent_interactions",
-            "get_interaction",
-            "search_interactions",
-            "list_context_memories",
-        ):
-            with self.subTest(method=method):
-                getattr(self.memory, method).assert_not_called()
-
-    def test_a_broken_history_read_cannot_affect_planning(self) -> None:
-        self.memory.get_recent_interactions.side_effect = RuntimeError(
-            "temporary interaction read failure"
+        self.memory.get_recent_interactions.assert_called_once_with(limit=3)
+        self.planner.create_plan.assert_called_once_with(
+            "help",
+            context={"recent_interactions": interactions},
         )
-        self.planner.create_plan.return_value = Plan("help", (), "help text")
+
+    def test_recent_interaction_runtime_error_is_logged_and_context_is_empty(
+        self,
+    ) -> None:
+        error = RuntimeError("temporary interaction read failure")
+        self.memory.get_recent_interactions.side_effect = error
+        plan = Plan("help", (), "help text")
+        self.planner.create_plan.return_value = plan
 
         response = self.brain.process("help")
 
         self.assertEqual(response.text, "help text")
-        self.logger.error.assert_not_called()
+        self.planner.create_plan.assert_called_once_with(
+            "help",
+            context={"recent_interactions": []},
+        )
+        self.logger.error.assert_called_once_with(
+            "Unable to retrieve recent memory: %s",
+            error,
+        )
 
     def test_zero_step_responses_are_returned_and_recorded(self) -> None:
         cases = (
@@ -231,7 +238,7 @@ class MariaBrainTests(unittest.TestCase):
         self.assertEqual(confirmed.text, "Renamed old.txt to new.txt")
         self.assertFalse(confirmed.needs_confirmation)
         self.assertEqual(self.planner.create_plan.call_count, 1)
-        self.memory.get_recent_interactions.assert_not_called()
+        self.assertEqual(self.memory.get_recent_interactions.call_count, 1)
         self.tool_manager.execute_tool.assert_called_once_with(
             "filesystem",
             "rename",
@@ -245,23 +252,13 @@ class MariaBrainTests(unittest.TestCase):
     def test_process_exposes_no_raw_text_confirmation_bypass(self) -> None:
         parameters = inspect.signature(MariaBrain.process).parameters
 
-        # V1-14 adds only the session's earlier exchanges, positionally, and
-        # V1-15 only the fingerprints of memories supplied to them, as one
-        # keyword that defaults to nothing. Neither can approve anything, and
-        # no other keyword can reach process.
-        self.assertEqual(
-            list(parameters),
-            ["self", "user_input", "conversation", "supplied_context"],
-        )
+        # V1-14 adds only the session's earlier exchanges, and only
+        # positionally, so no keyword of any name can reach process.
+        self.assertEqual(list(parameters), ["self", "user_input", "conversation"])
         self.assertIs(
             parameters["conversation"].kind,
             inspect.Parameter.VAR_POSITIONAL,
         )
-        self.assertIs(
-            parameters["supplied_context"].kind,
-            inspect.Parameter.KEYWORD_ONLY,
-        )
-        self.assertEqual(parameters["supplied_context"].default, frozenset())
         self.assertNotIn("confirmed", parameters)
         with self.assertRaises(TypeError):
             self.brain.process("rename old.txt to new.txt", confirmed=True)

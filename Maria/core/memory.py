@@ -2,8 +2,6 @@
 
 from __future__ import annotations
 
-import hashlib
-import re
 import sqlite3
 from collections.abc import Iterator
 from contextlib import contextmanager
@@ -17,7 +15,6 @@ from core.constants import (
     DATABASE_SCHEMA_VERSION,
     DEFAULT_DATABASE_BUSY_TIMEOUT_SECONDS,
 )
-from core.context import ContextConsentOutcome
 from core.failures import Failure, FailureKind, TypedFailureError
 from core.logger import get_logger
 
@@ -56,12 +53,10 @@ _UNVERSIONED_SCHEMA = 0
 
 # Maria's schema history, as a plain counter. Version 1 is the earliest shape
 # Maria ever created, before explicit memories existed. Version 2 adds the
-# ``memories`` table and is the published v0.2.0 baseline. Version 3 adds the
-# per-memory context-consent column. The current version lives in
-# ``core.constants`` as ``DATABASE_SCHEMA_VERSION``.
+# ``memories`` table and is the published v0.2.0 baseline. The current version
+# lives in ``core.constants`` as ``DATABASE_SCHEMA_VERSION``.
 _SCHEMA_BEFORE_EXPLICIT_MEMORIES = 1
 _SCHEMA_V0_2_BASELINE = 2
-_SCHEMA_MEMORY_CONTEXT_CONSENT = 3
 
 # The live schema. These statements describe the database this build expects
 # and are what a brand-new database is created from, so they move whenever the
@@ -87,18 +82,13 @@ _CREATE_NOTES_TABLE = """
     )
 """
 
-# ``context_enabled`` is the owner's per-memory consent to supply that memory
-# to the local reasoning model. It is off for every row unless the owner turns
-# it on for one memory at a time, and the CHECK admits nothing but 0 and 1.
 _CREATE_MEMORIES_TABLE = """
     CREATE TABLE IF NOT EXISTS memories (
         id INTEGER PRIMARY KEY AUTOINCREMENT,
         fact TEXT NOT NULL CHECK (length(fact) > 0),
         normalized_fact TEXT NOT NULL UNIQUE
             CHECK (length(normalized_fact) > 0),
-        created_at TEXT NOT NULL,
-        context_enabled INTEGER NOT NULL DEFAULT 0
-            CHECK (context_enabled IN (0, 1))
+        created_at TEXT NOT NULL
     )
 """
 
@@ -162,18 +152,6 @@ _HISTORICAL_MEMORIES_TABLE = """
     )
 """
 
-_HISTORICAL_MEMORIES_TABLE_WITH_CONTEXT_CONSENT = """
-    CREATE TABLE memories (
-        id INTEGER PRIMARY KEY AUTOINCREMENT,
-        fact TEXT NOT NULL CHECK (length(fact) > 0),
-        normalized_fact TEXT NOT NULL UNIQUE
-            CHECK (length(normalized_fact) > 0),
-        created_at TEXT NOT NULL,
-        context_enabled INTEGER NOT NULL DEFAULT 0
-            CHECK (context_enabled IN (0, 1))
-    )
-"""
-
 _HISTORICAL_INTERACTIONS_INDEX = """
     CREATE INDEX idx_interactions_created_at
         ON interactions (created_at)
@@ -184,16 +162,6 @@ _HISTORICAL_NOTES_INDEX = """
         ON notes (title)
 """
 
-# The one statement the version 3 step runs. SQLite records an added column in
-# the table's stored definition, and that definition fingerprints exactly as
-# the frozen version 3 table above does, so a migrated database and a newly
-# created one are the same schema. The DEFAULT is what turns consent off for
-# every row that already exists; the statement rewrites no row.
-_ADD_MEMORY_CONTEXT_CONSENT_COLUMN = """
-    ALTER TABLE memories ADD COLUMN context_enabled INTEGER NOT NULL DEFAULT 0
-        CHECK (context_enabled IN (0, 1))
-"""
-
 # Every version's complete schema, newest first. A marker is never taken at
 # its word: whatever version a database claims, its structure is checked
 # against the entry for that version before anything is migrated, so a file
@@ -202,16 +170,6 @@ _ADD_MEMORY_CONTEXT_CONSENT_COLUMN = """
 # one up to DATABASE_SCHEMA_VERSION therefore needs an entry here, and the
 # migration ladder refuses to run if one is missing.
 _FROZEN_SCHEMAS: tuple[tuple[int, tuple[str, ...]], ...] = (
-    (
-        _SCHEMA_MEMORY_CONTEXT_CONSENT,
-        (
-            _HISTORICAL_INTERACTIONS_TABLE,
-            _HISTORICAL_NOTES_TABLE,
-            _HISTORICAL_MEMORIES_TABLE_WITH_CONTEXT_CONSENT,
-            _HISTORICAL_INTERACTIONS_INDEX,
-            _HISTORICAL_NOTES_INDEX,
-        ),
-    ),
     (
         _SCHEMA_V0_2_BASELINE,
         (
@@ -267,45 +225,14 @@ class _Migration:
 
 # Every forward step, in ascending version order. A step is appended, never
 # edited or reordered, and there is deliberately no downgrade direction.
-#
-# A step runs frozen statements, never the live ones at the top of this module.
-# The live ``memories`` statement now describes version 3; had the version 2
-# step kept using it, a version 1 database would receive a version 3 table
-# stamped as version 2, the version 3 step would then fail on the column that
-# already exists, and the database would be refused at every later start.
 _MIGRATIONS: tuple[_Migration, ...] = (
     _Migration(
         version=_SCHEMA_V0_2_BASELINE,
         name="create_memories",
-        statements=(_HISTORICAL_MEMORIES_TABLE,),
-    ),
-    _Migration(
-        version=_SCHEMA_MEMORY_CONTEXT_CONSENT,
-        name="add_memory_context_consent",
-        statements=(_ADD_MEMORY_CONTEXT_CONSENT_COLUMN,),
+        statements=(_CREATE_MEMORIES_TABLE,),
     ),
 )
 
-
-
-# A fact digest is the lowercase hexadecimal SHA-256 of the fact's exact UTF-8
-# text: the identity an enable approval is bound to, never the text itself.
-_FACT_DIGEST_PATTERN = re.compile(r"[0-9a-f]{64}")
-
-
-@dataclass(frozen=True)
-class MemoryUpdate:
-    """What one memory update did.
-
-    ``updated`` is whether a row matched and received the new fact,
-    ``conflicting_id`` names another memory already holding the same
-    casefolded fact, and ``context_consent_cleared`` says the updated
-    memory's context consent had been on and was turned off.
-    """
-
-    updated: bool
-    conflicting_id: int | None = None
-    context_consent_cleared: bool = False
 
 
 class Memory:
@@ -818,29 +745,6 @@ class Memory:
         never refreshed and no updated_at exists, so an updated memory keeps
         its place in newest-first results; a fact matching the stored one, or
         differing from it only by casing, still counts as a successful update.
-
-        An update also turns the memory's context consent off, in the same
-        transaction; ``update_memory_reporting_consent`` is the same update
-        and also says whether consent had been on.
-        """
-        result = self.update_memory_reporting_consent(memory_id, new_fact)
-        return result.updated, result.conflicting_id
-
-    def update_memory_reporting_consent(
-        self,
-        memory_id: int,
-        new_fact: str,
-    ) -> MemoryUpdate:
-        """Replace one memory's fact and report whether consent was cleared.
-
-        This is ``update_memory`` itself, with the same validation, the same
-        statements, and the same outcomes, returned as a ``MemoryUpdate``.
-        Context consent belongs to the exact text the owner approved, so an
-        update always leaves the memory's consent off. It is turned off in
-        the same transaction as the new fact is written, and
-        ``context_consent_cleared`` reports whether it had been on, which is
-        the one case the owner needs to be told about. A conflicting or
-        missing row changes nothing, consent included.
         """
         if (
             not isinstance(memory_id, int)
@@ -854,7 +758,6 @@ class Memory:
         clean_fact = new_fact.strip()
         normalized_fact = clean_fact.casefold()
         updated = False
-        consent_cleared = False
         conflicting_id: int | None = None
         try:
             with self._connection() as connection:
@@ -868,20 +771,6 @@ class Memory:
                         (clean_fact, normalized_fact, memory_id),
                     )
                     updated = cursor.rowcount == 1
-                    if updated:
-                        # Same transaction as the fact: the first UPDATE
-                        # already holds the write lock, so no other
-                        # connection can enable consent in between, and a
-                        # failure here rolls the new fact back with it.
-                        consent_cursor = connection.execute(
-                            """
-                            UPDATE memories
-                            SET context_enabled = 0
-                            WHERE id = ? AND context_enabled = 1
-                            """,
-                            (memory_id,),
-                        )
-                        consent_cleared = consent_cursor.rowcount == 1
                 except sqlite3.IntegrityError as exc:
                     if not _is_unique_violation(exc):
                         raise
@@ -900,215 +789,10 @@ class Memory:
                     conflicting_id = int(row["id"])
             if updated:
                 self.logger.info("Updated memory %s.", memory_id)
-            if consent_cleared:
-                self.logger.info(
-                    "Turned off context consent for updated memory %s.",
-                    memory_id,
-                )
-            return MemoryUpdate(updated, conflicting_id, consent_cleared)
+            return updated, conflicting_id
         except sqlite3.Error as exc:
             self.logger.exception("Failed to update memory.")
             raise RuntimeError("Unable to update memory.") from exc
-
-    def memory_fact_digest(self, memory_id: int) -> str | None:
-        """Return the identity of one memory's exact fact, or None if absent.
-
-        The identity is the lowercase hexadecimal SHA-256 of the fact's exact
-        UTF-8 text, so an approval can be bound to precisely the text that
-        was stored when it was requested. The fact itself is never returned
-        or logged. Raises ValueError for a non-positive-integer id.
-        """
-        _require_memory_id(memory_id)
-        try:
-            with self._connection() as connection:
-                row = connection.execute(
-                    """
-                    SELECT fact
-                    FROM memories
-                    WHERE id = ?
-                    """,
-                    (memory_id,),
-                ).fetchone()
-            return None if row is None else _fact_digest(row["fact"])
-        except sqlite3.Error as exc:
-            self.logger.exception("Failed to read memory identity.")
-            raise RuntimeError("Unable to read memory.") from exc
-
-    def enable_memory_context(
-        self,
-        memory_id: int,
-        expected_fact_digest: str | None,
-    ) -> ContextConsentOutcome:
-        """Turn one memory's context consent on, only for the approved text.
-
-        ``expected_fact_digest`` is the identity ``memory_fact_digest``
-        returned when confirmation was requested, or None when no such memory
-        existed then. The check and the change are one write transaction:
-        ``BEGIN IMMEDIATE`` takes the write lock before the fact is read, so
-        no other connection can change it in between, and the UPDATE itself
-        applies only while the fact is still exactly the text that was
-        checked. A matching memory is enabled; a memory that no longer
-        exists, or never did, is ``NOT_FOUND``; and a memory whose text is
-        not the approved text, or that appeared after an approval requested
-        for a missing id, is ``TARGET_CHANGED`` and is left unchanged.
-
-        Raises ValueError for a non-positive-integer id or an identity that
-        is neither None nor a lowercase hexadecimal SHA-256. The fact is
-        never returned or logged.
-        """
-        _require_memory_id(memory_id)
-        if expected_fact_digest is not None and not (
-            type(expected_fact_digest) is str
-            and _FACT_DIGEST_PATTERN.fullmatch(expected_fact_digest)
-        ):
-            raise ValueError("A memory fact identity must be a SHA-256 digest.")
-
-        try:
-            with self._connection() as connection:
-                connection.execute("BEGIN IMMEDIATE")
-                row = connection.execute(
-                    """
-                    SELECT fact
-                    FROM memories
-                    WHERE id = ?
-                    """,
-                    (memory_id,),
-                ).fetchone()
-                if row is None:
-                    outcome = ContextConsentOutcome.NOT_FOUND
-                elif (
-                    expected_fact_digest is None
-                    or _fact_digest(row["fact"]) != expected_fact_digest
-                ):
-                    outcome = ContextConsentOutcome.TARGET_CHANGED
-                else:
-                    cursor = connection.execute(
-                        """
-                        UPDATE memories
-                        SET context_enabled = 1
-                        WHERE id = ? AND fact = ?
-                        """,
-                        (memory_id, row["fact"]),
-                    )
-                    outcome = (
-                        ContextConsentOutcome.ENABLED
-                        if cursor.rowcount == 1
-                        else ContextConsentOutcome.TARGET_CHANGED
-                    )
-            if outcome is ContextConsentOutcome.ENABLED:
-                self.logger.info("Enabled context consent for memory %s.", memory_id)
-            elif outcome is ContextConsentOutcome.TARGET_CHANGED:
-                self.logger.info(
-                    "Refused context consent for memory %s: approved text changed.",
-                    memory_id,
-                )
-            return outcome
-        except sqlite3.Error as exc:
-            self.logger.exception("Failed to change memory context consent.")
-            raise RuntimeError("Unable to change memory context consent.") from exc
-
-    def disable_memory_context(self, memory_id: int) -> bool:
-        """Turn one memory's context consent off by its database id.
-
-        Returns True when a row matched memory_id, including when its consent
-        was already off, and False when none did. At most one row can
-        change, because the id is the primary key. Turning consent off only
-        narrows what can be sent, so it needs no text check. Raises
-        ValueError for a non-positive-integer id. The memory's fact is never
-        read, logged, or returned.
-        """
-        _require_memory_id(memory_id)
-        try:
-            with self._connection() as connection:
-                cursor = connection.execute(
-                    """
-                    UPDATE memories
-                    SET context_enabled = 0
-                    WHERE id = ?
-                    """,
-                    (memory_id,),
-                )
-                matched = cursor.rowcount == 1
-            if matched:
-                self.logger.info("Disabled context consent for memory %s.", memory_id)
-            return matched
-        except sqlite3.Error as exc:
-            self.logger.exception("Failed to change memory context consent.")
-            raise RuntimeError("Unable to change memory context consent.") from exc
-
-    def list_context_memories(
-        self,
-        limit: int,
-        max_fact_bytes: int,
-    ) -> list[dict[str, Any]]:
-        """Return context-enabled memories in ascending id order, bounded.
-
-        This is the only read of Tier A context, and it is bounded in both
-        directions. At most ``limit`` rows come back, clamped to 1 through
-        100: a caller that wants to know whether more exist asks for one more
-        row than it will use, rather than counting them all. Each row holds
-        ``id``, ``oversized``, and ``fact``. A fact whose UTF-8 size is at
-        most ``max_fact_bytes`` comes back whole with ``oversized`` False;
-        any longer one comes back with ``fact`` None and ``oversized`` True,
-        so the caller can name the memory without ever holding its text.
-
-        The bound is UTF-8 whatever text encoding the database file uses.
-        SQLite measures a fact in the file's own encoding, so the size test
-        runs there first: in a UTF-8 database it is the exact bound, and an
-        oversized fact never reaches Python at all. A UTF-16 database stores
-        a fact in at most twice its UTF-8 size, so the test there admits
-        every fact stored in at most twice the bound — never more than
-        ``max_fact_bytes`` characters — and each admitted fact's exact UTF-8
-        size is then measured here before anything is returned.
-
-        Raises ValueError when ``max_fact_bytes`` is not a positive int, and
-        ``RuntimeError("Unable to read memory context.")`` when SQLite fails
-        or a returned fact is not text, so any read that cannot be trusted
-        ends the same way.
-        """
-        if type(max_fact_bytes) is not int or max_fact_bytes < 1:
-            raise ValueError("A fact size bound must be a positive whole number.")
-        safe_limit = max(1, min(limit, 100))
-        try:
-            with self._connection() as connection:
-                encoding = connection.execute("PRAGMA encoding").fetchone()[0]
-                stored_bound = (
-                    max_fact_bytes if encoding == "UTF-8" else 2 * max_fact_bytes
-                )
-                # The size test runs inside SQLite on the stored bytes, so a
-                # fact far beyond the bound is never materialised in Python:
-                # only its id and the flag cross the boundary.
-                rows = connection.execute(
-                    """
-                    SELECT
-                        id,
-                        CASE
-                            WHEN length(CAST(fact AS BLOB)) <= ? THEN fact
-                        END AS fact,
-                        length(CAST(fact AS BLOB)) > ? AS oversized
-                    FROM memories
-                    WHERE context_enabled = 1
-                    ORDER BY id ASC
-                    LIMIT ?
-                    """,
-                    (stored_bound, stored_bound, safe_limit),
-                ).fetchall()
-        except sqlite3.Error as exc:
-            self.logger.exception("Failed to read memory context.")
-            raise RuntimeError("Unable to read memory context.") from exc
-
-        # The column is declared TEXT, but SQLite still stores a value of
-        # another type as it was given. A fact that is not text cannot be
-        # measured or supplied as text, so the whole read is untrustworthy:
-        # it fails with the same fixed message as any other unreadable read,
-        # and neither the message nor the log line carries the value.
-        if any(
-            row["fact"] is not None and type(row["fact"]) is not str
-            for row in rows
-        ):
-            self.logger.error("Refused a memory context read: a fact is not text.")
-            raise RuntimeError("Unable to read memory context.")
-        return [_bounded_context_row(row, max_fact_bytes) for row in rows]
 
     def forget_memory(self, memory_id: int) -> bool:
         """Delete one explicit memory by its database id.
@@ -1389,38 +1073,6 @@ def _is_unique_violation(exc: sqlite3.Error) -> bool:
 def _utc_timestamp() -> str:
     """Return the current UTC timestamp as an ISO 8601 string."""
     return datetime.now(timezone.utc).isoformat()
-
-
-def _require_memory_id(memory_id: object) -> None:
-    """Refuse anything but an exact positive int memory id."""
-    if (
-        not isinstance(memory_id, int)
-        or isinstance(memory_id, bool)
-        or memory_id < 1
-    ):
-        raise ValueError("Memory id must be a positive whole number.")
-
-
-def _bounded_context_row(row: sqlite3.Row, max_fact_bytes: int) -> dict[str, Any]:
-    """Return one Tier A row, holding its fact only within the UTF-8 bound.
-
-    SQLite admitted the fact against its stored size; this settles the exact
-    UTF-8 size, which in a UTF-8 database never changes the answer and in a
-    UTF-16 database turns any fact over the bound into an oversized row with
-    no text.
-    """
-    fact = row["fact"]
-    oversized = bool(row["oversized"])
-    if fact is not None and (
-        len(fact.encode("utf-8", "surrogatepass")) > max_fact_bytes
-    ):
-        fact, oversized = None, True
-    return {"id": int(row["id"]), "fact": fact, "oversized": oversized}
-
-
-def _fact_digest(fact: str) -> str:
-    """Return the lowercase hexadecimal SHA-256 of a fact's exact UTF-8 text."""
-    return hashlib.sha256(fact.encode("utf-8", "surrogatepass")).hexdigest()
 
 
 def _validate_migration_ladder() -> None:

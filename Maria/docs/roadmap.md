@@ -192,14 +192,6 @@ Every context item included in reasoning carries deterministic provenance produc
 Maria — a memory, note, task, reminder, or project id, or a file identity — never
 supplied by the model. Maria discloses conflicts, stale information, and uncertainty.
 
-"When relevant" is not yet implemented as relevance. Under the owner-approved
-transitional rule introduced in Stage V1-15 (decision V1-15-R1), every context-enabled
-explicit memory is eligible to be sent to the owner's local model on **any**
-model-backed conversational turn, in ascending memory id order, subject only to hard
-item and byte bounds. Maria makes no relevance judgement and claims none. That rule
-stands until a later context stage replaces it after an owner-reviewed relevance
-decision; see the relevance-review gate in Stage V1-16.
-
 Storage existence alone is not consent to unrestricted use.
 
 Maria v1.0 ships none of the following: bulk, wildcard, clear-all, or date-range
@@ -889,83 +881,38 @@ they find gets its own focused `fix/<topic>` branch, never a release branch.
   Tier A context with deterministic provenance, and retire the recent-interaction
   plumbing that currently feeds Tier C raw history into the planning path and which the
   planner discards unused.
-- Owner-approved amendment (V1-15-R1): the V1-15 read-only entry audit found that this
-  entry named record types that do not exist yet, promised a claim Maria cannot prove,
-  and omitted modules the typed request and session boundary require. The owner
-  approved the corrections below, and this entry is amended in the V1-15 pull request
-  itself. The permanent safety boundaries are unchanged.
-- Owner-visible result: With reasoning enabled, Maria answers conversational requests
-  with the explicit memories the owner has enabled for context. In V1-15, Tier A
-  consists of explicit memories only: a preference is represented only when the owner
-  stores it as a memory and enables it, and structured tasks, reminders, and project
-  facts do not exist until later stages add them. After every model-backed
-  conversational response Maria names, from her own database ids, exactly which
-  memories she supplied to that request; she does not and cannot claim which ones the
-  model used. When no memory context was sent she says "No memory context supplied."
-  When context was sent she says she cannot verify whether those memories are still
-  current or whether they conflict. Every pre-existing and newly created memory
-  defaults to not context-enabled, and raw interaction history is no longer assembled
-  into any context.
-- Transitional selection rule: an enabled memory is eligible on **any** model-backed
-  conversational turn — a deliberate V1-15 policy, not relevance inference. Memories
-  are taken in ascending id order, at most 16 of them and at most 2 KiB of fully
-  rendered context including ids and framing, whole or not at all. The current request,
-  the rendered context, and the retained conversation together fit the 8 KiB
-  conversational limit or the configured input budget, whichever is smaller, with the
-  request first, then fitting context, then the newest fitting earlier exchanges.
-  Memories left out by a bound are disclosed; ids a bounded read did not retrieve are
-  never named. The enable confirmation and the documentation state this rule. The
-  relevance-review gate in Stage V1-16 revisits it.
+- Owner-visible result: Maria answers using the owner's consented memories, preferences,
+  and active records, and names exactly which record she used by id. Every pre-existing
+  memory defaults to not context-enabled, and raw interaction history is no longer
+  assembled into any context.
 - Architecture affected: the memory layer for the consent column, its forward migration,
-  the one-id consent toggle, and the bounded Tier A read; a new core context module
-  carrying provenance value objects, the selection rule, and the fixed notices;
-  `core/brain.py` for reading Tier A on the conversational path and removal of the
-  recent-interaction feed; `core/planner.py` for the consent commands and the context
-  argument it currently deletes unused; `core/reasoning.py` for the typed,
-  provenance-bearing context field and the shared byte accounting;
-  `core/conversation.py` for the budget order, the owner-visible notices, and
-  revocation checks; `core/ollama_adapter.py` for rendering context as delimited data;
-  `core/session.py` for the supplied-memory fingerprints kept beside the conversation;
+  and the Tier A queries; a new core context module carrying provenance value objects;
+  `core/brain.py` for context assembly and removal of the recent-interaction feed;
+  `core/planner.py` for the context argument it currently deletes unused;
   `tools/memory.py`; the contract registry; `core/permissions.py`.
 - Privacy and security: Storage existence is not consent to unrestricted use, so the
   migration sets every pre-existing memory to not context-enabled and that default is
   stated in the changelog and documentation. Enabling a memory widens automatic
   exposure, so the enable action is confirmation-required and is added to the mandatory
-  set explicitly rather than left to the default-allow path; disabling is
-  confirmation-required too. Consent applies to exact text, so updating a memory turns
-  its consent off in the same transaction. Every context item carries a deterministic
-  provenance identity produced by Maria, never by the model, and a model reply claiming
-  another id cannot change the disclosure. Stored memory text is untrusted data: it is
-  never placed in a system-level instruction, it travels only as clearly delimited
-  data separate from Maria's fixed instructions, and it never grants tool authority.
-  The session tracks fingerprints of supplied memories and discards its whole earlier
-  conversation before sending anything once one is disabled, changed, or forgotten,
-  including through another database connection; if Tier A cannot be read, neither
-  context nor earlier exchanges are sent. This does not promise instantaneous
-  revocation across a concurrent read-and-send race or erasure of text already
-  delivered to a model. Tier C sources remain unreachable by any automatic path.
-  Maria claims no record is stale, fresh, consistent, or conflicting without evidence;
-  no `updated_at` column is added in V1-15. No retrieved fact or note body is logged.
+  set explicitly rather than left to the default-allow path. Every context item carries
+  a deterministic provenance identity produced by Maria, never by the model. Tier C
+  sources remain unreachable by any automatic path. Maria discloses conflicts,
+  staleness, and uncertainty among Tier A items rather than presenting them flatly. No
+  retrieved fact or note body is logged.
 - Non-goals: No Tier B bounded search, which is V1-16. No embeddings, semantic search,
   vector store, ranking, or inferred relevance. No inferred preferences, behavioral
-  learning, or automatic enabling. No task, reminder, preference, or project-fact
-  record type. No file content, log content, or model-originated provenance.
-- Deliberate deterministic-command exceptions: every existing command keeps its text
-  and recording behavior, except that the two new consent commands exist, `help` lists
-  them, and updating a memory whose consent was on says that its consent was turned
-  off. Updating a memory whose consent was off answers byte for byte as before.
+  learning, or automatic enabling. No file content, log content, or model-originated
+  provenance.
 - Completion criteria: The migration runs through the V1-09 runner from the frozen
-  v0.2.0 baseline fixture and is tested for idempotency and atomicity; the version 2
-  step runs its frozen historical statement, so version 1 reaches version 3 and
-  reopens; a test asserts no interaction-history row can reach a reasoning request or a
-  plan under any configuration; every context item disclosed to the owner carries its
-  record id, and with every memory disabled no context is sent and Maria says so; the
+  v0.2.0 baseline fixture and is tested for idempotency and atomicity; a test asserts no
+  interaction-history row can reach a reasoning request or a plan under any
+  configuration; every context item rendered to the owner carries its record id, and
+  with every memory disabled the assembled context is empty and Maria says so; the
   consent toggle takes a positive decimal integer id with a minimum of 1, affects
-  exactly one row, is confirmation-required, and has a contract registry entry; a
-  request with no context is byte-identical to V1-14's at the adapter boundary; Brain
-  no longer passes recent interactions into planning and the planner no longer accepts
-  and discards a context argument it never used; every deterministic command stays
-  identical apart from the exceptions above and still works with no model present.
+  exactly one row, is confirmation-required, and has a contract registry entry; Brain no
+  longer passes recent interactions into planning and the planner no longer accepts and
+  discards a context argument it never used; every deterministic command stays identical
+  and still works with no model present.
 - Changelog: one entry — per-memory context consent, off by default for existing
   memories and confirmation-required to change, plus Tier A context assembly with
   deterministic provenance; raw interaction history is no longer assembled into the
@@ -978,11 +925,6 @@ they find gets its own focused `fix/<topic>` branch, never a release branch.
 - Purpose: Add the bounded automatic search over notes and older explicit memories that
   the tiered policy allows, with hard bounds, disclosed sources, and a registration
   point that later record types extend.
-- Relevance-review gate: this stage's read-only entry audit must review V1-15's
-  transitional Tier A selection rule, under which every enabled memory is eligible on
-  any model-backed conversational turn, and present the owner with the choice of
-  keeping it or replacing it with an explicit relevance rule. Any change to that rule
-  needs the owner's written approval before implementation.
 - Owner-visible result: Maria can find relevant stored material on her own and always
   shows what she used, where it came from, and where sources conflict or look stale.
 - Architecture affected: the core context module, the memory layer for read-only bounded

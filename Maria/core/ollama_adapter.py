@@ -20,14 +20,9 @@ string value in the request body.
 Only the model identifier and the conversation are sent: each earlier
 exchange as a user message followed by an assistant message, oldest first,
 then the prompt as the final user message. With no earlier exchange that is
-the prompt alone, exactly as before. When the request carries memory context,
-two messages come first: Maria's fixed context instructions as the system
-message, which never contain a stored fact, and then the delimited memory
-data block as a user message of its own, so stored text is only ever data.
-With no context the request is byte for byte what it was before context
-existed. The whole request, context included, is validated and measured
-against the input budget again here, before anything is serialized. Only the
-assistant message's ``content`` comes back, as one inert string.
+the prompt alone, exactly as before. The whole request is measured against the
+input budget again here, before anything is serialized. Only the assistant
+message's ``content`` comes back, as one inert string.
 Thinking text, tool calls, and every other field of the reply are ignored
 after bounded JSON parsing; only ``message.content`` is returned. This module
 has no import path to planning, permissions, tool dispatch, or persistence,
@@ -62,11 +57,6 @@ import time
 from dataclasses import replace
 from typing import NoReturn
 
-from core.context import (
-    CONTEXT_INSTRUCTIONS,
-    ContextItem,
-    render_context_data,
-)
 from core.failures import Failure, FailureKind, TypedFailureError
 from core.reasoning import (
     REASONING_REQUEST_TYPE_MESSAGE,
@@ -166,10 +156,10 @@ class OllamaReasoningProvider:
         """Ask the local runtime one question and return its complete answer.
 
         Raises ``TypedFailureError`` carrying one reasoning kind: input over
-        budget, when the prompt, history, and rendered context together
-        exceed the input budget, before any connection is opened; timeout
-        when the deadline passes at any stage; unavailable when nothing
-        answers, or the answer is not success; truncated when the reply ends early or says it is
+        budget, when the prompt and history together exceed the input
+        budget, before any connection is opened; timeout when the deadline
+        passes at any stage; unavailable when nothing answers, or the answer
+        is not success; truncated when the reply ends early or says it is
         incomplete; malformed when it is not the expected shape; and output
         over budget when the response or the answer is too large.
         """
@@ -189,27 +179,18 @@ class OllamaReasoningProvider:
         """Run one bounded exchange and settle it as a reply or a failure."""
         deadline = time.monotonic() + self._deadline_seconds
 
-        # The prompt, the history, and the context are read again rather than
-        # trusted from construction, and the whole request is validated and
-        # measured against this adapter's own budget, without being copied
-        # when it is plainly too long, before any of it is serialized.
+        # The prompt and the history are read again rather than trusted from
+        # construction, and the whole request is measured against this
+        # adapter's own budget, without being copied when it is plainly too
+        # long, before any of it is serialized.
         prompt = request.prompt
         history = getattr(request, "history", None)
-        context = getattr(request, "context", None)
-        size = request_content_bytes(
-            prompt,
-            history,
-            self._max_input_bytes,
-            context,
-        )
+        size = request_content_bytes(prompt, history, self._max_input_bytes)
         if size > self._max_input_bytes:
             return Failure(FailureKind.REASONING_INPUT_OVER_BUDGET)
 
         try:
-            body = self._converse(
-                self._request_bytes(prompt, history, context),
-                deadline,
-            )
+            body = self._converse(self._request_bytes(prompt, history), deadline)
         except TypedFailureError as stopped:
             return stopped.failure
         return _answer(body, self._max_output_bytes)
@@ -218,17 +199,12 @@ class OllamaReasoningProvider:
         self,
         prompt: str,
         history: tuple[ReasoningExchange, ...],
-        context: tuple[ContextItem, ...] = (),
     ) -> bytes:
         """Return the one HTTP request: the model and the conversation.
 
         Each earlier exchange becomes a user message and then an assistant
         message, oldest first, and the prompt is the final user message.
-        Memory context, when there is any, comes first as two messages:
-        Maria's fixed context instructions as the system message, and the
-        delimited memory data block as a user message, so no stored fact is
-        ever placed in a system-level instruction. With no context there is
-        no system message at all. There is no template, option, tool, or
+        There is no system message, template, context, option, tool, or
         thinking request, and no credential or proxy header. The request
         line names only the path, never a scheme or host.
         """
@@ -240,11 +216,6 @@ class OllamaReasoningProvider:
                 {"role": "assistant", "content": exchange.assistant},
             )
         ]
-        if context:
-            messages[:0] = [
-                {"role": "system", "content": CONTEXT_INSTRUCTIONS},
-                {"role": "user", "content": render_context_data(context)},
-            ]
         messages.append({"role": "user", "content": prompt})
         body = json.dumps(
             {
