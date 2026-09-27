@@ -11,8 +11,18 @@ from unittest.mock import Mock, call, patch
 
 import main as main_module
 from core.brain import BrainResponse
+from core.config import load_config
+from core.constants import CONFIG_PATH
 from core.failures import Failure, FailureKind, TypedFailureError
+from core.ollama_adapter import OLLAMA_DESTINATION_MESSAGE, OllamaReasoningProvider
 from core.planner import Plan, PlanStep
+from core.reasoning import (
+    DISABLED_REASONING,
+    ReasoningExchange,
+    ReasoningSettings,
+    ReasoningTransport,
+)
+from core.session import MariaSession
 
 
 MAIN_PATH = Path(__file__).resolve().parents[1] / "main.py"
@@ -88,7 +98,9 @@ class MainCliTests(unittest.TestCase):
             status = main_module.run_cli()
 
         self.assertEqual(status, 0)
-        factory.assert_called_once_with()
+        factory.assert_called_once_with(
+            reasoning_factory=main_module.build_reasoning_provider,
+        )
         brain.process.assert_not_called()
         self.assertIn(BANNER, stdout.getvalue())
         self.assertEqual(stderr.getvalue(), "")
@@ -235,7 +247,7 @@ class MainCliTests(unittest.TestCase):
             runpy.run_path(str(MAIN_PATH), run_name="__main__")
 
         self.assertEqual(raised.exception.code, 1)
-        factory.assert_called_once_with()
+        self._assert_default_startup_call(factory)
         self.assertEqual(stdout.getvalue(), "")
         self.assertEqual(stderr.getvalue(), f"{STARTUP_FAILURE_MESSAGE}\n")
         self.assertNotIn("Traceback", stderr.getvalue())
@@ -258,7 +270,7 @@ class MainCliTests(unittest.TestCase):
             runpy.run_path(str(MAIN_PATH), run_name="__main__")
 
         self.assertEqual(raised.exception.code, 0)
-        factory.assert_called_once_with()
+        self._assert_default_startup_call(factory)
         input_mock.assert_called_once_with("You: ")
         brain.process.assert_not_called()
         self.assertEqual(
@@ -584,6 +596,116 @@ class MainCliTests(unittest.TestCase):
         default_factory.assert_not_called()
         self.assertEqual(stderr, "")
 
+    def test_the_runtime_factory_builds_the_adapter_only_when_enabled(
+        self,
+    ) -> None:
+        settings = _enabled_settings()
+
+        with patch.object(main_module, "OllamaReasoningProvider") as adapter:
+            self.assertIsNone(
+                main_module.build_reasoning_provider(DISABLED_REASONING)
+            )
+            adapter.assert_not_called()
+
+            built = main_module.build_reasoning_provider(settings)
+
+        self.assertIs(built, adapter.return_value)
+        adapter.assert_called_once_with(settings)
+
+    def test_the_runtime_factory_builds_the_real_adapter_without_connecting(
+        self,
+    ) -> None:
+        self.assertIsInstance(
+            main_module.build_reasoning_provider(_enabled_settings()),
+            OllamaReasoningProvider,
+        )
+        private_lan = _enabled_settings(
+            transport=ReasoningTransport.PRIVATE_LAN,
+            host="192.168.1.20",
+        )
+        with self.assertRaises(ValueError) as caught:
+            main_module.build_reasoning_provider(private_lan)
+        self.assertEqual(str(caught.exception), OLLAMA_DESTINATION_MESSAGE)
+
+    def test_the_tracked_configuration_builds_no_provider(self) -> None:
+        tracked = load_config(CONFIG_PATH).reasoning
+
+        self.assertIsNone(main_module.build_reasoning_provider(tracked))
+
+    def test_the_cli_carries_the_session_conversation_to_the_next_request(
+        self,
+    ) -> None:
+        exchange = ReasoningExchange("hello there", "Hello.")
+        brain = Mock(spec=main_module.MariaBrain)
+        brain.process.side_effect = [
+            BrainResponse("Hello.", conversation=(exchange,)),
+            BrainResponse("System ready."),
+        ]
+
+        status, stdout, stderr, _ = self._run_cli(
+            Mock(return_value=brain),
+            ["hello there", "system", "exit"],
+        )
+
+        self.assertEqual(status, 0)
+        self.assertEqual(
+            brain.process.call_args_list,
+            [call("hello there"), call("system", exchange)],
+        )
+        self.assertEqual(
+            stdout,
+            f"{BANNER}\n{HELP_HINT}\n"
+            "Maria: Hello.\nMaria: System ready.\nMaria: Goodbye.\n",
+        )
+        self.assertEqual(stderr, "")
+
+    def test_every_way_out_of_the_cli_ends_the_session(self) -> None:
+        exchange = ReasoningExchange("hello there", "Hello.")
+        cases = (
+            ("exit command", ["hello there", "exit"], None),
+            ("end of input", ["hello there", EOFError()], None),
+            ("interrupt", ["hello there", KeyboardInterrupt()], None),
+            ("request exception", ["hello there", "system"], RuntimeError),
+        )
+        for label, inputs, raised in cases:
+            with self.subTest(case=label):
+                ended: list[tuple[ReasoningExchange, ...]] = []
+                sessions: list[MariaSession] = []
+
+                class RecordingSession(MariaSession):
+                    """A real session that notes each end and what it held."""
+
+                    def __init__(self, *args: object, **kwargs: object) -> None:
+                        super().__init__(*args, **kwargs)
+                        sessions.append(self)
+
+                    def end(self) -> None:
+                        ended.append(self.conversation)
+                        super().end()
+
+                brain = Mock(spec=main_module.MariaBrain)
+                brain.process.side_effect = [
+                    BrainResponse("Hello.", conversation=(exchange,)),
+                    RuntimeError("private-request-detail"),
+                ]
+
+                with patch.object(main_module, "MariaSession", RecordingSession):
+                    if raised is None:
+                        status, _, stderr, _ = self._run_cli(
+                            Mock(return_value=brain),
+                            inputs,
+                        )
+                        self.assertEqual(status, 0)
+                        self.assertEqual(stderr, "")
+                    else:
+                        with self.assertRaises(raised):
+                            self._run_cli(Mock(return_value=brain), inputs)
+
+                self.assertEqual(ended, [(exchange,)])
+                (session,) = sessions
+                self.assertEqual(session.conversation, ())
+                self.assertIsNone(session.pending_approval)
+
     def test_brain_request_exception_is_not_converted_to_startup_failure(self) -> None:
         error = RuntimeError("private-request-detail")
         brain = Mock(spec=main_module.MariaBrain)
@@ -607,6 +729,20 @@ class MainCliTests(unittest.TestCase):
         self.assertNotIn(STARTUP_FAILURE_MESSAGE, stdout.getvalue())
         self.assertEqual(stderr.getvalue(), "")
 
+    def _assert_default_startup_call(self, from_defaults: Mock) -> None:
+        """Assert the entrypoint built Brain once with the reasoning factory.
+
+        Run as a script, ``main.py`` is a fresh module, so its factory is
+        matched by name rather than by identity with the imported one.
+        """
+        (args, kwargs), = from_defaults.call_args_list
+        self.assertEqual(args, ())
+        self.assertEqual(list(kwargs), ["reasoning_factory"])
+        self.assertEqual(
+            kwargs["reasoning_factory"].__name__,
+            "build_reasoning_provider",
+        )
+
     def _run_cli(
         self,
         factory: Mock,
@@ -624,6 +760,23 @@ class MainCliTests(unittest.TestCase):
             status = main_module.run_cli(factory)
 
         return status, stdout.getvalue(), stderr.getvalue(), input_mock
+
+
+def _enabled_settings(
+    *,
+    transport: ReasoningTransport = ReasoningTransport.LOOPBACK,
+    host: str = "127.0.0.1",
+) -> ReasoningSettings:
+    """Return valid enabled reasoning settings; nothing here connects."""
+    return ReasoningSettings(
+        enabled=True,
+        transport=transport,
+        host=host,
+        model="stub-model:1b",
+        request_deadline_seconds=5,
+        max_input_bytes=64,
+        max_output_bytes=64,
+    )
 
 
 if __name__ == "__main__":

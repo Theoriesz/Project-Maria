@@ -31,7 +31,9 @@ from core.reasoning import (
     REASONING_DEADLINE_MESSAGE,
     REASONING_DISABLED_FIELDS_MESSAGE,
     REASONING_ENABLED_MESSAGE,
+    REASONING_EXCHANGE_MESSAGE,
     REASONING_FAILURE_KINDS,
+    REASONING_HISTORY_MESSAGE,
     REASONING_HOST_MESSAGE,
     REASONING_MAX_INPUT_MESSAGE,
     REASONING_MAX_OUTPUT_MESSAGE,
@@ -43,10 +45,13 @@ from core.reasoning import (
     REASONING_SETTINGS_TYPE_MESSAGE,
     REASONING_TEXT_MESSAGE,
     REASONING_TRANSPORT_MESSAGE,
+    ReasoningExchange,
     ReasoningRequest,
     ReasoningResponse,
     ReasoningSettings,
     ReasoningTransport,
+    history_content_bytes,
+    request_content_bytes,
     request_reasoning,
 )
 from tests.log_assertions import assert_log_omits
@@ -226,14 +231,22 @@ def rendered(value: object) -> str:
 class ReasoningValueTests(unittest.TestCase):
     """Verify requests and replies are frozen, bounded, and redacted."""
 
-    def test_the_request_and_response_carry_exactly_one_text_field(self) -> None:
-        self.assertEqual([f.name for f in fields(ReasoningRequest)], ["prompt"])
+    def test_the_request_carries_a_prompt_and_history_the_response_one_text(
+        self,
+    ) -> None:
+        self.assertEqual(
+            [f.name for f in fields(ReasoningRequest)],
+            ["prompt", "history"],
+        )
         self.assertEqual([f.name for f in fields(ReasoningResponse)], ["text"])
+        self.assertEqual(ReasoningRequest(PROMPT_SENTINEL).history, ())
 
     def test_the_request_has_no_context_or_template_field(self) -> None:
         request = ReasoningRequest(PROMPT_SENTINEL)
 
-        for name in ("context", "system", "template", "history", "memories"):
+        # "history" left this list in V1-14: it is now the conversation's
+        # earlier exchanges, and nothing retrieved on the owner's behalf.
+        for name in ("context", "system", "template", "memories"):
             with self.subTest(name=name):
                 self.assertFalse(hasattr(request, name))
 
@@ -915,6 +928,203 @@ class RequestReasoningBoundaryTests(unittest.TestCase):
                 self.assertEqual(str(caught.exception), message)
                 self.assertNotIn(PROMPT_SENTINEL, str(caught.exception))
         self.assertEqual(provider.calls, 0)
+
+
+class ReasoningHistoryTests(unittest.TestCase):
+    """Verify earlier exchanges are typed, bounded, redacted, and re-measured.
+
+    A request's size is the UTF-8 length of its prompt plus every earlier
+    exchange's user and assistant text, and nothing else. It is bounded by
+    the hard ceiling at construction and by the configured budget at the
+    boundary, where it is measured again however the request was built.
+    """
+
+    def setUp(self) -> None:
+        self.log = Mock(spec=logging.Logger)
+        self.exchange = ReasoningExchange("u", "a")
+
+    def _ask(
+        self,
+        provider: AdversarialReasoningProvider,
+        request: ReasoningRequest,
+        settings: ReasoningSettings | None = None,
+    ) -> ReasoningResponse | Failure:
+        """Ask through the boundary with this test's recording logger."""
+        return request_reasoning(
+            provider,
+            request,
+            enabled_settings() if settings is None else settings,
+            self.log,
+        )
+
+    def test_an_exchange_is_frozen_redacted_and_exact_text(self) -> None:
+        exchange = ReasoningExchange(PROMPT_SENTINEL, FAKE_PAYLOAD_SENTINEL)
+        request = ReasoningRequest("question", (exchange,))
+
+        with self.assertRaises(FrozenInstanceError):
+            exchange.user = "changed"
+        with self.assertRaises(FrozenInstanceError):
+            request.history = ()
+        for value in (exchange, request):
+            with self.subTest(value=type(value).__name__):
+                text = rendered(value)
+                self.assertNotIn(PROMPT_SENTINEL, text)
+                self.assertNotIn(FAKE_PAYLOAD_SENTINEL, text)
+                self.assertIn("<redacted>", repr(value))
+
+    def test_exchange_text_must_be_exact_non_empty_encodable_str(self) -> None:
+        class Text(str):
+            """A str subclass that must not pass as exact text."""
+
+        for user, assistant in (
+            (None, "a"),
+            ("u", None),
+            ("", "a"),
+            ("u", ""),
+            (Text("u"), "a"),
+            ("u", Text("a")),
+            ("\ud800", "a"),
+            ("u", b"a"),
+        ):
+            with self.subTest(user=type(user).__name__, assistant=assistant):
+                with self.assertRaises(ValueError) as caught:
+                    ReasoningExchange(user, assistant)
+                self.assertEqual(str(caught.exception), REASONING_EXCHANGE_MESSAGE)
+
+    def test_exchange_text_is_bounded_by_the_hard_ceilings(self) -> None:
+        ReasoningExchange(
+            "é" * (REASONING_MAXIMUM_INPUT_BYTES // 2),
+            "é" * (REASONING_MAXIMUM_OUTPUT_BYTES // 2),
+        )
+        for user, assistant in (
+            ("é" * (REASONING_MAXIMUM_INPUT_BYTES // 2) + "a", "a"),
+            ("u", "é" * (REASONING_MAXIMUM_OUTPUT_BYTES // 2) + "a"),
+        ):
+            with self.assertRaises(ValueError) as caught:
+                ReasoningExchange(user, assistant)
+            self.assertEqual(str(caught.exception), REASONING_EXCHANGE_MESSAGE)
+
+    def test_history_must_be_an_exact_tuple_of_exact_exchanges(self) -> None:
+        class History(tuple):
+            """A tuple subclass that must not pass as exact history."""
+
+        for history in (
+            [self.exchange],
+            History((self.exchange,)),
+            (("u", "a"),),
+            ("u",),
+            (self.exchange, None),
+            None,
+        ):
+            with self.subTest(history=type(history).__name__):
+                with self.assertRaises(ValueError) as caught:
+                    ReasoningRequest("question", history)
+                self.assertEqual(str(caught.exception), REASONING_HISTORY_MESSAGE)
+
+    def test_prompt_and_history_together_meet_the_hard_ceiling(self) -> None:
+        # The exchange is two bytes, so this prompt fills the ceiling exactly.
+        at_ceiling = "p" * (REASONING_MAXIMUM_INPUT_BYTES - 2)
+
+        request = ReasoningRequest(at_ceiling, (self.exchange,))
+        self.assertEqual(request.history, (self.exchange,))
+        with self.assertRaises(ValueError) as caught:
+            ReasoningRequest(at_ceiling + "p", (self.exchange,))
+        self.assertEqual(str(caught.exception), REASONING_HISTORY_MESSAGE)
+
+    def test_the_accounting_counts_utf8_text_and_stops_once_over(self) -> None:
+        history = (
+            ReasoningExchange("é", "€"),
+            ReasoningExchange("a", "\U0001f600"),
+        )
+        self.assertEqual(history_content_bytes(history, 100), 10)
+        self.assertEqual(request_content_bytes("é", history, 100), 12)
+
+        # Past the bound nothing further is inspected, so a broken exchange
+        # beyond it is never reached.
+        broken = ReasoningExchange("u", "a")
+        object.__setattr__(broken, "assistant", "")
+        self.assertGreater(
+            request_content_bytes("é", (*history, broken), 11),
+            11,
+        )
+        with self.assertRaises(ValueError) as caught:
+            request_content_bytes("é", (*history, broken), 100)
+        self.assertEqual(str(caught.exception), REASONING_HISTORY_MESSAGE)
+
+    def test_the_boundary_measures_prompt_and_history_against_the_budget(
+        self,
+    ) -> None:
+        settings = enabled_settings(max_input_bytes=10)
+        # Two bytes of user text and six of assistant text: eight in all.
+        history = (ReasoningExchange("é", "€€"),)
+        cases = {
+            "at the budget": ("ab", 1),
+            "one byte over": ("abc", 0),
+            "fewer characters, more bytes": ("éa", 0),
+        }
+        for label, (prompt, expected_calls) in cases.items():
+            with self.subTest(case=label):
+                provider = AdversarialReasoningProvider.returning(
+                    ReasoningResponse("reply")
+                )
+                request = ReasoningRequest(prompt, history)
+
+                result = self._ask(provider, request, settings)
+
+                self.assertEqual(provider.calls, expected_calls)
+                if expected_calls:
+                    self.assertEqual(result, ReasoningResponse("reply"))
+                    self.assertIs(provider.requests[0], request)
+                else:
+                    self.assertEqual(
+                        result,
+                        Failure(FailureKind.REASONING_INPUT_OVER_BUDGET),
+                    )
+
+    def test_a_history_enlarged_after_construction_is_refused_uncopied(
+        self,
+    ) -> None:
+        enlarged = ReasoningExchange("u", "a")
+        object.__setattr__(enlarged, "assistant", "a" * HUGE_TEXT_LENGTH)
+        cases = {
+            "an enlarged exchange": (enlarged,),
+            "far too many exchanges": (self.exchange,) * 500_000,
+        }
+        for label, history in cases.items():
+            with self.subTest(case=label):
+                request = ReasoningRequest("question")
+                object.__setattr__(request, "history", history)
+                provider = AdversarialReasoningProvider.returning(
+                    ReasoningResponse("reply")
+                )
+
+                result, peak = peak_allocation(lambda: self._ask(provider, request))
+
+                self.assertEqual(
+                    result,
+                    Failure(FailureKind.REASONING_INPUT_OVER_BUDGET),
+                )
+                self.assertEqual(provider.calls, 0)
+                self.assertLess(peak, REASONING_MAXIMUM_INPUT_BYTES)
+
+    def test_a_history_tampered_into_anything_but_exchanges_is_refused(
+        self,
+    ) -> None:
+        emptied = ReasoningExchange("u", "a")
+        object.__setattr__(emptied, "assistant", "")
+        for history in (None, [self.exchange], ("u",), (emptied,)):
+            with self.subTest(history=repr(history)[:30]):
+                request = ReasoningRequest("question")
+                object.__setattr__(request, "history", history)
+                provider = AdversarialReasoningProvider.returning(
+                    ReasoningResponse("reply")
+                )
+
+                with self.assertRaises(ValueError) as caught:
+                    self._ask(provider, request)
+
+                self.assertEqual(str(caught.exception), REASONING_HISTORY_MESSAGE)
+                self.assertEqual(provider.calls, 0)
 
 
 class AdversarialFakeTests(unittest.TestCase):

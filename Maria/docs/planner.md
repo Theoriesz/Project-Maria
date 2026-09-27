@@ -16,6 +16,19 @@ Supported command families:
 - Interaction-history commands
 - Read-only system information commands
 
+Input that matches no command receives the planner's generic no-action
+response:
+
+```text
+I do not have an executable plan for that yet. Type 'help' to see supported commands.
+```
+
+The planner is unchanged by conversation and knows nothing about it. When
+reasoning is enabled, Brain answers exactly that generic fallback with a
+text-only reply from the local model instead of showing it, and records
+nothing; help, every usage response, and every command are unaffected. See
+"Deterministic-First Conversation" in `docs/architecture.md`.
+
 ## Memory Command Grammar
 
 Memory commands use strict command syntax. Command keywords are
@@ -63,7 +76,8 @@ Use: recall <query>
 
 The planner does not infer commands from recent interaction context. Requests
 such as `please remember ...`, `what do you remember about ...`, and
-`memories extra` remain unsupported.
+`memories extra` remain unsupported. With reasoning enabled they receive a
+conversational reply, which stores and retrieves nothing.
 
 ## Memory Lifecycle Grammar
 

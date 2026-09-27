@@ -301,7 +301,10 @@ by `read note`, note-creation requests, calculator expressions and results,
 remembered or retrieved facts, filesystem paths and failure messages,
 system-information output, and unsupported, malformed, denied, or failed
 request responses. Blank input, CLI-only exit and cancellation paths, startup
-failures, and the initial confirmation-required response are not recorded. An
+failures, and the initial confirmation-required response are not recorded.
+With reasoning enabled, unsupported input is answered conversationally instead,
+and no conversational request, reply, or controlled failure is recorded; the
+conversation lives only in the session's memory. An
 approved confirmation is processed again and its completed result follows the
 normal recording path.
 

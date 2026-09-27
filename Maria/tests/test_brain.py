@@ -252,8 +252,18 @@ class MariaBrainTests(unittest.TestCase):
     def test_process_exposes_no_raw_text_confirmation_bypass(self) -> None:
         parameters = inspect.signature(MariaBrain.process).parameters
 
-        self.assertEqual(list(parameters), ["self", "user_input"])
+        # V1-14 adds only the session's earlier exchanges, and only
+        # positionally, so no keyword of any name can reach process.
+        self.assertEqual(list(parameters), ["self", "user_input", "conversation"])
+        self.assertIs(
+            parameters["conversation"].kind,
+            inspect.Parameter.VAR_POSITIONAL,
+        )
         self.assertNotIn("confirmed", parameters)
+        with self.assertRaises(TypeError):
+            self.brain.process("rename old.txt to new.txt", confirmed=True)
+        self.planner.create_plan.assert_not_called()
+        self.tool_manager.execute_tool.assert_not_called()
 
     def test_denied_step_prevents_dispatch_and_records_denial(self) -> None:
         plan = _single_step_plan(

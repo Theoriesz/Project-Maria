@@ -5,12 +5,49 @@ public network APIs.
 
 ## Brain
 
-`MariaBrain.process(user_input: str) -> BrainResponse`
+`MariaBrain(config, planner, memory, tool_manager, permissions, logger=None,
+reasoning: ReasoningProvider | None = None)`
+
+`reasoning` is the owner's reasoning provider, typed only through the
+`ReasoningProvider` protocol, or `None` for a deterministic-only Brain. Brain
+never imports or names an adapter, and it keeps no state between requests.
+
+`MariaBrain.from_defaults(reasoning_factory: Callable[[ReasoningSettings],
+ReasoningProvider | None] | None = None) -> MariaBrain`
+
+Builds the runtime Brain from configuration. When a factory is given it is
+called exactly once with the settled `config.reasoning`, before roots are
+prepared, logging is configured, or the database is opened, so a provider
+that refuses its settings stops startup with nothing created. Its result
+becomes `reasoning`. Without a factory, Brain is deterministic only.
+
+`MariaBrain.process(user_input: str, *conversation: ReasoningExchange) ->
+BrainResponse`
 
 Plans one request and coordinates it from input to plan, whole-plan permission
 resolution, tool execution, and interaction-history recording. A plan holding a
 step that requires confirmation returns before execution, carrying its `Plan` on
-the response.
+the response. The deterministic planner always runs first. Only when a
+reasoning provider was supplied and the plan is exactly the planner's generic
+no-action fallback is the request answered conversationally instead, in the
+context of `conversation`, the caller's earlier exchanges passed positionally,
+oldest first (see "Conversation"). No keyword of any name is accepted.
+
+`BrainResponse(text, needs_confirmation=False, plan=None, conversation=None)`
+
+`conversation` is set only by a completed conversational reply: the session's
+conversation as it stands after that reply, for the session to keep. Every
+other response, including a failed or refused conversational turn, leaves it
+`None`.
+
+`main.build_reasoning_provider(settings: ReasoningSettings) ->
+ReasoningProvider | None` and `main.build_runtime_brain() -> MariaBrain`
+
+The runtime composition point. `build_reasoning_provider` returns `None` for
+disabled settings and otherwise constructs `OllamaReasoningProvider(settings)`,
+whose own `ValueError` refuses settings it cannot honour.
+`build_runtime_brain()` is the CLI's default startup and calls
+`MariaBrain.from_defaults(reasoning_factory=build_reasoning_provider)`.
 
 `MariaBrain.execute_confirmed_plan(plan: Plan) -> BrainResponse`
 
@@ -111,8 +148,22 @@ invalidation, replay prevention, and refusal.
 
 `MariaSession.submit(user_input: str) -> BrainResponse`
 
-Discards any approval still pending, then plans the request exactly once.
-A confirmation-required response becomes the single pending approval.
+Discards any approval still pending, then plans the request exactly once,
+handing Brain the session's conversation. A confirmation-required response
+becomes the single pending approval. A response carrying a `conversation`
+replaces the session's conversation, held to the retention limits again
+here; every other response leaves it unchanged.
+
+`MariaSession.conversation -> tuple[ReasoningExchange, ...]`
+
+The session's completed conversational exchanges, oldest first: at most
+eight, with at most 8 KiB of content. Empty for a new session.
+
+`MariaSession.end() -> None`
+
+Ends the session: discards its conversation and any pending approval, writes
+nothing, and logs only `Session ended.`. Ending again changes nothing. The CLI
+calls it on every way out of its main loop.
 
 `MariaSession.confirm() -> BrainResponse`
 
@@ -149,6 +200,63 @@ through the same interface wording as any other response. The same message
 covers a second confirmation after success, a confirmation after cancellation,
 and a confirmation after an intervening request, because all four mean the
 approval binds no executable plan.
+
+## Conversation
+
+`core/conversation.py` settles one conversational turn. It keeps no state; the
+conversation belongs to the caller's session. It imports only the shared
+failures, the logger, the planner's plan types, and the reasoning interface,
+so it has no path to permissions, tool dispatch, or persistence.
+
+`GENERIC_FALLBACK_RESPONSE` and `is_generic_fallback(plan: object) -> bool`
+
+The planner's exact generic no-action text, and the one test Brain uses to
+recognise that fallback: true only for an exact `Plan` equal to
+`Plan(plan.original_request, (), GENERIC_FALLBACK_RESPONSE)`, so a plan with a
+step, another recording policy, other text, or a `Plan` subtype is never the
+fallback. The planner itself is unchanged.
+
+`CONVERSATION_MAX_EXCHANGES = 8` and `CONVERSATION_MAX_BYTES = 8192`
+
+The most completed exchanges a session keeps or a request carries, and the
+hard content limit.
+
+`conversation_budget(settings: ReasoningSettings) -> int`
+
+`CONVERSATION_MAX_BYTES` or the configured `max_input_bytes`, whichever is
+smaller; the hard limit alone for disabled settings.
+
+`fitted_history(request, conversation, budget)` and
+`bounded_conversation(exchanges, budget=CONVERSATION_MAX_BYTES)`
+
+`fitted_history` returns the newest whole exchanges that fit beside the
+request within the budget, at most eight. `bounded_conversation` keeps the
+newest eight and then drops the oldest, whole, until their content fits the
+budget. Neither ever truncates text. Anything but an exact tuple of exact
+exchanges raises `ValueError(REASONING_HISTORY_MESSAGE)`.
+
+`transient_plan(request: str, response: str) -> Plan`
+
+`Plan(request, (), response, RecordingPolicy.TRANSIENT)`: the zero-step plan
+every conversational turn produces, so Brain's recording gate writes no row.
+
+`converse(provider, settings, request, conversation, logger=None) ->
+ConversationTurn`
+
+Answers one request conversationally, as text only:
+
+| Situation | Response text | Provider asked | Conversation |
+| --- | --- | --- | --- |
+| Request cannot be carried as text (for example a lone surrogate) | `CONVERSATION_UNSENDABLE_MESSAGE` | no | unchanged |
+| Request alone over the budget | the fixed input-over-budget message | no | unchanged |
+| Typed failure, crash, or malformed reply | that failure's fixed message | once | unchanged |
+| Request and reply together over the budget | `CONVERSATION_EXCHANGE_TOO_LARGE_MESSAGE` | once | unchanged |
+| Reply that fits | the reply, verbatim | once | fitted history plus the new exchange, bounded |
+
+`ConversationTurn(plan, conversation=None)` carries the transient plan and,
+only for a completed exchange, the conversation to keep. Refusals log a fixed
+line such as `Conversational request refused: over budget.`; no request,
+reply, or history text is ever logged.
 
 ## Planner
 
@@ -851,15 +959,16 @@ newer build, and `run_cli()` prints its message.
 
 `core/reasoning.py` is the provider-independent contract for Maria's one
 owner-controlled local model. It contains no transport, no model, and no
-provider; nothing in Maria calls a provider yet, and no command's behavior
-changes. Its own imports include no network, threading, asynchronous, or
+provider; the conversation module is the one caller that asks a provider
+anything. Its own imports include no network, threading, asynchronous, or
 subprocess module, and it imports nothing from Maria except `core.failures`
 and `core.logger`, so it has no path to planning, permissions, tool dispatch,
 or persistence.
 
-`ReasoningRequest(prompt: str)` and `ReasoningResponse(text: str)`
+`ReasoningRequest(prompt: str, history: tuple[ReasoningExchange, ...] = ())`
+and `ReasoningResponse(text: str)`
 
-Frozen dataclasses with exactly one field each. The text must be an exact,
+Frozen dataclasses. The prompt and the response text must each be an exact,
 non-empty, UTF-8-encodable `str` of at most 1,048,576 UTF-8 bytes
 (`REASONING_MAXIMUM_INPUT_BYTES` and `REASONING_MAXIMUM_OUTPUT_BYTES`);
 anything else raises `ValueError` with a fixed message that never repeats the
@@ -867,9 +976,37 @@ value. Sizes are bytes, not tokens, so no runtime's tokenizer is assumed.
 Because every encodable character takes at least one UTF-8 byte, text with
 more characters than a limit is refused without being encoded, so text of any
 length is never copied just to be measured.
-There is no field for personal context, a system prompt, a template, a
-credential, a header, an endpoint, a port, or a model path. `repr()`,
-`str()`, and formatting show `<redacted>` rather than the text.
+`history` holds the earlier exchanges of the current conversation, oldest
+first, and is empty by default. It must be an exact `tuple` of exact
+`ReasoningExchange` values, and the prompt with every exchange's text must be
+at most `REASONING_MAXIMUM_INPUT_BYTES`, or `ValueError(REASONING_HISTORY_MESSAGE)`
+is raised. There is no field for personal context, a system prompt, a
+template, a credential, a header, an endpoint, a port, or a model path.
+`repr()`, `str()`, and formatting show `<redacted>` rather than any text.
+
+`ReasoningExchange(user: str, assistant: str)`
+
+One completed turn of the conversation: what the owner asked and the reply
+the model gave. A frozen dataclass; `user` must be exact, non-empty, encodable
+text within `REASONING_MAXIMUM_INPUT_BYTES`, and `assistant` within
+`REASONING_MAXIMUM_OUTPUT_BYTES`, or `ValueError(REASONING_EXCHANGE_MESSAGE)`
+is raised. It is two strings and nothing more, redacted from every
+representation.
+
+`request_content_bytes(prompt, history, maximum_bytes) -> int` and
+`history_content_bytes(history, maximum_bytes) -> int`
+
+The one definition of a request's size: the UTF-8 length of the prompt plus
+the UTF-8 length of every exchange's `user` and `assistant` text, and nothing
+else. No role name, message structure, separator, model identifier, or
+transport framing counts. Every text is read again rather than trusted, and
+counting stops as soon as the total passes `maximum_bytes`, so the result is
+then only some value above the bound. A prompt that is not exact, encodable,
+non-empty text raises `ValueError(REASONING_PROMPT_MESSAGE)`; a history that is
+not an exact tuple of exact exchanges holding such text raises
+`ValueError(REASONING_HISTORY_MESSAGE)`. Request construction,
+`request_reasoning`, the adapter, and the conversation module all measure with
+it.
 
 `ReasoningTransport`
 
@@ -920,8 +1057,10 @@ provider is reached. Then, in order:
 
 1. Disabled settings return `REASONING_UNAVAILABLE` without asking the
    provider.
-2. A prompt over `max_input_bytes` returns `REASONING_INPUT_OVER_BUDGET`
-   without asking the provider.
+2. A request whose prompt and history together, measured again by
+   `request_content_bytes`, exceed `max_input_bytes` returns
+   `REASONING_INPUT_OVER_BUDGET` without asking the provider. A prompt or
+   history tampered into anything a request cannot hold raises `ValueError`.
 3. The provider is asked exactly once. A `TypedFailureError` of exactly that
    type, carrying a reasoning kind, returns that kind. Any other typed failure,
    a derived or tampered carrier, and every other `Exception` return
@@ -935,7 +1074,7 @@ provider is reached. Then, in order:
    discarded whole, never truncated. Text with more characters than the budget
    is judged over it before any encoding, even when it would also fail to
    encode, so a reply enlarged after construction is never copied to be
-   measured. The prompt check in step 2 is bounded the same way.
+   measured. The request check in step 2 is bounded the same way.
 6. Otherwise a fresh `ReasoningResponse` holding the same text is returned.
 
 The reply is untrusted, inert text: nothing in this module parses, repairs,
@@ -992,8 +1131,8 @@ Loading logs nothing.
 owner's local Ollama runtime, reached over its native HTTP API (decision
 V1-13-R1). It is the only production module that imports a network module
 (`socket`), and it imports nothing from Maria except `core.failures` and
-`core.reasoning`. Nothing in Maria constructs it yet, and no command's
-behavior changes.
+`core.reasoning`. Only `main.build_reasoning_provider` constructs it, for
+enabled settings alone, and Brain receives it only as a `ReasoningProvider`.
 
 `OLLAMA_ADDRESS = ("127.0.0.1", 11434)` and `OLLAMA_CHAT_PATH = "/api/chat"`
 
@@ -1020,16 +1159,24 @@ ReasoningResponse`
 
 Asks the runtime one question over one new connection and returns the
 complete answer, or raises `TypedFailureError`. Anything but an exact
-`ReasoningRequest` raises `ValueError(REASONING_REQUEST_TYPE_MESSAGE)`, and a
+`ReasoningRequest` raises `ValueError(REASONING_REQUEST_TYPE_MESSAGE)`, a
 prompt altered into anything but non-empty, encodable text raises
-`ValueError(REASONING_PROMPT_MESSAGE)`. The request is `POST /api/chat
-HTTP/1.1` with `Host`, `Content-Type`, `Content-Length`, and `Connection:
-close` headers only, and the JSON body `{"model": <model>, "messages":
-[{"role": "user", "content": <prompt>}], "stream": false}`.
+`ValueError(REASONING_PROMPT_MESSAGE)`, and a history altered into anything
+but an exact tuple of exact exchanges raises
+`ValueError(REASONING_HISTORY_MESSAGE)`. Before anything is serialized, the
+prompt and history are measured together against `max_input_bytes` with
+`request_content_bytes`. The request is `POST /api/chat HTTP/1.1` with `Host`,
+`Content-Type`, `Content-Length`, and `Connection: close` headers only, and
+the JSON body `{"model": <model>, "messages": [...], "stream": false}`, where
+the messages are each exchange's `{"role": "user", "content": <user>}` then
+`{"role": "assistant", "content": <assistant>}`, oldest first, and finally
+`{"role": "user", "content": <prompt>}`. With no history the body is exactly
+`{"model": <model>, "messages": [{"role": "user", "content": <prompt>}],
+"stream": false}`, byte for byte as before.
 
 | Outcome | Result |
 | --- | --- |
-| Prompt over `max_input_bytes` | `REASONING_INPUT_OVER_BUDGET`, before any connection |
+| Prompt and history together over `max_input_bytes` | `REASONING_INPUT_OVER_BUDGET`, before any connection |
 | Deadline passed while connecting, sending, or receiving | `REASONING_TIMEOUT` |
 | Connection refused or failed before any reply byte, or the connection closed with no reply | `REASONING_UNAVAILABLE` |
 | Any status but `200`, including a missing model (`404`) and every redirect, which is never followed | `REASONING_UNAVAILABLE` |

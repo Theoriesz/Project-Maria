@@ -1,4 +1,9 @@
-"""Command line entry point for Maria."""
+"""Command line entry point for Maria.
+
+This is also Maria's runtime composition point: the one production module
+that names the local reasoning adapter, which it builds only when reasoning is
+enabled and hands to Brain through the ``ReasoningProvider`` interface.
+"""
 
 from __future__ import annotations
 
@@ -8,6 +13,8 @@ from collections.abc import Callable
 from core.brain import BrainResponse, MariaBrain
 from core.constants import APP_NAME, APP_VERSION
 from core.failures import TypedFailureError
+from core.ollama_adapter import OllamaReasoningProvider
+from core.reasoning import ReasoningProvider, ReasoningSettings
 from core.session import MariaSession
 
 
@@ -45,11 +52,30 @@ def print_response(response: BrainResponse) -> None:
     print(f"{APP_NAME}: {response.text}")
 
 
+def build_reasoning_provider(
+    settings: ReasoningSettings,
+) -> ReasoningProvider | None:
+    """Return the owner's local reasoning adapter, or None when disabled.
+
+    The adapter is constructed only for enabled settings. Enabled settings it
+    cannot honour raise its fixed ``ValueError``, which stops startup
+    through the ordinary sanitized failure.
+    """
+    if not settings.enabled:
+        return None
+    return OllamaReasoningProvider(settings)
+
+
+def build_runtime_brain() -> MariaBrain:
+    """Create the runtime Brain, with the local adapter when it is enabled."""
+    return MariaBrain.from_defaults(reasoning_factory=build_reasoning_provider)
+
+
 def run_cli(
     brain_factory: Callable[[], MariaBrain] | None = None,
 ) -> int:
     """Run Maria's minimal command line interface."""
-    factory = MariaBrain.from_defaults if brain_factory is None else brain_factory
+    factory = build_runtime_brain if brain_factory is None else brain_factory
 
     try:
         brain = factory()
@@ -71,35 +97,41 @@ def run_cli(
 
     session = MariaSession(brain)
 
-    print(f"{APP_NAME} v{APP_VERSION}")
-    print("Type 'help' for supported commands. Type 'exit' to quit.")
+    try:
+        print(f"{APP_NAME} v{APP_VERSION}")
+        print("Type 'help' for supported commands. Type 'exit' to quit.")
 
-    while True:
-        try:
-            user_input = input("You: ").strip()
-        except (EOFError, KeyboardInterrupt):
-            print(f"\n{APP_NAME}: Goodbye.")
-            break
+        while True:
+            try:
+                user_input = input("You: ").strip()
+            except (EOFError, KeyboardInterrupt):
+                print(f"\n{APP_NAME}: Goodbye.")
+                break
 
-        if not user_input:
-            continue
+            if not user_input:
+                continue
 
-        if user_input.lower() in EXIT_COMMANDS:
-            print(f"{APP_NAME}: Goodbye.")
-            break
+            if user_input.lower() in EXIT_COMMANDS:
+                print(f"{APP_NAME}: Goodbye.")
+                break
 
-        response = session.submit(user_input)
+            response = session.submit(user_input)
 
-        if response.needs_confirmation:
+            if response.needs_confirmation:
+                print_response(response)
+                if ask_for_confirmation():
+                    print_response(session.confirm())
+                else:
+                    session.cancel()
+                    print(f"{APP_NAME}: Action cancelled.")
+                continue
+
             print_response(response)
-            if ask_for_confirmation():
-                print_response(session.confirm())
-            else:
-                session.cancel()
-                print(f"{APP_NAME}: Action cancelled.")
-            continue
-
-        print_response(response)
+    finally:
+        # Every way out ends the session, including an exception this
+        # boundary deliberately lets propagate, so its conversation and any
+        # pending approval never outlive it.
+        session.end()
 
     return _EXIT_SUCCESS
 

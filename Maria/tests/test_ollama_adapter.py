@@ -71,11 +71,13 @@ from core.planner import Planner
 from core.reasoning import (
     DISABLED_REASONING,
     REASONING_DEADLINE_MESSAGE,
+    REASONING_HISTORY_MESSAGE,
     REASONING_HOST_MESSAGE,
     REASONING_MODEL_MESSAGE,
     REASONING_PROMPT_MESSAGE,
     REASONING_REQUEST_TYPE_MESSAGE,
     REASONING_SETTINGS_TYPE_MESSAGE,
+    ReasoningExchange,
     ReasoningRequest,
     ReasoningResponse,
     ReasoningSettings,
@@ -1079,6 +1081,135 @@ class OllamaAdapterDeadlineTests(StubbedAdapterTestCase):
         self.assertEqual(waits, sorted(waits, reverse=True))
 
 
+# --- Conversation history --------------------------------------------------
+
+
+class OllamaAdapterHistoryTests(StubbedAdapterTestCase):
+    """Prove earlier exchanges travel as ordered chat messages, measured first.
+
+    The adapter measures the prompt and every exchange's text against its
+    own input budget, with the same accounting the reasoning boundary
+    uses, before anything is serialized or any connection opened.
+    """
+
+    def test_history_is_sent_as_ordered_user_and_assistant_messages(self) -> None:
+        transport = self.install(
+            StubTransport(send(http_response(chat_body())))
+        )
+        history = (
+            ReasoningExchange("first question", "first answer"),
+            ReasoningExchange("Grüße → 世界", "second answer"),
+        )
+
+        response = self.provider().respond(
+            ReasoningRequest(PROMPT_SENTINEL, history)
+        )
+
+        self.assertEqual(response.text, REPLY_SENTINEL)
+        self.assertOnlyTheFixedDestination(transport)
+        _, body = split_request(transport.requests[0])
+        self.assertEqual(
+            json.loads(body.decode("utf-8")),
+            {
+                "model": MODEL_SENTINEL,
+                "messages": [
+                    {"role": "user", "content": "first question"},
+                    {"role": "assistant", "content": "first answer"},
+                    {"role": "user", "content": "Grüße → 世界"},
+                    {"role": "assistant", "content": "second answer"},
+                    {"role": "user", "content": PROMPT_SENTINEL},
+                ],
+                "stream": False,
+            },
+        )
+
+    def test_an_empty_history_sends_exactly_the_single_question_request(
+        self,
+    ) -> None:
+        prompt = "Grüße → 世界, " + PROMPT_SENTINEL
+        # The request as V1-13 sent it, spelled out byte for byte.
+        body = (
+            '{"model": "' + MODEL_SENTINEL + '", "messages": '
+            '[{"role": "user", "content": "' + prompt + '"}], "stream": false}'
+        ).encode("utf-8")
+        expected = (
+            b"POST /api/chat HTTP/1.1\r\n"
+            b"Host: 127.0.0.1:11434\r\n"
+            b"Content-Type: application/json\r\n"
+            b"Content-Length: %d\r\n"
+            b"Connection: close\r\n"
+            b"\r\n" % len(body)
+        ) + body
+
+        sent = []
+        for request in (ReasoningRequest(prompt), ReasoningRequest(prompt, ())):
+            transport = self.install(
+                StubTransport(send(http_response(chat_body())))
+            )
+            self.provider().respond(request)
+            sent.append(transport.requests[0])
+
+        self.assertEqual(sent, [expected, expected])
+
+    def test_the_whole_request_is_measured_before_any_connection(self) -> None:
+        provider = self.provider(max_input_bytes=16)
+        # Six bytes of user text and six of assistant text.
+        history = (ReasoningExchange("é" * 3, "xyzuvw"),)
+        transport = self.install(
+            StubTransport(send(http_response(chat_body())))
+        )
+
+        # Four bytes of prompt fill the budget exactly, so this is sent.
+        provider.respond(ReasoningRequest("abcd", history))
+        self.assertEqual(len(transport.opened), 1)
+
+        for prompt in ("abcde", "ééa"):
+            with self.subTest(characters=len(prompt)):
+                self.assertRefusedAs(
+                    FailureKind.REASONING_INPUT_OVER_BUDGET,
+                    provider,
+                    ReasoningRequest(prompt, history),
+                )
+        self.assertEqual(len(transport.opened), 1)
+
+    def test_a_history_enlarged_after_construction_is_refused_uncopied(
+        self,
+    ) -> None:
+        exchange = ReasoningExchange("u", "a")
+        object.__setattr__(exchange, "assistant", "x" * (8 * 1024 * 1024))
+        request = ReasoningRequest("small")
+        object.__setattr__(request, "history", (exchange,))
+        provider = self.provider()
+
+        # The guard opener fails the test if a connection is attempted.
+        tracemalloc.start()
+        try:
+            self.assertRefusedAs(
+                FailureKind.REASONING_INPUT_OVER_BUDGET,
+                provider,
+                request,
+            )
+            peak = tracemalloc.get_traced_memory()[1]
+        finally:
+            tracemalloc.stop()
+        self.assertLess(peak, 1024 * 1024)
+
+    def test_a_history_tampered_into_anything_but_exchanges_is_refused(
+        self,
+    ) -> None:
+        emptied = ReasoningExchange("u", "a")
+        object.__setattr__(emptied, "assistant", "")
+        for history in (None, [], ("u",), (emptied,)):
+            with self.subTest(history=repr(history)[:30]):
+                request = ReasoningRequest("small")
+                object.__setattr__(request, "history", history)
+
+                with self.assertRaises(ValueError) as caught:
+                    self.provider().respond(request)
+
+                self.assertEqual(str(caught.exception), REASONING_HISTORY_MESSAGE)
+
+
 # --- Bounds ----------------------------------------------------------------
 
 
@@ -1711,6 +1842,10 @@ FORBIDDEN_MODULES = NETWORK_MODULES | THREADING_MODULES
 ADAPTER_MODULE = "core.ollama_adapter"
 ADAPTER_PATH = PROJECT_ROOT / "core" / "ollama_adapter.py"
 
+# The one production module permitted to name and construct the adapter: the
+# CLI entry point, which hands it to Brain through the provider interface.
+COMPOSITION_POINT = "main"
+
 # The one network module the adapter may import, and nothing else from the
 # forbidden set: no HTTP library, which would bring proxy and redirect
 # handling, and no thread, task, or process.
@@ -2305,19 +2440,30 @@ class NetworkImportBoundaryTests(unittest.TestCase):
         self.assertEqual(set(reached), set(ADAPTER_REACH))
         self.assertEqual(unfollowed, set())
 
-    def test_no_production_module_imports_the_adapter_yet(self) -> None:
-        """V1-13 wires the adapter into nothing; a later stage changes this."""
+    def test_only_the_composition_point_imports_the_adapter(self) -> None:
+        """V1-14 wires the adapter in at the entry point and nowhere else.
+
+        Every other production module, Brain and every guarded module
+        included, neither names nor reaches it. Nothing imports the entry
+        point, so reaching the adapter through it is impossible too.
+        """
         for path in production_modules():
             name = module_name(path)
-            if name == ADAPTER_MODULE:
+            if name in {ADAPTER_MODULE, COMPOSITION_POINT}:
                 continue
             with self.subTest(module=name):
                 reached, _ = reachable_modules(name)
                 source = path.read_text(encoding="utf-8")
 
                 self.assertNotIn(ADAPTER_MODULE, reached)
+                self.assertNotIn(COMPOSITION_POINT, reached)
                 self.assertNotIn("ollama_adapter", source)
                 self.assertNotIn("OllamaReasoningProvider", source)
+
+        reached, unfollowed = reachable_modules(COMPOSITION_POINT)
+        self.assertIn(ADAPTER_MODULE, reached)
+        self.assertEqual(unfollowed, set())
+        self.assertEqual(forbidden_in(PROJECT_ROOT / "main.py"), set())
 
     def test_the_guard_follows_nested_relative_dynamic_and_transitive_imports(
         self,

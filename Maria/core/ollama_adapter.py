@@ -5,8 +5,9 @@ V1-13-R1): Ollama's native HTTP API on the owner's own machine, reached only
 at the fixed loopback destination ``127.0.0.1:11434`` with one
 ``POST /api/chat`` request whose ``stream`` is false. Everything specific to
 Ollama lives here, and this is the only production module that imports a
-network module. Nothing in Maria constructs it yet, so Brain, the CLI,
-planning, memory, and tools cannot reach it.
+network module. Only the runtime composition point in ``main.py`` constructs
+it, and hands it to Brain through the ``ReasoningProvider`` interface, so
+Brain, planning, memory, and tools never import or reach it.
 
 The destination is fixed here rather than configured. Settings must name the
 loopback transport and the host ``127.0.0.1``, or the adapter refuses to
@@ -16,8 +17,12 @@ nothing is resolved, no proxy setting is consulted, no redirect is followed,
 and no URL is ever built or parsed. The model identifier is only ever a JSON
 string value in the request body.
 
-Only the model identifier and the prompt, as one user message, are sent.
-Only the assistant message's ``content`` comes back, as one inert string.
+Only the model identifier and the conversation are sent: each earlier
+exchange as a user message followed by an assistant message, oldest first,
+then the prompt as the final user message. With no earlier exchange that is
+the prompt alone, exactly as before. The whole request is measured against the
+input budget again here, before anything is serialized. Only the assistant
+message's ``content`` comes back, as one inert string.
 Thinking text, tool calls, and every other field of the reply are ignored
 after bounded JSON parsing; only ``message.content`` is returned. This module
 has no import path to planning, permissions, tool dispatch, or persistence,
@@ -54,13 +59,14 @@ from typing import NoReturn
 
 from core.failures import Failure, FailureKind, TypedFailureError
 from core.reasoning import (
-    REASONING_PROMPT_MESSAGE,
     REASONING_REQUEST_TYPE_MESSAGE,
     REASONING_SETTINGS_TYPE_MESSAGE,
+    ReasoningExchange,
     ReasoningRequest,
     ReasoningResponse,
     ReasoningSettings,
     ReasoningTransport,
+    request_content_bytes,
 )
 
 
@@ -150,7 +156,8 @@ class OllamaReasoningProvider:
         """Ask the local runtime one question and return its complete answer.
 
         Raises ``TypedFailureError`` carrying one reasoning kind: input over
-        budget before any connection is opened; timeout when the deadline
+        budget, when the prompt and history together exceed the input
+        budget, before any connection is opened; timeout when the deadline
         passes at any stage; unavailable when nothing answers, or the answer
         is not success; truncated when the reply ends early or says it is
         incomplete; malformed when it is not the expected shape; and output
@@ -172,32 +179,48 @@ class OllamaReasoningProvider:
         """Run one bounded exchange and settle it as a reply or a failure."""
         deadline = time.monotonic() + self._deadline_seconds
 
-        # The prompt is read again rather than trusted from construction,
-        # and measured without being copied when it is plainly too long.
+        # The prompt and the history are read again rather than trusted from
+        # construction, and the whole request is measured against this
+        # adapter's own budget, without being copied when it is plainly too
+        # long, before any of it is serialized.
         prompt = request.prompt
-        size = _utf8_size(prompt, self._max_input_bytes)
-        if size is None or size == 0:
-            raise ValueError(REASONING_PROMPT_MESSAGE)
+        history = getattr(request, "history", None)
+        size = request_content_bytes(prompt, history, self._max_input_bytes)
         if size > self._max_input_bytes:
             return Failure(FailureKind.REASONING_INPUT_OVER_BUDGET)
 
         try:
-            body = self._converse(self._request_bytes(prompt), deadline)
+            body = self._converse(self._request_bytes(prompt, history), deadline)
         except TypedFailureError as stopped:
             return stopped.failure
         return _answer(body, self._max_output_bytes)
 
-    def _request_bytes(self, prompt: str) -> bytes:
-        """Return the one HTTP request: the model and the prompt, and no more.
+    def _request_bytes(
+        self,
+        prompt: str,
+        history: tuple[ReasoningExchange, ...],
+    ) -> bytes:
+        """Return the one HTTP request: the model and the conversation.
 
+        Each earlier exchange becomes a user message and then an assistant
+        message, oldest first, and the prompt is the final user message.
         There is no system message, template, context, option, tool, or
         thinking request, and no credential or proxy header. The request
         line names only the path, never a scheme or host.
         """
+        messages = [
+            message
+            for exchange in history
+            for message in (
+                {"role": "user", "content": exchange.user},
+                {"role": "assistant", "content": exchange.assistant},
+            )
+        ]
+        messages.append({"role": "user", "content": prompt})
         body = json.dumps(
             {
                 "model": self._model,
-                "messages": [{"role": "user", "content": prompt}],
+                "messages": messages,
                 "stream": False,
             },
             ensure_ascii=False,
