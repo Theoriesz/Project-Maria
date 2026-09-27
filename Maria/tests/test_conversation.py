@@ -168,6 +168,17 @@ EARLIER_SESSION_SENTINEL = "earlier-session-turn-6f2d1b8e40"
 
 ZERO_ROWS = {"interactions": 0, "notes": 0, "memories": 0}
 
+# Since V1-15 every model-backed conversational response ends with Maria's own
+# notice about memory context, after a blank line and outside the reply the
+# session keeps. With no memory enabled, that notice is this fixed sentence,
+# written out so the owner-facing wording is pinned rather than agreed with.
+NO_MEMORY_CONTEXT_SUFFIX = "\n\nNo memory context supplied."
+
+
+def _shown(text: str) -> str:
+    """Return what the owner sees for a conversational turn with no context."""
+    return text + NO_MEMORY_CONTEXT_SUFFIX
+
 
 def enabled_settings(
     *,
@@ -733,8 +744,8 @@ class FollowUpTests(unittest.TestCase):
         first = session.submit(COLOUR_STATEMENT)
         second = session.submit(COLOUR_QUESTION)
 
-        self.assertEqual(first.text, REMEMBERED_REPLY)
-        self.assertEqual(second.text, "Your favourite colour is teal.")
+        self.assertEqual(first.text, _shown(REMEMBERED_REPLY))
+        self.assertEqual(second.text, _shown("Your favourite colour is teal."))
         opening, follow_up = provider.requests
         self.assertEqual(opening.prompt, COLOUR_STATEMENT)
         self.assertEqual(opening.history, ())
@@ -761,7 +772,7 @@ class FollowUpTests(unittest.TestCase):
 
         self.assertEqual(
             response.text,
-            "You have not told me your favourite colour.",
+            _shown("You have not told me your favourite colour."),
         )
 
 
@@ -789,7 +800,7 @@ class SessionConversationTests(unittest.TestCase):
         self.assertEqual(self.provider.requests[-1].history, ())
         self.assertEqual(
             response.text,
-            "You have not told me your favourite colour.",
+            _shown("You have not told me your favourite colour."),
         )
         self.assertNotIn(
             EARLIER_SESSION_SENTINEL,
@@ -941,10 +952,10 @@ class ConversationBoundsTests(unittest.TestCase):
         self.assertEqual(provider.calls, 1)
         self.assertEqual(provider.requests[0].prompt, at_budget)
         # Sent, but the finished exchange cannot fit beside its reply.
-        self.assertEqual(sent.text, CONVERSATION_EXCHANGE_TOO_LARGE_MESSAGE)
+        self.assertEqual(sent.text, _shown(CONVERSATION_EXCHANGE_TOO_LARGE_MESSAGE))
 
         refused = session.submit(over_budget)
-        self.assertEqual(refused.text, OVER_BUDGET_MESSAGE)
+        self.assertEqual(refused.text, _shown(OVER_BUDGET_MESSAGE))
         self.assertIsNone(refused.conversation)
         self.assertEqual(provider.calls, 1)
         self.assertEqual(session.conversation, ())
@@ -964,7 +975,7 @@ class ConversationBoundsTests(unittest.TestCase):
         refused = session.submit(over_limit)
 
         self.assertEqual([request.prompt for request in provider.requests], [at_limit])
-        self.assertEqual(refused.text, OVER_BUDGET_MESSAGE)
+        self.assertEqual(refused.text, _shown(OVER_BUDGET_MESSAGE))
         self.assertEqual(harness.row_counts(), ZERO_ROWS)
 
     def test_an_exchange_exactly_at_the_budget_is_kept(self) -> None:
@@ -974,7 +985,7 @@ class ConversationBoundsTests(unittest.TestCase):
 
         response = session.submit(request)
 
-        self.assertEqual(response.text, reply)
+        self.assertEqual(response.text, _shown(reply))
         self.assertEqual(session.conversation, (_exchange(request, reply),))
         self.assertEqual(harness.row_counts(), ZERO_ROWS)
 
@@ -985,7 +996,10 @@ class ConversationBoundsTests(unittest.TestCase):
 
         response = session.submit(request)
 
-        self.assertEqual(response.text, CONVERSATION_EXCHANGE_TOO_LARGE_MESSAGE)
+        self.assertEqual(
+            response.text,
+            _shown(CONVERSATION_EXCHANGE_TOO_LARGE_MESSAGE),
+        )
         self.assertNotIn("é", response.text)
         self.assertIsNone(response.conversation)
         self.assertFalse(response.needs_confirmation)
@@ -1062,7 +1076,7 @@ class ProviderFailureTests(unittest.TestCase):
 
         response = session.submit(PROMPT_SENTINEL)
 
-        self.assertEqual(response.text, expected)
+        self.assertEqual(response.text, _shown(expected))
         self.assertIsNone(response.conversation)
         self.assertFalse(response.needs_confirmation)
         self.assertNotIn("Traceback", response.text)
@@ -1110,7 +1124,7 @@ class ProviderFailureTests(unittest.TestCase):
 
         response = session.submit("unpaired \ud800 surrogate")
 
-        self.assertEqual(response.text, CONVERSATION_UNSENDABLE_MESSAGE)
+        self.assertEqual(response.text, _shown(CONVERSATION_UNSENDABLE_MESSAGE))
         self.assertEqual(provider.calls, 0)
         self.assertEqual(harness.row_counts(), ZERO_ROWS)
 
@@ -1138,7 +1152,7 @@ class HostileReplyTests(unittest.TestCase):
 
                 response = session.submit(PROMPT_SENTINEL)
 
-                self.assertEqual(response.text, hostile_payload(output))
+                self.assertEqual(response.text, _shown(hostile_payload(output)))
                 self.assertFalse(response.needs_confirmation)
                 self.assertEqual(response.plan.steps, ())
                 self.assertIsNone(session.pending_approval)
@@ -1161,7 +1175,7 @@ class HostileReplyTests(unittest.TestCase):
 
         self.assertEqual(
             response.text,
-            Failure(FailureKind.REASONING_OUTPUT_OVER_BUDGET).message,
+            _shown(Failure(FailureKind.REASONING_OUTPUT_OVER_BUDGET).message),
         )
         self.assertNotIn(FAKE_PAYLOAD_SENTINEL, response.text)
         self.assertEqual(session.conversation, ())
@@ -1477,8 +1491,10 @@ class ConversationImportBoundaryTests(unittest.TestCase):
     PERMITTED = frozenset(
         {
             "__future__",
+            "collections.abc",
             "dataclasses",
             "logging",
+            "core.context",
             "core.failures",
             "core.logger",
             "core.planner",

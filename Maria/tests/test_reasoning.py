@@ -126,7 +126,9 @@ FORBIDDEN_ATTRIBUTE_CALLS = frozenset({"import_module"})
 
 # The only Maria modules the interface may depend on. Anything reaching
 # planning, permissions, dispatch, persistence, sessions, or tools is refused.
-PERMITTED_MARIA_IMPORTS = frozenset({"core.failures", "core.logger"})
+PERMITTED_MARIA_IMPORTS = frozenset(
+    {"core.context", "core.failures", "core.logger"}
+)
 
 PRODUCTION_SOURCES = (
     *sorted((PROJECT_ROOT / "core").glob("*.py")),
@@ -236,17 +238,21 @@ class ReasoningValueTests(unittest.TestCase):
     ) -> None:
         self.assertEqual(
             [f.name for f in fields(ReasoningRequest)],
-            ["prompt", "history"],
+            ["prompt", "history", "context"],
         )
         self.assertEqual([f.name for f in fields(ReasoningResponse)], ["text"])
         self.assertEqual(ReasoningRequest(PROMPT_SENTINEL).history, ())
+        self.assertEqual(ReasoningRequest(PROMPT_SENTINEL).context, ())
 
-    def test_the_request_has_no_context_or_template_field(self) -> None:
+    def test_the_request_has_no_system_template_or_raw_history_field(
+        self,
+    ) -> None:
         request = ReasoningRequest(PROMPT_SENTINEL)
 
-        # "history" left this list in V1-14: it is now the conversation's
-        # earlier exchanges, and nothing retrieved on the owner's behalf.
-        for name in ("context", "system", "template", "memories"):
+        # "history" left this list in V1-14: it is the conversation's earlier
+        # exchanges. "context" left it in V1-15: it is the typed Tier A
+        # memory context, and nothing else retrieved on the owner's behalf.
+        for name in ("system", "template", "memories", "interactions"):
             with self.subTest(name=name):
                 self.assertFalse(hasattr(request, name))
 

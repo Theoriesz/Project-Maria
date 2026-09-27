@@ -208,14 +208,13 @@ class Planner:
     def __init__(self, logger: Logger | None = None) -> None:
         self.logger = logger or get_logger(__name__)
 
-    def create_plan(
-        self,
-        user_input: str,
-        context: dict[str, Any] | None = None,
-    ) -> Plan:
-        """Create a plan for a supported request."""
-        del context
+    def create_plan(self, user_input: str) -> Plan:
+        """Create a plan for a supported request.
 
+        The request text is the planner's only input. No stored record, no
+        interaction history, and no memory context is consulted, so the same
+        text always produces the same plan.
+        """
         text = user_input.strip()
         lowered = text.lower()
         command_parts = text.split(maxsplit=1)
@@ -287,6 +286,42 @@ class Planner:
                     "Memory id must be a positive whole number.",
                 )
             return self._single_step(text, "memory", "forget", {"id": memory_id})
+
+        if lowered == "enable memory context":
+            return self._no_action(text, "Use: enable memory context <id>")
+
+        if lowered.startswith("enable memory context "):
+            operand = text[len("enable memory context ") :].strip()
+            memory_id = _parse_positive_ascii_id(operand)
+            if memory_id is None:
+                return self._no_action(
+                    text,
+                    "Memory id must be a positive whole number.",
+                )
+            return self._single_step(
+                text,
+                "memory",
+                "enable_context",
+                {"id": memory_id},
+            )
+
+        if lowered == "disable memory context":
+            return self._no_action(text, "Use: disable memory context <id>")
+
+        if lowered.startswith("disable memory context "):
+            operand = text[len("disable memory context ") :].strip()
+            memory_id = _parse_positive_ascii_id(operand)
+            if memory_id is None:
+                return self._no_action(
+                    text,
+                    "Memory id must be a positive whole number.",
+                )
+            return self._single_step(
+                text,
+                "memory",
+                "disable_context",
+                {"id": memory_id},
+            )
 
         if lowered.startswith(("list ", "ls ")):
             path = _remove_first_word(text)
@@ -560,6 +595,8 @@ def _help_text() -> str:
         "- memories\n"
         "- update memory <id>: <new fact>\n"
         "- forget memory <id>\n"
+        "- enable memory context <id>\n"
+        "- disable memory context <id>\n"
         "- system\n"
         "- time\n"
         "- history\n"

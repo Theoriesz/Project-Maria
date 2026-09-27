@@ -4,7 +4,7 @@ from __future__ import annotations
 
 import importlib
 from collections.abc import Mapping
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from logging import Logger
 from typing import Any, Protocol
 
@@ -17,6 +17,7 @@ from core.config import MariaConfig
 from core.failures import Failure, FailureKind
 from core.logger import get_logger
 from core.memory import Memory
+from core.planner import Plan, PlanStep
 
 
 BUILT_IN_TOOL_MODULES = (
@@ -40,7 +41,15 @@ class ToolExecutionResult:
 
 
 class Tool(Protocol):
-    """Minimal interface every Maria tool must provide."""
+    """Minimal interface every Maria tool must provide.
+
+    A tool whose action depends on stored state that could change while the
+    owner decides may also provide ``confirmation_binding(action,
+    arguments) -> Mapping[str, Any]``, returning arguments that pin that
+    state into the plan the owner approves; see
+    ``ToolManager.bind_for_confirmation``. It is optional and not part of
+    this protocol's required surface.
+    """
 
     name: str
     description: str
@@ -113,6 +122,63 @@ class ToolManager:
         anything else in the pipeline runs.
         """
         return self.contracts.validate(tool_name, action, arguments)
+
+    def bind_for_confirmation(self, plan: Plan) -> Plan:
+        """Return the plan to present for approval, pinned to its exact targets.
+
+        Brain calls this once, when a plan is about to wait for the owner's
+        answer, so the plan the owner approves, and whose fingerprint binds
+        that approval, already names the exact state each step acts on.
+        Each step's tool may add arguments through its optional
+        ``confirmation_binding``. A binding can only add: it cannot replace
+        an argument the step already has, change a step's tool or action, or
+        add or remove a step, and a tool that binds nothing leaves its step
+        exactly as it was. A plan no tool binds comes back as the very same
+        object.
+
+        A binding that fails is contained and simply adds nothing. A tool
+        that relies on a binding therefore has to treat an unbound step as
+        unapproved for the state it would have pinned, which is how every
+        failure here stays safe. The contract check at confirmation
+        validates whatever was added.
+        """
+        steps: list[PlanStep] = []
+        for step in plan.steps:
+            binder = getattr(
+                self._tools.get(step.tool_name),
+                "confirmation_binding",
+                None,
+            )
+            added: Mapping[str, Any] = {}
+            if binder is not None:
+                try:
+                    added = binder(step.action, step.arguments)
+                except Exception:  # noqa: BLE001 - binding must not crash Maria.
+                    self.logger.error(
+                        "Confirmation binding failed: %s.%s",
+                        step.tool_name,
+                        step.action,
+                    )
+                    added = {}
+            if not added:
+                steps.append(step)
+                continue
+            if not isinstance(added, Mapping) or set(added) & set(step.arguments):
+                raise ValueError(
+                    "A confirmation binding may only add new arguments."
+                )
+            steps.append(
+                PlanStep(
+                    step.tool_name,
+                    step.action,
+                    {**step.arguments, **added},
+                )
+            )
+
+        bound = tuple(steps)
+        if all(new is old for new, old in zip(bound, plan.steps)):
+            return plan
+        return replace(plan, steps=bound)
 
     def execute_tool(
         self,

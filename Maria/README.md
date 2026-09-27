@@ -60,6 +60,8 @@ recall editor
 memories
 update memory 1: My editor is Neovim
 forget memory 1
+enable memory context 1
+disable memory context 1
 system
 time
 history
@@ -70,9 +72,10 @@ delete interaction 1
 
 File rename and move operations, `delete interaction <id>`, the three note
 lifecycle commands `retitle note <id>: <new title>`, `edit note <id>: <new
-body>`, and `delete note <id>`, and the two memory lifecycle commands `update
-memory <id>: <new fact>` and `forget memory <id>` require explicit
-confirmation. `delete interaction <id>` targets at most one interaction row by
+body>`, and `delete note <id>`, the two memory lifecycle commands `update
+memory <id>: <new fact>` and `forget memory <id>`, and the two memory context
+consent commands `enable memory context <id>` and `disable memory context
+<id>` require explicit confirmation. `delete interaction <id>` targets at most one interaction row by
 ID and removes it when found; it never cascades to notes or memories. Each note
 lifecycle command likewise targets at most one note by positive whole-number ID
 only, never by title, and never cascades into interaction history or explicit
@@ -228,7 +231,11 @@ never downloads a model, installs software, or starts a process.
 
 It sends only the model identifier and the conversation: the current session's
 earlier conversational exchanges as alternating user and assistant messages,
-then the request as the final user message. It takes back only the answer
+then the request as the final user message. When you have enabled memories
+for context, they come first: Maria's fixed instructions as the system
+message, which never contain a memory, and then the memories as a separate,
+clearly marked data message. With no memory enabled the request is exactly
+what it was before memory context existed. It takes back only the answer
 text. Any separate thinking text and any tool
 calls in the reply are ignored after bounded JSON parsing; only
 `message.content` is returned, and an answer is only ever text, never an
@@ -260,12 +267,14 @@ action, and it cannot run a tool, change a record, or confirm anything,
 whatever it says. That includes claims to have done something: a reply saying
 "I saved that" saves nothing. Use the commands above to act.
 
-Within one session the model sees the current request and the earlier
-conversational turns of that session, so a follow-up question is understood.
-It never sees a command or its result, an explicit memory, a note, a file, the
-interaction history, or anything from an earlier session. Maria keeps at most
-the last eight exchanges, and at most 8 KiB of their text together with the
-current request, or `max_input_bytes` if that is smaller. The oldest exchanges
+Within one session the model sees the current request, the earlier
+conversational turns of that session, so a follow-up question is understood,
+and the explicit memories you have enabled for context (see "Memory Context"
+below). It never sees a command or its result, a memory you have not enabled,
+a note, a file, the interaction history, or anything from an earlier session.
+Maria keeps at most the last eight exchanges, and at most 8 KiB of their text
+together with the current request and any memory context, or
+`max_input_bytes` if that is smaller. The oldest exchanges
 are dropped first, whole. A request too large on its own, or a reply too large
 to keep beside its request, is refused with a fixed message rather than cut
 short. The conversation lives only in memory and is discarded when the session
@@ -277,6 +286,56 @@ to interaction history or anywhere else. When the model is unavailable, too
 slow, or answers with something unusable, Maria shows a fixed message such as
 `The local reasoning model is unavailable.`, and every command keeps working.
 
+### Memory Context
+
+Every explicit memory is private to the model until you enable it, one memory
+at a time. Existing memories and every new memory start with context consent
+off.
+
+```text
+enable memory context 1
+Confirmation required: memory.enable_context requires explicit confirmation. Once enabled, this memory may be sent to your local reasoning model on any conversational turn, within Maria's memory context limits. Maria does not choose memories by relevance.
+```
+
+That confirmation states the rule exactly. Maria does not pick memories that
+seem relevant: while reasoning is enabled, **every** enabled memory is eligible
+to be sent to your local model on **any** conversational turn. This is a
+deliberate, transitional rule, not a judgement about relevance, and a later
+stage revisits it. Memories are taken in ascending ID order, whole, at most 16
+of them and at most 2 KiB of context including Maria's framing and the IDs.
+Your current request always comes first, then as much memory context as fits,
+then as many earlier turns as fit. Your approval covers the memory's text as
+it was when Maria asked: if that memory changes before you confirm, even from
+another Maria window, nothing is enabled and Maria asks you to request
+confirmation again. `disable memory context <id>` turns consent off again, and
+also asks for confirmation. Updating a memory turns its consent
+off, because consent applies to the exact text you approved; Maria tells you
+when that happens.
+
+After every conversational reply Maria adds her own note, separate from the
+model's answer:
+
+```text
+Memory context supplied: memory 1, memory 4. Maria cannot verify whether these memories are still current or whether they conflict with one another.
+No memory context supplied.
+```
+
+The first names, from Maria's own database IDs, exactly which memories were
+sent with that request. Maria cannot know which of them the model actually
+used, and a reply that mentions other IDs changes nothing she reports. If the
+request failed, she names the memories selected for it and says she cannot
+confirm the model received them. When the limits leave enabled memories out,
+she says so, naming only IDs she actually read.
+
+Memory text is sent as clearly marked reference data, never as an instruction,
+and it gives the model no ability to act. If you disable, change, or forget a
+memory that was sent earlier in the session, Maria clears that session's
+earlier conversation before sending anything else, so an earlier reply cannot
+carry the old text back, even when the change came from another Maria
+window. If memory context cannot be read, Maria sends neither memory context
+nor earlier turns and says so. This controls what Maria sends next; it cannot
+erase anything the model already received.
+
 ## Persistent Memory
 
 Maria stores deliberately remembered facts in SQLite, so they remain available
@@ -287,6 +346,9 @@ after the application restarts. The supported syntax is strict:
 - `memories` lists the newest stored facts.
 - `update memory <id>: <new fact>` replaces one stored fact.
 - `forget memory <id>` removes one stored fact.
+- `enable memory context <id>` and `disable memory context <id>` turn one
+  memory's consent to be sent to the local model on or off; see "Memory
+  Context" under "Local Reasoning Settings".
 
 Command keywords are case-insensitive, and surrounding whitespace is removed
 from facts and queries without changing their display casing. `remember` and
@@ -429,8 +491,13 @@ Maria's shipped runtime has no cloud integration and does not itself transmit
 this history. Its only network-capable code is the local Ollama adapter
 described under "Local Ollama Adapter": it can reach only `127.0.0.1:11434` on
 the same machine, it is disabled by default, and when enabled it receives only
-the current session's conversation, never stored history, notes, memories, or
-files.
+the current session's conversation and the explicit memories you have enabled
+for context, never stored history, notes, other memories, or files.
+
+`enable memory context <id>` and `disable memory context <id>` change one
+memory's consent flag, after mandatory confirmation; the recorded interaction
+names only the ID, never the fact. Consent is off for every memory until you
+turn it on.
 Configured network-mounted or synchronized paths and operating-system backup
 or sync services remain outside Maria's boundary.
 

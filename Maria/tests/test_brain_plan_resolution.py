@@ -86,6 +86,9 @@ class ResolutionTestCase(unittest.TestCase):
         self.planner = Mock(spec=Planner)
         self.memory = Mock(spec=Memory)
         self.tool_manager = Mock(spec=ToolManager)
+        # No mocked tool pins confirmation state, so the plan offered
+        # for approval is the plan itself.
+        self.tool_manager.bind_for_confirmation.side_effect = lambda plan: plan
         self.tool_manager.validate_action.return_value = None
         self.permissions = Mock(spec=PermissionManager)
         self.logger = Mock(spec=logging.Logger)
@@ -243,7 +246,7 @@ class ConfirmationResolutionTests(ResolutionTestCase):
         self.assertEqual(confirmed.text, "2\nRenamed old.txt to new.txt")
         self.assertFalse(confirmed.needs_confirmation)
         self.assertEqual(self.planner.create_plan.call_count, 1)
-        self.assertEqual(self.memory.get_recent_interactions.call_count, 1)
+        self.memory.get_recent_interactions.assert_not_called()
         self.assertEqual(
             self.events,
             [
@@ -574,6 +577,9 @@ class RenderingLoggingPrivacyTests(unittest.TestCase):
         self.planner = Mock(spec=Planner)
         self.memory = Mock(spec=Memory)
         self.tool_manager = Mock(spec=ToolManager)
+        # No mocked tool pins confirmation state, so the plan offered
+        # for approval is the plan itself.
+        self.tool_manager.bind_for_confirmation.side_effect = lambda plan: plan
         self.tool_manager.validate_action.return_value = None
         self.permissions = Mock(spec=PermissionManager)
         self.memory.get_recent_interactions.return_value = []

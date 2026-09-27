@@ -4,6 +4,11 @@ The brain coordinates the configured planner, memory layer, permission
 manager, and tool manager, and, when a reasoning provider was supplied, the
 conversation module. It does not directly perform database work, tool logic,
 or any provider-specific work, and it never imports a reasoning adapter.
+
+The planner receives the request text and nothing else. The one stored input
+to reasoning is the owner's enabled memory context, read through the memory
+layer's bounded Tier A query only on the conversational path; interaction
+history is never read for planning or reasoning.
 """
 
 from __future__ import annotations
@@ -15,6 +20,11 @@ from logging import Logger
 from core.action_contracts import ContractViolation
 from core.config import MariaConfig, load_config
 from core.constants import LOCAL_CONFIG_PATH
+from core.context import (
+    CONTEXT_MAX_BYTES,
+    CONTEXT_QUERY_LIMIT,
+    ContextFingerprint,
+)
 from core.conversation import converse, is_generic_fallback
 from core.filesystem_roots import prepare_roots
 from core.logger import configure_logging, get_logger
@@ -37,16 +47,20 @@ from core.tool_manager import ToolExecutionResult, ToolManager
 class BrainResponse:
     """Response returned by Maria's controller.
 
-    ``conversation`` is set only by a completed conversational reply: it is
-    the session's conversation as it stands after that reply, for the
-    session to keep. Every other response leaves it None, so no command, its
-    result, or a failed conversational turn ever becomes conversation.
+    ``conversation`` is set by a completed conversational reply, to the
+    session's conversation as it stands after that reply, and to an empty
+    conversation by a conversational turn that had to clear it. Every other
+    response leaves it None, so no command, its result, or a failed
+    conversational turn ever becomes conversation. ``supplied_context``
+    travels with it: the fingerprints of every memory supplied since that
+    conversation was last cleared, which the session keeps beside it.
     """
 
     text: str
     needs_confirmation: bool = False
     plan: Plan | None = None
     conversation: tuple[ReasoningExchange, ...] | None = None
+    supplied_context: frozenset[ContextFingerprint] = frozenset()
 
 
 @dataclass(frozen=True)
@@ -187,17 +201,21 @@ class MariaBrain:
         self,
         user_input: str,
         *conversation: ReasoningExchange,
+        supplied_context: frozenset[ContextFingerprint] = frozenset(),
     ) -> BrainResponse:
         """Plan one user request and run it unless it needs confirmation.
 
-        The deterministic planner always answers first. Only when a reasoning
-        provider was supplied, the configured reasoning settings are enabled,
-        and the planner returned its exact generic no-action fallback, is the
-        request answered conversationally instead, in the context of
-        ``conversation``: the caller's earlier exchanges, oldest first. With
-        reasoning disabled the fallback is answered and recorded exactly as
-        it always was, whether or not a provider is present. Every other plan
-        runs exactly as it always has and never sees the conversation.
+        The deterministic planner always answers first, from the request text
+        alone. Only when a reasoning provider was supplied, the configured
+        reasoning settings are enabled, and the planner returned its exact
+        generic no-action fallback, is the request answered conversationally
+        instead, in the context of ``conversation``: the caller's earlier
+        exchanges, oldest first, with ``supplied_context``, the fingerprints
+        of the memories supplied since they began. With reasoning disabled
+        the fallback is answered and recorded exactly as it always was,
+        whether or not a provider is present. Every other plan runs exactly
+        as it always has and never sees the conversation or any memory
+        context.
         """
         cleaned_input = user_input.strip()
         if not cleaned_input:
@@ -205,23 +223,14 @@ class MariaBrain:
 
         self.logger.info("Received user request.")
 
-        try:
-            recent_memory = self.memory.get_recent_interactions(limit=3)
-        except RuntimeError as exc:
-            self.logger.error("Unable to retrieve recent memory: %s", exc)
-            recent_memory = []
-
-        plan = self.planner.create_plan(
-            cleaned_input,
-            context={"recent_interactions": recent_memory},
-        )
+        plan = self.planner.create_plan(cleaned_input)
 
         if (
             self.reasoning is not None
             and self.config.reasoning.enabled
             and is_generic_fallback(plan)
         ):
-            return self._converse(cleaned_input, conversation)
+            return self._converse(cleaned_input, conversation, supplied_context)
 
         return self._run_plan(plan, confirmed=False)
 
@@ -229,27 +238,55 @@ class MariaBrain:
         self,
         request: str,
         conversation: tuple[ReasoningExchange, ...],
+        supplied_context: frozenset[ContextFingerprint],
     ) -> BrainResponse:
         """Answer one unrecognised request with the local model, as text.
+
+        This is the only place Tier A context is read, and only after every
+        gate above has passed: the memory layer's bounded query returns the
+        enabled memories, in ascending id order, one row more than can be
+        sent, and never the text of a fact too long ever to be sent. A read
+        that fails is handed on as None, and the conversation module then
+        sends no context and no earlier exchange.
 
         The conversation module settles the whole turn and produces a
         zero-step plan that it, as the plan's producer, made transient. That
         plan takes the ordinary zero-step path, which returns before any
         contract, permission, or tool is consulted and records nothing. The
-        conversation it returns is handed back for the session to keep, and
-        nothing else is: no retrieved context, no stored record, and no
-        earlier command reaches the model through here.
+        conversation and supplied-context fingerprints it returns are handed
+        back for the session to keep, and nothing else is: no interaction
+        history, no other stored record, and no earlier command reaches the
+        model through here.
         """
         self.logger.info("Answering request conversationally.")
+        try:
+            enabled_memories_read = self.memory.list_context_memories(
+                limit=CONTEXT_QUERY_LIMIT,
+                max_fact_bytes=CONTEXT_MAX_BYTES,
+            )
+        except RuntimeError:
+            # The memory layer's message is fixed, but nothing about the
+            # failure is needed here: the turn fails closed either way.
+            self.logger.warning("Unable to read memory context.")
+            enabled_memories_read = None
+
         turn = converse(
             self.reasoning,
             self.config.reasoning,
             request,
             conversation,
             self.logger,
+            supplied_context=supplied_context,
+            enabled_memories_read=enabled_memories_read,
         )
         response = self._run_plan(turn.plan, confirmed=False)
-        return replace(response, conversation=turn.conversation)
+        if turn.conversation is None:
+            return response
+        return replace(
+            response,
+            conversation=turn.conversation,
+            supplied_context=turn.supplied_context,
+        )
 
     def execute_confirmed_plan(self, plan: Plan) -> BrainResponse:
         """Run an already-approved plan without planning the request again.
@@ -316,10 +353,13 @@ class MariaBrain:
                     resolved_step.step.tool_name,
                     resolved_step.step.action,
                 )
+            # The plan offered for approval is pinned to the exact state its
+            # steps act on now, so the approval, bound to this plan's
+            # fingerprint, cannot later be spent on different state.
             return BrainResponse(
                 text=self._format_confirmation_request(resolved),
                 needs_confirmation=True,
-                plan=plan,
+                plan=self.tool_manager.bind_for_confirmation(plan),
             )
 
         return self._execute_resolved_plan(resolved)

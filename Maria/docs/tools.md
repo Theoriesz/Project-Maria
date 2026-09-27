@@ -5,7 +5,7 @@ Tools are small modules that expose controlled capabilities to Maria.
 ## Declared Argument Contracts
 
 Every built-in tool action is declared once in `core/action_contracts.py`,
-which is the positive allowlist of the 22 supported tool actions and of the
+which is the positive allowlist of the 24 supported tool actions and of the
 arguments each one accepts. A tool's `actions` set answers only whether an
 action is registered; the contract answers which arguments it takes, whether
 each is required, its exact type, any numeric bound, and, for a path field, the
@@ -429,13 +429,15 @@ contains no SQL; `core/memory.py` owns all database operations.
 
 ## Memory Tool
 
-The memory tool supports exactly five actions:
+The memory tool supports exactly seven actions:
 
 - `store`: store a deliberate fact
 - `search`: find facts by literal, case-insensitive substring
 - `list`: list the newest stored facts
 - `update`: replace one memory's fact by numeric ID
 - `forget`: remove one memory by numeric ID
+- `enable_context`: turn one memory's context consent on by numeric ID
+- `disable_context`: turn one memory's context consent off by numeric ID
 
 Successful store messages use one of these forms:
 
@@ -485,6 +487,36 @@ are already short and content-free. `update` writes only `fact` and
 `normalized_fact` and preserves `created_at`; because no `updated_at` exists, an
 updated memory keeps its place in newest-first output. A fact identical to the
 stored one, or differing only by casing, still counts as a successful update.
+Consent covers the exact text the owner approved, so an update also turns that
+memory's context consent off in the same transaction. When consent had been
+on, and only then, the message continues:
+
+```text
+Updated memory <id>. Context consent for memory <id> was turned off because its text changed.
+```
+
+`enable_context` and `disable_context` validate `id` the same way and change at
+most one row. They return `Enabled context for memory <id>.` or `Disabled
+context for memory <id>.` with `data={"id": <id>, "context_enabled": <bool>}`,
+or `Memory not found: <id>.` — never the fact, so the interaction row a consent
+change records carries only the id. Enabling an enabled memory, or disabling a
+disabled one, succeeds and changes nothing. A `Memory` failure is wrapped as
+`Memory context change failed: <message>`.
+
+An enable approval covers exact text. The tool's `confirmation_binding` adds
+`fact_digest`, the SHA-256 of the memory's current text, to the step when
+confirmation is offered, and `enable_context` enables consent only while the
+memory is still exactly that text, checked and changed in one transaction. If
+it is not — or no identity was pinned for a memory that exists — nothing
+changes and the result is:
+
+```text
+Context was not enabled for memory <id> because it could not be confirmed unchanged since confirmation was requested. Request confirmation again with: enable memory context <id>
+```
+
+`disable_context` needs no identity, because it only narrows what can be sent. What consent means, and how enabled
+memories reach the model, is described under "Tier A Memory Context" in
+`docs/architecture.md`.
 
 Because memory facts stay unique over `casefold()`, an update whose new fact
 already belongs to a different memory returns the controlled failure `Memory
@@ -506,8 +538,8 @@ The tool receives the shared `Memory` instance through dependency injection.
 It is registered as `tools.memory` through Tool Manager's standard
 `build_tool(...)` factory contract and travels through the normal permission
 path; `memory.store`, `memory.search`, and `memory.list` are allowed by
-default, while `memory.update` and `memory.forget` always require explicit
-confirmation. The tool contains no SQL; `core/memory.py` owns all database
+default, while `memory.update`, `memory.forget`, `memory.enable_context`, and
+`memory.disable_context` always require explicit confirmation. The tool contains no SQL; `core/memory.py` owns all database
 operations.
 
 ## System Tool

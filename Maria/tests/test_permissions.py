@@ -39,6 +39,14 @@ policy = "read_only"
 enabled = false
 """
 
+# The one confirmation that carries more than the standard sentence, written
+# out so the owner-facing wording is pinned rather than agreed with.
+ENABLE_CONTEXT_NOTICE = (
+    "Once enabled, this memory may be sent to your local reasoning model on "
+    "any conversational turn, within Maria's memory context limits. Maria "
+    "does not choose memories by relevance."
+)
+
 
 class PermissionManagerTests(unittest.TestCase):
     """Verify mandatory policy, configured extensions, and logging."""
@@ -340,10 +348,12 @@ class PermissionManagerTests(unittest.TestCase):
                     "notes.delete",
                     "memory.update",
                     "memory.forget",
+                    "memory.enable_context",
+                    "memory.disable_context",
                 }
             ),
         )
-        self.assertEqual(len(MANDATORY_CONFIRMATION_ACTIONS), 8)
+        self.assertEqual(len(MANDATORY_CONFIRMATION_ACTIONS), 10)
         self.assertEqual(
             MANDATORY_DENIED_ACTIONS,
             frozenset({"filesystem.delete", "filesystem.write"}),
@@ -520,12 +530,15 @@ class PermissionManagerTests(unittest.TestCase):
                 )
                 for action_id in sorted(MANDATORY_CONFIRMATION_ACTIONS):
                     tool_name, action = action_id.split(".")
+                    reason = f"{action_id} requires explicit confirmation."
+                    if action_id == "memory.enable_context":
+                        reason = f"{reason} {ENABLE_CONTEXT_NOTICE}"
                     with self.subTest(action_id=action_id):
                         self.assertEqual(
                             manager.check(tool_name, action),
                             PermissionResult(
                                 PermissionDecision.REQUIRES_CONFIRMATION,
-                                f"{action_id} requires explicit confirmation.",
+                                reason,
                             ),
                         )
 

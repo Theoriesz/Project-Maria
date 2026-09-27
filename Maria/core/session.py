@@ -7,9 +7,12 @@ command line and any future interface share one contract.
 
 A session also owns its conversation: the completed conversational exchanges
 of this session alone, bounded in count and size, held in process memory, and
-discarded when the session ends. Brain keeps nothing between requests, so a
-new session always starts with no conversation and can never observe
-another's.
+discarded when the session ends. Beside it the session keeps the fingerprints
+of every memory supplied to the model since that conversation was last
+cleared, never the memories' text, so a later turn can discard the whole
+conversation before an earlier reply carries a revoked memory back. Brain
+keeps nothing between requests, so a new session always starts with no
+conversation and can never observe another's.
 """
 
 from __future__ import annotations
@@ -18,6 +21,7 @@ from dataclasses import dataclass
 from logging import Logger
 
 from core.brain import BrainResponse, MariaBrain
+from core.context import ContextFingerprint
 from core.conversation import bounded_conversation
 from core.logger import get_logger
 from core.planner import Plan
@@ -53,6 +57,7 @@ class MariaSession:
         self.logger = logger or get_logger(__name__)
         self._pending: PendingApproval | None = None
         self._conversation: tuple[ReasoningExchange, ...] = ()
+        self._supplied_context: frozenset[ContextFingerprint] = frozenset()
 
     @property
     def pending_approval(self) -> PendingApproval | None:
@@ -64,6 +69,11 @@ class MariaSession:
         """Return this session's completed conversational exchanges."""
         return self._conversation
 
+    @property
+    def supplied_context(self) -> frozenset[ContextFingerprint]:
+        """Return the fingerprints of memories supplied to this conversation."""
+        return self._supplied_context
+
     def submit(self, user_input: str) -> BrainResponse:
         """Plan one request, discarding any approval still pending.
 
@@ -71,16 +81,35 @@ class MariaSession:
         approval can never be transferred to, or replayed against, a plan the
         owner was not shown.
 
-        The session's conversation goes with the request, and only a
-        completed conversational reply replaces it. Whatever comes back is
-        held to the retention limits again here, so the session never keeps
-        more than they allow, whoever computed it.
+        The session's conversation goes with the request, and its supplied
+        memory fingerprints go with it whenever there are any; a conversation
+        that never carried memory context has nothing to verify, so the call
+        is then exactly what it always was. Only a conversational turn
+        replaces them, and it replaces both together: a completed reply with
+        the conversation after it, and a turn that had to clear the
+        conversation with nothing. Whatever comes back is held to the
+        retention limits again here, so the session never keeps more than
+        they allow, whoever computed it.
         """
         self._pending = None
-        response = self.brain.process(user_input, *self._conversation)
+        if self._supplied_context:
+            response = self.brain.process(
+                user_input,
+                *self._conversation,
+                supplied_context=self._supplied_context,
+            )
+        else:
+            response = self.brain.process(user_input, *self._conversation)
 
         if response.conversation is not None:
             self._conversation = bounded_conversation(response.conversation)
+            # Fingerprints only ever describe a conversation that exists, so
+            # an emptied conversation takes them with it.
+            self._supplied_context = (
+                frozenset(response.supplied_context)
+                if self._conversation
+                else frozenset()
+            )
 
         if not response.needs_confirmation:
             return response
@@ -128,9 +157,11 @@ class MariaSession:
     def end(self) -> None:
         """End the session, discarding its conversation and pending approval.
 
-        Nothing the session held survives it or is written anywhere. Ending
-        an already-ended session changes nothing.
+        The supplied-context fingerprints go with the conversation. Nothing
+        the session held survives it or is written anywhere. Ending an
+        already-ended session changes nothing.
         """
         self._conversation = ()
+        self._supplied_context = frozenset()
         self._pending = None
         self.logger.info("Session ended.")

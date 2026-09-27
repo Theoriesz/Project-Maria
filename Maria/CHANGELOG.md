@@ -2,6 +2,54 @@
 
 ## Unreleased
 
+- Added per-memory context consent, off by default for existing memories and
+  confirmation-required to change, plus Tier A context assembly with
+  deterministic provenance; raw interaction history is no longer assembled
+  into the planning path. The database schema advances to version 3 through
+  the V1-09 migration runner: one atomic step adds a `context_enabled` column
+  that is off for every existing memory, and every new memory is stored off
+  too. The version 2 step now runs its frozen historical statement rather
+  than the live one, so a pre-memories database still migrates cleanly to
+  version 3 and reopens. `enable memory context <id>` and `disable memory
+  context <id>` turn one memory's consent on or off by positive whole-number
+  id; both always require confirmation, which configuration cannot remove,
+  and their recorded rows name the id, never the fact. An enable approval is
+  bound to the memory's exact text when confirmation is offered: if the text
+  changes before the owner confirms, through Maria or another connection,
+  nothing is enabled and the owner is asked to confirm again. The released
+  two-value `Memory.update_memory` result is unchanged. The enable confirmation
+  states the rule: with reasoning enabled, every enabled memory is eligible
+  to be sent to the owner's local model on any conversational turn — a
+  deliberate transitional policy, not relevance selection — in ascending id
+  order, whole, at most 16 memories and 2 KiB of fully rendered context,
+  after the current request and before earlier turns, all within the
+  existing 8 KiB conversational limit or `max_input_bytes`, whichever is
+  smaller. Updating a memory turns its consent off in the same transaction,
+  and the update response says so only when consent had been on; otherwise
+  it is unchanged. After every model-backed conversational response Maria
+  adds her own notice, outside the model's reply and the kept conversation:
+  the memories she supplied, by database id, with the caveat that she cannot
+  verify whether they are current or conflict; the memories selected for a
+  failed request, without claiming delivery; or `No memory context
+  supplied.` Memories left out by a limit are disclosed without naming ids
+  the bounded read did not return, and a reply naming other ids changes
+  nothing. Stored text travels to Ollama only as a clearly delimited data
+  message after Maria's fixed instructions, never as a system instruction,
+  with every line separator escaped so a memory cannot pose as another, and
+  grants no authority to act. A memory too long ever to be sent, measured in
+  UTF-8 whatever the database file's encoding, is named as left out without
+  its text being returned by the memory layer. A request with no memory
+  context is byte for byte what it was before. The session now keeps fingerprints of the
+  memories it supplied and discards its whole earlier conversation before
+  sending anything once one of them is disabled, changed, or forgotten, even
+  through another database connection; if memory context cannot be read,
+  neither it nor earlier turns are sent. This does not promise instantaneous
+  revocation across a concurrent read and send, or erasure of text a model
+  already received. Brain no longer reads recent interactions on every
+  request, and the planner now accepts the request text alone. `help` lists
+  the two new commands; every other command's text and recording are
+  unchanged. No dependency, network destination, configuration field, or
+  version change was introduced.
 - Added transient, text-only conversational responses with a bounded
   in-memory view of the current session, so follow-up turns are understood,
   using the owner's local model. Model output cannot select or execute any
