@@ -1061,7 +1061,10 @@ class Memory:
         ``max_fact_bytes`` characters — and each admitted fact's exact UTF-8
         size is then measured here before anything is returned.
 
-        Raises ValueError when ``max_fact_bytes`` is not a positive int.
+        Raises ValueError when ``max_fact_bytes`` is not a positive int, and
+        ``RuntimeError("Unable to read memory context.")`` when SQLite fails
+        or a returned fact is not text, so any read that cannot be trusted
+        ends the same way.
         """
         if type(max_fact_bytes) is not int or max_fact_bytes < 1:
             raise ValueError("A fact size bound must be a positive whole number.")
@@ -1090,10 +1093,22 @@ class Memory:
                     """,
                     (stored_bound, stored_bound, safe_limit),
                 ).fetchall()
-            return [_bounded_context_row(row, max_fact_bytes) for row in rows]
         except sqlite3.Error as exc:
             self.logger.exception("Failed to read memory context.")
             raise RuntimeError("Unable to read memory context.") from exc
+
+        # The column is declared TEXT, but SQLite still stores a value of
+        # another type as it was given. A fact that is not text cannot be
+        # measured or supplied as text, so the whole read is untrustworthy:
+        # it fails with the same fixed message as any other unreadable read,
+        # and neither the message nor the log line carries the value.
+        if any(
+            row["fact"] is not None and type(row["fact"]) is not str
+            for row in rows
+        ):
+            self.logger.error("Refused a memory context read: a fact is not text.")
+            raise RuntimeError("Unable to read memory context.")
+        return [_bounded_context_row(row, max_fact_bytes) for row in rows]
 
     def forget_memory(self, memory_id: int) -> bool:
         """Delete one explicit memory by its database id.

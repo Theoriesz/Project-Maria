@@ -2026,7 +2026,7 @@ class MemoryContextConsentTests(unittest.TestCase):
         its exact UTF-8 size.
         """
         facts = (
-            ("ࠀ" * 1000, True),  # 3,000 UTF-8 bytes; 2,000 stored.
+            ("\u0800" * 1000, True),  # 3,000 UTF-8 bytes; 2,000 stored.
             ("a" * 1500, False),  # 1,500 UTF-8 bytes; 3,000 stored.
             ("é" * 1024, False),
             ("é" * 1025, True),
@@ -2201,6 +2201,57 @@ class MemoryContextConsentTests(unittest.TestCase):
                 r"^Unable to read memory context\.$",
             ):
                 self.memory.list_context_memories(limit=17, max_fact_bytes=2048)
+
+    def _insert_enabled_blob(self, blob: bytes) -> int:
+        """Store a non-text fact directly, as SQLite allows in a TEXT column."""
+        with closing(sqlite3.connect(self.database_path)) as connection:
+            cursor = connection.execute(
+                """
+                INSERT INTO memories
+                    (fact, normalized_fact, created_at, context_enabled)
+                VALUES (?, ?, ?, 1)
+                """,
+                (blob, f"blob-{len(blob)}", "2026-09-27T00:00:00+00:00"),
+            )
+            connection.commit()
+            return int(cursor.lastrowid)
+
+    def test_a_fact_that_is_not_text_makes_the_read_untrustworthy(self) -> None:
+        """A nonempty BLOB fits the TEXT column's shape but is not a fact."""
+        blob = b"synthetic-blob-fact-3d9a"
+        (text_id,) = self._store("synthetic text fact")
+        self._enable(text_id)
+        self._insert_enabled_blob(blob)
+        mock_logger = Mock(spec=logging.Logger)
+
+        with self.assertRaisesRegex(
+            RuntimeError,
+            r"^Unable to read memory context\.$",
+        ) as raised:
+            Memory(self.database_path, logger=mock_logger).list_context_memories(
+                limit=17,
+                max_fact_bytes=2048,
+            )
+
+        self.assertIsNone(raised.exception.__cause__)
+        self.assertNotIn("synthetic-blob", repr(raised.exception.args))
+        mock_logger.error.assert_called_once_with(
+            "Refused a memory context read: a fact is not text."
+        )
+        for logger_call in mock_logger.method_calls:
+            self.assertNotIn(
+                "synthetic-blob",
+                " ".join(str(arg) for arg in logger_call.args),
+            )
+
+    def test_an_oversized_non_text_fact_is_only_ever_metadata(self) -> None:
+        """A BLOB beyond the byte bound never reaches Python to be checked."""
+        blob_id = self._insert_enabled_blob(b"B" * 4096)
+
+        self.assertEqual(
+            self.memory.list_context_memories(limit=17, max_fact_bytes=2048),
+            [{"id": blob_id, "fact": None, "oversized": True}],
+        )
 
 
 class UniqueViolationClassificationTests(unittest.TestCase):

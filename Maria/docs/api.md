@@ -681,9 +681,13 @@ when its schema matches, a fact is stored in at most twice its UTF-8 size, so
 the test admits every fact stored in at most twice the bound, never more than
 `max_fact_bytes` characters, and the memory layer then
 measures each admitted fact's exact UTF-8 size before returning it. A
-`max_fact_bytes` that is not a
-positive `int` raises `ValueError`. SQLite failures raise
-`RuntimeError("Unable to read memory context.")`. `get_memory`,
+`max_fact_bytes` that is not a positive `int` raises `ValueError`. SQLite
+failures raise `RuntimeError("Unable to read memory context.")`, and so does
+a returned fact that is not text — SQLite will store a BLOB in the `TEXT`
+column — after logging the fixed line `Refused a memory context read: a fact
+is not text.`; neither carries the value, and Brain treats either as an
+unreadable read and fails closed. A non-text value beyond the stored-byte
+test is never read and is reported as oversized like any other. `get_memory`,
 `search_memories`, and `list_memories` never return the consent flag.
 
 ### Notes

@@ -1008,6 +1008,95 @@ class RevocationTests(unittest.TestCase):
         self.assertNotIn(MEMORY_SENTINEL, everything_sent(self.provider.requests[1:]))
 
 
+class NonTextFactTests(unittest.TestCase):
+    """Prove a non-text fact ends a turn through the fail-closed path.
+
+    SQLite stores a nonempty BLOB in the TEXT ``fact`` column without
+    changing the schema's shape. Such a row is not a fact Maria can measure
+    or send, so the read is untrustworthy: the turn sends neither memory
+    context nor earlier exchanges, clears both session structures, and says
+    so with the fixed unreadable notice. Sending the bare current request is
+    the approved V1-15 policy for an unreadable read.
+    """
+
+    BLOB = b"synthetic-blob-fact-5e2b"
+
+    def setUp(self) -> None:
+        self.provider = ScriptedProvider(_echoing_model)
+        self.harness = _Harness(self, self.provider)
+        self.session = self.harness.session()
+        (self.memory_id,) = _enable(self.harness, MEMORY_SENTINEL)
+        self.session.submit("what do you know")
+        self.assertEqual(len(self.session.conversation), 1)
+        self.assertEqual(len(self.session.supplied_context), 1)
+
+    def _insert_enabled_blob(self) -> int:
+        with closing(sqlite3.connect(self.harness.database_path)) as connection:
+            cursor = connection.execute(
+                """
+                INSERT INTO memories
+                    (fact, normalized_fact, created_at, context_enabled)
+                VALUES (?, ?, ?, 1)
+                """,
+                (self.BLOB, "synthetic blob", "2026-09-27T00:00:00+00:00"),
+            )
+            connection.commit()
+            return int(cursor.lastrowid)
+
+    def _assert_nothing_stored_was_sent(self, requests) -> None:
+        for request in requests:
+            self.assertEqual((request.history, request.context), ((), ()))
+        sent = everything_sent(requests)
+        self.assertNotIn(MEMORY_SENTINEL, sent)
+        self.assertNotIn(self.BLOB.decode("ascii"), sent)
+
+    def test_the_turn_fails_closed_and_clears_both_session_structures(self) -> None:
+        blob_id = self._insert_enabled_blob()
+        sent_before = self.provider.calls
+
+        response = self.session.submit("and now")
+
+        after = self.provider.requests[sent_before:]
+        self.assertEqual([request.prompt for request in after], ["and now"])
+        self._assert_nothing_stored_was_sent(after)
+        self.assertEqual(
+            response.text,
+            f"I know nothing stored.\n\n{UNREADABLE_NOTICE}\n{NO_CONTEXT_NOTICE}",
+        )
+        self.assertEqual(
+            self.session.conversation,
+            (ReasoningExchange("and now", "I know nothing stored."),),
+        )
+        self.assertEqual(self.session.supplied_context, frozenset())
+
+        # It stays closed while the row stays enabled, and recovers once it
+        # is not, without anything from the cleared turns coming back.
+        self.session.submit("still there")
+        self._assert_nothing_stored_was_sent(self.provider.requests[-1:])
+        self.harness.memory.disable_memory_context(blob_id)
+        recovered = self.session.submit("once more")
+        last = self.provider.requests[-1]
+        self.assertEqual(last.context, (_item(self.memory_id, MEMORY_SENTINEL),))
+        self.assertNotIn(UNREADABLE_NOTICE, recovered.text)
+
+    def test_a_failed_reply_still_clears_both_session_structures(self) -> None:
+        self._insert_enabled_blob()
+
+        def fail(request: ReasoningRequest) -> str:
+            raise TypedFailureError(Failure(FailureKind.REASONING_UNAVAILABLE))
+
+        failing = ScriptedProvider(fail)
+        self.harness.brain.reasoning = failing
+
+        response = self.session.submit("and now")
+
+        self._assert_nothing_stored_was_sent(failing.requests)
+        self.assertEqual(response.conversation, ())
+        self.assertEqual(self.session.conversation, ())
+        self.assertEqual(self.session.supplied_context, frozenset())
+        self.assertIn(UNREADABLE_NOTICE, response.text)
+
+
 class NoInteractionHistoryTests(unittest.TestCase):
     """Prove no interaction row reaches a plan or a reasoning request."""
 
@@ -1604,7 +1693,7 @@ class BoundedTierAReadTests(unittest.TestCase):
             connection.commit()
         memory = Memory(path, logger=_quiet_logger("tests.context.utf16"))
         memory.initialize()
-        wide = "ࠀ" * 1000
+        wide = "\u0800" * 1000
         for fact in (wide, "synthetic small fact"):
             memory_id, _ = memory.store_memory(fact)
             _enable_id(memory, memory_id)

@@ -565,7 +565,11 @@ database whose file is UTF-16 is still accepted when its schema matches, and
 there a fact is stored in between two thirds of and twice its UTF-8 size, so
 the test admits every fact stored in at most twice the bound — never more than
 `max_fact_bytes` characters — and the memory layer measures each admitted
-fact's exact UTF-8 size before returning it. Brain asks for 17 rows —
+fact's exact UTF-8 size before returning it. A `TEXT` column does not stop
+SQLite storing a BLOB, so a returned fact that is not text makes the whole
+read fail with the same fixed `Unable to read memory context.` error, without
+the value reaching a log or a message, and the conversational turn fails
+closed. Brain asks for 17 rows —
 one more than a request may carry — with a 2,048-byte bound, the most any one
 memory could ever occupy, and only on the model-backed conversational path, so
 Maria learns whether more enabled memories exist without counting all of them,
