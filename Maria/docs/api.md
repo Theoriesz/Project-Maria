@@ -672,9 +672,16 @@ list[dict[str, Any]]`
 
 The only read of Tier A context: enabled memories only, in ascending `id`
 order, with `limit` clamped to 1 through 100, each as `{"id": int, "fact": str
-| None, "oversized": bool}`. The size test runs inside SQLite on each fact's
-UTF-8 bytes, so a fact longer than `max_fact_bytes` never reaches Python: its
-`fact` is `None` and `oversized` is `True`. A `max_fact_bytes` that is not a
+| None, "oversized": bool}`. The bound is on each fact's UTF-8 bytes, whatever
+the database file's text encoding: a fact longer than `max_fact_bytes` comes
+back with `fact` `None` and `oversized` `True`. The size test runs first inside
+SQLite on the stored bytes. In a UTF-8 database that test is exact, so an
+oversized fact never reaches Python. In a UTF-16 database, which Maria accepts
+when its schema matches, a fact is stored in at most twice its UTF-8 size, so
+the test admits every fact stored in at most twice the bound, never more than
+`max_fact_bytes` characters, and the memory layer then
+measures each admitted fact's exact UTF-8 size before returning it. A
+`max_fact_bytes` that is not a
 positive `int` raises `ValueError`. SQLite failures raise
 `RuntimeError("Unable to read memory context.")`. `get_memory`,
 `search_memories`, and `list_memories` never return the consent flag.

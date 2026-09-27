@@ -25,6 +25,7 @@ import sqlite3
 import tempfile
 import unittest
 from collections.abc import Iterable
+from contextlib import closing
 from pathlib import Path
 from unittest.mock import patch
 
@@ -67,6 +68,7 @@ from core.reasoning import (
     request_reasoning,
 )
 from tests.log_assertions import assert_log_omits
+from tests.schema_fixtures import V0_2_0_BASELINE_SCHEMA
 from tests.test_brain_recording_policy import _quiet_logger
 from tests.test_conversation import (
     ScriptedProvider,
@@ -1488,7 +1490,15 @@ class LineSeparatorRenderingTests(unittest.TestCase):
 
 
 class BoundedTierAReadTests(unittest.TestCase):
-    """Prove a huge enabled fact never reaches context assembly or a hash."""
+    """Prove the automatic conversational read stays bounded for a huge fact.
+
+    The guarantee is about the read every model-backed conversational turn
+    makes: it never hands a huge enabled fact to context assembly, and
+    context assembly never hashes one. Enabling such a fact explicitly is a
+    different path: it reads and hashes the fact once, in the memory layer,
+    to bind the approval to its exact text, which is what ``_enable`` does
+    here while setting up.
+    """
 
     BIG = "B" * (3 * 1024 * 1024)
 
@@ -1574,6 +1584,55 @@ class BoundedTierAReadTests(unittest.TestCase):
             CONTEXT_MAX_ITEMS,
         )
         self.assertEqual(len(self.hashed), CONTEXT_MAX_ITEMS)
+
+    def test_a_utf16_database_omits_by_utf8_size_instead_of_failing_closed(
+        self,
+    ) -> None:
+        """A fact stored in fewer UTF-16 bytes than its UTF-8 size is omitted.
+
+        Before the read settled each fact's exact UTF-8 size, such a fact was
+        returned as fitting, context assembly refused the whole read, and
+        every conversational turn cleared the session instead of naming it.
+        """
+        temporary = tempfile.TemporaryDirectory()
+        self.addCleanup(temporary.cleanup)
+        path = Path(temporary.name) / "maria.db"
+        with closing(sqlite3.connect(path)) as connection:
+            connection.execute("PRAGMA encoding = 'UTF-16le'")
+            for statement in V0_2_0_BASELINE_SCHEMA:
+                connection.execute(statement)
+            connection.commit()
+        memory = Memory(path, logger=_quiet_logger("tests.context.utf16"))
+        memory.initialize()
+        wide = "ࠀ" * 1000
+        for fact in (wide, "synthetic small fact"):
+            memory_id, _ = memory.store_memory(fact)
+            _enable_id(memory, memory_id)
+        provider = ScriptedProvider(lambda request: REPLY)
+
+        turn = converse(
+            provider,
+            enabled_settings(),
+            "hello",
+            (),
+            _quiet_logger("tests.context.utf16"),
+            enabled_memories_read=memory.list_context_memories(
+                limit=CONTEXT_QUERY_LIMIT,
+                max_fact_bytes=CONTEXT_MAX_BYTES,
+            ),
+        )
+
+        self.assertEqual(
+            provider.requests[0].context,
+            (_item(2, "synthetic small fact"),),
+        )
+        self.assertEqual(
+            turn.plan.response_if_no_action,
+            _supplied(REPLY, "memory 2")
+            + "\nNot included because of the memory context limits: memory 1.",
+        )
+        self.assertNotIn(UNREADABLE_NOTICE, turn.plan.response_if_no_action)
+        self.assertNotIn(wide, everything_sent(provider.requests))
 
     def test_a_supplied_fact_that_becomes_oversized_revokes_the_conversation(
         self,

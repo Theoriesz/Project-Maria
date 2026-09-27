@@ -19,6 +19,7 @@ from unittest.mock import MagicMock, Mock, patch
 from core import memory as memory_module
 from core.context import ContextConsentOutcome
 from core.memory import Memory, MemoryUpdate
+from tests.schema_fixtures import V0_2_0_BASELINE_SCHEMA
 
 
 TEST_LOGGER = logging.getLogger("tests.memory")
@@ -1987,6 +1988,7 @@ class MemoryContextConsentTests(unittest.TestCase):
         )
 
     def test_an_oversized_fact_never_leaves_sqlite(self) -> None:
+        """In a UTF-8 database the size test is exact and runs in SQLite."""
         facts = (
             "B" * (3 * 1024 * 1024),
             "x" * 2048,
@@ -2011,6 +2013,82 @@ class MemoryContextConsentTests(unittest.TestCase):
                 else:
                     self.assertEqual(row["fact"], facts[row["id"] - 1])
                     self.assertLessEqual(len(row["fact"].encode("utf-8")), 2048)
+
+    def test_a_utf16_database_is_accepted_and_the_read_bound_stays_utf8(
+        self,
+    ) -> None:
+        """SQLite measures stored bytes; the bound is on UTF-8 bytes.
+
+        A v0.2.0 database whose file encoding is UTF-16 matches Maria's
+        schema, so initialization accepts and migrates it and it keeps its
+        encoding. There a fact stores in as little as half, or as much as
+        twice, its UTF-8 size, so the read must still settle each fact by
+        its exact UTF-8 size.
+        """
+        facts = (
+            ("ࠀ" * 1000, True),  # 3,000 UTF-8 bytes; 2,000 stored.
+            ("a" * 1500, False),  # 1,500 UTF-8 bytes; 3,000 stored.
+            ("é" * 1024, False),
+            ("é" * 1025, True),
+            ("\U0001F600" * 512, False),
+            ("\U0001F600" * 513, True),
+            ("x" * 2048, False),  # Stored in exactly twice the bound.
+            ("x" * 2049, True),
+            ("B" * (3 * 1024 * 1024), True),
+        )
+        for encoding in ("UTF-16le", "UTF-16be"):
+            with self.subTest(encoding=encoding):
+                path = Path(self.temp_dir.name) / encoding / "maria.db"
+                path.parent.mkdir()
+                with closing(sqlite3.connect(path)) as connection:
+                    connection.execute(f"PRAGMA encoding = '{encoding}'")
+                    for statement in V0_2_0_BASELINE_SCHEMA:
+                        connection.execute(statement)
+                    connection.commit()
+                memory = Memory(path, logger=TEST_LOGGER)
+
+                memory.initialize()
+                memory.initialize()
+
+                self.assertEqual(memory.schema_version(), 3)
+                with closing(sqlite3.connect(path)) as connection:
+                    self.assertEqual(
+                        connection.execute("PRAGMA encoding").fetchone()[0],
+                        encoding,
+                    )
+                for fact, _ in facts:
+                    memory_id, _ = memory.store_memory(fact)
+                    memory.enable_memory_context(
+                        memory_id,
+                        memory.memory_fact_digest(memory_id),
+                    )
+
+                rows = memory.list_context_memories(limit=17, max_fact_bytes=2048)
+
+                self.assertEqual(
+                    [row["oversized"] for row in rows],
+                    [oversized for _, oversized in facts],
+                )
+                for row, (fact, oversized) in zip(rows, facts):
+                    self.assertEqual(row["fact"], None if oversized else fact)
+
+                # Only facts stored within twice the bound ever reach Python,
+                # so no more than 2,048 characters of any one of them do.
+                raw_sizes: list[int | None] = []
+                original = memory_module._bounded_context_row
+
+                def measuring(row, max_fact_bytes):
+                    raw = row["fact"]
+                    raw_sizes.append(None if raw is None else len(raw))
+                    return original(row, max_fact_bytes)
+
+                with patch.object(memory_module, "_bounded_context_row", measuring):
+                    memory.list_context_memories(limit=17, max_fact_bytes=2048)
+                self.assertIsNone(raw_sizes[-1])
+                self.assertLessEqual(
+                    max(size for size in raw_sizes if size is not None),
+                    2048,
+                )
 
     def test_existing_read_shapes_are_unchanged_for_an_enabled_memory(self) -> None:
         (memory_id,) = self._store("My editor is VS Code")

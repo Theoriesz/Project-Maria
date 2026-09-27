@@ -36,9 +36,10 @@
   nothing. Stored text travels to Ollama only as a clearly delimited data
   message after Maria's fixed instructions, never as a system instruction,
   with every line separator escaped so a memory cannot pose as another, and
-  grants no authority to act. A memory too long ever to be sent is named as
-  left out without its text being read from the database. A request with no memory context is byte
-  for byte what it was before. The session now keeps fingerprints of the
+  grants no authority to act. A memory too long ever to be sent, measured in
+  UTF-8 whatever the database file's encoding, is named as left out without
+  its text being returned by the memory layer. A request with no memory
+  context is byte for byte what it was before. The session now keeps fingerprints of the
   memories it supplied and discards its whole earlier conversation before
   sending anything once one of them is disabled, changed, or forgotten, even
   through another database connection; if memory context cannot be read,

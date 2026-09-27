@@ -1044,14 +1044,22 @@ class Memory:
         """Return context-enabled memories in ascending id order, bounded.
 
         This is the only read of Tier A context, and it is bounded in both
-        directions before anything reaches Python. At most ``limit`` rows
-        come back, clamped to 1 through 100: a caller that wants to know
-        whether more exist asks for one more row than it will use, rather
-        than counting them all. Each row holds ``id``, ``oversized``, and
-        ``fact``. A fact whose UTF-8 size is at most ``max_fact_bytes`` comes
-        back whole with ``oversized`` False; a longer one never leaves
-        SQLite, so ``fact`` is None and ``oversized`` is True, and the caller
-        can name the memory without ever holding its text.
+        directions. At most ``limit`` rows come back, clamped to 1 through
+        100: a caller that wants to know whether more exist asks for one more
+        row than it will use, rather than counting them all. Each row holds
+        ``id``, ``oversized``, and ``fact``. A fact whose UTF-8 size is at
+        most ``max_fact_bytes`` comes back whole with ``oversized`` False;
+        any longer one comes back with ``fact`` None and ``oversized`` True,
+        so the caller can name the memory without ever holding its text.
+
+        The bound is UTF-8 whatever text encoding the database file uses.
+        SQLite measures a fact in the file's own encoding, so the size test
+        runs there first: in a UTF-8 database it is the exact bound, and an
+        oversized fact never reaches Python at all. A UTF-16 database stores
+        a fact in at most twice its UTF-8 size, so the test there admits
+        every fact stored in at most twice the bound — never more than
+        ``max_fact_bytes`` characters — and each admitted fact's exact UTF-8
+        size is then measured here before anything is returned.
 
         Raises ValueError when ``max_fact_bytes`` is not a positive int.
         """
@@ -1060,9 +1068,13 @@ class Memory:
         safe_limit = max(1, min(limit, 100))
         try:
             with self._connection() as connection:
-                # The size test runs inside SQLite on the fact's UTF-8
-                # bytes, so an oversized fact is never materialised in
-                # Python: only its id and the flag cross the boundary.
+                encoding = connection.execute("PRAGMA encoding").fetchone()[0]
+                stored_bound = (
+                    max_fact_bytes if encoding == "UTF-8" else 2 * max_fact_bytes
+                )
+                # The size test runs inside SQLite on the stored bytes, so a
+                # fact far beyond the bound is never materialised in Python:
+                # only its id and the flag cross the boundary.
                 rows = connection.execute(
                     """
                     SELECT
@@ -1076,16 +1088,9 @@ class Memory:
                     ORDER BY id ASC
                     LIMIT ?
                     """,
-                    (max_fact_bytes, max_fact_bytes, safe_limit),
+                    (stored_bound, stored_bound, safe_limit),
                 ).fetchall()
-            return [
-                {
-                    "id": int(row["id"]),
-                    "fact": row["fact"],
-                    "oversized": bool(row["oversized"]),
-                }
-                for row in rows
-            ]
+            return [_bounded_context_row(row, max_fact_bytes) for row in rows]
         except sqlite3.Error as exc:
             self.logger.exception("Failed to read memory context.")
             raise RuntimeError("Unable to read memory context.") from exc
@@ -1379,6 +1384,23 @@ def _require_memory_id(memory_id: object) -> None:
         or memory_id < 1
     ):
         raise ValueError("Memory id must be a positive whole number.")
+
+
+def _bounded_context_row(row: sqlite3.Row, max_fact_bytes: int) -> dict[str, Any]:
+    """Return one Tier A row, holding its fact only within the UTF-8 bound.
+
+    SQLite admitted the fact against its stored size; this settles the exact
+    UTF-8 size, which in a UTF-8 database never changes the answer and in a
+    UTF-16 database turns any fact over the bound into an oversized row with
+    no text.
+    """
+    fact = row["fact"]
+    oversized = bool(row["oversized"])
+    if fact is not None and (
+        len(fact.encode("utf-8", "surrogatepass")) > max_fact_bytes
+    ):
+        fact, oversized = None, True
+    return {"id": int(row["id"]), "fact": fact, "oversized": oversized}
 
 
 def _fact_digest(fact: str) -> str:

@@ -896,8 +896,9 @@ tool, and a tool can only add arguments to its own step.
 (decision V1-15-R1), every enabled memory is eligible on any model-backed
 conversational turn. Brain asks the memory layer for enabled memories in
 ascending id order, one row more than can be sent, with any fact longer than
-2 KiB reported only by id and an oversized flag so its text never reaches
-Python, and `context.py` takes them
+2 KiB of UTF-8 reported only by id and an oversized flag — its text never
+leaves the memory layer, and in a UTF-8 database never leaves SQLite — and
+`context.py` takes them
 whole, in that order, while at most 16 items and at most 2 KiB of fully
 rendered context — fixed instructions, ids, and framing included — fit, and
 while they fit beside the request within the conversational budget. A memory

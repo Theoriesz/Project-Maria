@@ -555,14 +555,22 @@ nor its digest is ever logged or returned in a result.
 
 `list_context_memories(limit, max_fact_bytes)` is the only read of Tier A
 context. It returns enabled memories only, in ascending `id` order, with the
-limit clamped to 1 through 100, each as `id`, `fact`, and `oversized`. The size
-test runs in SQLite on each fact's UTF-8 bytes (`length(CAST(fact AS BLOB))`),
-so a fact longer than `max_fact_bytes` is returned as `fact = NULL` with
-`oversized` true and its text never reaches Python. Brain asks for 17 rows —
+limit clamped to 1 through 100, each as `id`, `fact`, and `oversized`. The
+bound is on UTF-8 bytes whatever the file's text encoding, and a fact longer
+than `max_fact_bytes` is returned with no text and `oversized` true. SQLite
+measures a fact in the file's own encoding (`length(CAST(fact AS BLOB))`, after
+reading `PRAGMA encoding`). In a UTF-8 database, which is what Maria creates,
+that test is exact and an oversized fact's text never reaches Python. A
+database whose file is UTF-16 is still accepted when its schema matches, and
+there a fact is stored in between two thirds of and twice its UTF-8 size, so
+the test admits every fact stored in at most twice the bound — never more than
+`max_fact_bytes` characters — and the memory layer measures each admitted
+fact's exact UTF-8 size before returning it. Brain asks for 17 rows —
 one more than a request may carry — with a 2,048-byte bound, the most any one
 memory could ever occupy, and only on the model-backed conversational path, so
 Maria learns whether more enabled memories exist without counting all of them,
-and an oversized memory is named as left out without its text being read.
+and an oversized memory is named as left out without its text ever being
+returned.
 Existing reads (`get_memory`, `list_memories`, `search_memories`) still return
 exactly `id`, `fact`, and `created_at`; the consent flag never appears in
 `memories` or `recall` output.
