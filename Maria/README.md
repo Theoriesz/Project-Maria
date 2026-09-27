@@ -304,8 +304,11 @@ deliberate, transitional rule, not a judgement about relevance, and a later
 stage revisits it. Memories are taken in ascending ID order, whole, at most 16
 of them and at most 2 KiB of context including Maria's framing and the IDs.
 Your current request always comes first, then as much memory context as fits,
-then as many earlier turns as fit. `disable memory context <id>` turns consent
-off again, and also asks for confirmation. Updating a memory turns its consent
+then as many earlier turns as fit. Your approval covers the memory's text as
+it was when Maria asked: if that memory changes before you confirm, even from
+another Maria window, nothing is enabled and Maria asks you to request
+confirmation again. `disable memory context <id>` turns consent off again, and
+also asks for confirmation. Updating a memory turns its consent
 off, because consent applies to the exact text you approved; Maria tells you
 when that happens.
 

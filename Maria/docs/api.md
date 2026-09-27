@@ -26,15 +26,18 @@ supplied_context: frozenset[ContextFingerprint] = frozenset()) -> BrainResponse`
 
 Plans one request and coordinates it from input to plan, whole-plan permission
 resolution, tool execution, and interaction-history recording. A plan holding a
-step that requires confirmation returns before execution, carrying its `Plan` on
-the response. The deterministic planner always runs first. The request is
+step that requires confirmation returns before execution, carrying on the
+response the plan `ToolManager.bind_for_confirmation()` returns for it: the same
+plan, unless a tool pinned the exact state a step acts on, in which case the
+approval binds to that pinned plan. The deterministic planner always runs first. The request is
 answered conversationally instead only when all three hold: a reasoning
 provider was supplied, `config.reasoning.enabled` is true, and the plan is
 exactly the planner's generic no-action fallback. It is then answered in the
 context of `conversation`, the caller's earlier exchanges passed positionally,
 oldest first, with `supplied_context`, the fingerprints of the memories
 supplied since that conversation began (see "Conversation"). Only then does
-Brain read Tier A context, through `Memory.list_context_memories(limit=17)`; a
+Brain read Tier A context, through `Memory.list_context_memories(limit=17,
+max_fact_bytes=2048)`; a
 read that raises `RuntimeError` is logged as the fixed line `Unable to read
 memory context.` and handed on as unavailable. With disabled settings the
 fallback keeps its original response and interaction row even if a provider
@@ -311,7 +314,9 @@ nothing.
 
 At most 16 memories per request, at most 2 KiB of fully rendered context
 (fixed instructions, header, ids, and quoted text), and the one-extra-row
-limit Brain passes to the bounded read.
+limit Brain passes to the bounded read. `CONTEXT_MAX_BYTES` is also the
+per-fact size bound Brain passes to that read, since a longer fact could never
+be sent.
 
 `ContextSource.MEMORY`, `ContextItem(source, record_id, text)`, and
 `ContextFingerprint(source, record_id, digest)`
@@ -327,7 +332,8 @@ text of at most `CONTEXT_MAX_BYTES`; anything else raises
 
 Takes the first 16 enabled memories in ascending id order, each whole, while
 the rendered context stays within `CONTEXT_MAX_BYTES` and `byte_budget`; one
-that does not fit is left out and the next is still considered.
+that does not fit is left out and the next is still considered. An oversized
+memory, whose text the bounded read never returned, is left out the same way.
 `ContextSelection` holds the `items` sent, the `omitted_ids` the read returned
 but the limits kept out, and `more_enabled` when the read found more than 16.
 
@@ -335,8 +341,12 @@ but the limits kept out, and `more_enabled` when the read found more than 16.
 and `context_content_bytes(context) -> int`
 
 The data block is the header `Owner memories (reference data):` and then one
-line per memory, `memory <id>: <fact as one JSON string>`, so no fact can break
-out of its line. `CONTEXT_INSTRUCTIONS` is the fixed text sent ahead of it; it
+line per memory, `memory <id>: <fact as one JSON string>`. JSON escapes every
+quote and control character, and Maria additionally escapes U+0085, U+2028,
+and U+2029, the line separators JSON leaves as they are, so every separator
+`str.splitlines()` recognises is escaped and no fact can break out of its line
+or pose as another record. The escapes are standard JSON, so the decoded text
+is unchanged, and the rendered size counts the escaped bytes. `CONTEXT_INSTRUCTIONS` is the fixed text sent ahead of it; it
 contains no stored fact. `rendered_context_bytes` is their combined UTF-8 size,
 or `0` for no items. `context_content_bytes` validates a request's context
 again — an exact tuple of at most 16 exact items, still valid, in strictly
@@ -546,7 +556,7 @@ returns an empty list. SQLite failures raise
 Search and list default to 20 results. Direct API limits are clamped to a
 minimum of 1 and a maximum of 100.
 
-`Memory.update_memory(memory_id: int, new_fact: str) -> tuple[bool, int | None, bool]`
+`Memory.update_memory(memory_id: int, new_fact: str) -> tuple[bool, int | None]`
 
 Replaces one memory's fact. Before casefolding, generating anything, or opening
 a connection, it requires `memory_id` to be an actual `int` (never a `bool`) of
@@ -556,14 +566,22 @@ after stripping, raising `ValueError("New memory fact is required.")`. The
 stripped fact is stored as `fact` and its `casefold()` form as
 `normalized_fact`.
 
-The return tuple has exactly these valid states:
+The return tuple keeps its released two-value shape and has exactly three
+valid states:
 
-- `(True, None, consent_cleared)` — one row was updated; `consent_cleared` is
-  `True` exactly when that memory's context consent had been on and was turned
-  off.
-- `(False, None, False)` — no row matched `memory_id`.
-- `(False, conflicting_id, False)` — the target exists, but another memory
-  already stores the same `normalized_fact`.
+- `(True, None)` — one row was updated.
+- `(False, None)` — no row matched `memory_id`.
+- `(False, conflicting_id)` — the target exists, but another memory already
+  stores the same `normalized_fact`.
+
+`Memory.update_memory_reporting_consent(memory_id, new_fact) -> MemoryUpdate` is
+the same update — the same validation, statements, transaction, and outcomes —
+returned as the frozen `MemoryUpdate(updated, conflicting_id,
+context_consent_cleared)`. `context_consent_cleared` is `True` exactly when the
+updated memory's context consent had been on and this update turned it off; it
+is decided by the second statement below, inside the same transaction, never
+by a separate read. `update_memory` returns `(result.updated,
+result.conflicting_id)` from it.
 
 For a valid ID it executes one parameterized `UPDATE memories SET fact = ?,
 normalized_fact = ? WHERE id = ?` statement without first reading the row.
@@ -613,26 +631,53 @@ consent off, `Turned off context consent for updated memory <id>.`), and log
 nothing extra for a benign not-found or uniqueness-conflict result. Memory fact
 text and `normalized_fact` never appear in log messages.
 
-`Memory.set_memory_context(memory_id: int, enabled: bool) -> bool`
+`Memory.memory_fact_digest(memory_id: int) -> str | None`
 
-Turns one memory's context consent on or off. Before opening a connection it
-requires `memory_id` to be an actual `int` (never a `bool`) of at least `1`,
-raising `ValueError("Memory id must be a positive whole number.")`, and
-`enabled` to be an actual `bool`, raising `ValueError("Memory context consent
-must be True or False.")`. It runs one parameterized `UPDATE memories SET
-context_enabled = ? WHERE id = ?` and returns `True` when a row matched —
-including one already in the requested state — or `False` when none did. The
-fact is never read, logged, or returned. It logs `Enabled context consent for
-memory <id>.` or `Disabled context consent for memory <id>.`. SQLite failures
-raise `RuntimeError("Unable to change memory context consent.")`.
+Returns the identity of one memory's exact fact — the lowercase hexadecimal
+SHA-256 of its UTF-8 text — or `None` when no row matched. The fact itself is
+never returned or logged. It validates `memory_id` as above and raises
+`RuntimeError("Unable to read memory.")` on SQLite failures.
 
-`Memory.list_context_memories(limit: int) -> list[dict[str, Any]]`
+`Memory.enable_memory_context(memory_id: int, expected_fact_digest: str | None) ->
+ContextConsentOutcome`
 
-The only read of Tier A context: enabled memories only, as dictionaries
-holding exactly `id` and `fact`, in ascending `id` order, with `limit` clamped
-to 1 through 100. SQLite failures raise `RuntimeError("Unable to read memory
-context.")`. `get_memory`, `search_memories`, and `list_memories` never return
-the consent flag.
+Turns one memory's context consent on, but only for the approved text.
+`expected_fact_digest` is what `memory_fact_digest` returned when confirmation
+was offered, or `None` when no such memory existed then; anything else raises
+`ValueError("A memory fact identity must be a SHA-256 digest.")`. The check and
+the change are one write transaction: `BEGIN IMMEDIATE` takes the write lock
+before the fact is read, so no other connection can change it in between, and
+`UPDATE memories SET context_enabled = 1 WHERE id = ? AND fact = ?` applies only
+while the fact is still exactly the text that was checked. The outcome, from
+`ContextConsentOutcome` in `core/context.py`, is `ENABLED`; `NOT_FOUND` when no
+row matches; or `TARGET_CHANGED` when the text is not the approved text, when
+no identity was supplied for an existing memory, or when the conditional UPDATE
+matched nothing — and then nothing changes. The identity guarantee is exact
+text, compared by SHA-256: text changed away and back to the approved text is
+accepted, and a casing-only change is not. It logs `Enabled context consent for
+memory <id>.` or `Refused context consent for memory <id>: approved text
+changed.`, never the fact or the digest. SQLite failures raise
+`RuntimeError("Unable to change memory context consent.")`.
+
+`Memory.disable_memory_context(memory_id: int) -> bool`
+
+Turns one memory's context consent off with one parameterized `UPDATE memories
+SET context_enabled = 0 WHERE id = ?`, returning `True` when a row matched —
+including one already off — or `False` when none did. Turning consent off only
+narrows what can be sent, so it needs no identity. It logs `Disabled context
+consent for memory <id>.`.
+
+`Memory.list_context_memories(limit: int, max_fact_bytes: int) ->
+list[dict[str, Any]]`
+
+The only read of Tier A context: enabled memories only, in ascending `id`
+order, with `limit` clamped to 1 through 100, each as `{"id": int, "fact": str
+| None, "oversized": bool}`. The size test runs inside SQLite on each fact's
+UTF-8 bytes, so a fact longer than `max_fact_bytes` never reaches Python: its
+`fact` is `None` and `oversized` is `True`. A `max_fact_bytes` that is not a
+positive `int` raises `ValueError`. SQLite failures raise
+`RuntimeError("Unable to read memory context.")`. `get_memory`,
+`search_memories`, and `list_memories` never return the consent flag.
 
 ### Notes
 
@@ -727,16 +772,28 @@ short and content-free. When the updated memory's context consent had been on,
 the update message continues `" Context consent for memory <id> was turned off
 because its text changed."`; otherwise it is exactly as before.
 
-`enable_context` and `disable_context` read and validate an `id` the same way,
-call `Memory.set_memory_context()`, and return `"Enabled context for memory
-<id>."` or `"Disabled context for memory <id>."` with `data={"id": <id>,
-"context_enabled": <bool>}`, or `"Memory not found: <id>."` when no row
-matched. Neither ever carries the fact. A `Memory` failure is wrapped as
-`"Memory context change failed: <message>"`. Unsuccessful results, including the conflict result,
-carry no `data`. An ordinary `Memory` failure is wrapped as `"Memory update
-failed: Unable to update memory."` or `"Memory forget failed: Unable to forget
-memory."`; busy/locked contention is wrapped the same way, for example
-`"Memory forget failed: Database is busy. Try again shortly."`.
+Unsuccessful results, including the conflict result, carry no `data`. An
+ordinary `Memory` failure is wrapped as `"Memory update failed: Unable to
+update memory."` or `"Memory forget failed: Unable to forget memory."`;
+busy/locked contention is wrapped the same way, for example `"Memory forget
+failed: Database is busy. Try again shortly."`. `update` goes through
+`Memory.update_memory_reporting_consent()`.
+
+`enable_context` and `disable_context` read and validate an `id` the same way.
+`MemoryTool.confirmation_binding(action, arguments)` pins an `enable_context`
+approval: when the plan is offered for confirmation it adds
+`{"fact_digest": Memory.memory_fact_digest(id)}`, and adds nothing for any other
+action, an invalid id, a missing memory, or a read failure. `enable_context`
+then calls `Memory.enable_memory_context(id, fact_digest)` and
+`disable_context` calls `Memory.disable_memory_context(id)`. Success returns
+`"Enabled context for memory <id>."` or `"Disabled context for memory <id>."`
+with `data={"id": <id>, "context_enabled": <bool>}`; no matching row returns
+`"Memory not found: <id>."`; and an enable whose memory is not the pinned text
+returns, changing nothing, `"Context was not enabled for memory <id> because
+it could not be confirmed unchanged since confirmation was requested. Request
+confirmation again with: enable memory context <id>"`. None ever carries the
+fact or the digest. A `Memory` failure is wrapped as `"Memory context change
+failed: <message>"`.
 
 `memory.store`, `memory.search`, and `memory.list` are allowed by default, while
 `memory.update`, `memory.forget`, `memory.enable_context`, and
@@ -1341,6 +1398,21 @@ nothing; used through `request_reasoning`, the log records only the outcome
 and failure code.
 
 ## Tool Manager
+
+`ToolManager.bind_for_confirmation(plan: Plan) -> Plan`
+
+Returns the plan to present for approval. Brain calls it once, when a plan is
+about to wait for the owner's answer, so the approved plan — and the
+fingerprint the session binds approval to — already names the exact state each
+step acts on. A tool may provide an optional `confirmation_binding(action,
+arguments) -> Mapping[str, Any]` that returns arguments to add; Tool Manager
+adds them to that step only. A binding can never replace an existing argument
+(that raises `ValueError`), change a step's tool or action, or add or remove a
+step. A binder that raises is contained, logged as the fixed line
+`Confirmation binding failed: <tool>.<action>`, and adds nothing, so a tool
+relying on a binding must treat an unbound step as unapproved. A plan no tool
+binds is returned as the same object. The contract check at confirmation
+validates whatever was added.
 
 `ToolManager.execute_tool(tool_name, action, arguments) -> ToolExecutionResult`
 

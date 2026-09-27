@@ -13,7 +13,11 @@
   version 3 and reopens. `enable memory context <id>` and `disable memory
   context <id>` turn one memory's consent on or off by positive whole-number
   id; both always require confirmation, which configuration cannot remove,
-  and their recorded rows name the id, never the fact. The enable confirmation
+  and their recorded rows name the id, never the fact. An enable approval is
+  bound to the memory's exact text when confirmation is offered: if the text
+  changes before the owner confirms, through Maria or another connection,
+  nothing is enabled and the owner is asked to confirm again. The released
+  two-value `Memory.update_memory` result is unchanged. The enable confirmation
   states the rule: with reasoning enabled, every enabled memory is eligible
   to be sent to the owner's local model on any conversational turn — a
   deliberate transitional policy, not relevance selection — in ascending id
@@ -31,7 +35,9 @@
   the bounded read did not return, and a reply naming other ids changes
   nothing. Stored text travels to Ollama only as a clearly delimited data
   message after Maria's fixed instructions, never as a system instruction,
-  and grants no authority to act. A request with no memory context is byte
+  with every line separator escaped so a memory cannot pose as another, and
+  grants no authority to act. A memory too long ever to be sent is named as
+  left out without its text being read from the database. A request with no memory context is byte
   for byte what it was before. The session now keeps fingerprints of the
   memories it supplied and discards its whole earlier conversation before
   sending anything once one of them is disabled, changed, or forgotten, even

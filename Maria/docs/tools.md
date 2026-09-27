@@ -501,7 +501,20 @@ context for memory <id>.` with `data={"id": <id>, "context_enabled": <bool>}`,
 or `Memory not found: <id>.` — never the fact, so the interaction row a consent
 change records carries only the id. Enabling an enabled memory, or disabling a
 disabled one, succeeds and changes nothing. A `Memory` failure is wrapped as
-`Memory context change failed: <message>`. What consent means, and how enabled
+`Memory context change failed: <message>`.
+
+An enable approval covers exact text. The tool's `confirmation_binding` adds
+`fact_digest`, the SHA-256 of the memory's current text, to the step when
+confirmation is offered, and `enable_context` enables consent only while the
+memory is still exactly that text, checked and changed in one transaction. If
+it is not — or no identity was pinned for a memory that exists — nothing
+changes and the result is:
+
+```text
+Context was not enabled for memory <id> because it could not be confirmed unchanged since confirmation was requested. Request confirmation again with: enable memory context <id>
+```
+
+`disable_context` needs no identity, because it only narrows what can be sent. What consent means, and how enabled
 memories reach the model, is described under "Tier A Memory Context" in
 `docs/architecture.md`.
 

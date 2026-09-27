@@ -530,19 +530,39 @@ storage.
 memory at a time. The migration leaves every pre-existing memory off, and a
 newly stored memory is off because its insert never names the column.
 
-`enable memory context <id>` and `disable memory context <id>` each run one
-parameterized `UPDATE memories SET context_enabled = ? WHERE id = ?`, so at
-most one row can change, after mandatory explicit confirmation. The fact is
-never read, logged, or returned, and the recorded interaction names only the
-id. A missing id changes nothing and reports `Memory not found: <id>.`
-Re-enabling an enabled memory, or disabling a disabled one, matches its row and
-succeeds without changing anything.
+`enable memory context <id>` and `disable memory context <id>` each change at
+most one row by primary-key id, after mandatory explicit confirmation, and the
+recorded interaction names only the id. A missing id changes nothing and
+reports `Memory not found: <id>.`
 
-`list_context_memories(limit)` is the only read of Tier A context. It returns
-`id` and `fact` for enabled memories only, in ascending `id` order, with the
-limit clamped to 1 through 100. Brain asks it for 17 rows — one more than a
-request may carry — only on the model-backed conversational path, so Maria
-learns whether more enabled memories exist without counting all of them.
+Consent covers exact text, so an enable approval is bound to the fact as it
+was when confirmation was offered. At that moment `memory_fact_digest(id)`
+reads the fact and returns the SHA-256 of its exact UTF-8 text, and that
+identity becomes part of the plan the owner approves. At execution,
+`enable_memory_context(id, digest)` runs one `BEGIN IMMEDIATE` transaction:
+the write lock is taken before the fact is read, the fact's digest is compared
+with the approved one, and only a match runs `UPDATE memories SET
+context_enabled = 1 WHERE id = ? AND fact = ?` with the text just checked. If
+the text is not the approved text — changed through Maria or any other
+connection, including a casing-only change — or no identity was pinned for a
+memory that exists, nothing changes and the owner is asked to request
+confirmation again. The guarantee is exact text, not an unedited history: text
+changed away and back to the approved text is enabled. Disabling runs one
+`UPDATE memories SET context_enabled = 0 WHERE id = ?` with no text check,
+because it only narrows what can be sent. Re-enabling an enabled memory, or
+disabling a disabled one, succeeds without changing anything. Neither the fact
+nor its digest is ever logged or returned in a result.
+
+`list_context_memories(limit, max_fact_bytes)` is the only read of Tier A
+context. It returns enabled memories only, in ascending `id` order, with the
+limit clamped to 1 through 100, each as `id`, `fact`, and `oversized`. The size
+test runs in SQLite on each fact's UTF-8 bytes (`length(CAST(fact AS BLOB))`),
+so a fact longer than `max_fact_bytes` is returned as `fact = NULL` with
+`oversized` true and its text never reaches Python. Brain asks for 17 rows —
+one more than a request may carry — with a 2,048-byte bound, the most any one
+memory could ever occupy, and only on the model-backed conversational path, so
+Maria learns whether more enabled memories exist without counting all of them,
+and an oversized memory is named as left out without its text being read.
 Existing reads (`get_memory`, `list_memories`, `search_memories`) still return
 exactly `id`, `fact`, and `created_at`; the consent flag never appears in
 `memories` or `recall` output.

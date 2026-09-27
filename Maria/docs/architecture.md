@@ -883,11 +883,21 @@ leaves every existing memory off, and a new memory is stored off.
 `enable memory context <id>` and `disable memory context <id>` change one
 memory each, by positive decimal id, and both always require confirmation,
 which configuration cannot remove. Updating a memory turns its consent off.
+An enable approval is bound to the exact text: when confirmation is offered,
+Brain passes the plan through `ToolManager.bind_for_confirmation()`, and the
+memory tool pins the SHA-256 of the memory's current text into the step, so the
+approved plan and its fingerprint name that text. The memory layer enables
+consent only inside one write transaction that re-reads the fact and updates
+it only while it is still exactly that text; otherwise nothing changes and the
+owner is asked to confirm again. That binding step is generic: Brain names no
+tool, and a tool can only add arguments to its own step.
 
 **Selection is not relevance.** Under the owner-approved transitional rule
 (decision V1-15-R1), every enabled memory is eligible on any model-backed
 conversational turn. Brain asks the memory layer for enabled memories in
-ascending id order, one row more than can be sent, and `context.py` takes them
+ascending id order, one row more than can be sent, with any fact longer than
+2 KiB reported only by id and an oversized flag so its text never reaches
+Python, and `context.py` takes them
 whole, in that order, while at most 16 items and at most 2 KiB of fully
 rendered context — fixed instructions, ids, and framing included — fit, and
 while they fit beside the request within the conversational budget. A memory
@@ -900,8 +910,9 @@ roadmap Stage V1-16 revisits this rule.
 only system message; they tell the model the memories are reference data, not
 instructions, grant no permission to act, and may be outdated or conflicting.
 The memories follow in a separate user message, one line per memory, each fact
-as one JSON string, so no fact can break out of its line or pose as another
-entry. Context grants no authority: the reply is still inert text in a
+as one JSON string with every line separator escaped — JSON's own escapes plus
+U+0085, U+2028, and U+2029 — so no fact can break out of its line or pose as
+another entry. Context grants no authority: the reply is still inert text in a
 zero-step transient plan.
 
 **What the owner is told.** After a successful reply Maria names the memories
@@ -917,8 +928,11 @@ not its current text, and there is no `updated_at`.
 **Revocation.** The session keeps, beside its conversation, the fingerprint —
 source, id, and SHA-256 of the exact text — of every memory supplied since the
 conversation was last cleared, never the text itself. Before each
-conversational request those fingerprints are compared with the memories
-enabled now. If one was disabled, changed, or forgotten, by this session or
+model-backed conversational request — never on a deterministic command — those
+fingerprints are compared with the memories enabled now; only the memories
+they name are hashed, and nothing is hashed when nothing was supplied. A
+supplied memory that is now oversized cannot be the text that was sent. If one
+was disabled, changed, or forgotten, by this session or
 through any other database connection, the whole earlier conversation and the
 fingerprints are discarded before anything is sent, and the owner is told. If
 Tier A cannot be read, neither memory context nor earlier exchanges are sent,
