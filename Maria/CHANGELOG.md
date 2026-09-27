@@ -2,6 +2,37 @@
 
 ## Unreleased
 
+- Added one owner-controlled local reasoning adapter with an enforced
+  transport class, hard request deadline, bounded input and output, and typed
+  failures. This is the first network-capable code in Maria's runtime; it is
+  disabled by default and not yet reachable from any interface. The new
+  `core/ollama_adapter.py` implements the reasoning provider interface for
+  the owner-selected runtime, Ollama, through its native HTTP API: one
+  `POST /api/chat` request with streaming off, sent only to the fixed
+  loopback address `127.0.0.1:11434`, which is part of the adapter rather than
+  configuration. The adapter refuses to exist for anything but the `loopback`
+  transport and host `127.0.0.1`, so a private-LAN host or another loopback
+  address is never contacted, and it refuses a model identifier that names an
+  Ollama cloud model. It connects straight to the numeric address with no name
+  resolution, proxy, redirect, retry, or fallback, and it downloads,
+  installs, and launches nothing. It sends only the model identifier and the
+  request text, and returns only the assistant's answer text: any thinking
+  text and tool calls are ignored after bounded JSON parsing, and only
+  `message.content` is returned. One absolute deadline covers
+  connecting, sending, and the whole reply, so a runtime that trickles bytes
+  cannot stretch it; the headers and the whole reply are bounded before
+  parsing, and an answer over the output budget is discarded whole. Timeout,
+  unavailable, truncated, malformed, and over-budget outcomes each return
+  their own typed failure, raised with no chained exception, and no prompt,
+  answer, address, model identifier, endpoint, header, or runtime error text
+  reaches a failure message or the log. An import-boundary guard now keeps
+  every network and threading module out of Brain, the planner, permissions,
+  Tool Manager, the memory layer, configuration, and every tool, directly or
+  through any Maria module they import, and allows only this adapter a
+  network import. Nothing constructs the adapter yet, so every command
+  behaves exactly as before, and Ollama's own local-only setting remains the
+  owner's to configure. No dependency, schema, permission, command,
+  configuration field, or version change was introduced.
 - Added a typed, provider-independent local reasoning interface with typed
   failure classes and fail-closed provider configuration, disabled by
   default, with machine-specific settings confined to an untracked local

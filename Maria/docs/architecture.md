@@ -26,9 +26,10 @@ Maria is organized around a small set of modules with clear ownership.
     two-identity resolution both rely on. Startup prepares the declared roots
     once, before logging is configured and before the memory layer opens the
     database.
-13. `reasoning.py` defines the typed, provider-independent contract a later
-    local reasoning model will sit behind. Nothing in the flow above calls it
-    yet; see "Reasoning Interface and Local Override".
+13. `reasoning.py` defines the typed, provider-independent contract a local
+    reasoning model sits behind, and `ollama_adapter.py` is the one provider
+    that implements it. Nothing in the flow above calls either yet; see
+    "Reasoning Interface and Local Override" and "Local Ollama Adapter".
 
 An explicit memory request uses the same execution path as every other tool
 request:
@@ -609,7 +610,8 @@ deliberately contains no transport, no model, and no provider. A
 `ReasoningRequest` holds one bounded prompt and nothing else — there is no
 field through which personal context, a system prompt, or a template could
 travel — and a `ReasoningResponse` holds one bounded, untrusted string. The
-`ReasoningProvider` protocol is what the later local adapter implements.
+`ReasoningProvider` protocol is what the local adapter,
+`core/ollama_adapter.py`, implements.
 `request_reasoning` is the one boundary through which a provider is asked
 anything: it answers without asking when reasoning is disabled or the prompt
 is over budget, asks at most once, and returns either a fresh response holding
@@ -648,6 +650,64 @@ is a fixed message raised with no cause or context, so neither the file's text
 nor a parser's or the operating system's error text survives in it, and
 configuration loading logs nothing.
 
+## Local Ollama Adapter
+
+`core/ollama_adapter.py` is the one local runtime the owner selected for v1.0
+(decision V1-13-R1): Ollama's native HTTP API on the owner's own machine.
+`OllamaReasoningProvider` implements `ReasoningProvider`, and everything
+specific to Ollama — the destination, the request and reply shapes, and the
+HTTP framing — is confined to that module. It is the only production module
+that imports a network module, and it imports only `socket`: no HTTP library,
+so no proxy, redirect, or URL handling exists to be reached. Nothing
+constructs it yet. Brain, the CLI, the planner, memory, and tools cannot reach
+it, so every command behaves exactly as before.
+
+The destination is fixed in the module and is not configuration: the IPv4
+loopback address `127.0.0.1`, port `11434`, and path `/api/chat`. Construction
+re-validates the settings and refuses, with a fixed `ValueError`, disabled
+settings, any transport but `loopback`, any host but `127.0.0.1`, and a model
+identifier that designates an Ollama cloud model (a `cloud` tag or one ending
+`-cloud`). So neither a `private_lan` host nor another loopback address can
+ever be contacted. Each request opens one IPv4 connection straight to the
+numeric address, with no name resolution, no proxy, no redirect, no retry,
+and no fallback of any kind.
+
+The request carries only the model identifier, as an opaque JSON string, and
+the prompt as one user message, with `stream` false; there is no system
+message, option, tool, or thinking request. Of the reply, only
+`message.content` is kept, as inert text. Thinking text, tool calls, and every
+other field are ignored after bounded JSON parsing; only `message.content` is
+returned. The module has no import path to planning, permissions, dispatch, or
+persistence, so a reply cannot become an action.
+
+One absolute monotonic deadline, `request_deadline_seconds` from the start of
+`respond`, covers connecting, sending, the response headers, and the body.
+Every socket wait is given only the time that remains, so a runtime that
+trickles bytes cannot stretch it. The status line and headers may take at
+most 16 KiB. Only `200` carries an answer; any other status, a redirect
+included, is unavailable. The body must be framed by one `Content-Length` or
+by chunked transfer coding, so a reply that ends early can always be told
+from a complete one. The whole body, chunk framing included, is bounded
+before parsing by an envelope of 64 KiB plus six times `max_output_bytes`,
+because JSON may spell one byte of the answer as up to six. The extracted
+answer must then be non-empty and fit within `max_output_bytes`. Nothing
+oversized is read in full, and nothing is truncated or returned in part.
+
+Every other outcome is one typed reasoning failure: input over budget before
+any connection; timeout at any stage; unavailable when nothing answers or the
+status is not success; truncated when the reply ends early, `done` is false,
+or `done_reason` is `length`; malformed for any other unexpected shape; and
+output over budget for an oversized envelope or answer. The failure is raised
+outside every handler, so no caught exception travels with it as a cause or
+context, and every connection is closed on every path. The adapter logs
+nothing itself; `request_reasoning` records the outcome code, and no prompt,
+reply, address, model identifier, endpoint, header, or runtime error text
+reaches a log or a failure message.
+
+Ollama's own local-only setting is separate and is the owner's to configure.
+The adapter's refusal of cloud-tagged model identifiers is defense in depth
+and cannot prove the runtime will not reach a cloud model.
+
 ## Boundaries
 
 The brain does not run SQL or perform tool work directly. The planner does not
@@ -660,7 +720,13 @@ generic filesystem commands out of Maria's own repository. The action-contract
 registry declares argument shapes only: it holds no tool logic, never calls a
 tool to decide whether arguments are valid, and decides nothing about
 permission. `core/reasoning.py` reaches nothing but the shared failures and the
-logger; no module passes a reasoning reply to the planner, Brain, or a tool.
+logger, and `core/ollama_adapter.py` nothing but those and the reasoning
+interface; no module passes a reasoning reply to the planner, Brain, or a tool.
+`core/ollama_adapter.py` is the only production module that imports a network
+module. An import-boundary guard asserts that Brain, the planner, permissions,
+Tool Manager, the memory layer, configuration, and every tool import no
+network or threading module, directly or through any Maria module they
+import, and that none of them reaches the adapter.
 
 The brain has no memory-specific dispatch branch. `MemoryTool` contains no SQL;
 it receives the shared `Memory` object and calls its public persistence methods.

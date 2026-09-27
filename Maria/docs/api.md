@@ -902,7 +902,8 @@ machine-specific: `repr()` and `str()` show only
 
 `ReasoningProvider`
 
-The protocol the later local adapter implements: `respond(request) ->
+The protocol the local adapter, `OllamaReasoningProvider` (see "Local Ollama
+Adapter"), implements: `respond(request) ->
 ReasoningResponse`, or raise `TypedFailureError` carrying one of the seven
 `REASONING_FAILURE_KINDS`. A provider enforces its own hard deadline and
 output budget, reports a timeout, an oversized reply, or a cut-off reply as
@@ -984,6 +985,78 @@ with a fixed message that names no path, host, model, file content, or parser
 or operating-system error text, and is raised with neither a cause nor a
 context, because Python's TOML error keeps the whole document it was parsing.
 Loading logs nothing.
+
+## Local Ollama Adapter
+
+`core/ollama_adapter.py` holds the one `ReasoningProvider` implementation: the
+owner's local Ollama runtime, reached over its native HTTP API (decision
+V1-13-R1). It is the only production module that imports a network module
+(`socket`), and it imports nothing from Maria except `core.failures` and
+`core.reasoning`. Nothing in Maria constructs it yet, and no command's
+behavior changes.
+
+`OLLAMA_ADDRESS = ("127.0.0.1", 11434)` and `OLLAMA_CHAT_PATH = "/api/chat"`
+
+The one fixed destination. Neither is configurable, and no setting names a
+port or endpoint.
+
+`OllamaReasoningProvider(settings: ReasoningSettings)`
+
+Settles everything the adapter uses at construction. `settings` must be an
+exact `ReasoningSettings`, or `ValueError` is raised with
+`REASONING_SETTINGS_TYPE_MESSAGE`. The settings are rebuilt, which re-runs
+their own validation, so values altered after construction raise that field's
+fixed message; the adapter keeps its own copies, so later changes cannot reach
+it. Disabled settings, any transport but `loopback`, and any host but
+`127.0.0.1` raise `ValueError(OLLAMA_DESTINATION_MESSAGE)`. A model identifier
+whose tag, after the last colon of its final path segment and ignoring any
+`@` digest, is `cloud` or ends `-cloud`, compared without regard to case,
+raises `ValueError(OLLAMA_CLOUD_MODEL_MESSAGE)`. Both messages are fixed and
+name no host, port, path, or model. `repr()` is
+`OllamaReasoningProvider(<redacted>)`.
+
+`OllamaReasoningProvider.respond(request: ReasoningRequest) ->
+ReasoningResponse`
+
+Asks the runtime one question over one new connection and returns the
+complete answer, or raises `TypedFailureError`. Anything but an exact
+`ReasoningRequest` raises `ValueError(REASONING_REQUEST_TYPE_MESSAGE)`, and a
+prompt altered into anything but non-empty, encodable text raises
+`ValueError(REASONING_PROMPT_MESSAGE)`. The request is `POST /api/chat
+HTTP/1.1` with `Host`, `Content-Type`, `Content-Length`, and `Connection:
+close` headers only, and the JSON body `{"model": <model>, "messages":
+[{"role": "user", "content": <prompt>}], "stream": false}`.
+
+| Outcome | Result |
+| --- | --- |
+| Prompt over `max_input_bytes` | `REASONING_INPUT_OVER_BUDGET`, before any connection |
+| Deadline passed while connecting, sending, or receiving | `REASONING_TIMEOUT` |
+| Connection refused or failed before any reply byte, or the connection closed with no reply | `REASONING_UNAVAILABLE` |
+| Any status but `200`, including a missing model (`404`) and every redirect, which is never followed | `REASONING_UNAVAILABLE` |
+| Reply ended or failed partway, `done` false, or `done_reason` `"length"` | `REASONING_OUTPUT_TRUNCATED` |
+| Status line and headers over 16 KiB, bad status line or header field, missing or ambiguous framing, bad chunk framing, a body that is not UTF-8 JSON, or any unexpected shape | `REASONING_MALFORMED_OUTPUT` |
+| Body over the envelope, declared or received | `REASONING_OUTPUT_OVER_BUDGET` |
+| `message.content` over `max_output_bytes` | `REASONING_OUTPUT_OVER_BUDGET` |
+| Complete reply | a `ReasoningResponse` holding exactly `message.content` |
+
+The reply must be one JSON object whose `done` is exactly `true` and whose
+`message` has `role` `"assistant"` and non-empty `content` text. A
+`done_reason` is optional; when present it must be text. The framing must be
+exactly one `Content-Length` of digits or `Transfer-Encoding: chunked`, never
+both and never neither. A JSON document that is cut off inside a complete
+frame is malformed, not truncated, because the frame says it is whole.
+
+The deadline is absolute: `request_deadline_seconds` measured on the
+monotonic clock from the start of `respond`. Every socket wait receives only
+the time that remains. The status line and headers are bounded by
+`MAXIMUM_RESPONSE_HEADER_BYTES` (16,384). The whole body, chunk framing and
+trailers included, is bounded by `RESPONSE_ENVELOPE_OVERHEAD_BYTES` (65,536)
+plus `JSON_ESCAPE_EXPANSION` (6) times `max_output_bytes`, and a declared
+length or chunk size over what remains is refused before it is read. Every
+failure is raised outside any exception handler, so it has neither a cause
+nor a context, and the connection is closed on every path. The adapter logs
+nothing; used through `request_reasoning`, the log records only the outcome
+and failure code.
 
 ## Tool Manager
 
