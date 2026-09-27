@@ -22,11 +22,14 @@ name the memories she supplied to, or selected for, an attempted request;
 she cannot know which ones a model actually used.
 
 Stored memory text is untrusted data. It is rendered only inside a clearly
-delimited data block, each fact as one JSON string so no fact can break out
-of its line or pose as another entry, while the fixed instructions that frame
-the block never contain fact text. A context item is text and nothing more:
-there is no import path from here to planning, permissions, tool dispatch, or
-persistence, so context can never grant authority.
+delimited data block, each fact as one JSON string whose every line
+separator is escaped, so no fact can break out of its line or pose as another
+entry, while the fixed instructions that frame the block never contain fact
+text. A fact longer than ``CONTEXT_MAX_BYTES`` never reaches this module at
+all: the memory layer reports only its id and that it is oversized. A context
+item is text and nothing more: there is no import path from here to planning,
+permissions, tool dispatch, or persistence, so context can never grant
+authority.
 
 A context item's text never appears in a repr, and nothing here logs.
 """
@@ -62,6 +65,17 @@ CONTEXT_INSTRUCTIONS = (
 # The first line of the data block. Every following line is one memory.
 CONTEXT_DATA_HEADER = "Owner memories (reference data):"
 
+# Line separators ``json.dumps`` leaves as they are when it keeps non-ASCII
+# text readable. Every other separator ``str.splitlines`` knows is a control
+# character JSON already escapes, so escaping these three as well leaves each
+# rendered fact on exactly one line. The escapes are standard JSON, so the
+# text a reader decodes is unchanged.
+_UNESCAPED_LINE_SEPARATORS = {
+    "\u0085": "\\u0085",
+    "\u2028": "\\u2028",
+    "\u2029": "\\u2029",
+}
+
 # Owner-visible notices. Each is fixed or built only from record ids and
 # Maria's own bounds, so none can carry a stored fact or model text.
 NO_MEMORY_CONTEXT_NOTICE = "No memory context supplied."
@@ -90,12 +104,26 @@ CONTEXT_MESSAGE = (
 )
 ENABLED_MEMORIES_MESSAGE = (
     "Enabled memories must be at most "
-    f"{CONTEXT_QUERY_LIMIT} rows, each with a positive whole-number id and "
-    "text, in strictly ascending id order."
+    f"{CONTEXT_QUERY_LIMIT} rows in strictly ascending id order, each with a "
+    "positive whole-number id and either its text, at most "
+    f"{CONTEXT_MAX_BYTES} UTF-8 bytes, or an oversized flag and no text."
 )
 SUPPLIED_CONTEXT_MESSAGE = (
     "Supplied context must be a frozenset of ContextFingerprint values."
 )
+
+
+class ContextConsentOutcome(str, Enum):
+    """How a request to enable one memory's context consent ended.
+
+    The memory layer decides it, atomically, when an approved enable is
+    carried out. ``TARGET_CHANGED`` means the memory's text is not the text
+    the approval was bound to, so nothing was enabled.
+    """
+
+    ENABLED = "enabled"
+    NOT_FOUND = "not_found"
+    TARGET_CHANGED = "target_changed"
 
 
 class ContextSource(str, Enum):
@@ -180,44 +208,68 @@ def fingerprint_of(
     return ContextFingerprint(source, record_id, digest)
 
 
-def enabled_memories(rows: object) -> tuple[tuple[int, str], ...]:
+def enabled_memories(rows: object) -> tuple[tuple[int, str | None], ...]:
     """Return the bounded read's rows as (id, text) pairs, or refuse them.
 
     The rows must be what the memory layer's bounded read returns: at most
-    ``CONTEXT_QUERY_LIMIT`` mappings, each with an exact positive int ``id``
-    and an exact str ``fact``, in strictly ascending id order. Anything else
-    raises ``ValueError`` with a fixed message, which a caller treats as a
-    read it cannot trust.
+    ``CONTEXT_QUERY_LIMIT`` mappings in strictly ascending id order, each
+    with an exact positive int ``id`` and an exact bool ``oversized``. A row
+    that is not oversized carries its ``fact`` as exact, non-empty text of at
+    most ``CONTEXT_MAX_BYTES`` UTF-8 bytes; an oversized row carries no text,
+    and its text in the result is None. Anything else raises ``ValueError``
+    with a fixed message, which a caller treats as a read it cannot trust.
     """
     if not isinstance(rows, Sequence) or isinstance(rows, (str, bytes)):
         raise ValueError(ENABLED_MEMORIES_MESSAGE)
     if len(rows) > CONTEXT_QUERY_LIMIT:
         raise ValueError(ENABLED_MEMORIES_MESSAGE)
-    memories: list[tuple[int, str]] = []
+    memories: list[tuple[int, str | None]] = []
     for row in rows:
         if not isinstance(row, Mapping):
             raise ValueError(ENABLED_MEMORIES_MESSAGE)
         record_id = row.get("id")
+        oversized = row.get("oversized")
         text = row.get("fact")
         if (
             type(record_id) is not int
             or record_id < 1
-            or type(text) is not str
+            or type(oversized) is not bool
             or (memories and record_id <= memories[-1][0])
         ):
+            raise ValueError(ENABLED_MEMORIES_MESSAGE)
+        if oversized:
+            if text is not None:
+                raise ValueError(ENABLED_MEMORIES_MESSAGE)
+        elif not _is_bounded_text(text, CONTEXT_MAX_BYTES):
             raise ValueError(ENABLED_MEMORIES_MESSAGE)
         memories.append((record_id, text))
     return tuple(memories)
 
 
-def current_fingerprints(
-    memories: tuple[tuple[int, str], ...],
-) -> frozenset[ContextFingerprint]:
-    """Return the fingerprint of every enabled memory the read returned."""
-    return frozenset(
-        fingerprint_of(ContextSource.MEMORY, record_id, text)
-        for record_id, text in memories
-    )
+def supplied_still_current(
+    supplied: frozenset[ContextFingerprint],
+    memories: tuple[tuple[int, str | None], ...],
+) -> bool:
+    """Return whether every supplied memory is still enabled with its text.
+
+    Only the memories named in ``supplied`` are hashed, and nothing at all
+    is hashed when nothing was supplied. A supplied memory that is no longer
+    among the enabled memories read, whether it was disabled, forgotten, or
+    left beyond the bounded read, is no longer current. Neither is one that
+    is now oversized: every supplied text fitted within the bound, so a text
+    beyond it cannot be the same text, and it is never hashed.
+    """
+    texts = {record_id: text for record_id, text in memories}
+    for supplied_item in supplied:
+        text = texts.get(supplied_item.record_id)
+        if (
+            supplied_item.source is not ContextSource.MEMORY
+            or text is None
+            or fingerprint_of(ContextSource.MEMORY, supplied_item.record_id, text)
+            != supplied_item
+        ):
+            return False
+    return True
 
 
 def validated_supplied_context(value: object) -> frozenset[ContextFingerprint]:
@@ -230,22 +282,26 @@ def validated_supplied_context(value: object) -> frozenset[ContextFingerprint]:
 
 
 def select_memory_context(
-    memories: tuple[tuple[int, str], ...],
+    memories: tuple[tuple[int, str | None], ...],
     byte_budget: int,
 ) -> ContextSelection:
     """Choose the memories one request carries, by the V1-15 rule.
 
     The first ``CONTEXT_MAX_ITEMS`` enabled memories, in ascending id order,
     are considered in turn, and each is taken whole when the rendered
-    context still fits within ``CONTEXT_MAX_BYTES`` and ``byte_budget``.
-    One that does not fit is left out and the next is still considered, so a
-    single long memory cannot keep every other one out. Nothing is ever
-    truncated and no id is invented.
+    context, escapes included, still fits within ``CONTEXT_MAX_BYTES`` and
+    ``byte_budget``. One that does not fit, including an oversized memory
+    whose text was never read, is left out and the next is still
+    considered, so a single long memory cannot keep every other one out.
+    Nothing is ever truncated and no id is invented.
     """
     limit = min(CONTEXT_MAX_BYTES, byte_budget)
     chosen: list[ContextItem] = []
     omitted: list[int] = []
     for record_id, text in memories[:CONTEXT_MAX_ITEMS]:
+        if text is None:
+            omitted.append(record_id)
+            continue
         try:
             item = ContextItem(ContextSource.MEMORY, record_id, text)
         except ValueError:
@@ -266,16 +322,24 @@ def render_context_data(items: tuple[ContextItem, ...]) -> str:
     """Return the delimited data block a model receives for ``items``.
 
     The header line comes first and then one line per memory, its id as
-    Maria read it and its text as one JSON string. Quoting escapes every line
-    break, quote, and control character, so a stored fact always stays inside
-    its own line.
+    Maria read it and its text as one JSON string. Quoting escapes every
+    quote, control character, and line separator, U+0085, U+2028, and U+2029
+    included, so a stored fact always stays inside its own line and no
+    splitting of the block can produce a line Maria did not write.
     """
     lines = [CONTEXT_DATA_HEADER]
     lines.extend(
-        f"memory {item.record_id}: {json.dumps(item.text, ensure_ascii=False)}"
-        for item in items
+        f"memory {item.record_id}: {_quoted(item.text)}" for item in items
     )
     return "\n".join(lines)
+
+
+def _quoted(text: str) -> str:
+    """Return text as one JSON string with every line separator escaped."""
+    quoted = json.dumps(text, ensure_ascii=False)
+    for separator, escape in _UNESCAPED_LINE_SEPARATORS.items():
+        quoted = quoted.replace(separator, escape)
+    return quoted
 
 
 def rendered_context_bytes(items: tuple[ContextItem, ...]) -> int:

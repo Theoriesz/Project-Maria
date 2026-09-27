@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import hashlib
 import logging
 import tempfile
 import unittest
@@ -292,7 +293,7 @@ class MemoryToolTests(unittest.TestCase):
             ),
             (
                 "update",
-                "update_memory",
+                "update_memory_reporting_consent",
                 {"id": 1, "fact": "A fact"},
                 "Unable to update memory.",
                 "Memory update failed: Unable to update memory.",
@@ -341,7 +342,7 @@ class MemoryToolTests(unittest.TestCase):
             ),
             (
                 "update",
-                "update_memory",
+                "update_memory_reporting_consent",
                 {"id": 1, "fact": "A fact"},
                 f"Memory update failed: {busy_text}",
             ),
@@ -496,7 +497,11 @@ class MemoryToolTests(unittest.TestCase):
         self,
     ) -> None:
         cases = (
-            ("update", "update_memory", {"fact": "Replacement fact"}),
+            (
+                "update",
+                "update_memory_reporting_consent",
+                {"fact": "Replacement fact"},
+            ),
             ("forget", "forget_memory", {}),
         )
         invalid_ids = (0, -1, "1", 1.0, True, False, None)
@@ -535,7 +540,9 @@ class MemoryToolTests(unittest.TestCase):
 
         for new_fact in (None, 5, True, [], object(), "", "   "):
             with self.subTest(new_fact=new_fact):
-                with patch.object(self.memory, "update_memory") as memory_method:
+                with patch.object(
+                    self.memory, "update_memory_reporting_consent"
+                ) as memory_method:
                     result = self.tool.execute(
                         "update",
                         {"id": memory_id, "fact": new_fact},
@@ -546,7 +553,9 @@ class MemoryToolTests(unittest.TestCase):
                 memory_method.assert_not_called()
 
         with self.subTest(new_fact="missing"):
-            with patch.object(self.memory, "update_memory") as memory_method:
+            with patch.object(
+                self.memory, "update_memory_reporting_consent"
+            ) as memory_method:
                 result = self.tool.execute("update", {"id": memory_id})
             self.assertFalse(result.success)
             self.assertEqual(result.message, "New memory fact is required.")
@@ -612,7 +621,7 @@ class MemoryToolTests(unittest.TestCase):
 
 
 class MemoryToolContextConsentTests(unittest.TestCase):
-    """Verify the consent actions name an id, never a fact, and change one row."""
+    """Verify consent actions bind to exact text and name an id, never a fact."""
 
     def setUp(self) -> None:
         self.temporary_directory = tempfile.TemporaryDirectory()
@@ -624,10 +633,65 @@ class MemoryToolContextConsentTests(unittest.TestCase):
         self.memory_id, _ = self.memory.store_memory("secret consent fact")
 
     def _enabled(self) -> list[int]:
-        return [row["id"] for row in self.memory.list_context_memories(limit=100)]
+        return [
+            row["id"]
+            for row in self.memory.list_context_memories(
+                limit=100,
+                max_fact_bytes=2048,
+            )
+        ]
+
+    def _bound(self, memory_id: int) -> dict:
+        """Return enable arguments pinned as confirmation would pin them."""
+        arguments = {"id": memory_id}
+        return {
+            **arguments,
+            **self.tool.confirmation_binding("enable_context", arguments),
+        }
+
+    def test_the_binding_pins_the_exact_fact_identity(self) -> None:
+        binding = self.tool.confirmation_binding(
+            "enable_context",
+            {"id": self.memory_id},
+        )
+
+        self.assertEqual(
+            binding,
+            {
+                "fact_digest": hashlib.sha256(
+                    "secret consent fact".encode("utf-8")
+                ).hexdigest()
+            },
+        )
+        for action, arguments in (
+            ("disable_context", {"id": self.memory_id}),
+            ("forget", {"id": self.memory_id}),
+            ("enable_context", {"id": 999}),
+            ("enable_context", {"id": True}),
+            ("enable_context", {"id": "1"}),
+            ("enable_context", {}),
+        ):
+            with self.subTest(action=action, arguments=arguments):
+                self.assertEqual(self.tool.confirmation_binding(action, arguments), {})
+
+    def test_a_binding_that_cannot_read_binds_nothing(self) -> None:
+        with patch.object(
+            self.memory,
+            "memory_fact_digest",
+            side_effect=RuntimeError("Database is busy. Try again shortly."),
+        ):
+            binding = self.tool.confirmation_binding(
+                "enable_context",
+                {"id": self.memory_id},
+            )
+
+        self.assertEqual(binding, {})
+        result = self.tool.execute("enable_context", {"id": self.memory_id})
+        self.assertFalse(result.success)
+        self.assertEqual(self._enabled(), [])
 
     def test_enable_and_disable_report_the_id_and_never_the_fact(self) -> None:
-        enabled = self.tool.execute("enable_context", {"id": self.memory_id})
+        enabled = self.tool.execute("enable_context", self._bound(self.memory_id))
         self.assertEqual(self._enabled(), [self.memory_id])
         disabled = self.tool.execute("disable_context", {"id": self.memory_id})
         self.assertEqual(self._enabled(), [])
@@ -647,35 +711,65 @@ class MemoryToolContextConsentTests(unittest.TestCase):
             self.assertNotIn("secret consent fact", result.message)
             self.assertNotIn("secret consent fact", str(result.data))
 
+    def test_changed_or_unbound_text_is_refused_with_a_fixed_message(self) -> None:
+        refusal = (
+            f"Context was not enabled for memory {self.memory_id} because it "
+            "could not be confirmed unchanged since confirmation was requested. "
+            "Request confirmation again with: enable memory context "
+            f"{self.memory_id}"
+        )
+        stale = self._bound(self.memory_id)
+        self.memory.update_memory(self.memory_id, "secret replacement fact")
+
+        for label, arguments in (
+            ("changed text", stale),
+            ("no identity", {"id": self.memory_id}),
+        ):
+            with self.subTest(case=label):
+                result = self.tool.execute("enable_context", arguments)
+
+                self.assertFalse(result.success)
+                self.assertEqual(result.message, refusal)
+                self.assertIsNone(result.data)
+                self.assertNotIn("secret", result.message)
+        self.assertEqual(self._enabled(), [])
+
     def test_a_missing_memory_cannot_report_success(self) -> None:
-        for action in ("enable_context", "disable_context"):
-            with self.subTest(action=action):
-                result = self.tool.execute(action, {"id": 999})
+        for action, arguments in (
+            ("enable_context", {"id": 999}),
+            ("enable_context", {"id": 999, "fact_digest": "a" * 64}),
+            ("disable_context", {"id": 999}),
+        ):
+            with self.subTest(action=action, arguments=arguments):
+                result = self.tool.execute(action, arguments)
 
                 self.assertFalse(result.success)
                 self.assertEqual(result.message, "Memory not found: 999.")
         self.assertEqual(self._enabled(), [])
 
     def test_invalid_ids_never_reach_memory(self) -> None:
-        for action in ("enable_context", "disable_context"):
+        for action, method_name in (
+            ("enable_context", "enable_memory_context"),
+            ("disable_context", "disable_memory_context"),
+        ):
             for invalid_id in (0, -1, "1", 1.0, True, False, None):
                 with self.subTest(action=action, invalid_id=invalid_id):
-                    with patch.object(self.memory, "set_memory_context") as setter:
+                    with patch.object(self.memory, method_name) as memory_method:
                         result = self.tool.execute(action, {"id": invalid_id})
                     self.assertFalse(result.success)
                     self.assertEqual(
                         result.message,
                         "Memory id must be a positive whole number.",
                     )
-                    setter.assert_not_called()
+                    memory_method.assert_not_called()
 
     def test_a_memory_failure_becomes_a_fixed_message(self) -> None:
         with patch.object(
             self.memory,
-            "set_memory_context",
+            "enable_memory_context",
             side_effect=RuntimeError("Unable to change memory context consent."),
         ):
-            result = self.tool.execute("enable_context", {"id": self.memory_id})
+            result = self.tool.execute("enable_context", self._bound(self.memory_id))
 
         self.assertFalse(result.success)
         self.assertEqual(
@@ -688,7 +782,7 @@ class MemoryToolContextConsentTests(unittest.TestCase):
             "update",
             {"id": self.memory_id, "fact": "secret revised fact"},
         )
-        self.tool.execute("enable_context", {"id": self.memory_id})
+        self.tool.execute("enable_context", self._bound(self.memory_id))
         noticed = self.tool.execute(
             "update",
             {"id": self.memory_id, "fact": "secret final fact"},

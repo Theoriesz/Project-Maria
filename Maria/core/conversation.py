@@ -40,12 +40,12 @@ from core.context import (
     NO_MEMORY_CONTEXT_NOTICE,
     ContextFingerprint,
     ContextItem,
-    current_fingerprints,
     enabled_memories,
     omission_notice,
     select_memory_context,
     selected_notice,
     supplied_notice,
+    supplied_still_current,
     validated_supplied_context,
 )
 from core.failures import Failure, FailureKind
@@ -245,7 +245,7 @@ def converse(
     before: list[str] = []
     cleared = False
 
-    memories: tuple[tuple[int, str], ...] | None = None
+    memories: tuple[tuple[int, str | None], ...] | None = None
     if enabled_memories_read is not None:
         try:
             memories = enabled_memories(enabled_memories_read)
@@ -256,7 +256,7 @@ def converse(
         before.append(CONTEXT_UNREADABLE_NOTICE)
         memories = ()
         cleared = True
-    elif not supplied <= current_fingerprints(memories):
+    elif not supplied_still_current(supplied, memories):
         log.info("Earlier conversation cleared: supplied memory context changed.")
         before.append(CONVERSATION_CLEARED_NOTICE)
         cleared = True

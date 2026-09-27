@@ -13,6 +13,7 @@ from unittest.mock import Mock, patch
 
 from core.action_contracts import (
     BUILT_IN_ACTION_CONTRACTS,
+    FACT_DIGEST_LENGTH,
     MAXIMUM_EXPRESSION_LENGTH,
     MAXIMUM_LIST_LIMIT,
     MINIMUM_LIST_LIMIT,
@@ -454,7 +455,7 @@ class RegistryCompletenessTests(unittest.TestCase):
             if argument.value_type is str
         ]
 
-        self.assertEqual(len(text_fields), 16)
+        self.assertEqual(len(text_fields), 17)
         for contract, argument in text_fields:
             with self.subTest(field=f"{contract.identifier}.{argument.name}"):
                 self.assertIsInstance(argument.allow_blank, bool)
@@ -473,7 +474,7 @@ class RegistryCompletenessTests(unittest.TestCase):
 
         self.assertEqual(accepting_blank, set())
 
-    def test_the_calculator_expression_is_the_only_declared_text_maximum(
+    def test_only_the_expression_and_the_fact_identity_declare_text_bounds(
         self,
     ) -> None:
         bounded = {
@@ -491,10 +492,21 @@ class RegistryCompletenessTests(unittest.TestCase):
 
         self.assertEqual(
             bounded,
-            {"calculator.calculate.expression": MAXIMUM_EXPRESSION_LENGTH},
+            {
+                "calculator.calculate.expression": MAXIMUM_EXPRESSION_LENGTH,
+                "memory.enable_context.fact_digest": FACT_DIGEST_LENGTH,
+            },
         )
         self.assertEqual(MAXIMUM_EXPRESSION_LENGTH, 200)
-        self.assertEqual(minimums, set())
+        self.assertEqual(FACT_DIGEST_LENGTH, 64)
+        self.assertEqual(minimums, {"memory.enable_context.fact_digest"})
+        digest = BUILT_IN_ACTION_CONTRACTS.contract_for(
+            "memory",
+            "enable_context",
+        ).arguments[1]
+        self.assertEqual(digest.minimum_length, FACT_DIGEST_LENGTH)
+        self.assertFalse(digest.required)
+        self.assertFalse(digest.allow_blank)
 
     def test_every_filesystem_path_field_declares_the_safe_root_class(self) -> None:
         declared_paths = {
@@ -578,6 +590,9 @@ class RegistryCompletenessTests(unittest.TestCase):
                 ("memory", "list", "limit"),
                 ("notes", "list", "limit"),
                 ("notes", "create", "title"),
+                # Absent from the planner's plan and pinned when confirmation
+                # is offered, so an approval names the exact fact text.
+                ("memory", "enable_context", "fact_digest"),
             },
         )
 

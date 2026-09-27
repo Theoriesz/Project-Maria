@@ -20,7 +20,11 @@ from logging import Logger
 from core.action_contracts import ContractViolation
 from core.config import MariaConfig, load_config
 from core.constants import LOCAL_CONFIG_PATH
-from core.context import CONTEXT_QUERY_LIMIT, ContextFingerprint
+from core.context import (
+    CONTEXT_MAX_BYTES,
+    CONTEXT_QUERY_LIMIT,
+    ContextFingerprint,
+)
 from core.conversation import converse, is_generic_fallback
 from core.filesystem_roots import prepare_roots
 from core.logger import configure_logging, get_logger
@@ -241,8 +245,9 @@ class MariaBrain:
         This is the only place Tier A context is read, and only after every
         gate above has passed: the memory layer's bounded query returns the
         enabled memories, in ascending id order, one row more than can be
-        sent. A read that fails is handed on as None, and the conversation
-        module then sends no context and no earlier exchange.
+        sent, and never the text of a fact too long ever to be sent. A read
+        that fails is handed on as None, and the conversation module then
+        sends no context and no earlier exchange.
 
         The conversation module settles the whole turn and produces a
         zero-step plan that it, as the plan's producer, made transient. That
@@ -256,7 +261,8 @@ class MariaBrain:
         self.logger.info("Answering request conversationally.")
         try:
             enabled_memories_read = self.memory.list_context_memories(
-                limit=CONTEXT_QUERY_LIMIT
+                limit=CONTEXT_QUERY_LIMIT,
+                max_fact_bytes=CONTEXT_MAX_BYTES,
             )
         except RuntimeError:
             # The memory layer's message is fixed, but nothing about the
@@ -347,10 +353,13 @@ class MariaBrain:
                     resolved_step.step.tool_name,
                     resolved_step.step.action,
                 )
+            # The plan offered for approval is pinned to the exact state its
+            # steps act on now, so the approval, bound to this plan's
+            # fingerprint, cannot later be spent on different state.
             return BrainResponse(
                 text=self._format_confirmation_request(resolved),
                 needs_confirmation=True,
-                plan=plan,
+                plan=self.tool_manager.bind_for_confirmation(plan),
             )
 
         return self._execute_resolved_plan(resolved)

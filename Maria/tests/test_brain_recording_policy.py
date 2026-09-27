@@ -478,6 +478,9 @@ class _MockComponents:
         self.memory = Mock(spec=Memory)
         self.memory.get_recent_interactions.return_value = []
         self.tool_manager = Mock(spec=ToolManager)
+        # No mocked tool pins confirmation state, so the plan offered
+        # for approval is the plan itself.
+        self.tool_manager.bind_for_confirmation.side_effect = lambda plan: plan
         self.tool_manager.validate_action.return_value = None
         self.permissions = Mock(spec=PermissionManager)
         self.permissions.check.return_value = ALLOWED

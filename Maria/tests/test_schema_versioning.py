@@ -2138,7 +2138,10 @@ class StampedSchemaValidationTests(_TemporaryDatabaseTestCase):
                 self.memory.get_memory(identifier),
                 {"id": identifier, "fact": fact, "created_at": created_at},
             )
-        self.assertEqual(self.memory.list_context_memories(limit=100), [])
+        self.assertEqual(
+            self.memory.list_context_memories(limit=100, max_fact_bytes=2048),
+            [],
+        )
 
     def test_validating_a_current_database_reads_and_writes_nothing(
         self,
@@ -2280,7 +2283,10 @@ class MemoryContextConsentMigrationTests(_TemporaryDatabaseTestCase):
                     "updated_at": updated_at,
                 },
             )
-        self.assertEqual(self.memory.list_context_memories(limit=100), [])
+        self.assertEqual(
+            self.memory.list_context_memories(limit=100, max_fact_bytes=2048),
+            [],
+        )
 
     def test_version_one_reaches_version_three_and_reopens_cleanly(self) -> None:
         create_pre_memories_baseline(self.database_path)

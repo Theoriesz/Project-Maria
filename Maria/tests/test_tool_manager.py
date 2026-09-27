@@ -26,6 +26,7 @@ from core.filesystem_roots import (
 from core.failures import FailureKind
 from core.logger import configure_logging
 from core.memory import Memory
+from core.planner import Plan, PlanStep
 from core.tool_manager import (
     BUILT_IN_TOOL_MODULES,
     ToolExecutionResult,
@@ -555,6 +556,88 @@ class ToolManagerLogPrivacyTests(unittest.TestCase):
         self.assertEqual(
             [line.split(" | ", 1)[1] for line in added.splitlines()],
             ["INFO | maria.tool_manager | Executing tool action: sample.run"],
+        )
+
+
+class ConfirmationBindingTests(unittest.TestCase):
+    """Verify a tool can only add pinned state to a plan offered for approval."""
+
+    # The same temporary configuration and public loading flow, without
+    # inheriting, and so re-running, every dispatch test.
+    setUp = ToolManagerTests.setUp
+    _load_single_tool = ToolManagerTests._load_single_tool
+
+    def _binding_tool(self, binding: Any) -> _StubTool:
+        """Return a stub whose binder answers with ``binding`` or raises it."""
+        tool = _StubTool("sample")
+
+        def confirmation_binding(action: str, arguments: Any) -> Any:
+            del action, arguments
+            if isinstance(binding, Exception):
+                raise binding
+            return binding
+
+        tool.confirmation_binding = confirmation_binding
+        return tool
+
+    def test_a_plan_no_tool_binds_is_returned_as_the_same_object(self) -> None:
+        manager = self._load_single_tool(_StubTool("sample"))
+        plan = Plan("run it", (PlanStep("sample", "run", {"value": 1}),))
+
+        self.assertIs(manager.bind_for_confirmation(plan), plan)
+        self.assertIs(
+            self._load_single_tool(self._binding_tool({})).bind_for_confirmation(
+                plan
+            ),
+            plan,
+        )
+
+    def test_a_binding_only_adds_arguments_to_its_own_step(self) -> None:
+        manager = self._load_single_tool(self._binding_tool({"pinned": "abc"}))
+        untouched = PlanStep("other", "run", {"value": 2})
+        plan = Plan(
+            "run it",
+            (PlanStep("sample", "run", {"value": 1}), untouched),
+        )
+
+        bound = manager.bind_for_confirmation(plan)
+
+        self.assertEqual(
+            bound,
+            Plan(
+                "run it",
+                (
+                    PlanStep("sample", "run", {"value": 1, "pinned": "abc"}),
+                    untouched,
+                ),
+            ),
+        )
+        self.assertIs(bound.steps[1], untouched)
+        self.assertNotEqual(bound.fingerprint, plan.fingerprint)
+
+    def test_a_binding_may_never_replace_an_argument(self) -> None:
+        for binding in ({"value": 99}, ["not", "a", "mapping"]):
+            with self.subTest(binding=binding):
+                manager = self._load_single_tool(self._binding_tool(binding))
+                plan = Plan("run it", (PlanStep("sample", "run", {"value": 1}),))
+
+                with self.assertRaises(ValueError):
+                    manager.bind_for_confirmation(plan)
+
+    def test_a_failing_binding_is_contained_and_adds_nothing(self) -> None:
+        manager = self._load_single_tool(
+            self._binding_tool(RuntimeError(EXCEPTION_SENTINEL))
+        )
+        plan = Plan(
+            "run it",
+            (PlanStep("sample", "run", {"value": ARGUMENT_SENTINEL}),),
+        )
+
+        self.assertIs(manager.bind_for_confirmation(plan), plan)
+        self.manager_logger.error.assert_called_once_with(
+            "Confirmation binding failed: %s.%s",
+            "sample",
+            "run",
         )
 
 
