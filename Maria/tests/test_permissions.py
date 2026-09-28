@@ -46,6 +46,15 @@ ENABLE_CONTEXT_NOTICE = (
     "any conversational turn, within Maria's memory context limits. Maria "
     "does not choose memories by relevance."
 )
+# V1-16's note consent notice, pinned the same way.
+ENABLE_NOTE_CONTEXT_NOTICE = (
+    "Once enabled, this note's entire title and body may be sent to your local "
+    "reasoning model on a later conversational turn when a word of four or "
+    "more characters from your request appears literally in its title or its "
+    "body, within Maria's context limits. Maria does not check the note for "
+    "passwords or other secrets, and enabling it does not mean it contains "
+    "none."
+)
 
 
 class PermissionManagerTests(unittest.TestCase):
@@ -346,6 +355,8 @@ class PermissionManagerTests(unittest.TestCase):
                     "notes.retitle",
                     "notes.edit",
                     "notes.delete",
+                    "notes.enable_context",
+                    "notes.disable_context",
                     "memory.update",
                     "memory.forget",
                     "memory.enable_context",
@@ -353,7 +364,7 @@ class PermissionManagerTests(unittest.TestCase):
                 }
             ),
         )
-        self.assertEqual(len(MANDATORY_CONFIRMATION_ACTIONS), 10)
+        self.assertEqual(len(MANDATORY_CONFIRMATION_ACTIONS), 12)
         self.assertEqual(
             MANDATORY_DENIED_ACTIONS,
             frozenset({"filesystem.delete", "filesystem.write"}),
@@ -533,6 +544,8 @@ class PermissionManagerTests(unittest.TestCase):
                     reason = f"{action_id} requires explicit confirmation."
                     if action_id == "memory.enable_context":
                         reason = f"{reason} {ENABLE_CONTEXT_NOTICE}"
+                    if action_id == "notes.enable_context":
+                        reason = f"{reason} {ENABLE_NOTE_CONTEXT_NOTICE}"
                     with self.subTest(action_id=action_id):
                         self.assertEqual(
                             manager.check(tool_name, action),

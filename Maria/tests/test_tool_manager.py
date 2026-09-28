@@ -29,6 +29,7 @@ from core.memory import Memory
 from core.planner import Plan, PlanStep
 from core.tool_manager import (
     BUILT_IN_TOOL_MODULES,
+    ConfirmationBinding,
     ToolExecutionResult,
     ToolManager,
 )
@@ -584,11 +585,11 @@ class ConfirmationBindingTests(unittest.TestCase):
         manager = self._load_single_tool(_StubTool("sample"))
         plan = Plan("run it", (PlanStep("sample", "run", {"value": 1}),))
 
-        self.assertIs(manager.bind_for_confirmation(plan), plan)
+        self.assertIs(manager.prepare_confirmation(plan).plan, plan)
         self.assertIs(
-            self._load_single_tool(self._binding_tool({})).bind_for_confirmation(
+            self._load_single_tool(self._binding_tool({})).prepare_confirmation(
                 plan
-            ),
+            ).plan,
             plan,
         )
 
@@ -600,7 +601,7 @@ class ConfirmationBindingTests(unittest.TestCase):
             (PlanStep("sample", "run", {"value": 1}), untouched),
         )
 
-        bound = manager.bind_for_confirmation(plan)
+        bound = manager.prepare_confirmation(plan).plan
 
         self.assertEqual(
             bound,
@@ -622,7 +623,7 @@ class ConfirmationBindingTests(unittest.TestCase):
                 plan = Plan("run it", (PlanStep("sample", "run", {"value": 1}),))
 
                 with self.assertRaises(ValueError):
-                    manager.bind_for_confirmation(plan)
+                    manager.prepare_confirmation(plan)
 
     def test_a_failing_binding_is_contained_and_adds_nothing(self) -> None:
         manager = self._load_single_tool(
@@ -633,11 +634,60 @@ class ConfirmationBindingTests(unittest.TestCase):
             (PlanStep("sample", "run", {"value": ARGUMENT_SENTINEL}),),
         )
 
-        self.assertIs(manager.bind_for_confirmation(plan), plan)
+        prepared = manager.prepare_confirmation(plan)
+
+        self.assertIs(prepared.plan, plan)
+        self.assertEqual(prepared.previews, ())
         self.manager_logger.error.assert_called_once_with(
             "Confirmation binding failed: %s.%s",
             "sample",
             "run",
+        )
+
+    def test_a_preview_comes_back_beside_the_plan_and_never_enters_it(
+        self,
+    ) -> None:
+        manager = self._load_single_tool(
+            self._binding_tool(
+                ConfirmationBinding({"pinned": "abc"}, ARGUMENT_SENTINEL)
+            )
+        )
+        plan = Plan("run it", (PlanStep("sample", "run", {"value": 1}),))
+
+        prepared = manager.prepare_confirmation(plan)
+
+        self.assertEqual(prepared.previews, (ARGUMENT_SENTINEL,))
+        self.assertEqual(
+            prepared.plan,
+            Plan(
+                "run it",
+                (PlanStep("sample", "run", {"value": 1, "pinned": "abc"}),),
+            ),
+        )
+        self.assertNotIn(ARGUMENT_SENTINEL, repr(prepared.plan))
+        self.assertEqual(repr(prepared), "PreparedConfirmation(<redacted>)")
+
+    def test_a_preview_alone_leaves_the_plan_as_the_same_object(self) -> None:
+        manager = self._load_single_tool(
+            self._binding_tool(ConfirmationBinding({}, "shown"))
+        )
+        plan = Plan("run it", (PlanStep("sample", "run", {"value": 1}),))
+
+        prepared = manager.prepare_confirmation(plan)
+
+        self.assertIs(prepared.plan, plan)
+        self.assertEqual(prepared.previews, ("shown",))
+
+    def test_a_binding_is_arguments_and_optional_text_and_hides_both(
+        self,
+    ) -> None:
+        for arguments, preview in ((["pinned"], None), ({}, b"bytes"), ({}, 5)):
+            with self.subTest(arguments=arguments, preview=preview):
+                with self.assertRaises(ValueError):
+                    ConfirmationBinding(arguments, preview)
+        self.assertEqual(
+            repr(ConfirmationBinding({"pinned": ARGUMENT_SENTINEL}, ARGUMENT_SENTINEL)),
+            "ConfirmationBinding(<redacted>)",
         )
 
 

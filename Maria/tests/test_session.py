@@ -22,7 +22,7 @@ from core.session import (
     MariaSession,
     PendingApproval,
 )
-from core.tool_manager import ToolExecutionResult, ToolManager
+from core.tool_manager import PreparedConfirmation, ToolExecutionResult, ToolManager
 
 
 ALLOWED = PermissionResult(PermissionDecision.ALLOWED, "allowed")
@@ -69,7 +69,7 @@ class SessionTestCase(unittest.TestCase):
         self.tool_manager = Mock(spec=ToolManager)
         # No mocked tool pins confirmation state, so the plan offered
         # for approval is the plan itself.
-        self.tool_manager.bind_for_confirmation.side_effect = lambda plan: plan
+        self.tool_manager.prepare_confirmation.side_effect = PreparedConfirmation
         self.tool_manager.validate_action.return_value = None
         self.permissions = Mock(spec=PermissionManager)
         self.brain_logger = Mock(spec=logging.Logger)
@@ -571,7 +571,7 @@ class SessionLoggingPrivacyTests(unittest.TestCase):
         self.tool_manager = Mock(spec=ToolManager)
         # No mocked tool pins confirmation state, so the plan offered
         # for approval is the plan itself.
-        self.tool_manager.bind_for_confirmation.side_effect = lambda plan: plan
+        self.tool_manager.prepare_confirmation.side_effect = PreparedConfirmation
         self.tool_manager.validate_action.return_value = None
         self.permissions = Mock(spec=PermissionManager)
         self.memory.get_recent_interactions.return_value = []

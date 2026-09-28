@@ -437,6 +437,42 @@ class Planner:
                 )
             return self._single_step(text, "notes", "delete", {"id": note_id})
 
+        if lowered == "enable note context":
+            return self._no_action(text, "Use: enable note context <id>")
+
+        if lowered.startswith("enable note context "):
+            operand = text[len("enable note context ") :].strip()
+            note_id = _parse_positive_ascii_id(operand)
+            if note_id is None:
+                return self._no_action(
+                    text,
+                    "Note id must be a positive whole number.",
+                )
+            return self._single_step(
+                text,
+                "notes",
+                "enable_context",
+                {"id": note_id},
+            )
+
+        if lowered == "disable note context":
+            return self._no_action(text, "Use: disable note context <id>")
+
+        if lowered.startswith("disable note context "):
+            operand = text[len("disable note context ") :].strip()
+            note_id = _parse_positive_ascii_id(operand)
+            if note_id is None:
+                return self._no_action(
+                    text,
+                    "Note id must be a positive whole number.",
+                )
+            return self._single_step(
+                text,
+                "notes",
+                "disable_context",
+                {"id": note_id},
+            )
+
         if lowered == "history":
             return self._single_step(text, "history", "list", {})
 
@@ -590,6 +626,8 @@ def _help_text() -> str:
         "- retitle note <id>: <new title>\n"
         "- edit note <id>: <new body>\n"
         "- delete note <id>\n"
+        "- enable note context <id>\n"
+        "- disable note context <id>\n"
         "- remember <fact>\n"
         "- recall <query>\n"
         "- memories\n"

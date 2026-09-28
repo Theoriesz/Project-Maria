@@ -49,7 +49,7 @@ DEFAULT_DATABASE_BUSY_TIMEOUT_SECONDS = 5.0
 # number. 0 is SQLite's default marker and means "never stamped"; 1 is the
 # earliest schema Maria ever created, before explicit memories existed; 2 is
 # the published v0.2.0 baseline, which adds the ``memories`` table; 3 adds the
-# per-memory ``context_enabled`` consent column and is the current schema. A
-# new version is added by appending one migration, never by editing this
-# value's meaning.
-DATABASE_SCHEMA_VERSION = 3
+# per-memory ``context_enabled`` consent column; 4 adds the per-note
+# ``context_digest`` consent column and is the current schema. A new version
+# is added by appending one migration, never by editing this value's meaning.
+DATABASE_SCHEMA_VERSION = 4

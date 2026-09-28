@@ -55,7 +55,10 @@ TESTS_DIR = PROJECT_ROOT / "tests"
 # the test instead of agreed with: the stamp the v0.2.0 baseline receives when
 # it is classified, and the current schema every database ends at.
 BASELINE_SCHEMA_VERSION = 2
-EXPECTED_SCHEMA_VERSION = 3
+EXPECTED_SCHEMA_VERSION = 4
+# V1-15's memory consent step, pinned by its own number now that V1-16's
+# note consent step follows it and the current version has moved on.
+MEMORY_CONTEXT_CONSENT_VERSION = 3
 UNVERSIONED = 0
 PRE_MEMORIES_VERSION = 1
 
@@ -303,7 +306,7 @@ class BaselineClassificationTests(_TemporaryDatabaseTestCase):
         )
 
     def test_a_valid_unversioned_baseline_is_stamped_then_migrated_once(self) -> None:
-        """Classified as the baseline, it runs only the consent step."""
+        """Classified as the baseline, it runs only the consent steps."""
         create_v0_2_0_baseline(self.database_path)
         recording_logger = Mock(spec=logging.Logger)
 
@@ -327,7 +330,7 @@ class BaselineClassificationTests(_TemporaryDatabaseTestCase):
         )
         self.assertEqual(
             [args[1] for args in logged if "Applied migration" in args[0]],
-            ["add_memory_context_consent"],
+            ["add_memory_context_consent", "add_note_context_consent"],
         )
 
     def test_baseline_rows_survive_initialization_unchanged(self) -> None:
@@ -900,7 +903,11 @@ class MigrationRunnerTests(_TemporaryDatabaseTestCase):
                 for call in recording_logger.info.call_args_list
                 if "Applied migration" in call.args[0]
             ],
-            ["create_memories", "add_memory_context_consent"],
+            [
+                "create_memories",
+                "add_memory_context_consent",
+                "add_note_context_consent",
+            ],
         )
         for identifier, request, response, created_at in BASELINE_INTERACTIONS:
             self.assertEqual(
@@ -2196,6 +2203,24 @@ V3_SCHEMA = tuple(
     for statement in V0_2_0_BASELINE_SCHEMA
 )
 
+# The version 4 ``notes`` table, pinned the same way: version 3 with V1-16's
+# per-note consent column, which holds the approved text's identity.
+V4_NOTES_TABLE = """
+    CREATE TABLE notes (
+        id INTEGER PRIMARY KEY AUTOINCREMENT,
+        title TEXT NOT NULL,
+        body TEXT NOT NULL,
+        created_at TEXT NOT NULL,
+        updated_at TEXT NOT NULL,
+        context_digest TEXT
+            CHECK (context_digest IS NULL OR length(context_digest) = 64)
+    )
+    """
+V4_SCHEMA = tuple(
+    V4_NOTES_TABLE if "CREATE TABLE notes" in statement else statement
+    for statement in V3_SCHEMA
+)
+
 
 class MemoryContextConsentMigrationTests(_TemporaryDatabaseTestCase):
     """Verify V1-15's consent column arrives through the V1-09 runner.
@@ -2226,7 +2251,7 @@ class MemoryContextConsentMigrationTests(_TemporaryDatabaseTestCase):
         self.assertEqual(
             memory_module._reference_schema(V3_SCHEMA),
             memory_module._reference_schema(
-                memory_module._frozen_schema(EXPECTED_SCHEMA_VERSION)
+                memory_module._frozen_schema(MEMORY_CONTEXT_CONSENT_VERSION)
             ),
         )
 
@@ -2257,7 +2282,7 @@ class MemoryContextConsentMigrationTests(_TemporaryDatabaseTestCase):
         self.memory.initialize()
 
         self.assertEqual(read_schema_version(self.database_path), EXPECTED_SCHEMA_VERSION)
-        self.assertEqual(self.describe(), memory_module._reference_schema(V3_SCHEMA))
+        self.assertEqual(self.describe(), memory_module._reference_schema(V4_SCHEMA))
         self.assertEqual(
             self._raw_memories(),
             [(*row, 0) for row in BASELINE_MEMORIES],
@@ -2302,7 +2327,11 @@ class MemoryContextConsentMigrationTests(_TemporaryDatabaseTestCase):
                 for call in recording_logger.info.call_args_list
                 if "Applied migration" in call.args[0]
             ],
-            ["create_memories", "add_memory_context_consent"],
+            [
+                "create_memories",
+                "add_memory_context_consent",
+                "add_note_context_consent",
+            ],
         )
         self.assertEqual(read_schema_version(self.database_path), EXPECTED_SCHEMA_VERSION)
         self.assertEqual(self.describe(), self.describe(fresh_path))
@@ -2337,13 +2366,14 @@ class MemoryContextConsentMigrationTests(_TemporaryDatabaseTestCase):
         broken = (
             memory_module._MIGRATIONS[0],
             memory_module._Migration(
-                version=EXPECTED_SCHEMA_VERSION,
+                version=MEMORY_CONTEXT_CONSENT_VERSION,
                 name="add_memory_context_consent",
                 statements=(
                     memory_module._ADD_MEMORY_CONTEXT_CONSENT_COLUMN,
                     "CREATE TABLE never_committed (INVALID",
                 ),
             ),
+            *memory_module._MIGRATIONS[2:],
         )
 
         with patch.object(memory_module, "_MIGRATIONS", broken):
@@ -2372,7 +2402,7 @@ class MemoryContextConsentMigrationTests(_TemporaryDatabaseTestCase):
                 for call in recording_logger.info.call_args_list
                 if "Applied migration" in call.args[0]
             ],
-            ["add_memory_context_consent"],
+            ["add_memory_context_consent", "add_note_context_consent"],
         )
         self.assertEqual(
             self._raw_memories(),
@@ -2410,9 +2440,238 @@ class MemoryContextConsentMigrationTests(_TemporaryDatabaseTestCase):
                 self.database_path = self.root / label / "maria-test.db"
                 self.memory = Memory(self.database_path, logger=TEST_LOGGER)
                 create_schema(self.database_path, schema)
-                stamp_schema_version(self.database_path, EXPECTED_SCHEMA_VERSION)
+                stamp_schema_version(
+                    self.database_path,
+                    MEMORY_CONTEXT_CONSENT_VERSION,
+                )
 
-                self._assert_refused_untouched(marker=EXPECTED_SCHEMA_VERSION)
+                self._assert_refused_untouched(
+                    marker=MEMORY_CONTEXT_CONSENT_VERSION,
+                )
+
+
+class NoteContextConsentMigrationTests(_TemporaryDatabaseTestCase):
+    """Verify V1-16's note consent column arrives through the V1-09 runner.
+
+    Every case starts from the frozen fixtures, reused unchanged, or from the
+    pinned version 3 shape, and ends at version 4 with every existing note's
+    consent off: its ``context_digest`` NULL.
+    """
+
+    NOTE_CONTEXT_CONSENT_VERSION = 4
+
+    def _raw_notes(self, database_path: Path | None = None) -> list[tuple]:
+        """Read every note row, consent included, from a temporary database."""
+        target = self.database_path if database_path is None else database_path
+        connection = sqlite3.connect(target)
+        try:
+            return [
+                tuple(row)
+                for row in connection.execute(
+                    """
+                    SELECT id, title, body, created_at, updated_at, context_digest
+                    FROM notes
+                    ORDER BY id
+                    """
+                )
+            ]
+        finally:
+            connection.close()
+
+    def _applied(self, logger: Mock) -> list[str]:
+        """Return the migration names a recording logger saw applied."""
+        return [
+            call.args[1]
+            for call in logger.info.call_args_list
+            if "Applied migration" in call.args[0]
+        ]
+
+    def test_the_pinned_version_four_schema_is_frozen_and_current(self) -> None:
+        pinned = memory_module._reference_schema(V4_SCHEMA)
+
+        self.assertEqual(
+            pinned,
+            memory_module._reference_schema(
+                memory_module._frozen_schema(self.NOTE_CONTEXT_CONSENT_VERSION)
+            ),
+        )
+        self.assertEqual(
+            pinned,
+            memory_module._reference_schema(memory_module._CURRENT_SCHEMA_STATEMENTS),
+        )
+        self.assertEqual(memory_module._MIGRATIONS[-1].name, "add_note_context_consent")
+        self.assertEqual(
+            memory_module._MIGRATIONS[-1].statements,
+            (memory_module._ADD_NOTE_CONTEXT_CONSENT_COLUMN,),
+        )
+
+    def test_a_fresh_database_is_created_directly_at_version_four(self) -> None:
+        self.memory.initialize()
+        note_id = self.memory.create_note("Fresh", "body")
+
+        self.assertEqual(read_schema_version(self.database_path), 4)
+        self.assertEqual(self.describe(), memory_module._reference_schema(V4_SCHEMA))
+        self.assertIsNone(self._raw_notes()[0][-1])
+        self.assertEqual(self._raw_notes()[0][0], note_id)
+
+    def test_the_v0_2_0_fixture_keeps_every_row_and_turns_note_consent_off(
+        self,
+    ) -> None:
+        create_v0_2_0_baseline(self.database_path)
+        recording_logger = Mock(spec=logging.Logger)
+
+        Memory(self.database_path, logger=recording_logger).initialize()
+
+        self.assertEqual(read_schema_version(self.database_path), 4)
+        self.assertEqual(self.describe(), memory_module._reference_schema(V4_SCHEMA))
+        self.assertEqual(
+            self._applied(recording_logger),
+            ["add_memory_context_consent", "add_note_context_consent"],
+        )
+        self.assertEqual(
+            self._raw_notes(),
+            [(*row, None) for row in BASELINE_NOTES],
+        )
+        for identifier, fact, _normalized, created_at in BASELINE_MEMORIES:
+            self.assertEqual(
+                self.memory.get_memory(identifier),
+                {"id": identifier, "fact": fact, "created_at": created_at},
+            )
+        self.assertEqual(self.memory.search_context_notes(("list",), 9, 2048), [])
+        logged = " ".join(str(call) for call in recording_logger.mock_calls)
+        for _identifier, title, body, _created, _updated in BASELINE_NOTES:
+            self.assertNotIn(title, logged)
+            self.assertNotIn(body, logged)
+
+    def test_versions_one_two_and_three_each_reach_version_four_and_reopen(
+        self,
+    ) -> None:
+        fresh_path = self.root / "fresh" / "maria-test.db"
+        Memory(fresh_path, logger=TEST_LOGGER).initialize()
+        starts = {
+            PRE_MEMORIES_VERSION: (
+                lambda path: create_pre_memories_baseline(path),
+                [
+                    "create_memories",
+                    "add_memory_context_consent",
+                    "add_note_context_consent",
+                ],
+            ),
+            BASELINE_SCHEMA_VERSION: (
+                lambda path: create_v0_2_0_baseline(path),
+                ["add_memory_context_consent", "add_note_context_consent"],
+            ),
+            MEMORY_CONTEXT_CONSENT_VERSION: (
+                lambda path: create_schema(
+                    path,
+                    V3_SCHEMA,
+                    with_rows=True,
+                    with_memories=True,
+                ),
+                ["add_note_context_consent"],
+            ),
+        }
+        for version, (create, expected_steps) in starts.items():
+            with self.subTest(version=version):
+                path = self.root / f"from-{version}" / "maria-test.db"
+                create(path)
+                stamp_schema_version(path, version)
+                recording_logger = Mock(spec=logging.Logger)
+
+                Memory(path, logger=recording_logger).initialize()
+
+                self.assertEqual(self._applied(recording_logger), expected_steps)
+                self.assertEqual(read_schema_version(path), 4)
+                self.assertEqual(self.describe(path), self.describe(fresh_path))
+                self.assertEqual(
+                    self._raw_notes(path),
+                    [(*row, None) for row in BASELINE_NOTES],
+                )
+                migrated = path.read_bytes()
+                Memory(path, logger=TEST_LOGGER).initialize()
+                self.assertEqual(path.read_bytes(), migrated)
+
+    def test_a_failed_note_step_leaves_version_three_whole_then_applies_once(
+        self,
+    ) -> None:
+        create_schema(self.database_path, V3_SCHEMA, with_rows=True, with_memories=True)
+        stamp_schema_version(self.database_path, MEMORY_CONTEXT_CONSENT_VERSION)
+        broken = (
+            *memory_module._MIGRATIONS[:2],
+            memory_module._Migration(
+                version=self.NOTE_CONTEXT_CONSENT_VERSION,
+                name="add_note_context_consent",
+                statements=(
+                    memory_module._ADD_NOTE_CONTEXT_CONSENT_COLUMN,
+                    "CREATE TABLE never_committed (INVALID",
+                ),
+            ),
+        )
+
+        with patch.object(memory_module, "_MIGRATIONS", broken):
+            with self.assertRaisesRegex(
+                RuntimeError,
+                r"^Unable to initialize Maria database\.$",
+            ) as raised:
+                self.memory.initialize()
+
+        self.assertIsInstance(raised.exception.__cause__, sqlite3.Error)
+        self.assertEqual(
+            read_schema_version(self.database_path),
+            MEMORY_CONTEXT_CONSENT_VERSION,
+        )
+        self.assertEqual(self.describe(), memory_module._reference_schema(V3_SCHEMA))
+
+        recording_logger = Mock(spec=logging.Logger)
+        retrying = Memory(self.database_path, logger=recording_logger)
+        retrying.initialize()
+        retrying.initialize()
+
+        self.assertEqual(read_schema_version(self.database_path), 4)
+        self.assertEqual(self._applied(recording_logger), ["add_note_context_consent"])
+        self.assertEqual(
+            self._raw_notes(),
+            [(*row, None) for row in BASELINE_NOTES],
+        )
+
+    def test_a_drifted_version_four_database_is_refused_untouched(self) -> None:
+        column = (
+            "context_digest TEXT\n"
+            "            CHECK (context_digest IS NULL OR length(context_digest) = 64)"
+        )
+        drifts = {
+            "missing column": V3_SCHEMA,
+            "no check": "context_digest TEXT",
+            "wider check": "context_digest TEXT\n"
+            "            CHECK (context_digest IS NULL OR length(context_digest) >= 64)",
+            "integer column": "context_digest INTEGER\n"
+            "            CHECK (context_digest IS NULL OR length(context_digest) = 64)",
+            "never null": "context_digest TEXT NOT NULL DEFAULT ''",
+            "on by default": "context_digest TEXT DEFAULT '"
+            + "0" * 64
+            + "'\n"
+            "            CHECK (context_digest IS NULL OR length(context_digest) = 64)",
+        }
+        for label, drift in drifts.items():
+            with self.subTest(drift=label):
+                if isinstance(drift, tuple):
+                    schema = drift
+                else:
+                    schema = tuple(
+                        statement.replace(column, drift) for statement in V4_SCHEMA
+                    )
+                    self.assertNotEqual(schema, V4_SCHEMA)
+                self.database_path = self.root / label / "maria-test.db"
+                self.memory = Memory(self.database_path, logger=TEST_LOGGER)
+                create_schema(self.database_path, schema)
+                stamp_schema_version(
+                    self.database_path,
+                    self.NOTE_CONTEXT_CONSENT_VERSION,
+                )
+
+                self._assert_refused_untouched(
+                    marker=self.NOTE_CONTEXT_CONSENT_VERSION,
+                )
 
 
 def _object_names(database_path: Path) -> tuple[str, ...]:

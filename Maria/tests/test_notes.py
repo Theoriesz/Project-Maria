@@ -35,11 +35,23 @@ class NotesToolTests(unittest.TestCase):
         self.assertEqual(self.tool.name, "notes")
         self.assertEqual(
             self.tool.description,
-            "Creates, lists, reads, retitles, edits, and deletes notes.",
+            "Creates, lists, reads, retitles, edits, and deletes notes, and "
+            "turns one note's context consent on or off.",
         )
         self.assertEqual(
             self.tool.actions,
-            frozenset({"create", "list", "read", "retitle", "edit", "delete"}),
+            frozenset(
+                {
+                    "create",
+                    "list",
+                    "read",
+                    "retitle",
+                    "edit",
+                    "delete",
+                    "enable_context",
+                    "disable_context",
+                }
+            ),
         )
         self.assertIsInstance(factory_tool, NotesTool)
         self.assertIs(factory_tool.memory, self.memory)
@@ -388,8 +400,12 @@ class NotesToolTests(unittest.TestCase):
         self,
     ) -> None:
         mutations = (
-            ("retitle", "retitle_note", {"title": "New Title"}),
-            ("edit", "edit_note", {"body": "New body"}),
+            (
+                "retitle",
+                "retitle_note_reporting_consent",
+                {"title": "New Title"},
+            ),
+            ("edit", "edit_note_reporting_consent", {"body": "New body"}),
             ("delete", "delete_note", {}),
         )
         invalid_ids = (0, -1, "1", 1.0, True, False, None)
@@ -419,8 +435,18 @@ class NotesToolTests(unittest.TestCase):
     ) -> None:
         note_id = self.memory.create_note("Original Title", "Original body")
         mutations = (
-            ("retitle", "retitle_note", "title", "New note title is required."),
-            ("edit", "edit_note", "body", "New note body is required."),
+            (
+                "retitle",
+                "retitle_note_reporting_consent",
+                "title",
+                "New note title is required.",
+            ),
+            (
+                "edit",
+                "edit_note_reporting_consent",
+                "body",
+                "New note body is required.",
+            ),
         )
         invalid_values = (None, 5, True, [], object(), "", "   ")
 
@@ -529,28 +555,28 @@ class NotesToolTests(unittest.TestCase):
             ),
             (
                 "retitle",
-                "retitle_note",
+                "retitle_note_reporting_consent",
                 ValueError("New note title is required."),
                 {"id": 1, "title": "Title"},
                 "Note retitle failed: New note title is required.",
             ),
             (
                 "retitle",
-                "retitle_note",
+                "retitle_note_reporting_consent",
                 RuntimeError("Unable to retitle note."),
                 {"id": 1, "title": "Title"},
                 "Note retitle failed: Unable to retitle note.",
             ),
             (
                 "edit",
-                "edit_note",
+                "edit_note_reporting_consent",
                 ValueError("New note body is required."),
                 {"id": 1, "body": "Body"},
                 "Note edit failed: New note body is required.",
             ),
             (
                 "edit",
-                "edit_note",
+                "edit_note_reporting_consent",
                 RuntimeError("Unable to edit note."),
                 {"id": 1, "body": "Body"},
                 "Note edit failed: Unable to edit note.",
@@ -596,13 +622,13 @@ class NotesToolTests(unittest.TestCase):
             ),
             (
                 "retitle",
-                "retitle_note",
+                "retitle_note_reporting_consent",
                 {"id": 1, "title": "Title"},
                 f"Note retitle failed: {busy_text}",
             ),
             (
                 "edit",
-                "edit_note",
+                "edit_note_reporting_consent",
                 {"id": 1, "body": "Body"},
                 f"Note edit failed: {busy_text}",
             ),

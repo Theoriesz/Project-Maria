@@ -50,8 +50,8 @@ use temporary resources instead.
 - `MANDATORY_DENIED_ACTIONS` — `filesystem.delete` and `filesystem.write`
 - `MANDATORY_CONFIRMATION_ACTIONS` — `filesystem.rename`, `filesystem.move`,
   `history.delete`, `notes.retitle`, `notes.edit`, `notes.delete`,
-  `memory.update`, `memory.forget`, `memory.enable_context`, and
-  `memory.disable_context`
+  `notes.enable_context`, `notes.disable_context`, `memory.update`,
+  `memory.forget`, `memory.enable_context`, and `memory.disable_context`
 
 `PermissionManager.__init__` and `Maria/core/config.py` union these into whatever
 configuration supplies, so **configuration can extend the mandatory baseline but can never
@@ -83,9 +83,10 @@ interaction, the cleaned `user_input` is preserved unchanged. `history.read` is 
 current action that sets this field, using a fixed content-free summary. Brain applies
 the field generically, with no history-specific branch.
 
-Eight lifecycle actions can update or remove an existing stored record: `history.delete`,
-`notes.retitle`, `notes.edit`, `notes.delete`, `memory.update`, `memory.forget`,
-`memory.enable_context`, and `memory.disable_context`.
+Ten lifecycle actions can update or remove an existing stored record: `history.delete`,
+`notes.retitle`, `notes.edit`, `notes.delete`, `notes.enable_context`,
+`notes.disable_context`, `memory.update`, `memory.forget`, `memory.enable_context`, and
+`memory.disable_context`.
 Each requires explicit confirmation and targets at most one row selected by id. There is
 no bulk, wildcard, clear-all, or date-range deletion; no automatic retention or pruning;
 no cascade between the three record types; no undo or revision history; and no guarantee
@@ -93,10 +94,16 @@ of secure erasure. Be careful not to leak sensitive content into any of them whe
 features. See `Maria/docs/architecture.md` ("Persistence Models"), `Maria/docs/database.md`,
 and the "Data Retention and Privacy" section of `Maria/README.md`.
 
-A memory's `context_enabled` consent is the only thing that lets stored text reach the
-reasoning model automatically. It is off by default, changes only through the two
-confirmed consent actions, and is turned off by `memory.update`. Interaction history is
-never read for planning or reasoning. See "Tier A Memory Context" in
+Context consent is the only thing that lets stored text reach the reasoning model
+automatically: a memory's `context_enabled` flag and a note's `context_digest`, the
+identity of the exact title and body the owner approved. Each is off by default, changes
+only through its two confirmed consent actions, and is turned off by `memory.update` or by
+`notes.retitle` and `notes.edit` respectively; a note whose text no longer matches its
+stored identity is never eligible. Enabled memories are sent on every model-backed turn
+(Tier A, first 16 by id) or found by literal search beyond that window (Tier B), and
+enabled notes only by literal search. Consent is not inspection: Maria cannot tell a
+secret from other free text. Interaction history is never read for planning or
+reasoning. See "Tier A Memory Context" and "Tier B Search Context" in
 `Maria/docs/architecture.md`.
 
 ## Philosophy (in priority order)

@@ -23,10 +23,10 @@ There is deliberately no field for a system prompt, a template, a
 credential, a header, an endpoint URL, a port, or a model path. A request may
 carry the earlier exchanges of the owner's current conversation, each text
 the owner typed and text the model already replied, and one typed field of
-Tier A memory context: ``ContextItem`` values from ``core/context.py``, each
-bearing the record id Maria read, empty by default and validated again here
-rather than trusted. Nothing else personal can be carried, and raw
-interaction history has no field at all.
+context: ``ContextItem`` values from ``core/context.py``, Tier A memories and
+Tier B search matches, each bearing the source and record id Maria read,
+empty by default and validated again here rather than trusted. Nothing else
+personal can be carried, and raw interaction history has no field at all.
 """
 
 from __future__ import annotations
@@ -215,14 +215,17 @@ class ReasoningRequest:
 
     ``prompt`` is the question asked now. ``history`` holds the earlier
     exchanges of the same active conversation, oldest first. ``context``
-    holds the Tier A memories Maria selected for this request, each a
-    ``ContextItem`` bearing the record id Maria read, in ascending id order.
-    Both are empty by default, which is exactly the single context-free
-    question a request has always been. There is no field for a system
-    prompt, a template, or raw interaction history.
+    holds the records Maria selected for this request, each a
+    ``ContextItem`` bearing the source and record id Maria read: Tier A
+    memories first, then Tier B search matches. Both are empty by default,
+    which is exactly the single context-free question a request has always
+    been. There is no field for a system prompt, a template, or raw
+    interaction history.
 
-    The prompt is exact, non-empty text; the context is at most
-    ``CONTEXT_MAX_ITEMS`` items rendering to at most ``CONTEXT_MAX_BYTES``;
+    The prompt is exact, non-empty text; the context meets every bound
+    ``context_content_bytes`` checks, at most
+    ``COMBINED_CONTEXT_MAX_ITEMS`` items rendering to at most
+    ``COMBINED_CONTEXT_MAX_BYTES``, with Tier A inside its own V1-15 bounds;
     and the prompt, every exchange's text, and the rendered context together
     are at most ``REASONING_MAXIMUM_INPUT_BYTES`` UTF-8 bytes, counted as
     ``request_content_bytes`` counts them. The configured input budget is
@@ -415,9 +418,10 @@ def request_content_bytes(
 
     This is the one definition of a request's size: the UTF-8 length of the
     prompt, plus the UTF-8 length of every earlier exchange's user text and
-    assistant text, plus the fully rendered memory context, which is Maria's
-    fixed context instructions and the delimited data block with every id,
-    and nothing when the context is empty. Nothing else counts, so no role
+    assistant text, plus the fully rendered context, which is Maria's fixed
+    context instructions and the delimited data block with every header,
+    source, and id, and nothing when the context is empty. Nothing else
+    counts, so no role
     name, message structure, separator, or model identifier a provider adds
     to carry the text is included.
 

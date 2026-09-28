@@ -23,6 +23,7 @@ import logging
 import re
 import sqlite3
 import tempfile
+import traceback
 import unittest
 from collections.abc import Iterable
 from contextlib import closing
@@ -76,6 +77,7 @@ from tests.test_conversation import (
     enabled_settings,
     sent_texts,
 )
+from tools.memory import MemoryTool
 
 
 # Owner-visible wording, written out so it is pinned rather than agreed with.
@@ -89,8 +91,9 @@ UNREADABLE_NOTICE = (
     "session's earlier conversation was cleared."
 )
 CLEARED_NOTICE = (
-    "This session's earlier conversation was cleared because a memory "
-    "supplied to it is no longer enabled with the same text."
+    "This session's earlier conversation was cleared because a memory or note "
+    "supplied to it is no longer enabled with the same text, so the copy "
+    "supplied earlier was invalidated."
 )
 ENABLE_CONFIRMATION = (
     "Confirmation required: memory.enable_context requires explicit "
@@ -161,6 +164,119 @@ def _enable(harness: _Harness, *facts: str) -> list[int]:
 def _row(record_id: int, fact: str | None) -> dict:
     """Return one row shaped as the bounded Tier A read returns it."""
     return {"id": record_id, "fact": fact, "oversized": fact is None}
+
+
+# Stored text SQLite's own error message would repeat: a TEXT value that is
+# not valid UTF-8, whose decode error quotes it, or a trigger whose RAISE
+# quotes the text being written. It must reach no log and no failure.
+FAILURE_SENTINEL = "private-sqlite-detail-8d3f61c2a9"
+MALFORMED_TEXT = (FAILURE_SENTINEL + " ").encode("ascii") + b"\xff\xfe"
+
+
+class _FailurePrivacyCase(unittest.TestCase):
+    """A temporary database whose memory layer writes a real temporary log."""
+
+    def setUp(self) -> None:
+        temporary = tempfile.TemporaryDirectory()
+        self.addCleanup(temporary.cleanup)
+        root = Path(temporary.name)
+        self.database_path = root / "database" / "maria.db"
+        self.log_path = root / "logs" / "maria.log"
+        self.log_path.parent.mkdir()
+        self.logger = logging.getLogger(f"tests.failure_privacy.{self.id()}")
+        self.logger.handlers[:] = [
+            logging.FileHandler(self.log_path, encoding="utf-8")
+        ]
+        self.logger.setLevel(logging.DEBUG)
+        self.logger.propagate = False
+        self.addCleanup(self._close_log)
+        self.memory = Memory(self.database_path, logger=self.logger)
+        self.memory.initialize()
+
+    def _close_log(self) -> None:
+        for handler in self.logger.handlers:
+            handler.close()
+        self.logger.handlers.clear()
+
+    def raw(self, statement: str, parameters: tuple = ()) -> None:
+        """Run one statement through a second, raw connection."""
+        with closing(sqlite3.connect(self.database_path)) as connection:
+            connection.execute(statement, parameters)
+            connection.commit()
+
+    def raw_rows(self, statement: str, parameters: tuple = ()) -> list[tuple]:
+        """Read rows through a second, raw connection, never decoding text.
+
+        A caller selects ``CAST(... AS BLOB)`` for any text that may be
+        malformed, so the before and after states compare exactly.
+        """
+        with closing(sqlite3.connect(self.database_path)) as connection:
+            return connection.execute(statement, parameters).fetchall()
+
+    def refuse_when(self, name: str, event: str, condition: str) -> None:
+        """Create a trigger that refuses ``event`` with the sentinel.
+
+        The message is a plain string literal, which every SQLite version
+        accepts, and the ``WHEN`` condition on the OLD or NEW text makes the
+        trigger fire only for the row that holds the sentinel, so every other
+        write still succeeds.
+        """
+        self.raw(
+            f"CREATE TRIGGER {name} BEFORE {event} WHEN {condition} "
+            f"BEGIN SELECT RAISE(ABORT, 'refused: {FAILURE_SENTINEL}'); END"
+        )
+
+    def logged(self) -> str:
+        """Return everything the temporary log holds so far."""
+        for handler in self.logger.handlers:
+            handler.flush()
+        return self.log_path.read_text(encoding="utf-8")
+
+    def assert_fixed_failure(
+        self,
+        call,
+        message: str,
+        log_line: str,
+    ) -> None:
+        """Assert one failing call says only Maria's fixed text, anywhere.
+
+        The failure's message is fixed, it has neither a cause nor a context,
+        its formatted traceback omits the sentinel, and the only thing the
+        call adds to the temporary log is the one fixed line, with no
+        traceback.
+        """
+        before = len(self.logged())
+
+        with self.assertRaises(RuntimeError) as caught:
+            call()
+
+        failure = caught.exception
+        self.assertEqual(str(failure), message)
+        self.assertIsNone(failure.__cause__)
+        self.assertIsNone(failure.__context__)
+        self.assertNotIn(
+            FAILURE_SENTINEL,
+            "".join(traceback.format_exception(failure)),
+        )
+        self.assertEqual(self.logged()[before:], f"{log_line}\n")
+        assert_log_omits(self, self.log_path, (FAILURE_SENTINEL,))
+
+    def assert_displayed(self, shown: str, expected: str) -> None:
+        """Assert what the owner is shown is the fixed text, and the log too."""
+        self.assertEqual(shown, expected)
+        self.assertNotIn(FAILURE_SENTINEL, shown)
+        assert_log_omits(self, self.log_path, (FAILURE_SENTINEL,))
+
+    def assert_sqlite_quotes_the_sentinel(self, statement: str) -> None:
+        """Prove the synthetic setup really puts the sentinel in SQLite's error.
+
+        Without this, a failure that omits the sentinel could simply mean the
+        sentinel never reached SQLite's message at all.
+        """
+        with closing(sqlite3.connect(self.database_path)) as connection:
+            with self.assertRaises(sqlite3.Error) as caught:
+                connection.execute(statement).fetchall()
+        self.assertIn(FAILURE_SENTINEL, str(caught.exception))
 
 
 # --- The context module on its own -------------------------------------------------
@@ -1749,6 +1865,137 @@ class BoundedTierAReadTests(unittest.TestCase):
         self.assertNotIn(MEMORY_SENTINEL, everything_sent((last,)))
         self.assertEqual(self.hashed[hashed_before:], [])
         self._assert_nothing_large_crossed()
+
+
+class MemoryConsentFailurePrivacyTests(_FailurePrivacyCase):
+    """Prove a failing memory consent read or change repeats no stored text.
+
+    A malformed TEXT fact makes SQLite's decode error quote the fact, and a
+    trigger's message can hold the sentinel whenever the old or the new fact
+    does. Each failure changes nothing in the database, keeps its outcome,
+    and says only Maria's fixed text in the log, the failure, its traceback,
+    and what the owner sees.
+    """
+
+    def setUp(self) -> None:
+        super().setUp()
+        self.tool = MemoryTool(self.memory, logger=self.logger)
+        self.memory_id, _ = self.memory.store_memory(f"stored {FAILURE_SENTINEL}")
+
+    def _stored(self) -> list[tuple]:
+        return self.raw_rows(
+            "SELECT id, CAST(fact AS BLOB), normalized_fact, context_enabled "
+            "FROM memories ORDER BY id"
+        )
+
+    def test_a_malformed_fact_fails_its_identity_read_and_enable_privately(
+        self,
+    ) -> None:
+        self.raw(
+            "UPDATE memories SET fact = CAST(? AS TEXT) WHERE id = ?",
+            (MALFORMED_TEXT, self.memory_id),
+        )
+        self.assert_sqlite_quotes_the_sentinel("SELECT fact FROM memories")
+        before = self._stored()
+        self.assertEqual(before[0][1], MALFORMED_TEXT)
+        self.assertEqual(before[0][3], 0)
+
+        self.assert_fixed_failure(
+            lambda: self.memory.memory_fact_digest(self.memory_id),
+            "Unable to read memory.",
+            "Failed to read memory identity.",
+        )
+        self.assert_fixed_failure(
+            lambda: self.memory.enable_memory_context(self.memory_id, "a" * 64),
+            "Unable to change memory context consent.",
+            "Failed to change memory context consent.",
+        )
+        self.assertEqual(self._stored(), before)
+        self.assert_displayed(
+            self.tool.execute(
+                "enable_context",
+                {"id": self.memory_id, "fact_digest": "a" * 64},
+            ).message,
+            "Memory context change failed: Unable to change memory context "
+            "consent.",
+        )
+        self.assertEqual(
+            self.tool.confirmation_binding("enable_context", {"id": self.memory_id}),
+            {},
+        )
+        self.assertEqual(self._stored(), before)
+        assert_log_omits(self, self.log_path, (FAILURE_SENTINEL,))
+
+    def test_a_failed_disable_keeps_consent_on_and_repeats_no_fact(self) -> None:
+        _enable_id(self.memory, self.memory_id)
+        self.refuse_when(
+            "refuse_disable",
+            "UPDATE OF context_enabled ON memories",
+            f"instr(OLD.fact, '{FAILURE_SENTINEL}') > 0",
+        )
+        self.assert_sqlite_quotes_the_sentinel(
+            "UPDATE memories SET context_enabled = 0"
+        )
+        before = self._stored()
+        self.assertEqual(before[0][3], 1)
+
+        self.assert_fixed_failure(
+            lambda: self.memory.disable_memory_context(self.memory_id),
+            "Unable to change memory context consent.",
+            "Failed to change memory context consent.",
+        )
+        self.assert_displayed(
+            self.tool.execute("disable_context", {"id": self.memory_id}).message,
+            "Memory context change failed: Unable to change memory context "
+            "consent.",
+        )
+        self.assertEqual(self._stored(), before)
+
+    def test_a_failed_update_keeps_fact_and_consent_and_repeats_neither(
+        self,
+    ) -> None:
+        _enable_id(self.memory, self.memory_id)
+        self.refuse_when(
+            "refuse_update",
+            "UPDATE OF fact ON memories",
+            f"instr(NEW.fact, '{FAILURE_SENTINEL}') > 0",
+        )
+        new_fact = f"new {FAILURE_SENTINEL}"
+        self.assert_sqlite_quotes_the_sentinel(
+            f"UPDATE memories SET fact = '{new_fact}'"
+        )
+        before = self._stored()
+
+        self.assert_fixed_failure(
+            lambda: self.memory.update_memory_reporting_consent(
+                self.memory_id,
+                new_fact,
+            ),
+            "Unable to update memory.",
+            "Failed to update memory.",
+        )
+        self.assert_displayed(
+            self.tool.execute(
+                "update",
+                {"id": self.memory_id, "fact": new_fact},
+            ).message,
+            "Memory update failed: Unable to update memory.",
+        )
+        self.assertEqual(self._stored(), before)
+
+    def test_an_update_conflict_is_still_reported_by_id(self) -> None:
+        other_id, _ = self.memory.store_memory("other fact")
+
+        result = self.memory.update_memory_reporting_consent(
+            other_id,
+            f"STORED {FAILURE_SENTINEL}",
+        )
+
+        self.assertEqual(
+            (result.updated, result.conflicting_id, result.context_consent_cleared),
+            (False, self.memory_id, False),
+        )
+        assert_log_omits(self, self.log_path, (FAILURE_SENTINEL,))
 
 
 if __name__ == "__main__":

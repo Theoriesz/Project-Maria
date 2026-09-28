@@ -60,6 +60,8 @@ EXPECTED_ACTION_IDENTIFIERS = frozenset(
         "notes.retitle",
         "notes.edit",
         "notes.delete",
+        "notes.enable_context",
+        "notes.disable_context",
         "system.overview",
         "system.current_time",
     }
@@ -379,7 +381,7 @@ class RegistryCompletenessTests(unittest.TestCase):
             BUILT_IN_ACTION_CONTRACTS.action_identifiers,
             EXPECTED_ACTION_IDENTIFIERS,
         )
-        self.assertEqual(len(EXPECTED_ACTION_IDENTIFIERS), 24)
+        self.assertEqual(len(EXPECTED_ACTION_IDENTIFIERS), 26)
 
     def test_registry_and_loaded_tool_inventory_agree_in_both_directions(self) -> None:
         with TemporaryDirectory() as name:
@@ -417,7 +419,7 @@ class RegistryCompletenessTests(unittest.TestCase):
         ]
 
         self.assertEqual(len(identifiers), len(set(identifiers)))
-        self.assertEqual(len(identifiers), 24)
+        self.assertEqual(len(identifiers), 26)
 
     def test_no_contract_exists_for_a_mandatorily_denied_filesystem_action(
         self,
@@ -455,7 +457,7 @@ class RegistryCompletenessTests(unittest.TestCase):
             if argument.value_type is str
         ]
 
-        self.assertEqual(len(text_fields), 17)
+        self.assertEqual(len(text_fields), 18)
         for contract, argument in text_fields:
             with self.subTest(field=f"{contract.identifier}.{argument.name}"):
                 self.assertIsInstance(argument.allow_blank, bool)
@@ -495,11 +497,18 @@ class RegistryCompletenessTests(unittest.TestCase):
             {
                 "calculator.calculate.expression": MAXIMUM_EXPRESSION_LENGTH,
                 "memory.enable_context.fact_digest": FACT_DIGEST_LENGTH,
+                "notes.enable_context.text_digest": FACT_DIGEST_LENGTH,
             },
         )
         self.assertEqual(MAXIMUM_EXPRESSION_LENGTH, 200)
         self.assertEqual(FACT_DIGEST_LENGTH, 64)
-        self.assertEqual(minimums, {"memory.enable_context.fact_digest"})
+        self.assertEqual(
+            minimums,
+            {
+                "memory.enable_context.fact_digest",
+                "notes.enable_context.text_digest",
+            },
+        )
         digest = BUILT_IN_ACTION_CONTRACTS.contract_for(
             "memory",
             "enable_context",
@@ -547,6 +556,8 @@ class RegistryCompletenessTests(unittest.TestCase):
             ("notes", "retitle"),
             ("notes", "edit"),
             ("notes", "delete"),
+            ("notes", "enable_context"),
+            ("notes", "disable_context"),
         )
         for tool_name, action in identifier_actions:
             with self.subTest(action=f"{tool_name}.{action}"):
@@ -593,6 +604,9 @@ class RegistryCompletenessTests(unittest.TestCase):
                 # Absent from the planner's plan and pinned when confirmation
                 # is offered, so an approval names the exact fact text.
                 ("memory", "enable_context", "fact_digest"),
+                # V1-16: likewise pinned for a note, naming its exact title
+                # and body together.
+                ("notes", "enable_context", "text_digest"),
             },
         )
 
@@ -704,7 +718,7 @@ class RegistryConstructionTests(unittest.TestCase):
                 "sample", "run"
             )
 
-        self.assertEqual(len(BUILT_IN_ACTION_CONTRACTS.action_identifiers), 24)
+        self.assertEqual(len(BUILT_IN_ACTION_CONTRACTS.action_identifiers), 26)
 
     def test_unsupported_declared_type_is_rejected(self) -> None:
         with self.assertRaises(ValueError):

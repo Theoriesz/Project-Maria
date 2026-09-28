@@ -27,21 +27,30 @@ supplied_context: frozenset[ContextFingerprint] = frozenset()) -> BrainResponse`
 Plans one request and coordinates it from input to plan, whole-plan permission
 resolution, tool execution, and interaction-history recording. A plan holding a
 step that requires confirmation returns before execution, carrying on the
-response the plan `ToolManager.bind_for_confirmation()` returns for it: the same
+response the plan `ToolManager.prepare_confirmation()` returns for it: the same
 plan, unless a tool pinned the exact state a step acts on, in which case the
-approval binds to that pinned plan. The deterministic planner always runs first. The request is
+approval binds to that pinned plan. Any previews that call returns follow the
+confirmation request's text, each on its own lines, and go nowhere else. The deterministic planner always runs first. The request is
 answered conversationally instead only when all three hold: a reasoning
 provider was supplied, `config.reasoning.enabled` is true, and the plan is
 exactly the planner's generic no-action fallback. It is then answered in the
 context of `conversation`, the caller's earlier exchanges passed positionally,
-oldest first, with `supplied_context`, the fingerprints of the memories
-supplied since that conversation began (see "Conversation"). Only then does
-Brain read Tier A context, through `Memory.list_context_memories(limit=17,
-max_fact_bytes=2048)`; a
-read that raises `RuntimeError` is logged as the fixed line `Unable to read
-memory context.` and handed on as unavailable. With disabled settings the
-fallback keeps its original response and interaction row even if a provider
-was supplied, and no Tier A read happens. The planner receives the cleaned
+oldest first, with `supplied_context`, the fingerprints of the memories and
+notes supplied since that conversation began (see "Conversation"). Only then
+does Brain read context: Tier A through
+`Memory.list_context_memories(limit=17, max_fact_bytes=2048)`; the records
+`supplied_context` names, only when there are any, through
+`Memory.context_memories_by_id(ids, max_fact_bytes=2048)` and
+`Memory.context_notes_by_id(ids, max_text_bytes=2048)`; and, only when
+`context.search_terms(request)` yields terms, Tier B through
+`Memory.search_context_notes(terms, limit=9, max_text_bytes=2048)` and, only
+when Tier A's read returned 17 rows, `Memory.search_context_memories(terms,
+after_id=<16th id>, limit=9, max_fact_bytes=2048)`. A read that raises
+`RuntimeError`, or a Tier A read too malformed to start the search from, is
+logged as the fixed line `Unable to read memory context.` and ends every read,
+so the turn fails closed. With disabled settings the fallback keeps its
+original response and interaction row even if a provider was supplied, and no
+context read happens. The planner receives the cleaned
 request text alone, and no interaction history is read. `supplied_context` is
 the only keyword accepted; no keyword can approve anything.
 
@@ -52,7 +61,8 @@ supplied_context=frozenset())`
 conversation as it stands after that reply, and to `()` by a conversational
 turn that had to clear the conversation, whether or not the model then
 answered. `supplied_context` travels with it: the fingerprints of every memory
-supplied since that conversation was last cleared. Every other response,
+and note supplied since that conversation was last cleared, at most 64. Every
+other response,
 including a failed or refused conversational turn that cleared nothing, leaves
 `conversation` `None`.
 
@@ -148,10 +158,16 @@ Confirmation required for 2 planned actions:
 2. filesystem.rename: requires confirmation
 ```
 
-Neither form repeats an argument value, so no stored content, and no absolute
-host path, can reach the owner's interface, an interaction row, or a log through
-it. The rendering carries no fingerprint and no canonical serialized plan
-content, and a pending confirmation is not recorded to interaction history.
+Neither form repeats an argument value, so no absolute host path can reach the
+owner's interface, an interaction row, or a log through it. The rendering
+carries no fingerprint and no canonical serialized plan content, and a pending
+confirmation is not recorded to interaction history. The one addition is a
+tool's preview from `ToolManager.prepare_confirmation()`: owner-visible text,
+such as the exact title and body a `notes.enable_context` approval covers,
+appended after the request on its own lines. It is shown only; it is not part
+of the plan or its fingerprint, and it is never recorded, logged, retained in
+the conversation, or sent to a model. With no preview the request is exactly
+as before.
 
 ## Session
 
@@ -166,28 +182,30 @@ invalidation, replay prevention, and refusal.
 
 Discards any approval still pending, then plans the request exactly once,
 handing Brain the session's conversation and, when there are any, its
-supplied-memory fingerprints. A confirmation-required response becomes the
+supplied-record fingerprints. A confirmation-required response becomes the
 single pending approval. A response carrying a `conversation` replaces the
 session's conversation, held to the retention limits again here, and replaces
 its fingerprints with the response's `supplied_context`, or with nothing when
-the conversation is empty; every other response leaves both unchanged.
+the conversation is empty; a response carrying more than 64 fingerprints
+clears both. Every other response leaves both unchanged.
 
 `MariaSession.conversation -> tuple[ReasoningExchange, ...]`
 
 The session's completed conversational exchanges, oldest first: at most
 eight, with at most 8 KiB of content. Empty for a new session. Each exchange
-holds only the owner's request and the model's reply, never Maria's notice
-about memory context.
+holds only the owner's request and the model's reply, never Maria's notices
+about context.
 
 `MariaSession.supplied_context -> frozenset[ContextFingerprint]`
 
-The fingerprints of every memory supplied to the model since the conversation
-was last cleared: source, id, and a SHA-256 digest of the exact text, never the
-text. Empty for a new session and whenever the conversation is empty.
+The fingerprints of every memory and note supplied to the model since the
+conversation was last cleared, at most 64: source, id, and a SHA-256 digest of
+the exact text, a note's title and body together, never the text. Empty for a
+new session and whenever the conversation is empty.
 
 `MariaSession.end() -> None`
 
-Ends the session: discards its conversation, its supplied-memory fingerprints,
+Ends the session: discards its conversation, its supplied-record fingerprints,
 and any pending approval, writes nothing, and logs only `Session ended.`. Ending again changes nothing. The CLI
 calls it on every way out of its main loop.
 
@@ -268,15 +286,22 @@ exchanges raises `ValueError(REASONING_HISTORY_MESSAGE)`.
 every conversational turn produces, so Brain's recording gate writes no row.
 
 `converse(provider, settings, request, conversation, logger=None, *,
-supplied_context=frozenset(), enabled_memories_read=()) -> ConversationTurn`
+supplied_context=frozenset(), enabled_memories_read=(),
+supplied_memories_read=(), supplied_notes_read=(), searched_memories_read=(),
+searched_notes_read=()) -> ConversationTurn`
 
 Answers one request conversationally, as text only. `enabled_memories_read` is
-what Brain's bounded Tier A read returned, or `None` when it failed. It is
-settled first: a failed or malformed read sends no memory context and no
-earlier exchange and clears the conversation; otherwise, when a fingerprint in
-`supplied_context` is no longer among the enabled memories, the whole earlier
-conversation is cleared before anything is sent. The request then comes first,
-fitting memory context second, and fitting earlier exchanges third.
+what Brain's bounded Tier A read returned, or `None` when any context read
+failed; the `supplied_*` reads are the rechecks of the records
+`supplied_context` names, and the `searched_*` reads are Tier B's results. All
+are settled first: a failed or malformed read sends no context and no earlier
+exchange and clears the conversation; otherwise, when a fingerprint in
+`supplied_context` is no longer among the enabled records rechecked with the
+same text, the whole earlier conversation is cleared before anything is sent.
+The request then comes first, fitting Tier A context second, fitting Tier B
+matches third, memories before notes, and fitting earlier exchanges fourth. A
+conversation that would then carry more than 64 supplied records is cleared
+before sending, with `CONTEXT_LIMIT_CLEARED_NOTICE`.
 
 | Situation | Response text | Provider asked | Conversation |
 | --- | --- | --- | --- |
@@ -288,45 +313,89 @@ fitting memory context second, and fitting earlier exchanges third.
 
 "Unchanged" becomes "cleared" whenever the turn cleared the conversation.
 Every response text is followed, after a blank line, by Maria's notices: the
-cleared or unreadable notice when it applies; then `Memory context supplied:
-memory <id>, ...` with the uncertainty sentence after a reply, `Memory context
-selected for this request: memory <id>, ...` with the delivery caveat after a
-failure, or `No memory context supplied.` when no memory was sent; then the
-omission notice when a bound left enabled memories out.
+cleared, recheck-limit, or unreadable notice when it applies; then `Memory
+context supplied: memory <id>, ...` with the uncertainty sentence after a
+reply, or `Memory context selected for this request: memory <id>, ...` with
+the delivery caveat after a failure, when Tier A was sent; the Tier A omission
+notice when a bound left enabled memories out; then `Found by search and
+supplied: memory <id>, note <id>, ...` with its uncertainty sentence, or the
+matching `Found by search and selected for this request: ...` after a failure,
+when Tier B was sent; the search omission notice when a bound left matches
+out; and `Possible divergent versions: note <id> and note <id> have the same
+title and different bodies. ...` for selected notes that share a title. With
+no context at all the one notice is `No memory context supplied.`
 
 `ConversationTurn(plan, conversation=None, supplied_context=None)` carries the
 transient plan and, together, the conversation and fingerprints the session
 should keep; both are `None` when it keeps what it had, and setting only one
 raises `ValueError`. Refusals log a fixed line such as `Conversational request
 refused: over budget.`; the turn also logs `Memory context selected: <n>
-item(s).`, and clearing logs a fixed line. No request, reply, history, or
-memory text is ever logged.
+item(s).` and `Search context selected: <n> item(s).`, and clearing logs a
+fixed line. No request, reply, history, stored text, search term, or digest is
+ever logged.
 
 ## Context
 
-`core/context.py` holds Tier A context: the provenance values, the one
-selection rule, the rendering a model receives, and the fixed owner-visible
-notices. It imports no Maria module, reads nothing, stores nothing, and logs
-nothing.
+`core/context.py` holds Tier A and Tier B context: the provenance values, the
+selection rules, the search-term rule, the rendering a model receives, and the
+fixed owner-visible notices. It imports no Maria module, reads nothing, stores
+nothing, and logs nothing.
 
 `CONTEXT_MAX_ITEMS = 16`, `CONTEXT_MAX_BYTES = 2048`, and
 `CONTEXT_QUERY_LIMIT = 17`
 
-At most 16 memories per request, at most 2 KiB of fully rendered context
-(fixed instructions, header, ids, and quoted text), and the one-extra-row
-limit Brain passes to the bounded read. `CONTEXT_MAX_BYTES` is also the
-per-fact size bound Brain passes to that read, since a longer fact could never
-be sent.
+At most 16 Tier A memories per request, at most 2 KiB of Tier A rendered on
+its own (fixed instructions, header, ids, and quoted text), and the
+one-extra-row limit Brain passes to the bounded read. `CONTEXT_MAX_BYTES` is
+also the per-text size bound Brain passes to every context read, since a
+longer text could never be sent.
 
-`ContextSource.MEMORY`, `ContextItem(source, record_id, text)`, and
+`SEARCH_MAX_ITEMS = 8`, `SEARCH_QUERY_LIMIT = 9`, `SEARCH_MAX_TERMS = 8`,
+`SEARCH_TERM_MIN_CHARACTERS = 4`, `SEARCH_TERM_MAX_CHARACTERS = 64`,
+`COMBINED_CONTEXT_MAX_ITEMS = 24`, `COMBINED_CONTEXT_MAX_BYTES = 4096`, and
+`SUPPLIED_CONTEXT_MAX_RECORDS = 64`
+
+At most 8 Tier B items, 9 rows per source read, 8 search terms of 4 to 64
+characters, 24 items and 4,096 fully rendered bytes across both tiers, and 64
+supplied records a conversation may carry.
+
+`ContextSource.MEMORY`, `ContextSource.NOTE`, `ContextTier.A`, `ContextTier.B`,
+`ContextItem(source, record_id, text, title=None, tier=ContextTier.A)`, and
 `ContextFingerprint(source, record_id, digest)`
 
 A `ContextItem` is one stored record supplied to reasoning: an exact
-`ContextSource`, the positive `int` id Maria read, and non-empty, encodable
-text of at most `CONTEXT_MAX_BYTES`; anything else raises
+`ContextSource`, the positive `int` id Maria read, non-empty, encodable text of
+at most `CONTEXT_MAX_BYTES` — a memory's fact or a note's body — and a note's
+title under the same bound, with `title` None for any other source. Only a
+memory can be a Tier A item. Anything else raises
 `ValueError(CONTEXT_ITEM_MESSAGE)`. `item.fingerprint` returns its
-`ContextFingerprint`, whose `digest` is the SHA-256 of the exact text. Neither
-`repr()` shows text or digest.
+`ContextFingerprint`, whose `digest` is the SHA-256 of the exact text, or for a
+note `note_digest(title, body)`: the SHA-256 of both as one compact JSON
+array. Neither `repr()` shows text or digest. A later stage that makes another
+record type eligible adds a `ContextSource` member.
+
+`search_terms(request) -> tuple[str, ...]` and
+`memory_search_after(memories) -> int | None`
+
+`search_terms` casefolds the request, splits it on whitespace, strips
+non-alphanumeric characters from both ends of each word, keeps words of 4 to 64
+characters, drops repeats in first-seen order, and returns the first 8; text a
+request cannot carry yields none. `memory_search_after` returns the id of the
+16th memory Tier A considered when its read returned more, and None otherwise.
+
+`select_search_context(enabled_items, memories, notes, byte_budget) ->
+SearchSelection`
+
+Takes the first 8 rows of each source's search, memories first, each in
+ascending id order, whole, while fewer than 8 have been taken and the whole
+rendered context, Tier A included, stays within `COMBINED_CONTEXT_MAX_BYTES`
+and `byte_budget`. `SearchSelection` holds the `items` sent, the `omitted`
+`(source, id)` pairs a read returned that did not fit, or memories too large to
+supply, and `more`, the sources whose read returned a ninth row. A note search
+never returns a note by id only, and `searched_notes_whole(notes)` raises
+`ValueError(SEARCHED_NOTES_MESSAGE)` for one that does, so the conversation
+module treats such a read as untrustworthy and fails closed rather than naming
+the note.
 
 `select_memory_context(memories, byte_budget) -> ContextSelection`
 
@@ -341,17 +410,49 @@ but the limits kept out, and `more_enabled` when the read found more than 16.
 and `context_content_bytes(context) -> int`
 
 The data block is the header `Owner memories (reference data):` and then one
-line per memory, `memory <id>: <fact as one JSON string>`. JSON escapes every
-quote and control character, and Maria additionally escapes U+0085, U+2028,
-and U+2029, the line separators JSON leaves as they are, so every separator
-`str.splitlines()` recognises is escaped and no fact can break out of its line
-or pose as another record. The escapes are standard JSON, so the decoded text
-is unchanged, and the rendered size counts the escaped bytes. `CONTEXT_INSTRUCTIONS` is the fixed text sent ahead of it; it
-contains no stored fact. `rendered_context_bytes` is their combined UTF-8 size,
-or `0` for no items. `context_content_bytes` validates a request's context
-again — an exact tuple of at most 16 exact items, still valid, in strictly
-ascending id order, rendering within `CONTEXT_MAX_BYTES` — and returns its size,
-raising `ValueError(CONTEXT_MESSAGE)` otherwise.
+line per Tier A memory, `memory <id>: <fact as one JSON string>`, then, when
+Tier B is present, the header `Owner memories and notes found by search
+(reference data):` and one line per match: `memory <id>: <fact as one JSON
+string>` or `note <id>: {"title": ..., "body": ...}`. JSON escapes every quote
+and control character, and Maria additionally escapes U+0085, U+2028, and
+U+2029, the line separators JSON leaves as they are, so every separator
+`str.splitlines()` recognises is escaped and no stored text can break out of
+its line or pose as another record. The escapes are standard JSON, so the
+decoded text is unchanged, and the rendered size counts the escaped bytes.
+`context_instructions(items)` returns the fixed text sent ahead of it:
+`CONTEXT_INSTRUCTIONS`, exactly the V1-15 text, when only Tier A is present,
+and `SEARCH_CONTEXT_INSTRUCTIONS` otherwise; neither contains stored text.
+`rendered_context_bytes` is their combined UTF-8 size, or `0` for no items.
+`context_content_bytes` validates a request's context again — an exact tuple of
+at most 24 exact items, still valid; at most 16 Tier A memories first,
+rendering on their own within `CONTEXT_MAX_BYTES`; at most 8 Tier B items after
+them, grouped by source; each group in strictly ascending id order and no
+memory in both tiers; everything rendering within
+`COMBINED_CONTEXT_MAX_BYTES` — and returns its size, raising
+`ValueError(CONTEXT_MESSAGE)` otherwise.
+
+`supplied_still_current(supplied, memories, notes=()) -> bool`
+
+True when every supplied fingerprint names a record among the enabled rows a
+recheck by id returned, with exactly the text it had; a missing, oversized, or
+changed record is not current. Only supplied records are hashed.
+
+`search_supplied_notice(items)`, `search_selected_notice(items)`,
+`search_omission_notice(selection)`, and `divergent_notices(items)`
+
+Tier B's owner-visible notices, built from sources and ids only.
+`divergent_notices` names selected notes that share exactly a title while their
+bodies differ, as possible divergent versions; it never claims a contradiction
+or that either is stale.
+
+`quoted_for_owner(text) -> str`
+
+Returns stored text as one line of JSON the owner can read exactly: the
+model's quoting, with every character `str.isprintable()` rejects — control,
+format, and separator characters such as a newline, U+2028, U+202E, or a
+zero-width space — escaped as well. The escapes are standard JSON, so the text
+decodes unchanged; an invisible character is shown rather than hidden, and no
+stored text can start a new line or pose as Maria's own words.
 
 ## Planner
 
@@ -445,7 +546,7 @@ rather than inheriting it: a `SQLITE_BUSY` or `SQLITE_LOCKED` result raises
 including while the connection is being opened, because it is transient and
 worth retrying rather than a broken database.
 
-Unlike every other method here, this one logs nothing derived from the failure:
+This method logs nothing derived from the failure:
 a refusal records one fixed sentence carrying a stable event code, never an
 exception, its text, a traceback, or the database path. `docs/database.md`
 describes the classification, migration, refusal, and logging rules in full.
@@ -611,8 +712,10 @@ finds no row — the conflicting memory was removed concurrently — the method
 raises rather than mislabel the outcome as not-found, so the caller sees the
 ordinary failure below instead of an invented conflicting ID.
 
-Other SQLite failures raise `RuntimeError("Unable to update memory.")`, and
-busy/locked contention raises `RuntimeError("Database is busy. Try again
+Other SQLite failures are fixed failures (see "Fixed failures" below): they log
+only `Failed to update memory.` and raise `RuntimeError("Unable to update
+memory.")`, because SQLite's message can quote the old or the new fact.
+Busy/locked contention raises `RuntimeError("Database is busy. Try again
 shortly.")`.
 
 `Memory.forget_memory(memory_id: int) -> bool`
@@ -631,12 +734,28 @@ consent off, `Turned off context consent for updated memory <id>.`), and log
 nothing extra for a benign not-found or uniqueness-conflict result. Memory fact
 text and `normalized_fact` never appear in log messages.
 
+**Fixed failures.** SQLite's own error message can quote stored text: a
+`TEXT` value that is not valid UTF-8 makes the decode error repeat it, and a
+trigger's `RAISE` message can hold the text being written or removed. Every
+`Memory` method that reads or writes interactions, memories, or notes
+therefore fails in one fixed way: it catches only `sqlite3.Error`, logs one
+fixed line at error level with no traceback, and raises its fixed
+`RuntimeError` only after the `except` block has ended, so the failure has
+neither a `__cause__` nor a `__context__` and nothing from SQLite travels with
+it. SQL, transactions, rollback and closing, success logging, and the
+recognised uniqueness conflicts are unchanged. Busy/locked contention is still
+converted as before, logging and attaching SQLite's busy exception, whose
+message is SQLite's own fixed text. Only `initialize()` and `schema_version()`,
+which never read a stored record's text, keep SQLite's exception as the cause,
+and they log only fixed event codes; see `docs/database.md`.
+
 `Memory.memory_fact_digest(memory_id: int) -> str | None`
 
 Returns the identity of one memory's exact fact — the lowercase hexadecimal
 SHA-256 of its UTF-8 text — or `None` when no row matched. The fact itself is
-never returned or logged. It validates `memory_id` as above and raises
-`RuntimeError("Unable to read memory.")` on SQLite failures.
+never returned or logged. It validates `memory_id` as above; on SQLite failure
+it logs `Failed to read memory identity.` and raises the fixed failure
+`RuntimeError("Unable to read memory.")`.
 
 `Memory.enable_memory_context(memory_id: int, expected_fact_digest: str | None) ->
 ContextConsentOutcome`
@@ -656,7 +775,8 @@ matched nothing — and then nothing changes. The identity guarantee is exact
 text, compared by SHA-256: text changed away and back to the approved text is
 accepted, and a casing-only change is not. It logs `Enabled context consent for
 memory <id>.` or `Refused context consent for memory <id>: approved text
-changed.`, never the fact or the digest. SQLite failures raise
+changed.`, never the fact or the digest. On SQLite failure it logs `Failed to
+change memory context consent.` and raises the fixed failure
 `RuntimeError("Unable to change memory context consent.")`.
 
 `Memory.disable_memory_context(memory_id: int) -> bool`
@@ -665,7 +785,7 @@ Turns one memory's context consent off with one parameterized `UPDATE memories
 SET context_enabled = 0 WHERE id = ?`, returning `True` when a row matched —
 including one already off — or `False` when none did. Turning consent off only
 narrows what can be sent, so it needs no identity. It logs `Disabled context
-consent for memory <id>.`.
+consent for memory <id>.`, and fails exactly as `enable_memory_context` does.
 
 `Memory.list_context_memories(limit: int, max_fact_bytes: int) ->
 list[dict[str, Any]]`
@@ -682,13 +802,45 @@ the test admits every fact stored in at most twice the bound, never more than
 `max_fact_bytes` characters, and the memory layer then
 measures each admitted fact's exact UTF-8 size before returning it. A
 `max_fact_bytes` that is not a positive `int` raises `ValueError`. SQLite
-failures raise `RuntimeError("Unable to read memory context.")`, and so does
-a returned fact that is not text — SQLite will store a BLOB in the `TEXT`
-column — after logging the fixed line `Refused a memory context read: a fact
-is not text.`; neither carries the value, and Brain treats either as an
-unreadable read and fails closed. A non-text value beyond the stored-byte
+failures are fixed failures: they log only `Failed to read memory context.`
+and raise `RuntimeError("Unable to read memory context.")` with no cause or
+context, because SQLite's message for a stored text it cannot decode quotes
+that text. So does a returned fact that is not text — SQLite will store a BLOB in
+the `TEXT` column — after logging the fixed line `Refused a memory context
+read: a fact is not text.`; neither carries the value, and Brain treats either
+as an unreadable read and fails closed. A non-text value beyond the stored-byte
 test is never read and is reported as oversized like any other. `get_memory`,
 `search_memories`, and `list_memories` never return the consent flag.
+
+`Memory.context_memories_by_id(memory_ids: Sequence[int], max_fact_bytes: int)
+-> list[dict[str, Any]]`
+
+Rechecks memories already supplied to a conversation: returns, in the same
+shape and under the same bounds and failures as `list_context_memories`, those
+of the 1 to 64 distinct positive `int` ids named that are enabled now. Any
+other id list raises `ValueError("Record ids must be distinct positive whole
+numbers.")`.
+
+`Memory.search_context_memories(terms: Sequence[str], after_id: int, limit:
+int, max_fact_bytes: int) -> list[dict[str, Any]]`
+
+Tier B's memory search: enabled memories with an id above `after_id` holding
+one of the 1 to 8 casefolded terms, each non-empty and at most 64 characters,
+as a literal substring, so `%` and `_` are literal; in ascending id order, at
+most `limit` rows, clamped to 1 through 100, in the same shape and under the
+same bounds and failures as `list_context_memories`. The limit bounds returned
+rows, not rows examined. A fact within `max_fact_bytes` UTF-8 bytes is matched
+against its current text, casefolded, by a matcher SQLite hands it only once
+its stored size is within the bound; the matcher settles the exact UTF-8 size
+itself before casefolding, so a stale `normalized_fact` can neither add nor
+hide such a match. A fact too large to supply never leaves SQLite, so it cannot
+be casefolded: it is matched, with `instr()`, against its stored
+`normalized_fact` and comes back by id only. Maria writes that copy with every
+fact she stores or updates, but cannot check it against a fact too large to
+read, so a copy changed outside Maria can name an oversized memory that no
+longer holds a term, or miss one that does; such a row still counts toward
+`limit`. Invalid terms raise `ValueError("Search terms must be 1 to 8
+non-empty texts.")`, which repeats none of them.
 
 ### Notes
 
@@ -699,25 +851,102 @@ connection: raises `ValueError("Note id must be a positive whole number.")`
 when `note_id` is not an `int`, is a `bool`, or is less than 1, and
 `ValueError("New note title is required.")` when `new_title` is not a `str` or
 is blank after stripping. Non-string values are rejected rather than coerced.
-For valid arguments, executes one parameterized `UPDATE notes SET title = ?,
-updated_at = ? WHERE id = ?` statement without first reading the row, writing
-only the stripped title and a single current UTC timestamp. `body` and
-`created_at` are untouched. Returns `True` when exactly one row was updated or
-`False` when no row matched. A title identical to the stored one still returns
-`True` and still refreshes `updated_at`, because the row matched; duplicate
-titles across notes remain allowed. `updated_at` receives the current
+For valid arguments, and in one transaction without first reading the row, it
+turns the note's context consent off with `UPDATE notes SET context_digest =
+NULL WHERE id = ? AND context_digest IS NOT NULL`, then executes one
+parameterized `UPDATE notes SET title = ?, updated_at = ? WHERE id = ?`,
+writing only the stripped title and a single current UTC timestamp; a failure
+in the second rolls the first back. `body` and `created_at` are untouched.
+Returns `True` when exactly one row was updated or `False` when no row
+matched. A title identical to the stored one still returns `True`, still
+refreshes `updated_at`, and still turns consent off, because the row matched;
+duplicate titles across notes remain allowed. `updated_at` receives the current
 timestamp with no guarantee that it is strictly later than the previous value.
-SQLite failures raise `RuntimeError("Unable to retitle note.")`, and
-busy/locked contention raises `RuntimeError("Database is busy. Try again
+SQLite failures are fixed failures that log only `Failed to retitle note.` and
+raise `RuntimeError("Unable to retitle note.")`, and busy/locked contention
+raises `RuntimeError("Database is busy. Try again
 shortly.")`.
 
-`Memory.edit_note(note_id: int, new_body: str) -> bool`
+`Memory.retitle_note_reporting_consent(note_id: int, new_title: str) ->
+NoteUpdate`
 
-Behaves identically to `retitle_note`, except that it validates `new_body`
-with `ValueError("New note body is required.")`, executes `UPDATE notes SET
-body = ?, updated_at = ? WHERE id = ?`, leaves `title` and `created_at`
-untouched, and raises `RuntimeError("Unable to edit note.")` on SQLite
-failure.
+`retitle_note` itself, with the same validation, statements, and failures,
+returning `NoteUpdate(updated, context_consent_cleared)`: whether a row
+matched, and whether its consent had been on and was turned off, which also
+logs `Turned off context consent for retitled note <id>.`.
+
+`Memory.edit_note(note_id: int, new_body: str) -> bool` and
+`Memory.edit_note_reporting_consent(note_id: int, new_body: str) -> NoteUpdate`
+
+Behave identically to the retitle pair, except that they validate `new_body`
+with `ValueError("New note body is required.")`, execute `UPDATE notes SET
+body = ?, updated_at = ? WHERE id = ?`, leave `title` and `created_at`
+untouched, log `Turned off context consent for edited note <id>.`, and on
+SQLite failure log only `Failed to edit note.` and raise the fixed failure
+`RuntimeError("Unable to edit note.")`.
+
+`Memory.note_snapshot(note_id: int) -> NoteSnapshot | None` and
+`Memory.note_text_digest(note_id: int) -> str | None`
+
+`note_snapshot` reads the note's title and body in one `SELECT` and returns
+`NoteSnapshot(title, body, text_digest)`, where `text_digest` is
+`context.note_digest(title, body)` of exactly that text: the lowercase
+hexadecimal SHA-256 of both as one compact JSON array, the identity an enable
+approval is bound to. What an approval shows the owner and what it pins
+therefore come from one read. `repr()` shows neither text nor identity.
+`note_text_digest` returns that identity alone. Both return `None` when no such
+note exists or its title or body is not non-empty text, and neither logs text.
+Both raise `ValueError` for an invalid id, and on SQLite failure log the fixed
+line `Failed to read note identity.`, with no traceback, and raise
+`RuntimeError("Unable to read note.")` with no cause or context, because
+SQLite's message
+for a stored text it cannot decode quotes that text.
+
+`Memory.enable_note_context(note_id: int, expected_text_digest: str | None) ->
+ContextConsentOutcome` and `Memory.disable_note_context(note_id: int) -> bool`
+
+The note counterparts of `enable_memory_context` and `disable_memory_context`.
+Enabling runs one `BEGIN IMMEDIATE` transaction that re-reads the title and
+body, compares their identity with the approved one, and only on a match runs
+`UPDATE notes SET context_digest = ? WHERE id = ? AND title = ? AND body = ?`,
+storing that identity as the consent; otherwise the outcome is `NOT_FOUND` or
+`TARGET_CHANGED` and nothing changes. Disabling runs `UPDATE notes SET
+context_digest = NULL WHERE id = ?`. They log `Enabled context consent for
+note <id>.`, `Refused context consent for note <id>: approved text changed.`,
+or `Disabled context consent for note <id>.`, never text or identity. On SQLite
+failure they log the fixed line `Failed to change note context consent.`, with
+no traceback, and raise `RuntimeError("Unable to change note context
+consent.")` with no cause or context.
+
+`Memory.search_context_notes(terms: Sequence[str], limit: int, max_text_bytes:
+int) -> list[dict[str, Any]]` and `Memory.context_notes_by_id(note_ids:
+Sequence[int], max_text_bytes: int) -> list[dict[str, Any]]`
+
+Tier B's note search and the recheck of notes already supplied. Only notes
+whose consent is set and whose title and body are text are considered, in
+ascending id order, at most `limit` rows, clamped to 1 through 100; the limit
+bounds rows returned, not rows examined. Each row is `{"id": int, "title": str
+| None, "body": str | None, "oversized": bool}`.
+
+The search considers a note only while both texts are within `max_text_bytes`
+UTF-8 bytes and are still exactly the approved text, and it checks that inside
+SQLite, row by row, before anything is matched: consent, type, and stored size
+first, then an approval check that recomputes the identity from the current
+title and body and compares it with `context_digest`. Only then is either text
+handed to the matcher, which matches a note when a term occurs wholly within
+its casefolded title or wholly within its casefolded body, never across the
+two, after settling each text's exact UTF-8 size. A note changed outside Maria
+is therefore never matched and never uses up `limit`, and a note with a text
+too large to hash within the bound is never searched, returned, or named,
+since its approved identity cannot be verified; every search row is whole,
+with `oversized` `False`. The recheck returns a named note whole only while it
+is the approved text, by id only with `oversized` `True` when a text is too
+large, which the conversation treats as no longer current, and not at all when
+its text is no longer the approved text. SQLite failures log the fixed line
+`Failed to read note context.`, with no traceback, and raise
+`RuntimeError("Unable to read note context.")` with no cause or context.
+`get_note` and
+`list_notes` never return the consent column.
 
 `Memory.delete_note(note_id: int) -> bool`
 
@@ -852,8 +1081,9 @@ tool contains no SQL; `core/memory.py` owns all database operations.
 
 `NotesTool.execute(action: str, arguments: Mapping[str, Any]) -> ToolExecutionResult`
 
-The notes tool supports `create`, `list`, `read`, `retitle`, `edit`, and
-`delete`. `create`, `list`, and `read` are unchanged.
+The notes tool supports `create`, `list`, `read`, `retitle`, `edit`, `delete`,
+`enable_context`, and `disable_context`. `create`, `list`, and `read` are
+unchanged.
 
 `retitle`, `edit`, and `delete` each read an `id` argument and validate it the
 same way as the history tool (an actual `int`, not a `bool`, at least `1`),
@@ -874,15 +1104,46 @@ content-free. An ordinary `Memory` failure is wrapped as `"Note retitle
 failed: Unable to retitle note."`, `"Note edit failed: Unable to edit
 note."`, or `"Note deletion failed: Unable to delete note."`; busy/locked
 contention is wrapped the same way, for example `"Note deletion failed:
-Database is busy. Try again shortly."`.
+Database is busy. Try again shortly."`. `retitle` and `edit` go through
+`retitle_note_reporting_consent` and `edit_note_reporting_consent`; when the
+note's context consent had been on, their success message continues `Context
+consent for note <id> was turned off because its title changed.` or `... its
+body changed.`, and otherwise it is exactly as before.
+
+`enable_context` and `disable_context` take an `id` validated the same way.
+`NotesTool.confirmation_binding(action, arguments)` reads, for
+`enable_context` only, one `Memory.note_snapshot` when confirmation is offered
+and returns a `ConfirmationBinding`: its arguments pin `text_digest`, the
+snapshot's identity, so the approved plan names the exact title and body, and
+its preview shows the owner that same title and body in full, each quoted by
+`context.quoted_for_owner`:
+
+```text
+This approval covers note <id> exactly as it is stored now, shown quoted:
+Title: "<title>"
+Body: "<body>"
+```
+
+The preview follows the confirmation request and its exposure notice and goes
+nowhere else: the pending plan holds only the id and `text_digest`. The binding
+adds nothing for any other action, an invalid id, a missing note, or a failed
+read, and the owner then sees the request without a preview. Enabling then succeeds only while the note is still
+exactly that text: `"Enabled context for note <id>."`; otherwise `"Context was
+not enabled for note <id> because its title and body could not be confirmed
+unchanged since confirmation was requested. Request confirmation again with:
+enable note context <id>"`. Disabling returns `"Disabled context for note
+<id>."`. A missing note returns `"Note not found: <id>."`, and a failure is
+wrapped as `"Note context change failed: <message>"`. Results carry
+`data={"id": <id>, "context_enabled": <bool>}` and never the title, body, or
+identity.
 
 The tool receives the shared `Memory` instance through dependency injection.
 It is registered as `tools.notes` through Tool Manager's standard
 `build_tool(...)` factory contract and travels through the normal permission
 path; `notes.create`, `notes.list`, and `notes.read` are allowed by default,
-while `notes.retitle`, `notes.edit`, and `notes.delete` always require
-explicit confirmation. The tool contains no SQL; `core/memory.py` owns all
-database operations.
+while `notes.retitle`, `notes.edit`, `notes.delete`, `notes.enable_context`,
+and `notes.disable_context` always require explicit confirmation. The tool
+contains no SQL; `core/memory.py` owns all database operations.
 
 ## Action Contracts
 
@@ -1174,8 +1435,9 @@ length is never copied just to be measured.
 first, and is empty by default. It must be an exact `tuple` of exact
 `ReasoningExchange` values, and the prompt with every exchange's text must be
 at most `REASONING_MAXIMUM_INPUT_BYTES`, or `ValueError(REASONING_HISTORY_MESSAGE)`
-is raised. `context` holds the Tier A memories Maria selected, empty by
-default, and must satisfy `context_content_bytes` (see "Context"), or
+is raised. `context` holds the records Maria selected, Tier A memories and
+then Tier B search matches, empty by default, and must satisfy
+`context_content_bytes` (see "Context"), or
 `ValueError(CONTEXT_MESSAGE)` is raised. There is no field for a system
 prompt, a template, raw interaction history, a credential, a header, an
 endpoint, a port, or a model path.
@@ -1195,7 +1457,7 @@ representation.
 
 The one definition of a request's size: the UTF-8 length of the prompt, plus
 the UTF-8 length of every exchange's `user` and `assistant` text, plus the
-fully rendered memory context, which is nothing when the context is empty. No role name, message structure, separator, model identifier, or
+fully rendered context, which is nothing when the context is empty. No role name, message structure, separator, model identifier, or
 transport framing counts. Every text is read again rather than trusted, and
 counting stops as soon as the total passes `maximum_bytes`, so the result is
 then only some value above the bound. A prompt that is not exact, encodable,
@@ -1370,12 +1632,14 @@ the messages are each exchange's `{"role": "user", "content": <user>}` then
 `{"role": "assistant", "content": <assistant>}`, oldest first, and finally
 `{"role": "user", "content": <prompt>}`. With no history the body is exactly
 `{"model": <model>, "messages": [{"role": "user", "content": <prompt>}],
-"stream": false}`, byte for byte as before, and with no memory context the
-body is byte for byte what V1-14 sent. When the request carries memory
-context, the messages begin with `{"role": "system", "content":
-CONTEXT_INSTRUCTIONS}` and then `{"role": "user", "content": <rendered memory
-data block>}`, before the conversation; no stored fact is ever placed in the
-system message.
+"stream": false}`, byte for byte as before; with no context the body is
+byte for byte what V1-14 sent; and with Tier A context alone it is byte for
+byte what V1-15 sent. When the request carries context, the messages begin
+with `{"role": "system", "content": context_instructions(context)}` and then
+`{"role": "user", "content": <rendered data block>}`, before the
+conversation; the instructions are `CONTEXT_INSTRUCTIONS` unless a Tier B item
+is present, when they are `SEARCH_CONTEXT_INSTRUCTIONS`, and no stored text is
+ever placed in the system message.
 
 | Outcome | Result |
 | --- | --- |
@@ -1410,20 +1674,26 @@ and failure code.
 
 ## Tool Manager
 
-`ToolManager.bind_for_confirmation(plan: Plan) -> Plan`
+`ToolManager.prepare_confirmation(plan: Plan) -> PreparedConfirmation`
 
-Returns the plan to present for approval. Brain calls it once, when a plan is
-about to wait for the owner's answer, so the approved plan — and the
-fingerprint the session binds approval to — already names the exact state each
-step acts on. A tool may provide an optional `confirmation_binding(action,
-arguments) -> Mapping[str, Any]` that returns arguments to add; Tool Manager
-adds them to that step only. A binding can never replace an existing argument
-(that raises `ValueError`), change a step's tool or action, or add or remove a
-step. A binder that raises is contained, logged as the fixed line
-`Confirmation binding failed: <tool>.<action>`, and adds nothing, so a tool
-relying on a binding must treat an unbound step as unapproved. A plan no tool
-binds is returned as the same object. The contract check at confirmation
-validates whatever was added.
+Returns `PreparedConfirmation(plan, previews)`: the plan to present for
+approval and the owner-visible previews to show beside it. Brain calls it once,
+when a plan is about to wait for the owner's answer, so the approved plan — and
+the fingerprint the session binds approval to — already names the exact state
+each step acts on. A tool may provide an optional `confirmation_binding(action,
+arguments)` that returns either a mapping of arguments to add or a
+`ConfirmationBinding(arguments, preview=None)`, whose `preview` is text for the
+owner read in the same read as the state its arguments pin; Tool Manager adds
+the arguments to that step only and returns the previews, in plan order,
+outside the plan. A preview never enters the plan or its fingerprint.
+`ConfirmationBinding` refuses anything but a mapping and optional text with
+`ValueError`, and neither value object's `repr()` shows its contents. A binding
+can never replace an existing argument (that raises `ValueError`), change a
+step's tool or action, or add or remove a step. A binder that raises is
+contained, logged as the fixed line `Confirmation binding failed:
+<tool>.<action>`, and adds nothing, so a tool relying on a binding must treat
+an unbound step as unapproved. A plan no tool binds is returned as the same
+object. The contract check at confirmation validates whatever was added.
 
 `ToolManager.execute_tool(tool_name, action, arguments) -> ToolExecutionResult`
 
@@ -1471,10 +1741,14 @@ Permission results are one of `allowed`, `requires_confirmation`, or `denied`.
 Decisions follow denied, confirmation-required, then allowed precedence. A
 confirmation-required reason is `"<tool>.<action> requires explicit
 confirmation."`, followed, for an action listed in `CONFIRMATION_NOTICES`, by
-that action's fixed notice. Only `memory.enable_context` has one: it states
-that an enabled memory may be sent to the local reasoning model on any
-conversational turn, within Maria's memory context limits, and that Maria does
-not choose memories by relevance.
+that action's fixed notice. `memory.enable_context` has one stating that an
+enabled memory may be sent to the local reasoning model on any conversational
+turn, within Maria's memory context limits, and that Maria does not choose
+memories by relevance. `notes.enable_context` has one stating that the note's
+entire title and body may be sent on a later conversational turn when a word
+of four or more characters from the request appears literally in its title or
+its body, within Maria's context limits, and that Maria does not check the
+note for passwords or other secrets.
 
 `load_config` requires a present `[permissions]` value to be a TOML table and
 validates `require_confirmation` and `deny` as arrays of lowercase
@@ -1486,9 +1760,10 @@ are retained. Malformed permission values raise `ValueError`.
 
 Missing permission arrays and explicitly empty arrays use the mandatory secure
 baseline: `filesystem.rename`, `filesystem.move`, `history.delete`,
-`notes.retitle`, `notes.edit`, `notes.delete`, `memory.update`,
-`memory.forget`, `memory.enable_context`, and `memory.disable_context` require
-confirmation, while `filesystem.delete` and `filesystem.write` are denied.
+`notes.retitle`, `notes.edit`, `notes.delete`, `notes.enable_context`,
+`notes.disable_context`, `memory.update`, `memory.forget`,
+`memory.enable_context`, and `memory.disable_context` require confirmation,
+while `filesystem.delete` and `filesystem.write` are denied.
 Configuration can add restrictions but cannot remove this baseline.
 `PermissionManager` applies the same mandatory policy when constructed
 directly, and denial wins if an action also requires confirmation.

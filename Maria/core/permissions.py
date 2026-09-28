@@ -18,6 +18,8 @@ MANDATORY_CONFIRMATION_ACTIONS = frozenset(
         "notes.retitle",
         "notes.edit",
         "notes.delete",
+        "notes.enable_context",
+        "notes.disable_context",
         "memory.update",
         "memory.forget",
         "memory.enable_context",
@@ -34,6 +36,14 @@ CONFIRMATION_NOTICES = MappingProxyType(
             "Once enabled, this memory may be sent to your local reasoning "
             "model on any conversational turn, within Maria's memory context "
             "limits. Maria does not choose memories by relevance."
+        ),
+        "notes.enable_context": (
+            "Once enabled, this note's entire title and body may be sent to "
+            "your local reasoning model on a later conversational turn when a "
+            "word of four or more characters from your request appears "
+            "literally in its title or its body, within Maria's context "
+            "limits. Maria does not check the note for passwords or other "
+            "secrets, and enabling it does not mean it contains none."
         ),
     }
 )

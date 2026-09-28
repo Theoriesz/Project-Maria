@@ -24,7 +24,8 @@ counter over Maria's schema history rather than a release number:
 | 0 | SQLite's default. No marker was ever written; the database has to be classified by its structure. |
 | 1 | The earliest schema Maria created: `interactions`, `notes`, and the two secondary indexes. |
 | 2 | The published v0.2.0 baseline, which adds `memories`. |
-| 3 | Adds the per-memory `context_enabled` consent column to `memories`, off for every row. This is the current schema. |
+| 3 | Adds the per-memory `context_enabled` consent column to `memories`, off for every row. |
+| 4 | Adds the per-note `context_digest` consent column to `notes`, off (NULL) for every row. This is the current schema. |
 
 Versions 1 and 2 are the only shapes that can exist without a marker, because
 every database Maria creates or migrates from this build onwards is stamped.
@@ -208,7 +209,7 @@ database. Both boundaries classify contention themselves rather than
 inheriting the shared conversion, because that conversion logs the exception
 on its way past and these record a fixed event code instead.
 
-There are two migrations. `create_memories` brings a version 1 database to
+There are three migrations. `create_memories` brings a version 1 database to
 version 2 by adding the `memories` table; Maria does not copy or infer explicit
 memories from existing interaction rows. `add_memory_context_consent` brings a
 version 2 database to version 3 with one statement:
@@ -221,7 +222,17 @@ ALTER TABLE memories ADD COLUMN context_enabled INTEGER NOT NULL DEFAULT 0
 The `DEFAULT 0` is what turns consent off for every memory that already exists;
 SQLite records the added column in the table's definition without rewriting any
 row, and the resulting definition fingerprints exactly as a newly created
-version 3 table does. Neither step rewrites a row or deletes anything.
+version 3 table does. `add_note_context_consent` brings a version 3 database to
+version 4 with one statement:
+
+```sql
+ALTER TABLE notes ADD COLUMN context_digest TEXT
+    CHECK (context_digest IS NULL OR length(context_digest) = 64);
+```
+
+With no `DEFAULT` the new column is NULL, meaning consent off, for every note
+that already exists, and the resulting definition fingerprints exactly as a
+newly created version 4 table does. No step rewrites a row or deletes anything.
 
 Every step runs its own frozen historical statements, never the live schema
 statements a new database is created from. The version 2 step therefore creates
@@ -235,7 +246,7 @@ and requires the frozen successor, so no step can drift that way again.
 ### No pre-migration backup
 
 V1-09 writes no backup copy before migrating, and that is a decision rather
-than an omission; V1-15's step keeps it true. Every step is additive schema
+than an omission; V1-15's and V1-16's steps keep it true. Every step is additive schema
 change plus the version stamp, committed in a single transaction that SQLite
 rolls back in full on any failure, so the failure a backup would protect
 against — a half-applied migration — cannot be reached. No step reads, rewrites,
@@ -349,6 +360,7 @@ Stores simple notes created by the notes tool.
 | body | TEXT NOT NULL | Note body |
 | created_at | TEXT NOT NULL | UTC ISO 8601 timestamp |
 | updated_at | TEXT NOT NULL | UTC ISO 8601 timestamp |
+| context_digest | TEXT, NULL or exactly 64 characters | The owner's consent to supply this note to the local reasoning model: NULL while off, otherwise the identity of the exact title and body approved; see "Note Context Consent" below |
 
 Notes are returned newest first by `updated_at` descending and then `id`
 descending. The CLI normally returns at most 20 rows. When the notes tool's
@@ -360,11 +372,16 @@ that more notes exist. This does not delete, expire, or prune any row.
 
 `retitle note <id>: <new title>` and `edit note <id>: <new body>` each target
 at most one row by primary-key ID, after mandatory explicit confirmation and
-with no preview of stored content beforehand. Retitle runs a single
-parameterized `UPDATE notes SET title = ?, updated_at = ? WHERE id = ?` and
-edit runs a single parameterized `UPDATE notes SET body = ?, updated_at = ?
-WHERE id = ?`, so each writes exactly one content column and neither can
-overwrite the other's field. Neither reads the row first. `created_at` is
+with no preview of stored content beforehand. Each runs two parameterized
+statements in one transaction: first `UPDATE notes SET context_digest = NULL
+WHERE id = ? AND context_digest IS NOT NULL`, which turns the note's context
+consent off because consent covers the exact text the owner approved, and
+then retitle's `UPDATE notes SET title = ?, updated_at = ? WHERE id = ?` or
+edit's `UPDATE notes SET body = ?, updated_at = ? WHERE id = ?`, so each writes
+exactly one content column and neither can overwrite the other's field. A
+failure in the second rolls the first back. Neither reads the row first, and
+the response says consent was turned off only when it had been on.
+`created_at` is
 always preserved, and `updated_at` receives the current UTC timestamp
 generated once per call; that timestamp is not guaranteed to be strictly
 later than the previous value, and ordering ties are broken by descending
@@ -569,7 +586,11 @@ fact's exact UTF-8 size before returning it. A `TEXT` column does not stop
 SQLite storing a BLOB, so a returned fact that is not text makes the whole
 read fail with the same fixed `Unable to read memory context.` error, without
 the value reaching a log or a message, and the conversational turn fails
-closed. Brain asks for 17 rows —
+closed. A SQLite failure ends the same way: SQLite's own message for a stored
+text it cannot decode quotes that text, so the memory layer logs only the fixed
+line `Failed to read memory context.`, with no traceback, and raises the fixed
+error only after its handler has ended, with no cause or context. Brain asks
+for 17 rows —
 one more than a request may carry — with a 2,048-byte bound, the most any one
 memory could ever occupy, and only on the model-backed conversational path, so
 Maria learns whether more enabled memories exist without counting all of them,
@@ -583,6 +604,95 @@ The flag is not evidence of anything but consent. `created_at` records when a
 memory row was first stored, not when its text last changed, and no
 `updated_at` column exists, so Maria makes no claim that an enabled memory is
 current, stale, consistent, or conflicting.
+
+Two more reads return enabled memories, shaped and bounded exactly like
+`list_context_memories`, and both run only on the model-backed conversational
+path. `context_memories_by_id(ids, max_fact_bytes)` rechecks at most 64
+memories already supplied to the current conversation, by primary-key id; a
+named memory that is disabled or gone is simply absent.
+`search_context_memories(terms, after_id, limit, max_fact_bytes)` is Tier B's
+memory search: it returns enabled memories whose id is above `after_id` and
+that hold one of 1 to 8 casefolded terms as a literal substring, so `%` and `_`
+are literal, in ascending id order, at most `limit` rows, clamped to 1 through
+100. The limit bounds the rows returned, not every row SQLite examines to find
+them. Brain starts the search after the 16th memory Tier A considered and only
+when Tier A's read found more than 16.
+
+A fact within the bound is matched against its current text. The statement
+hands a fact to a Python matcher, registered on that read's own connection,
+only inside a `CASE` whose condition is the stored-size test, and the matcher
+settles the exact UTF-8 size before casefolding, so `normalized_fact` plays no
+part: a copy left stale by another connection can neither add nor hide a
+bounded match. A fact beyond the bound is never read into Python, so it cannot
+be casefolded; for it, and only for it, `instr()` over the stored
+`normalized_fact` decides, and the row comes back by id only. Maria writes
+that copy with every fact she stores or updates, but cannot check it against a
+fact too large to read: a copy changed outside Maria can name an oversized
+memory that no longer holds the term, or miss one that does, and such a row
+counts toward `limit`. An oversized memory is only ever named, never supplied.
+
+## Note Context Consent
+
+`context_digest` is NULL, meaning off, for every note unless the owner turns
+consent on, one note at a time. The migration leaves every pre-existing note
+off, and a newly created note is off because its insert never names the
+column.
+
+`enable note context <id>` and `disable note context <id>` each change at most
+one row by primary-key id, after mandatory explicit confirmation, and the
+recorded interaction names only the id. A missing id changes nothing and
+reports `Note not found: <id>.`
+
+Consent covers exact text, so an enable approval is bound to the title and
+body as they were when confirmation was offered, and the confirmation shows the
+owner both in full. At that moment `note_snapshot(id)` reads both in one
+`SELECT` and returns them with their identity: the SHA-256 of both, as one
+compact JSON array, so neither can trade text with the other. The text shown
+and the identity pinned into the pending plan therefore come from the same
+read; only the identity is kept in the plan. At execution,
+`enable_note_context(id, digest)` runs one `BEGIN IMMEDIATE` transaction that
+re-reads both, compares their identity with the approved one, and only on a
+match runs `UPDATE notes SET context_digest = ? WHERE id = ? AND title = ? AND
+body = ?`, storing that identity. Otherwise nothing changes and the owner is
+asked to request confirmation again. Disabling runs one `UPDATE notes SET
+context_digest = NULL WHERE id = ?` with no text check.
+
+The stored identity is what makes consent durable against text changed
+elsewhere. Every note context read recomputes the identity of the title and
+body it returns and requires it to equal `context_digest`, so a note changed
+through another connection that left `context_digest` in place is never
+eligible. A note whose title or body is not text, or is empty, can never
+match. The guard compares current text: a note changed away and back to its
+approved text is eligible again, and nothing records that it ever changed.
+
+`search_context_notes(terms, limit, max_text_bytes)` is Tier B's note search.
+It considers only notes whose `context_digest` is set, whose title and body are
+both text within `max_text_bytes` UTF-8 bytes, measured exactly whatever the
+file's encoding, and whose title and body are still their approved text, in
+ascending id order, at most `limit` rows, clamped to 1 through 100. Every one
+of those checks runs inside the statement, row by row, before anything is
+matched. One `CASE` settles consent, type, and stored size; only then does a
+nested `CASE` hand the title, body, and `context_digest` to an approval check,
+a Python function registered on that read's own connection that recomputes the
+identity and compares it; and only a note it confirms is handed to the
+matcher. A note matches when a term occurs wholly within its casefolded title
+or wholly within its casefolded body; the two are never joined. A note changed
+through another connection is therefore never matched and never counts toward
+`limit`, so it cannot crowd out an approved match. A note whose title or body
+is beyond the bound is never searched, returned, or named: its approved
+identity cannot be verified without reading the oversized text. Each row holds
+`id`, `title`, `body`, and `oversized`, which is always false for a search.
+`context_notes_by_id(ids, max_text_bytes)` rechecks at most 64 notes already
+supplied to the current conversation with the same approval check, applied
+after the read; there a note whose text is now too large comes back by id only,
+with `oversized` true, and the conversation treats it as no longer current. A
+failed read logs only the fixed line `Failed to read note context.`, with no
+traceback, and raises `RuntimeError("Unable to read note context.")` with no
+cause or context, and neither a title, a body, a term, nor an identity is ever logged or
+returned in a message.
+
+`updated_at` records when a note was last saved, which is a fact about the
+row, not evidence that its text is current or stale.
 
 ## Memory Retrieval
 
@@ -647,7 +757,9 @@ from an interaction row.
 Do not submit or request display of passwords, API keys, access tokens, private
 keys, recovery codes, confidential credentials, or other highly sensitive
 secrets. In particular, reading a sensitive file or note can copy its returned
-content into interaction history.
+content into interaction history, and enabling a note or memory for context
+lets its entire text reach the local reasoning model: Maria does not check
+consented text for secrets and cannot tell sensitive text from any other.
 
 ## Connection Timeouts and Contention
 
@@ -677,6 +789,36 @@ problems, and so on) keeps its existing static, operation-specific
 This affects only connection-level timeout and error classification. Schema,
 the transaction model, commit/rollback ordering, and deterministic connection
 closing on both success and failure are unchanged.
+
+## Failures That Could Carry Stored Text
+
+SQLite's own error message can quote stored text. A `TEXT` value that is not
+valid UTF-8, which only a change made outside Maria can store, makes Python's
+decode error repeat it, and a trigger's `RAISE` can repeat the text an
+`INSERT`, `UPDATE`, or `DELETE` writes or removes. Wherever such an error is
+logged with its traceback, or travels with the raised failure as its cause or
+context, that text reaches a log or an error.
+
+So no method that reads or writes a stored record lets it. Every such method
+catches only `sqlite3.Error`, logs one fixed line with no traceback, and
+raises its fixed `RuntimeError` only after the handler has ended, so the
+failure has no cause and no context. That covers the interaction methods
+(`record_interaction`, `get_recent_interactions`, `get_interaction`,
+`search_interactions`, `delete_interaction`), the memory methods
+(`store_memory`, `get_memory`, `search_memories`, `list_memories`,
+`update_memory`, `forget_memory`, and every memory consent and context
+method), and the note methods (`create_note`, `list_notes`, `get_note`,
+`retitle_note`, `edit_note`, `delete_note`, and every note consent and context
+method), with their `_reporting_consent` forms. Their SQL, transactions,
+rollback and closing, success logging, recognised uniqueness conflicts, and
+owner-visible messages are unchanged.
+
+Busy/locked contention is still converted as described above, and that
+conversion still logs SQLite's busy exception and attaches it, because its
+message is SQLite's own fixed text. Initialization and `schema_version()`
+never read a stored record's text; they record only their fixed event codes,
+as described under "What initialization logs", and keep SQLite's exception as
+the cause for a caller that needs it.
 
 ## Ownership
 

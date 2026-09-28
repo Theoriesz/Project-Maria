@@ -42,7 +42,7 @@ from core.permissions import (
 )
 from core.planner import Plan, Planner, PlanStep, RecordingPolicy
 from core.session import MariaSession
-from core.tool_manager import ToolExecutionResult, ToolManager
+from core.tool_manager import PreparedConfirmation, ToolExecutionResult, ToolManager
 
 
 RUN = "run"
@@ -70,6 +70,8 @@ HELP_TEXT = (
     "- retitle note <id>: <new title>\n"
     "- edit note <id>: <new body>\n"
     "- delete note <id>\n"
+    "- enable note context <id>\n"
+    "- disable note context <id>\n"
     "- remember <fact>\n"
     "- recall <query>\n"
     "- memories\n"
@@ -292,6 +294,39 @@ COMMAND_CORPUS: tuple[CorpusEntry, ...] = (
         CONFIRM,
     ),
     _records("disable memory context 99", "Memory not found: 99.", CONFIRM),
+    # V1-16's note consent commands run after V1-15's, so every id listed
+    # above is unchanged. Note 1 still exists, retitled and edited above.
+    # Every recorded consent row names the id, never the title or body.
+    _records("enable note context", "Use: enable note context <id>"),
+    _records(
+        "enable note context x",
+        "Note id must be a positive whole number.",
+    ),
+    _records_nothing("enable note context 1", CANCEL),
+    _records("enable note context 1", "Enabled context for note 1.", CONFIRM),
+    _records("enable note context 99", "Note not found: 99.", CONFIRM),
+    _records(
+        "edit note 1: Edited again",
+        "Edited note 1. Context consent for note 1 was turned off because "
+        "its body changed.",
+        CONFIRM,
+    ),
+    _records("edit note 1: Edited once more", "Edited note 1.", CONFIRM),
+    _records("enable note context 1", "Enabled context for note 1.", CONFIRM),
+    _records(
+        "retitle note 1: Retitled again",
+        "Retitled note 1. Context consent for note 1 was turned off because "
+        "its title changed.",
+        CONFIRM,
+    ),
+    _records("disable note context", "Use: disable note context <id>"),
+    _records(
+        "disable note context 0",
+        "Note id must be a positive whole number.",
+    ),
+    _records("enable note context 1", "Enabled context for note 1.", CONFIRM),
+    _records("disable note context 1", "Disabled context for note 1.", CONFIRM),
+    _records("disable note context 99", "Note not found: 99.", CONFIRM),
     _records_nothing("   ", RUN),
     _records_nothing("", REFUSE),
 )
@@ -480,7 +515,7 @@ class _MockComponents:
         self.tool_manager = Mock(spec=ToolManager)
         # No mocked tool pins confirmation state, so the plan offered
         # for approval is the plan itself.
-        self.tool_manager.bind_for_confirmation.side_effect = lambda plan: plan
+        self.tool_manager.prepare_confirmation.side_effect = PreparedConfirmation
         self.tool_manager.validate_action.return_value = None
         self.permissions = Mock(spec=PermissionManager)
         self.permissions.check.return_value = ALLOWED
