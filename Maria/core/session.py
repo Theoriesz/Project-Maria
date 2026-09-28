@@ -8,11 +8,12 @@ command line and any future interface share one contract.
 A session also owns its conversation: the completed conversational exchanges
 of this session alone, bounded in count and size, held in process memory, and
 discarded when the session ends. Beside it the session keeps the fingerprints
-of every memory supplied to the model since that conversation was last
-cleared, never the memories' text, so a later turn can discard the whole
-conversation before an earlier reply carries a revoked memory back. Brain
-keeps nothing between requests, so a new session always starts with no
-conversation and can never observe another's.
+of every memory and note supplied to the model since that conversation was
+last cleared, at most ``SUPPLIED_CONTEXT_MAX_RECORDS`` of them and never the
+records' text, so a later turn can discard the whole conversation before an
+earlier reply carries a revoked record back. Brain keeps nothing between
+requests, so a new session always starts with no conversation and can never
+observe another's.
 """
 
 from __future__ import annotations
@@ -21,7 +22,7 @@ from dataclasses import dataclass
 from logging import Logger
 
 from core.brain import BrainResponse, MariaBrain
-from core.context import ContextFingerprint
+from core.context import SUPPLIED_CONTEXT_MAX_RECORDS, ContextFingerprint
 from core.conversation import bounded_conversation
 from core.logger import get_logger
 from core.planner import Plan
@@ -71,7 +72,7 @@ class MariaSession:
 
     @property
     def supplied_context(self) -> frozenset[ContextFingerprint]:
-        """Return the fingerprints of memories supplied to this conversation."""
+        """Return the fingerprints of records supplied to this conversation."""
         return self._supplied_context
 
     def submit(self, user_input: str) -> BrainResponse:
@@ -82,14 +83,14 @@ class MariaSession:
         owner was not shown.
 
         The session's conversation goes with the request, and its supplied
-        memory fingerprints go with it whenever there are any; a conversation
-        that never carried memory context has nothing to verify, so the call
-        is then exactly what it always was. Only a conversational turn
-        replaces them, and it replaces both together: a completed reply with
-        the conversation after it, and a turn that had to clear the
-        conversation with nothing. Whatever comes back is held to the
-        retention limits again here, so the session never keeps more than
-        they allow, whoever computed it.
+        record fingerprints go with it whenever there are any; a conversation
+        that never carried context has nothing to verify, so the call is then
+        exactly what it always was. Only a conversational turn replaces them,
+        and it replaces both together: a completed reply with the
+        conversation after it, and a turn that had to clear the conversation
+        with nothing. Whatever comes back is held to the retention limits
+        again here, so the session never keeps more than they allow, whoever
+        computed it: fingerprints beyond what Maria rechecks clear both.
         """
         self._pending = None
         if self._supplied_context:
@@ -110,6 +111,9 @@ class MariaSession:
                 if self._conversation
                 else frozenset()
             )
+            if len(self._supplied_context) > SUPPLIED_CONTEXT_MAX_RECORDS:
+                self._conversation = ()
+                self._supplied_context = frozenset()
 
         if not response.needs_confirmation:
             return response

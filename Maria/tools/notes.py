@@ -7,9 +7,10 @@ from logging import Logger
 from typing import Any
 
 from core.action_contracts import MAXIMUM_LIST_LIMIT, MINIMUM_LIST_LIMIT
+from core.context import ContextConsentOutcome, quoted_for_owner
 from core.logger import get_logger
 from core.memory import Memory
-from core.tool_manager import ToolExecutionResult
+from core.tool_manager import ConfirmationBinding, ToolExecutionResult
 
 
 _DEFAULT_LIST_LIMIT = 20
@@ -20,10 +21,19 @@ _LIST_LIMIT_RANGE_MESSAGE = (
 
 
 class NotesTool:
-    """Create, retrieve, update, and delete notes through the memory layer."""
+    """Create, retrieve, update, and delete notes through the memory layer.
+
+    It also turns one note's context consent on or off. Those results name
+    the note's id and never its title or body, so the interaction row a
+    consent change records carries no stored text; only the confirmation
+    request for an enable shows the owner that text.
+    """
 
     name = "notes"
-    description = "Creates, lists, reads, retitles, edits, and deletes notes."
+    description = (
+        "Creates, lists, reads, retitles, edits, and deletes notes, and turns "
+        "one note's context consent on or off."
+    )
     actions = frozenset(
         {
             "create",
@@ -32,12 +42,58 @@ class NotesTool:
             "retitle",
             "edit",
             "delete",
+            "enable_context",
+            "disable_context",
         }
     )
 
     def __init__(self, memory: Memory, logger: Logger | None = None) -> None:
         self.memory = memory
         self.logger = logger or get_logger(__name__)
+
+    def confirmation_binding(
+        self,
+        action: str,
+        arguments: Mapping[str, Any],
+    ) -> Mapping[str, Any] | ConfirmationBinding:
+        """Pin an enable approval to the exact title and body shown for it.
+
+        Consent covers exact text, so the owner is shown the note's current
+        title and body in full, quoted exactly, and the plan they approve
+        for ``enable_context`` carries the identity of that same title and
+        body as ``text_digest``; both come from one read. At execution the
+        memory layer enables consent only while both are still exactly that
+        text. Only the identity enters the plan: the shown text is the
+        binding's preview, which is never recorded, logged, or sent to a
+        model. Nothing is added for any other action, for an id that is not
+        valid, for a note that does not exist, or when the note cannot be
+        read; an enable carrying no identity can never turn consent on for
+        an existing note, so each of those still ends safely.
+        """
+        if action != "enable_context":
+            return {}
+        note_id = arguments.get("id")
+        if not isinstance(note_id, int) or isinstance(note_id, bool) or note_id < 1:
+            return {}
+        try:
+            snapshot = self.memory.note_snapshot(note_id)
+        except RuntimeError:
+            self.logger.warning(
+                "Could not bind context approval for note %s.",
+                note_id,
+            )
+            return {}
+        if snapshot is None:
+            return {}
+        return ConfirmationBinding(
+            {"text_digest": snapshot.text_digest},
+            (
+                f"This approval covers note {note_id} exactly as it is stored "
+                "now, shown quoted:\n"
+                f"Title: {quoted_for_owner(snapshot.title)}\n"
+                f"Body: {quoted_for_owner(snapshot.body)}"
+            ),
+        )
 
     def execute(
         self,
@@ -57,6 +113,10 @@ class NotesTool:
             return self._edit(arguments)
         if action == "delete":
             return self._delete(arguments)
+        if action == "enable_context":
+            return self._set_context(arguments, enabled=True)
+        if action == "disable_context":
+            return self._set_context(arguments, enabled=False)
         return ToolExecutionResult(False, f"Unsupported notes action: {action}")
 
     def _create(self, arguments: Mapping[str, Any]) -> ToolExecutionResult:
@@ -163,20 +223,28 @@ class NotesTool:
             return ToolExecutionResult(False, "New note title is required.")
 
         try:
-            retitled = self.memory.retitle_note(note_id, new_title.strip())
+            result = self.memory.retitle_note_reporting_consent(
+                note_id,
+                new_title.strip(),
+            )
         except (RuntimeError, ValueError) as exc:
             self.logger.warning("Note retitle failed: %s", exc)
             return ToolExecutionResult(False, f"Note retitle failed: {exc}")
 
-        if not retitled:
+        if not result.updated:
             return ToolExecutionResult(False, f"Note not found: {note_id}.")
 
         self.logger.info("Retitled note %s through notes tool.", note_id)
-        return ToolExecutionResult(
-            True,
-            f"Retitled note {note_id}.",
-            {"id": note_id},
-        )
+        message = f"Retitled note {note_id}."
+        if result.context_consent_cleared:
+            # Consent covered the title and body the owner approved, and this
+            # retitle replaced one of them, so it is off now and the owner is
+            # told.
+            message = (
+                f"{message} Context consent for note {note_id} was turned off "
+                "because its title changed."
+            )
+        return ToolExecutionResult(True, message, {"id": note_id})
 
     def _edit(self, arguments: Mapping[str, Any]) -> ToolExecutionResult:
         """Edit one note's body by id."""
@@ -196,20 +264,25 @@ class NotesTool:
             return ToolExecutionResult(False, "New note body is required.")
 
         try:
-            edited = self.memory.edit_note(note_id, new_body.strip())
+            result = self.memory.edit_note_reporting_consent(
+                note_id,
+                new_body.strip(),
+            )
         except (RuntimeError, ValueError) as exc:
             self.logger.warning("Note edit failed: %s", exc)
             return ToolExecutionResult(False, f"Note edit failed: {exc}")
 
-        if not edited:
+        if not result.updated:
             return ToolExecutionResult(False, f"Note not found: {note_id}.")
 
         self.logger.info("Edited note %s through notes tool.", note_id)
-        return ToolExecutionResult(
-            True,
-            f"Edited note {note_id}.",
-            {"id": note_id},
-        )
+        message = f"Edited note {note_id}."
+        if result.context_consent_cleared:
+            message = (
+                f"{message} Context consent for note {note_id} was turned off "
+                "because its body changed."
+            )
+        return ToolExecutionResult(True, message, {"id": note_id})
 
     def _delete(self, arguments: Mapping[str, Any]) -> ToolExecutionResult:
         """Delete one note by id."""
@@ -238,6 +311,69 @@ class NotesTool:
             True,
             f"Deleted note {note_id}.",
             {"id": note_id},
+        )
+
+    def _set_context(
+        self,
+        arguments: Mapping[str, Any],
+        *,
+        enabled: bool,
+    ) -> ToolExecutionResult:
+        """Turn one note's context consent on or off by id.
+
+        Enabling is bound to the text identity pinned when confirmation was
+        offered, carried as ``text_digest``. If the note's title or body is no
+        longer exactly that text, or no identity was pinned for an existing
+        note, nothing changes and the owner is told to ask again; an approval
+        is never carried over to text the owner was not asked about.
+        Disabling only narrows what can be sent and needs no identity.
+        """
+        note_id = arguments.get("id")
+        if not isinstance(note_id, int) or isinstance(note_id, bool) or note_id < 1:
+            return ToolExecutionResult(
+                False,
+                "Note id must be a positive whole number.",
+            )
+
+        try:
+            if enabled:
+                outcome = self.memory.enable_note_context(
+                    note_id,
+                    arguments.get("text_digest"),
+                )
+                matched = outcome is not ContextConsentOutcome.NOT_FOUND
+            else:
+                outcome = None
+                matched = self.memory.disable_note_context(note_id)
+        except (RuntimeError, ValueError) as exc:
+            self.logger.warning("Note context change failed: %s", exc)
+            return ToolExecutionResult(
+                False,
+                f"Note context change failed: {exc}",
+            )
+
+        if not matched:
+            return ToolExecutionResult(False, f"Note not found: {note_id}.")
+
+        if outcome is ContextConsentOutcome.TARGET_CHANGED:
+            return ToolExecutionResult(
+                False,
+                f"Context was not enabled for note {note_id} because its title "
+                "and body could not be confirmed unchanged since confirmation "
+                "was requested. Request confirmation again with: enable note "
+                f"context {note_id}",
+            )
+
+        verb = "Enabled" if enabled else "Disabled"
+        self.logger.info(
+            "%s context consent for note %s through notes tool.",
+            verb,
+            note_id,
+        )
+        return ToolExecutionResult(
+            True,
+            f"{verb} context for note {note_id}.",
+            {"id": note_id, "context_enabled": enabled},
         )
 
 

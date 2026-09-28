@@ -5,15 +5,17 @@ manager, and tool manager, and, when a reasoning provider was supplied, the
 conversation module. It does not directly perform database work, tool logic,
 or any provider-specific work, and it never imports a reasoning adapter.
 
-The planner receives the request text and nothing else. The one stored input
-to reasoning is the owner's enabled memory context, read through the memory
-layer's bounded Tier A query only on the conversational path; interaction
-history is never read for planning or reasoning.
+The planner receives the request text and nothing else. The only stored
+inputs to reasoning are records the owner enabled for context - Tier A
+memories and what Tier B's bounded search finds among enabled memories and
+notes - read through the memory layer's bounded context queries only on the
+conversational path; interaction history is never read for planning or
+reasoning.
 """
 
 from __future__ import annotations
 
-from collections.abc import Callable
+from collections.abc import Callable, Sequence
 from dataclasses import dataclass, replace
 from logging import Logger
 
@@ -23,7 +25,14 @@ from core.constants import LOCAL_CONFIG_PATH
 from core.context import (
     CONTEXT_MAX_BYTES,
     CONTEXT_QUERY_LIMIT,
+    SEARCH_QUERY_LIMIT,
     ContextFingerprint,
+    ContextSource,
+    enabled_memories,
+    memory_search_after,
+    search_terms,
+    supplied_record_ids,
+    validated_supplied_context,
 )
 from core.conversation import converse, is_generic_fallback
 from core.filesystem_roots import prepare_roots
@@ -52,8 +61,9 @@ class BrainResponse:
     conversation by a conversational turn that had to clear it. Every other
     response leaves it None, so no command, its result, or a failed
     conversational turn ever becomes conversation. ``supplied_context``
-    travels with it: the fingerprints of every memory supplied since that
-    conversation was last cleared, which the session keeps beside it.
+    travels with it: the fingerprints of every memory and note supplied
+    since that conversation was last cleared, which the session keeps
+    beside it.
     """
 
     text: str
@@ -61,6 +71,22 @@ class BrainResponse:
     plan: Plan | None = None
     conversation: tuple[ReasoningExchange, ...] | None = None
     supplied_context: frozenset[ContextFingerprint] = frozenset()
+
+
+@dataclass(frozen=True)
+class _ContextReads:
+    """What one conversational turn's bounded context reads returned.
+
+    Transient: it exists only to hand the rows to the conversation module,
+    which validates them. ``enabled`` is None when any read failed, which
+    the conversation module treats as a read it cannot trust.
+    """
+
+    enabled: Sequence[object] | None
+    supplied_memories: Sequence[object] = ()
+    supplied_notes: Sequence[object] = ()
+    searched_memories: Sequence[object] = ()
+    searched_notes: Sequence[object] = ()
 
 
 @dataclass(frozen=True)
@@ -211,11 +237,11 @@ class MariaBrain:
         generic no-action fallback, is the request answered conversationally
         instead, in the context of ``conversation``: the caller's earlier
         exchanges, oldest first, with ``supplied_context``, the fingerprints
-        of the memories supplied since they began. With reasoning disabled
-        the fallback is answered and recorded exactly as it always was,
-        whether or not a provider is present. Every other plan runs exactly
-        as it always has and never sees the conversation or any memory
-        context.
+        of the memories and notes supplied since they began. With reasoning
+        disabled the fallback is answered and recorded exactly as it always
+        was, whether or not a provider is present. Every other plan runs
+        exactly as it always has and never sees the conversation or any
+        stored context.
         """
         cleaned_input = user_input.strip()
         if not cleaned_input:
@@ -242,12 +268,10 @@ class MariaBrain:
     ) -> BrainResponse:
         """Answer one unrecognised request with the local model, as text.
 
-        This is the only place Tier A context is read, and only after every
-        gate above has passed: the memory layer's bounded query returns the
-        enabled memories, in ascending id order, one row more than can be
-        sent, and never the text of a fact too long ever to be sent. A read
-        that fails is handed on as None, and the conversation module then
-        sends no context and no earlier exchange.
+        This is the only place context is read, and only after every gate
+        above has passed; ``_read_context`` says which bounded reads run.
+        When any of them fails, the conversation module sends no context and
+        no earlier exchange.
 
         The conversation module settles the whole turn and produces a
         zero-step plan that it, as the plan's producer, made transient. That
@@ -259,16 +283,10 @@ class MariaBrain:
         model through here.
         """
         self.logger.info("Answering request conversationally.")
-        try:
-            enabled_memories_read = self.memory.list_context_memories(
-                limit=CONTEXT_QUERY_LIMIT,
-                max_fact_bytes=CONTEXT_MAX_BYTES,
-            )
-        except RuntimeError:
-            # The memory layer's message is fixed, but nothing about the
-            # failure is needed here: the turn fails closed either way.
-            self.logger.warning("Unable to read memory context.")
-            enabled_memories_read = None
+        reads = self._read_context(
+            request,
+            validated_supplied_context(supplied_context),
+        )
 
         turn = converse(
             self.reasoning,
@@ -277,7 +295,11 @@ class MariaBrain:
             conversation,
             self.logger,
             supplied_context=supplied_context,
-            enabled_memories_read=enabled_memories_read,
+            enabled_memories_read=reads.enabled,
+            supplied_memories_read=reads.supplied_memories,
+            supplied_notes_read=reads.supplied_notes,
+            searched_memories_read=reads.searched_memories,
+            searched_notes_read=reads.searched_notes,
         )
         response = self._run_plan(turn.plan, confirmed=False)
         if turn.conversation is None:
@@ -287,6 +309,79 @@ class MariaBrain:
             conversation=turn.conversation,
             supplied_context=turn.supplied_context,
         )
+
+    def _read_context(
+        self,
+        request: str,
+        supplied: frozenset[ContextFingerprint],
+    ) -> _ContextReads:
+        """Run the bounded context reads one conversational turn needs.
+
+        Tier A's read of enabled memories always runs: in ascending id order,
+        one row more than can be sent, and never the text of a fact too long
+        ever to be sent. Records supplied earlier in the conversation are
+        then rechecked by id, and only when there are any. Tier B's searches
+        run only when the request yields search terms: its memory search
+        only when Tier A's read found more enabled memories than it
+        considers, starting after the last one it considered, and its note
+        search over notes the owner enabled. Every read goes through the
+        memory layer's own bounded query; nothing is kept once the turn ends.
+
+        Any read that fails, or a Tier A read too malformed to start the
+        search from, ends them all: the turn is handed None and fails closed.
+        """
+        try:
+            enabled = self.memory.list_context_memories(
+                limit=CONTEXT_QUERY_LIMIT,
+                max_fact_bytes=CONTEXT_MAX_BYTES,
+            )
+            memories_after = memory_search_after(enabled_memories(enabled))
+            terms = search_terms(request)
+            memory_ids = supplied_record_ids(supplied, ContextSource.MEMORY)
+            note_ids = supplied_record_ids(supplied, ContextSource.NOTE)
+            return _ContextReads(
+                enabled=enabled,
+                supplied_memories=(
+                    self.memory.context_memories_by_id(
+                        memory_ids,
+                        max_fact_bytes=CONTEXT_MAX_BYTES,
+                    )
+                    if memory_ids
+                    else ()
+                ),
+                supplied_notes=(
+                    self.memory.context_notes_by_id(
+                        note_ids,
+                        max_text_bytes=CONTEXT_MAX_BYTES,
+                    )
+                    if note_ids
+                    else ()
+                ),
+                searched_memories=(
+                    self.memory.search_context_memories(
+                        terms,
+                        after_id=memories_after,
+                        limit=SEARCH_QUERY_LIMIT,
+                        max_fact_bytes=CONTEXT_MAX_BYTES,
+                    )
+                    if terms and memories_after is not None
+                    else ()
+                ),
+                searched_notes=(
+                    self.memory.search_context_notes(
+                        terms,
+                        limit=SEARCH_QUERY_LIMIT,
+                        max_text_bytes=CONTEXT_MAX_BYTES,
+                    )
+                    if terms
+                    else ()
+                ),
+            )
+        except (RuntimeError, ValueError):
+            # The memory layer's messages are fixed, but nothing about the
+            # failure is needed here: the turn fails closed either way.
+            self.logger.warning("Unable to read memory context.")
+            return _ContextReads(enabled=None)
 
     def execute_confirmed_plan(self, plan: Plan) -> BrainResponse:
         """Run an already-approved plan without planning the request again.
@@ -355,11 +450,16 @@ class MariaBrain:
                 )
             # The plan offered for approval is pinned to the exact state its
             # steps act on now, so the approval, bound to this plan's
-            # fingerprint, cannot later be spent on different state.
+            # fingerprint, cannot later be spent on different state. Any
+            # preview of that state is shown here and goes nowhere else.
+            prepared = self.tool_manager.prepare_confirmation(plan)
             return BrainResponse(
-                text=self._format_confirmation_request(resolved),
+                text=self._format_confirmation_request(
+                    resolved,
+                    prepared.previews,
+                ),
                 needs_confirmation=True,
-                plan=self.tool_manager.bind_for_confirmation(plan),
+                plan=prepared.plan,
             )
 
         return self._execute_resolved_plan(resolved)
@@ -466,28 +566,34 @@ class MariaBrain:
             self.logger.error("Unable to record interaction: %s", exc)
 
     @staticmethod
-    def _format_confirmation_request(resolved: _ResolvedPlan) -> str:
+    def _format_confirmation_request(
+        resolved: _ResolvedPlan,
+        previews: tuple[str, ...] = (),
+    ) -> str:
         """Render the confirmation request for a resolved plan.
 
         A single-step plan keeps its existing wording exactly. A longer plan
         is listed in plan order, naming each step's tool action and the
         permission outcome it resolved to. Neither form repeats an argument
-        value, so no stored content and no host path can reach the owner's
-        interface, an interaction row, or a log through this text.
+        value, so no host path can reach the owner's interface, an
+        interaction row, or a log through this text. ``previews`` are the
+        tools' own texts showing the owner what an approval covers; each
+        follows on its own lines, and with none the request is exactly as
+        before. The request is shown and returned, never recorded or logged.
         """
         if len(resolved.steps) == 1:
-            return f"Confirmation required: {resolved.steps[0].permission.reason}"
-
-        lines = [
-            f"Confirmation required for {len(resolved.steps)} planned actions:"
-        ]
-        for position, resolved_step in enumerate(resolved.steps, start=1):
-            outcome = resolved_step.permission.decision.value.replace("_", " ")
-            lines.append(
-                f"{position}. {resolved_step.step.tool_name}."
-                f"{resolved_step.step.action}: {outcome}"
-            )
-        return "\n".join(lines)
+            lines = [f"Confirmation required: {resolved.steps[0].permission.reason}"]
+        else:
+            lines = [
+                f"Confirmation required for {len(resolved.steps)} planned actions:"
+            ]
+            for position, resolved_step in enumerate(resolved.steps, start=1):
+                outcome = resolved_step.permission.decision.value.replace("_", " ")
+                lines.append(
+                    f"{position}. {resolved_step.step.tool_name}."
+                    f"{resolved_step.step.action}: {outcome}"
+                )
+        return "\n".join((*lines, *previews))
 
     @staticmethod
     def _format_results(results: list[ToolExecutionResult]) -> str:

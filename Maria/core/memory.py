@@ -5,7 +5,7 @@ from __future__ import annotations
 import hashlib
 import re
 import sqlite3
-from collections.abc import Iterator
+from collections.abc import Callable, Iterator, Sequence
 from contextlib import contextmanager
 from dataclasses import dataclass, replace
 from datetime import datetime, timezone
@@ -17,7 +17,13 @@ from core.constants import (
     DATABASE_SCHEMA_VERSION,
     DEFAULT_DATABASE_BUSY_TIMEOUT_SECONDS,
 )
-from core.context import ContextConsentOutcome
+from core.context import (
+    SEARCH_MAX_TERMS,
+    SEARCH_TERM_MAX_CHARACTERS,
+    SUPPLIED_CONTEXT_MAX_RECORDS,
+    ContextConsentOutcome,
+    note_digest,
+)
 from core.failures import Failure, FailureKind, TypedFailureError
 from core.logger import get_logger
 
@@ -57,11 +63,13 @@ _UNVERSIONED_SCHEMA = 0
 # Maria's schema history, as a plain counter. Version 1 is the earliest shape
 # Maria ever created, before explicit memories existed. Version 2 adds the
 # ``memories`` table and is the published v0.2.0 baseline. Version 3 adds the
-# per-memory context-consent column. The current version lives in
-# ``core.constants`` as ``DATABASE_SCHEMA_VERSION``.
+# per-memory context-consent column. Version 4 adds the per-note context
+# consent column, which holds the approved text's identity. The current
+# version lives in ``core.constants`` as ``DATABASE_SCHEMA_VERSION``.
 _SCHEMA_BEFORE_EXPLICIT_MEMORIES = 1
 _SCHEMA_V0_2_BASELINE = 2
 _SCHEMA_MEMORY_CONTEXT_CONSENT = 3
+_SCHEMA_NOTE_CONTEXT_CONSENT = 4
 
 # The live schema. These statements describe the database this build expects
 # and are what a brand-new database is created from, so they move whenever the
@@ -77,13 +85,20 @@ _CREATE_INTERACTIONS_TABLE = """
     )
 """
 
+# ``context_digest`` is the owner's per-note consent to supply that note to
+# the local reasoning model, and the identity of exactly the title and body
+# the owner approved: the SHA-256 of both, or NULL while consent is off. A
+# note whose current text no longer has that identity is not eligible, even
+# if another connection changed it and left the value in place.
 _CREATE_NOTES_TABLE = """
     CREATE TABLE IF NOT EXISTS notes (
         id INTEGER PRIMARY KEY AUTOINCREMENT,
         title TEXT NOT NULL,
         body TEXT NOT NULL,
         created_at TEXT NOT NULL,
-        updated_at TEXT NOT NULL
+        updated_at TEXT NOT NULL,
+        context_digest TEXT
+            CHECK (context_digest IS NULL OR length(context_digest) = 64)
     )
 """
 
@@ -152,6 +167,18 @@ _HISTORICAL_NOTES_TABLE = """
     )
 """
 
+_HISTORICAL_NOTES_TABLE_WITH_CONTEXT_CONSENT = """
+    CREATE TABLE notes (
+        id INTEGER PRIMARY KEY AUTOINCREMENT,
+        title TEXT NOT NULL,
+        body TEXT NOT NULL,
+        created_at TEXT NOT NULL,
+        updated_at TEXT NOT NULL,
+        context_digest TEXT
+            CHECK (context_digest IS NULL OR length(context_digest) = 64)
+    )
+"""
+
 _HISTORICAL_MEMORIES_TABLE = """
     CREATE TABLE memories (
         id INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -194,6 +221,14 @@ _ADD_MEMORY_CONTEXT_CONSENT_COLUMN = """
         CHECK (context_enabled IN (0, 1))
 """
 
+# The one statement the version 4 step runs, frozen the same way. With no
+# DEFAULT the new column is NULL for every existing note, which is consent
+# off, and the statement rewrites no row.
+_ADD_NOTE_CONTEXT_CONSENT_COLUMN = """
+    ALTER TABLE notes ADD COLUMN context_digest TEXT
+        CHECK (context_digest IS NULL OR length(context_digest) = 64)
+"""
+
 # Every version's complete schema, newest first. A marker is never taken at
 # its word: whatever version a database claims, its structure is checked
 # against the entry for that version before anything is migrated, so a file
@@ -202,6 +237,16 @@ _ADD_MEMORY_CONTEXT_CONSENT_COLUMN = """
 # one up to DATABASE_SCHEMA_VERSION therefore needs an entry here, and the
 # migration ladder refuses to run if one is missing.
 _FROZEN_SCHEMAS: tuple[tuple[int, tuple[str, ...]], ...] = (
+    (
+        _SCHEMA_NOTE_CONTEXT_CONSENT,
+        (
+            _HISTORICAL_INTERACTIONS_TABLE,
+            _HISTORICAL_NOTES_TABLE_WITH_CONTEXT_CONSENT,
+            _HISTORICAL_MEMORIES_TABLE_WITH_CONTEXT_CONSENT,
+            _HISTORICAL_INTERACTIONS_INDEX,
+            _HISTORICAL_NOTES_INDEX,
+        ),
+    ),
     (
         _SCHEMA_MEMORY_CONTEXT_CONSENT,
         (
@@ -284,13 +329,25 @@ _MIGRATIONS: tuple[_Migration, ...] = (
         name="add_memory_context_consent",
         statements=(_ADD_MEMORY_CONTEXT_CONSENT_COLUMN,),
     ),
+    _Migration(
+        version=_SCHEMA_NOTE_CONTEXT_CONSENT,
+        name="add_note_context_consent",
+        statements=(_ADD_NOTE_CONTEXT_CONSENT_COLUMN,),
+    ),
 )
 
 
 
 # A fact digest is the lowercase hexadecimal SHA-256 of the fact's exact UTF-8
-# text: the identity an enable approval is bound to, never the text itself.
+# text, and a note's text digest that of its title and body together: the
+# identity an enable approval is bound to, never the text itself.
 _FACT_DIGEST_PATTERN = re.compile(r"[0-9a-f]{64}")
+
+# The SQL functions a context search registers, on its own connection only:
+# one tests a bounded text against the request's casefolded terms, and the
+# other tests whether a note's title and body are still its approved text.
+_CONTEXT_MATCH_FUNCTION = "maria_context_match"
+_NOTE_APPROVED_FUNCTION = "maria_note_approved"
 
 
 @dataclass(frozen=True)
@@ -306,6 +363,38 @@ class MemoryUpdate:
     updated: bool
     conflicting_id: int | None = None
     context_consent_cleared: bool = False
+
+
+@dataclass(frozen=True)
+class NoteUpdate:
+    """What one note retitle or edit did.
+
+    ``updated`` is whether a row matched and received the new text, and
+    ``context_consent_cleared`` says the note's context consent had been on
+    and was turned off.
+    """
+
+    updated: bool
+    context_consent_cleared: bool = False
+
+
+@dataclass(frozen=True, repr=False)
+class NoteSnapshot:
+    """One note's exact title and body, read together, and their identity.
+
+    ``text_digest`` is ``core.context.note_digest`` of exactly this
+    ``title`` and ``body``, all from one read, so what an approval shows
+    the owner is precisely the text it is bound to. Neither text nor the
+    identity is ever shown by ``repr``.
+    """
+
+    title: str
+    body: str
+    text_digest: str
+
+    def __repr__(self) -> str:
+        """Name the type without showing the text or its identity."""
+        return "NoteSnapshot(<redacted>)"
 
 
 class Memory:
@@ -574,6 +663,8 @@ class Memory:
     def record_interaction(self, user_input: str, response: str) -> int:
         """Record a user interaction and return its database id."""
         timestamp = _utc_timestamp()
+        interaction_id = 0
+        failed = False
         try:
             with self._connection() as connection:
                 cursor = connection.execute(
@@ -584,15 +675,21 @@ class Memory:
                     (user_input, response, timestamp),
                 )
                 interaction_id = int(cursor.lastrowid)
-            self.logger.info("Recorded interaction %s.", interaction_id)
-            return interaction_id
-        except sqlite3.Error as exc:
-            self.logger.exception("Failed to record interaction.")
-            raise RuntimeError("Unable to record interaction.") from exc
+        except sqlite3.Error:
+            failed = True
+        if failed:
+            raise self._fixed_failure(
+                "Failed to record interaction.",
+                "Unable to record interaction.",
+            )
+        self.logger.info("Recorded interaction %s.", interaction_id)
+        return interaction_id
 
     def get_recent_interactions(self, limit: int = 5) -> list[dict[str, Any]]:
         """Return recent interactions in newest-first order."""
         safe_limit = max(1, min(limit, 50))
+        rows: list[sqlite3.Row] = []
+        failed = False
         try:
             with self._connection() as connection:
                 rows = connection.execute(
@@ -604,13 +701,19 @@ class Memory:
                     """,
                     (safe_limit,),
                 ).fetchall()
-            return [dict(row) for row in rows]
-        except sqlite3.Error as exc:
-            self.logger.exception("Failed to fetch recent interactions.")
-            raise RuntimeError("Unable to fetch recent interactions.") from exc
+        except sqlite3.Error:
+            failed = True
+        if failed:
+            raise self._fixed_failure(
+                "Failed to fetch recent interactions.",
+                "Unable to fetch recent interactions.",
+            )
+        return [dict(row) for row in rows]
 
     def get_interaction(self, interaction_id: int) -> dict[str, Any] | None:
         """Return one interaction by its database id."""
+        row = None
+        failed = False
         try:
             with self._connection() as connection:
                 row = connection.execute(
@@ -621,10 +724,14 @@ class Memory:
                     """,
                     (interaction_id,),
                 ).fetchone()
-            return dict(row) if row else None
-        except sqlite3.Error as exc:
-            self.logger.exception("Failed to read interaction.")
-            raise RuntimeError("Unable to read interaction.") from exc
+        except sqlite3.Error:
+            failed = True
+        if failed:
+            raise self._fixed_failure(
+                "Failed to read interaction.",
+                "Unable to read interaction.",
+            )
+        return dict(row) if row else None
 
     def search_interactions(
         self,
@@ -644,6 +751,8 @@ class Memory:
             raise ValueError("Search query is required.")
 
         safe_limit = max(1, min(limit, 50))
+        rows: list[sqlite3.Row] = []
+        failed = False
         try:
             with self._connection() as connection:
                 rows = connection.execute(
@@ -657,10 +766,14 @@ class Memory:
                     """,
                     (clean_query, clean_query, safe_limit),
                 ).fetchall()
-            return [dict(row) for row in rows]
-        except sqlite3.Error as exc:
-            self.logger.exception("Failed to search interactions.")
-            raise RuntimeError("Unable to search interactions.") from exc
+        except sqlite3.Error:
+            failed = True
+        if failed:
+            raise self._fixed_failure(
+                "Failed to search interactions.",
+                "Unable to search interactions.",
+            )
+        return [dict(row) for row in rows]
 
     def delete_interaction(self, interaction_id: int) -> bool:
         """Delete one interaction by its database id.
@@ -677,6 +790,8 @@ class Memory:
         ):
             raise ValueError("Interaction id must be a positive whole number.")
 
+        deleted = False
+        failed = False
         try:
             with self._connection() as connection:
                 cursor = connection.execute(
@@ -687,12 +802,16 @@ class Memory:
                     (interaction_id,),
                 )
                 deleted = cursor.rowcount == 1
-            if deleted:
-                self.logger.info("Deleted interaction %s.", interaction_id)
-            return deleted
-        except sqlite3.Error as exc:
-            self.logger.exception("Failed to delete interaction.")
-            raise RuntimeError("Unable to delete interaction.") from exc
+        except sqlite3.Error:
+            failed = True
+        if failed:
+            raise self._fixed_failure(
+                "Failed to delete interaction.",
+                "Unable to delete interaction.",
+            )
+        if deleted:
+            self.logger.info("Deleted interaction %s.", interaction_id)
+        return deleted
 
     def store_memory(self, fact: str) -> tuple[int, bool]:
         """Store a fact and return its database id and creation status."""
@@ -702,6 +821,9 @@ class Memory:
 
         normalized_fact = clean_fact.casefold()
         timestamp = _utc_timestamp()
+        memory_id = 0
+        created = False
+        failed = False
         try:
             with self._connection() as connection:
                 cursor = connection.execute(
@@ -729,17 +851,23 @@ class Memory:
                             "Unable to resolve duplicate memory."
                         )
                     memory_id = int(row["id"])
-            if created:
-                self.logger.info("Stored memory %s.", memory_id)
-            else:
-                self.logger.info("Memory %s already exists.", memory_id)
-            return memory_id, created
-        except sqlite3.Error as exc:
-            self.logger.exception("Failed to store memory.")
-            raise RuntimeError("Unable to store memory.") from exc
+        except sqlite3.Error:
+            failed = True
+        if failed:
+            raise self._fixed_failure(
+                "Failed to store memory.",
+                "Unable to store memory.",
+            )
+        if created:
+            self.logger.info("Stored memory %s.", memory_id)
+        else:
+            self.logger.info("Memory %s already exists.", memory_id)
+        return memory_id, created
 
     def get_memory(self, memory_id: int) -> dict[str, Any] | None:
         """Return one memory by its database id."""
+        row = None
+        failed = False
         try:
             with self._connection() as connection:
                 row = connection.execute(
@@ -750,10 +878,14 @@ class Memory:
                     """,
                     (memory_id,),
                 ).fetchone()
-            return dict(row) if row else None
-        except sqlite3.Error as exc:
-            self.logger.exception("Failed to read memory.")
-            raise RuntimeError("Unable to read memory.") from exc
+        except sqlite3.Error:
+            failed = True
+        if failed:
+            raise self._fixed_failure(
+                "Failed to read memory.",
+                "Unable to read memory.",
+            )
+        return dict(row) if row else None
 
     def search_memories(
         self,
@@ -767,6 +899,8 @@ class Memory:
 
         normalized_query = clean_query.casefold()
         safe_limit = max(1, min(limit, 100))
+        rows: list[sqlite3.Row] = []
+        failed = False
         try:
             with self._connection() as connection:
                 rows = connection.execute(
@@ -779,14 +913,20 @@ class Memory:
                     """,
                     (normalized_query, safe_limit),
                 ).fetchall()
-            return [dict(row) for row in rows]
-        except sqlite3.Error as exc:
-            self.logger.exception("Failed to search memories.")
-            raise RuntimeError("Unable to search memories.") from exc
+        except sqlite3.Error:
+            failed = True
+        if failed:
+            raise self._fixed_failure(
+                "Failed to search memories.",
+                "Unable to search memories.",
+            )
+        return [dict(row) for row in rows]
 
     def list_memories(self, limit: int = 20) -> list[dict[str, Any]]:
         """Return stored memories in newest-first order."""
         safe_limit = max(1, min(limit, 100))
+        rows: list[sqlite3.Row] = []
+        failed = False
         try:
             with self._connection() as connection:
                 rows = connection.execute(
@@ -798,10 +938,14 @@ class Memory:
                     """,
                     (safe_limit,),
                 ).fetchall()
-            return [dict(row) for row in rows]
-        except sqlite3.Error as exc:
-            self.logger.exception("Failed to list memories.")
-            raise RuntimeError("Unable to list memories.") from exc
+        except sqlite3.Error:
+            failed = True
+        if failed:
+            raise self._fixed_failure(
+                "Failed to list memories.",
+                "Unable to list memories.",
+            )
+        return [dict(row) for row in rows]
 
     def update_memory(
         self,
@@ -840,7 +984,10 @@ class Memory:
         the same transaction as the new fact is written, and
         ``context_consent_cleared`` reports whether it had been on, which is
         the one case the owner needs to be told about. A conflicting or
-        missing row changes nothing, consent included.
+        missing row changes nothing, consent included. When SQLite fails it
+        raises ``RuntimeError("Unable to update memory.")`` with no SQLite
+        detail as its message, cause, or context, or in the log, because
+        SQLite's message can quote the old or the new fact.
         """
         if (
             not isinstance(memory_id, int)
@@ -856,6 +1003,7 @@ class Memory:
         updated = False
         consent_cleared = False
         conflicting_id: int | None = None
+        failed = False
         try:
             with self._connection() as connection:
                 try:
@@ -898,17 +1046,21 @@ class Memory:
                             "Unable to resolve conflicting memory."
                         )
                     conflicting_id = int(row["id"])
-            if updated:
-                self.logger.info("Updated memory %s.", memory_id)
-            if consent_cleared:
-                self.logger.info(
-                    "Turned off context consent for updated memory %s.",
-                    memory_id,
-                )
-            return MemoryUpdate(updated, conflicting_id, consent_cleared)
-        except sqlite3.Error as exc:
-            self.logger.exception("Failed to update memory.")
-            raise RuntimeError("Unable to update memory.") from exc
+        except sqlite3.Error:
+            failed = True
+        if failed:
+            raise self._fixed_failure(
+                "Failed to update memory.",
+                "Unable to update memory.",
+            )
+        if updated:
+            self.logger.info("Updated memory %s.", memory_id)
+        if consent_cleared:
+            self.logger.info(
+                "Turned off context consent for updated memory %s.",
+                memory_id,
+            )
+        return MemoryUpdate(updated, conflicting_id, consent_cleared)
 
     def memory_fact_digest(self, memory_id: int) -> str | None:
         """Return the identity of one memory's exact fact, or None if absent.
@@ -916,9 +1068,13 @@ class Memory:
         The identity is the lowercase hexadecimal SHA-256 of the fact's exact
         UTF-8 text, so an approval can be bound to precisely the text that
         was stored when it was requested. The fact itself is never returned
-        or logged. Raises ValueError for a non-positive-integer id.
+        or logged. Raises ValueError for a non-positive-integer id, and
+        ``RuntimeError("Unable to read memory.")`` when SQLite fails, with no
+        SQLite detail as its message, cause, or context, or in the log.
         """
         _require_memory_id(memory_id)
+        row = None
+        failed = False
         try:
             with self._connection() as connection:
                 row = connection.execute(
@@ -929,10 +1085,14 @@ class Memory:
                     """,
                     (memory_id,),
                 ).fetchone()
-            return None if row is None else _fact_digest(row["fact"])
-        except sqlite3.Error as exc:
-            self.logger.exception("Failed to read memory identity.")
-            raise RuntimeError("Unable to read memory.") from exc
+        except sqlite3.Error:
+            failed = True
+        if failed:
+            raise self._fixed_failure(
+                "Failed to read memory identity.",
+                "Unable to read memory.",
+            )
+        return None if row is None else _fact_digest(row["fact"])
 
     def enable_memory_context(
         self,
@@ -953,8 +1113,10 @@ class Memory:
         for a missing id, is ``TARGET_CHANGED`` and is left unchanged.
 
         Raises ValueError for a non-positive-integer id or an identity that
-        is neither None nor a lowercase hexadecimal SHA-256. The fact is
-        never returned or logged.
+        is neither None nor a lowercase hexadecimal SHA-256, and
+        ``RuntimeError("Unable to change memory context consent.")`` when
+        SQLite fails, with no SQLite detail as its message, cause, or
+        context, or in the log. The fact is never returned or logged.
         """
         _require_memory_id(memory_id)
         if expected_fact_digest is not None and not (
@@ -963,6 +1125,8 @@ class Memory:
         ):
             raise ValueError("A memory fact identity must be a SHA-256 digest.")
 
+        outcome = ContextConsentOutcome.NOT_FOUND
+        failed = False
         try:
             with self._connection() as connection:
                 connection.execute("BEGIN IMMEDIATE")
@@ -995,17 +1159,21 @@ class Memory:
                         if cursor.rowcount == 1
                         else ContextConsentOutcome.TARGET_CHANGED
                     )
-            if outcome is ContextConsentOutcome.ENABLED:
-                self.logger.info("Enabled context consent for memory %s.", memory_id)
-            elif outcome is ContextConsentOutcome.TARGET_CHANGED:
-                self.logger.info(
-                    "Refused context consent for memory %s: approved text changed.",
-                    memory_id,
-                )
-            return outcome
-        except sqlite3.Error as exc:
-            self.logger.exception("Failed to change memory context consent.")
-            raise RuntimeError("Unable to change memory context consent.") from exc
+        except sqlite3.Error:
+            failed = True
+        if failed:
+            raise self._fixed_failure(
+                "Failed to change memory context consent.",
+                "Unable to change memory context consent.",
+            )
+        if outcome is ContextConsentOutcome.ENABLED:
+            self.logger.info("Enabled context consent for memory %s.", memory_id)
+        elif outcome is ContextConsentOutcome.TARGET_CHANGED:
+            self.logger.info(
+                "Refused context consent for memory %s: approved text changed.",
+                memory_id,
+            )
+        return outcome
 
     def disable_memory_context(self, memory_id: int) -> bool:
         """Turn one memory's context consent off by its database id.
@@ -1014,10 +1182,13 @@ class Memory:
         was already off, and False when none did. At most one row can
         change, because the id is the primary key. Turning consent off only
         narrows what can be sent, so it needs no text check. Raises
-        ValueError for a non-positive-integer id. The memory's fact is never
-        read, logged, or returned.
+        ValueError for a non-positive-integer id, and the same fixed
+        RuntimeError as ``enable_memory_context`` when SQLite fails. The
+        memory's fact is never read, logged, or returned.
         """
         _require_memory_id(memory_id)
+        matched = False
+        failed = False
         try:
             with self._connection() as connection:
                 cursor = connection.execute(
@@ -1029,12 +1200,16 @@ class Memory:
                     (memory_id,),
                 )
                 matched = cursor.rowcount == 1
-            if matched:
-                self.logger.info("Disabled context consent for memory %s.", memory_id)
-            return matched
-        except sqlite3.Error as exc:
-            self.logger.exception("Failed to change memory context consent.")
-            raise RuntimeError("Unable to change memory context consent.") from exc
+        except sqlite3.Error:
+            failed = True
+        if failed:
+            raise self._fixed_failure(
+                "Failed to change memory context consent.",
+                "Unable to change memory context consent.",
+            )
+        if matched:
+            self.logger.info("Disabled context consent for memory %s.", memory_id)
+        return matched
 
     def list_context_memories(
         self,
@@ -1064,22 +1239,137 @@ class Memory:
         Raises ValueError when ``max_fact_bytes`` is not a positive int, and
         ``RuntimeError("Unable to read memory context.")`` when SQLite fails
         or a returned fact is not text, so any read that cannot be trusted
-        ends the same way.
+        ends the same way. That failure carries no SQLite detail, as its
+        message, its cause, its context, or a logged traceback, because
+        SQLite's message for a stored text it cannot decode quotes the text.
+        """
+        return self._context_memory_rows(limit, max_fact_bytes)
+
+    def context_memories_by_id(
+        self,
+        memory_ids: Sequence[int],
+        max_fact_bytes: int,
+    ) -> list[dict[str, Any]]:
+        """Return which of ``memory_ids`` are context-enabled now, with text.
+
+        This is the recheck of memories already supplied to a conversation:
+        only the named ids are read, at most ``SUPPLIED_CONTEXT_MAX_RECORDS``
+        of them, and the rows are exactly those ``list_context_memories``
+        returns for enabled memories, bounded the same way. A named memory
+        that is disabled or gone is simply absent. Raises ValueError for ids
+        that are not distinct positive ints, and the same RuntimeError as
+        ``list_context_memories`` for a read that cannot be trusted.
+        """
+        identifiers = _require_record_ids(memory_ids)
+        return self._context_memory_rows(
+            len(identifiers),
+            max_fact_bytes,
+            identifiers=identifiers,
+        )
+
+    def search_context_memories(
+        self,
+        terms: Sequence[str],
+        after_id: int,
+        limit: int,
+        max_fact_bytes: int,
+    ) -> list[dict[str, Any]]:
+        """Return context-enabled memories after ``after_id`` holding a term.
+
+        This is Tier B's memory search. A fact within ``max_fact_bytes``
+        UTF-8 bytes matches when one of the casefolded ``terms`` occurs,
+        literally, in that fact as it is now, casefolded; there are no
+        wildcards, ranking, or fuzziness. Only memories whose id is above
+        ``after_id`` are considered, in ascending id order, and at most
+        ``limit`` rows come back, clamped to 1 through 100: the limit bounds
+        what is returned, not how many rows SQLite examines to find them.
+        Rows are bounded and shaped exactly as ``list_context_memories``
+        returns them.
+
+        A fact too large to supply is never read into Python, so it cannot
+        be casefolded here. It is matched instead, inside SQLite, against the
+        casefolded copy stored beside it, and comes back by id only. Maria
+        writes that copy with every fact she stores, but cannot check it
+        against a fact too large to read: a copy changed outside Maria can
+        name an oversized memory that no longer holds the term, or miss one
+        that does. Such a row still counts toward ``limit``.
+
+        Raises ValueError for terms that are not 1 to ``SEARCH_MAX_TERMS``
+        non-empty texts or for an ``after_id`` that is not a positive int,
+        and the same RuntimeError as ``list_context_memories`` otherwise.
+        """
+        searched = _require_search_terms(terms)
+        _require_memory_id(after_id)
+        return self._context_memory_rows(
+            limit,
+            max_fact_bytes,
+            after_id=after_id,
+            terms=searched,
+        )
+
+    def _context_memory_rows(
+        self,
+        limit: int,
+        max_fact_bytes: int,
+        *,
+        identifiers: tuple[int, ...] = (),
+        after_id: int = 0,
+        terms: tuple[str, ...] = (),
+    ) -> list[dict[str, Any]]:
+        """Run one bounded read of context-enabled memories.
+
+        With neither ``identifiers`` nor ``terms`` every enabled memory is
+        read; ``identifiers`` narrows the read to those ids, and ``terms`` to
+        memories after ``after_id`` holding a term. Every value travels as a
+        bound parameter; the statement text around them is this module's
+        own. The rows are enabled memories in ascending id order, at most
+        ``limit`` of them, each fact whole only within the UTF-8 bound.
         """
         if type(max_fact_bytes) is not int or max_fact_bytes < 1:
             raise ValueError("A fact size bound must be a positive whole number.")
         safe_limit = max(1, min(limit, 100))
+        rows: list[sqlite3.Row] = []
+        failed = False
         try:
             with self._connection() as connection:
-                encoding = connection.execute("PRAGMA encoding").fetchone()[0]
-                stored_bound = (
-                    max_fact_bytes if encoding == "UTF-8" else 2 * max_fact_bytes
-                )
+                stored_bound = _stored_bound(connection, max_fact_bytes)
+                condition = ""
+                parameters: tuple[Any, ...] = ()
+                if identifiers:
+                    placeholders = ", ".join("?" for _ in identifiers)
+                    condition = f"AND id IN ({placeholders})"
+                    parameters = identifiers
+                elif terms:
+                    connection.create_function(
+                        _CONTEXT_MATCH_FUNCTION,
+                        1,
+                        _term_matcher(terms, max_fact_bytes),
+                        deterministic=True,
+                    )
+                    stored_copy = " OR ".join(
+                        "instr(normalized_fact, ?) > 0" for _ in terms
+                    )
+                    # A fact within the stored bound is handed to the matcher,
+                    # which answers for its current text, or NULL when it is
+                    # not text within the exact UTF-8 bound. Only then does
+                    # the stored casefolded copy decide, so a fact too large
+                    # to read never leaves SQLite.
+                    condition = f"""
+                        AND id > ?
+                        AND coalesce(
+                            CASE
+                                WHEN length(CAST(fact AS BLOB)) <= ?
+                                THEN {_CONTEXT_MATCH_FUNCTION}(fact)
+                            END,
+                            {stored_copy}
+                        )
+                    """
+                    parameters = (after_id, stored_bound, *terms)
                 # The size test runs inside SQLite on the stored bytes, so a
                 # fact far beyond the bound is never materialised in Python:
                 # only its id and the flag cross the boundary.
                 rows = connection.execute(
-                    """
+                    f"""
                     SELECT
                         id,
                         CASE
@@ -1087,15 +1377,19 @@ class Memory:
                         END AS fact,
                         length(CAST(fact AS BLOB)) > ? AS oversized
                     FROM memories
-                    WHERE context_enabled = 1
+                    WHERE context_enabled = 1 {condition}
                     ORDER BY id ASC
                     LIMIT ?
                     """,
-                    (stored_bound, stored_bound, safe_limit),
+                    (stored_bound, stored_bound, *parameters, safe_limit),
                 ).fetchall()
-        except sqlite3.Error as exc:
-            self.logger.exception("Failed to read memory context.")
-            raise RuntimeError("Unable to read memory context.") from exc
+        except sqlite3.Error:
+            failed = True
+        if failed:
+            raise self._fixed_failure(
+                "Failed to read memory context.",
+                "Unable to read memory context.",
+            )
 
         # The column is declared TEXT, but SQLite still stores a value of
         # another type as it was given. A fact that is not text cannot be
@@ -1125,6 +1419,8 @@ class Memory:
         ):
             raise ValueError("Memory id must be a positive whole number.")
 
+        forgotten = False
+        failed = False
         try:
             with self._connection() as connection:
                 cursor = connection.execute(
@@ -1135,12 +1431,16 @@ class Memory:
                     (memory_id,),
                 )
                 forgotten = cursor.rowcount == 1
-            if forgotten:
-                self.logger.info("Forgot memory %s.", memory_id)
-            return forgotten
-        except sqlite3.Error as exc:
-            self.logger.exception("Failed to forget memory.")
-            raise RuntimeError("Unable to forget memory.") from exc
+        except sqlite3.Error:
+            failed = True
+        if failed:
+            raise self._fixed_failure(
+                "Failed to forget memory.",
+                "Unable to forget memory.",
+            )
+        if forgotten:
+            self.logger.info("Forgot memory %s.", memory_id)
+        return forgotten
 
     def create_note(self, title: str, body: str) -> int:
         """Create a note and return its database id."""
@@ -1152,6 +1452,8 @@ class Memory:
             raise ValueError("Note body is required.")
 
         timestamp = _utc_timestamp()
+        note_id = 0
+        failed = False
         try:
             with self._connection() as connection:
                 cursor = connection.execute(
@@ -1162,15 +1464,21 @@ class Memory:
                     (clean_title, clean_body, timestamp, timestamp),
                 )
                 note_id = int(cursor.lastrowid)
-            self.logger.info("Created note %s.", note_id)
-            return note_id
-        except sqlite3.Error as exc:
-            self.logger.exception("Failed to create note.")
-            raise RuntimeError("Unable to create note.") from exc
+        except sqlite3.Error:
+            failed = True
+        if failed:
+            raise self._fixed_failure(
+                "Failed to create note.",
+                "Unable to create note.",
+            )
+        self.logger.info("Created note %s.", note_id)
+        return note_id
 
     def list_notes(self, limit: int = 20) -> list[dict[str, Any]]:
         """Return recent notes in newest-first order."""
         safe_limit = max(1, min(limit, 100))
+        rows: list[sqlite3.Row] = []
+        failed = False
         try:
             with self._connection() as connection:
                 rows = connection.execute(
@@ -1182,16 +1490,22 @@ class Memory:
                     """,
                     (safe_limit,),
                 ).fetchall()
-            return [dict(row) for row in rows]
-        except sqlite3.Error as exc:
-            self.logger.exception("Failed to list notes.")
-            raise RuntimeError("Unable to list notes.") from exc
+        except sqlite3.Error:
+            failed = True
+        if failed:
+            raise self._fixed_failure(
+                "Failed to list notes.",
+                "Unable to list notes.",
+            )
+        return [dict(row) for row in rows]
 
     def get_note(self, note_id: int | None = None, title: str | None = None) -> dict[str, Any] | None:
         """Return one note by id or exact title."""
         if note_id is None and not title:
             raise ValueError("A note id or title is required.")
 
+        row = None
+        failed = False
         try:
             with self._connection() as connection:
                 if note_id is not None:
@@ -1214,10 +1528,14 @@ class Memory:
                         """,
                         (title,),
                     ).fetchone()
-            return dict(row) if row else None
-        except sqlite3.Error as exc:
-            self.logger.exception("Failed to read note.")
-            raise RuntimeError("Unable to read note.") from exc
+        except sqlite3.Error:
+            failed = True
+        if failed:
+            raise self._fixed_failure(
+                "Failed to read note.",
+                "Unable to read note.",
+            )
+        return dict(row) if row else None
 
     def retitle_note(self, note_id: int, new_title: str) -> bool:
         """Replace one note's title, keeping its body and created_at.
@@ -1227,35 +1545,52 @@ class Memory:
         since this persistent mutation is validated independently of its
         callers. updated_at receives the current UTC timestamp even when
         new_title already matches the stored title.
+
+        A retitle also turns the note's context consent off, in the same
+        transaction; ``retitle_note_reporting_consent`` is the same retitle
+        and also says whether consent had been on.
         """
-        if (
-            not isinstance(note_id, int)
-            or isinstance(note_id, bool)
-            or note_id < 1
-        ):
-            raise ValueError("Note id must be a positive whole number.")
+        return self.retitle_note_reporting_consent(note_id, new_title).updated
+
+    def retitle_note_reporting_consent(
+        self,
+        note_id: int,
+        new_title: str,
+    ) -> NoteUpdate:
+        """Replace one note's title and report whether consent was cleared.
+
+        This is ``retitle_note`` itself, with the same validation, the same
+        outcome, and the same log line, returned as a ``NoteUpdate``. Context
+        consent belongs to the exact title and body the owner approved, so a
+        retitle always leaves the note's consent off, turned off in the same
+        transaction as the new title is written. When SQLite fails it raises
+        ``RuntimeError("Unable to retitle note.")`` with no SQLite detail as
+        its message, cause, or context, or in the log, because SQLite's
+        message can quote the old or the new text.
+        """
+        _require_note_id(note_id)
         if not isinstance(new_title, str) or not new_title.strip():
             raise ValueError("New note title is required.")
 
-        clean_title = new_title.strip()
-        timestamp = _utc_timestamp()
+        result = NoteUpdate(False)
+        failed = False
         try:
-            with self._connection() as connection:
-                cursor = connection.execute(
-                    """
-                    UPDATE notes
-                    SET title = ?, updated_at = ?
-                    WHERE id = ?
-                    """,
-                    (clean_title, timestamp, note_id),
-                )
-                retitled = cursor.rowcount == 1
-            if retitled:
-                self.logger.info("Retitled note %s.", note_id)
-            return retitled
-        except sqlite3.Error as exc:
-            self.logger.exception("Failed to retitle note.")
-            raise RuntimeError("Unable to retitle note.") from exc
+            result = self._rewrite_note(note_id, "title", new_title.strip())
+        except sqlite3.Error:
+            failed = True
+        if failed:
+            raise self._fixed_failure(
+                "Failed to retitle note.",
+                "Unable to retitle note.",
+            )
+        if result.updated:
+            self.logger.info("Retitled note %s.", note_id)
+        if result.context_consent_cleared:
+            self.logger.info(
+                "Turned off context consent for retitled note %s.",
+                note_id,
+            )
+        return result
 
     def edit_note(self, note_id: int, new_body: str) -> bool:
         """Replace one note's body, keeping its title and created_at.
@@ -1265,35 +1600,411 @@ class Memory:
         since this persistent mutation is validated independently of its
         callers. updated_at receives the current UTC timestamp even when
         new_body already matches the stored body.
+
+        An edit also turns the note's context consent off, in the same
+        transaction; ``edit_note_reporting_consent`` is the same edit and
+        also says whether consent had been on.
         """
-        if (
-            not isinstance(note_id, int)
-            or isinstance(note_id, bool)
-            or note_id < 1
-        ):
-            raise ValueError("Note id must be a positive whole number.")
+        return self.edit_note_reporting_consent(note_id, new_body).updated
+
+    def edit_note_reporting_consent(
+        self,
+        note_id: int,
+        new_body: str,
+    ) -> NoteUpdate:
+        """Replace one note's body and report whether consent was cleared.
+
+        This is ``edit_note`` itself, with the same validation, the same
+        outcome, and the same log line, returned as a ``NoteUpdate``. An
+        edit always leaves the note's consent off, turned off in the same
+        transaction as the new body is written. When SQLite fails it raises
+        ``RuntimeError("Unable to edit note.")`` with no SQLite detail as its
+        message, cause, or context, or in the log.
+        """
+        _require_note_id(note_id)
         if not isinstance(new_body, str) or not new_body.strip():
             raise ValueError("New note body is required.")
 
-        clean_body = new_body.strip()
-        timestamp = _utc_timestamp()
+        result = NoteUpdate(False)
+        failed = False
+        try:
+            result = self._rewrite_note(note_id, "body", new_body.strip())
+        except sqlite3.Error:
+            failed = True
+        if failed:
+            raise self._fixed_failure(
+                "Failed to edit note.",
+                "Unable to edit note.",
+            )
+        if result.updated:
+            self.logger.info("Edited note %s.", note_id)
+        if result.context_consent_cleared:
+            self.logger.info(
+                "Turned off context consent for edited note %s.",
+                note_id,
+            )
+        return result
+
+    def _rewrite_note(self, note_id: int, column: str, value: str) -> NoteUpdate:
+        """Write one note's title or body and turn its consent off together.
+
+        ``column`` is one of the two names this module passes, never a value.
+        Both statements run in one transaction. Consent is turned off first:
+        that UPDATE takes the write lock, so no other connection can enable
+        consent before the new text is written, and a failure writing the
+        text rolls the consent change back with it. A note that does not
+        exist changes in neither statement.
+        """
+        statement = {
+            "title": "UPDATE notes SET title = ?, updated_at = ? WHERE id = ?",
+            "body": "UPDATE notes SET body = ?, updated_at = ? WHERE id = ?",
+        }[column]
+        with self._connection() as connection:
+            consent_cursor = connection.execute(
+                """
+                UPDATE notes
+                SET context_digest = NULL
+                WHERE id = ? AND context_digest IS NOT NULL
+                """,
+                (note_id,),
+            )
+            cursor = connection.execute(
+                statement,
+                (value, _utc_timestamp(), note_id),
+            )
+            return NoteUpdate(cursor.rowcount == 1, consent_cursor.rowcount == 1)
+
+    def note_text_digest(self, note_id: int) -> str | None:
+        """Return the identity of one note's exact title and body, or None.
+
+        This is ``note_snapshot``'s identity alone, with the same validation,
+        the same None, and the same failure. Neither text is returned or
+        logged.
+        """
+        snapshot = self.note_snapshot(note_id)
+        return None if snapshot is None else snapshot.text_digest
+
+    def note_snapshot(self, note_id: int) -> NoteSnapshot | None:
+        """Return one note's exact title and body with their identity, or None.
+
+        Both texts come from one read, and the identity is
+        ``core.context.note_digest`` of exactly them, so an approval can show
+        the owner precisely the text it is bound to. None means no such note
+        exists, or that its title or body is not text and so could never be
+        approved. Neither text is logged. Raises ValueError for a
+        non-positive-integer id, and ``RuntimeError("Unable to read note.")``
+        when SQLite fails; that failure carries no SQLite detail, as its
+        message, its cause, its context, or a logged traceback, because
+        SQLite's message for a stored text it cannot decode quotes the text.
+        """
+        _require_note_id(note_id)
+        row = None
+        failed = False
+        try:
+            with self._connection() as connection:
+                row = connection.execute(
+                    """
+                    SELECT title, body
+                    FROM notes
+                    WHERE id = ?
+                    """,
+                    (note_id,),
+                ).fetchone()
+        except sqlite3.Error:
+            failed = True
+        if failed:
+            raise self._fixed_failure(
+                "Failed to read note identity.",
+                "Unable to read note.",
+            )
+        if row is None or not _is_note_text(row["title"], row["body"]):
+            return None
+        title, body = row["title"], row["body"]
+        return NoteSnapshot(title, body, note_digest(title, body))
+
+    def enable_note_context(
+        self,
+        note_id: int,
+        expected_text_digest: str | None,
+    ) -> ContextConsentOutcome:
+        """Turn one note's context consent on, only for the approved text.
+
+        ``expected_text_digest`` is the identity ``note_text_digest`` returned
+        when confirmation was requested, or None when there was none. The
+        check and the change are one write transaction: ``BEGIN IMMEDIATE``
+        takes the write lock before the note is read, and the UPDATE applies
+        only while the title and body are still exactly the text checked. It
+        stores that identity as the note's consent, so a later change made
+        anywhere, even one that leaves the stored identity in place, makes
+        the note ineligible rather than approving the new text. A matching
+        note is enabled; a note that no longer exists, or never did, is
+        ``NOT_FOUND``; and a note whose text is not the approved text, or
+        that appeared after an approval requested for a missing id, is
+        ``TARGET_CHANGED`` and is left unchanged.
+
+        Raises ValueError for a non-positive-integer id or an identity that
+        is neither None nor a lowercase hexadecimal SHA-256, and
+        ``RuntimeError("Unable to change note context consent.")`` when
+        SQLite fails, with no SQLite detail as its message, cause, or
+        context, or in the log. Neither text is returned or logged.
+        """
+        _require_note_id(note_id)
+        if expected_text_digest is not None and not (
+            type(expected_text_digest) is str
+            and _FACT_DIGEST_PATTERN.fullmatch(expected_text_digest)
+        ):
+            raise ValueError("A note text identity must be a SHA-256 digest.")
+
+        outcome = ContextConsentOutcome.NOT_FOUND
+        failed = False
+        try:
+            with self._connection() as connection:
+                connection.execute("BEGIN IMMEDIATE")
+                row = connection.execute(
+                    """
+                    SELECT title, body
+                    FROM notes
+                    WHERE id = ?
+                    """,
+                    (note_id,),
+                ).fetchone()
+                if row is None:
+                    outcome = ContextConsentOutcome.NOT_FOUND
+                elif (
+                    expected_text_digest is None
+                    or not _is_note_text(row["title"], row["body"])
+                    or note_digest(row["title"], row["body"])
+                    != expected_text_digest
+                ):
+                    outcome = ContextConsentOutcome.TARGET_CHANGED
+                else:
+                    cursor = connection.execute(
+                        """
+                        UPDATE notes
+                        SET context_digest = ?
+                        WHERE id = ? AND title = ? AND body = ?
+                        """,
+                        (expected_text_digest, note_id, row["title"], row["body"]),
+                    )
+                    outcome = (
+                        ContextConsentOutcome.ENABLED
+                        if cursor.rowcount == 1
+                        else ContextConsentOutcome.TARGET_CHANGED
+                    )
+        except sqlite3.Error:
+            failed = True
+        if failed:
+            raise self._fixed_failure(
+                "Failed to change note context consent.",
+                "Unable to change note context consent.",
+            )
+        if outcome is ContextConsentOutcome.ENABLED:
+            self.logger.info("Enabled context consent for note %s.", note_id)
+        elif outcome is ContextConsentOutcome.TARGET_CHANGED:
+            self.logger.info(
+                "Refused context consent for note %s: approved text changed.",
+                note_id,
+            )
+        return outcome
+
+    def disable_note_context(self, note_id: int) -> bool:
+        """Turn one note's context consent off by its database id.
+
+        Returns True when a row matched note_id, including when its consent
+        was already off, and False when none did. At most one row can change,
+        because the id is the primary key. Turning consent off only narrows
+        what can be sent, so it needs no text check. Raises ValueError for a
+        non-positive-integer id, and the same fixed RuntimeError as
+        ``enable_note_context`` when SQLite fails. Neither text is read,
+        logged, or returned.
+        """
+        _require_note_id(note_id)
+        matched = False
+        failed = False
         try:
             with self._connection() as connection:
                 cursor = connection.execute(
                     """
                     UPDATE notes
-                    SET body = ?, updated_at = ?
+                    SET context_digest = NULL
                     WHERE id = ?
                     """,
-                    (clean_body, timestamp, note_id),
+                    (note_id,),
                 )
-                edited = cursor.rowcount == 1
-            if edited:
-                self.logger.info("Edited note %s.", note_id)
-            return edited
-        except sqlite3.Error as exc:
-            self.logger.exception("Failed to edit note.")
-            raise RuntimeError("Unable to edit note.") from exc
+                matched = cursor.rowcount == 1
+        except sqlite3.Error:
+            failed = True
+        if failed:
+            raise self._fixed_failure(
+                "Failed to change note context consent.",
+                "Unable to change note context consent.",
+            )
+        if matched:
+            self.logger.info("Disabled context consent for note %s.", note_id)
+        return matched
+
+    def context_notes_by_id(
+        self,
+        note_ids: Sequence[int],
+        max_text_bytes: int,
+    ) -> list[dict[str, Any]]:
+        """Return which of ``note_ids`` are context-enabled now, with text.
+
+        This is the recheck of notes already supplied to a conversation: only
+        the named ids are read, at most ``SUPPLIED_CONTEXT_MAX_RECORDS`` of
+        them, each row holding ``id``, ``title``, ``body``, and
+        ``oversized``. A named note comes back whole only while its title and
+        body are both within ``max_text_bytes`` UTF-8 bytes and still exactly
+        its approved text, and by id only, with ``oversized`` True, when a
+        text is too large, which can never be the approved text. A named note
+        that is disabled, deleted, or no longer its approved text is simply
+        absent. Raises ValueError for ids that are not distinct positive
+        ints, and the same RuntimeError as ``search_context_notes`` for a
+        read that cannot be trusted.
+        """
+        identifiers = _require_record_ids(note_ids)
+        return self._context_note_rows(
+            max_text_bytes,
+            len(identifiers),
+            identifiers=identifiers,
+        )
+
+    def search_context_notes(
+        self,
+        terms: Sequence[str],
+        limit: int,
+        max_text_bytes: int,
+    ) -> list[dict[str, Any]]:
+        """Return context-enabled notes whose title or body holds a term.
+
+        This is Tier B's note search. Only notes whose consent is on, whose
+        title and body are both text within ``max_text_bytes`` UTF-8 bytes,
+        and whose title and body are still exactly the text the owner
+        approved are searched, in ascending id order. A note matches when one
+        of the casefolded ``terms`` occurs, literally, wholly within its
+        casefolded title or wholly within its casefolded body; the two are
+        never joined into one text.
+
+        Every check runs inside SQLite, row by row, before the matcher sees
+        anything: consent, type, and stored size first, then the approved
+        identity, recomputed from the current title and body. A note changed
+        outside Maria is therefore never matched and never counts toward
+        ``limit``. A note with a text beyond the bound is never searched at
+        all: its approved identity cannot be verified without reading that
+        text, so it is neither matched nor named. At most ``limit`` rows come
+        back, clamped to 1 through 100: the limit bounds what is returned,
+        not how many rows SQLite examines to find them. Each row holds
+        ``id``, ``title``, ``body``, and ``oversized``, which is always
+        False here.
+
+        Raises ValueError for terms that are not 1 to ``SEARCH_MAX_TERMS``
+        non-empty texts or a bound that is not a positive int, and
+        ``RuntimeError("Unable to read note context.")`` when SQLite fails;
+        that failure carries no SQLite detail, as its message, its cause, its
+        context, or a logged traceback, because SQLite's message for a stored
+        text it cannot decode quotes the text.
+        """
+        return self._context_note_rows(
+            max_text_bytes,
+            limit,
+            terms=_require_search_terms(terms),
+        )
+
+    def _context_note_rows(
+        self,
+        max_text_bytes: int,
+        limit: int,
+        *,
+        identifiers: tuple[int, ...] = (),
+        terms: tuple[str, ...] = (),
+    ) -> list[dict[str, Any]]:
+        """Run one bounded read of context-enabled notes, by id or by terms.
+
+        Exactly one of ``identifiers`` and ``terms`` is given. Every value
+        travels as a bound parameter; the statement text around them is this
+        module's own.
+        """
+        if type(max_text_bytes) is not int or max_text_bytes < 1:
+            raise ValueError("A text size bound must be a positive whole number.")
+        safe_limit = max(1, min(limit, 100))
+        rows: list[sqlite3.Row] = []
+        failed = False
+        try:
+            with self._connection() as connection:
+                stored_bound = _stored_bound(connection, max_text_bytes)
+                if terms:
+                    connection.create_function(
+                        _NOTE_APPROVED_FUNCTION,
+                        3,
+                        _approved_note_check(max_text_bytes),
+                        deterministic=True,
+                    )
+                    connection.create_function(
+                        _CONTEXT_MATCH_FUNCTION,
+                        1,
+                        _term_matcher(terms, max_text_bytes),
+                        deterministic=True,
+                    )
+                    # CASE settles its conditions in order, so the approval
+                    # check sees only a consented note whose texts both fit
+                    # the stored bound, and the matcher sees only a note the
+                    # approval check confirmed. A row that fails either is
+                    # never returned and so never counts toward the limit.
+                    condition = f"""
+                        AND CASE
+                            WHEN context_digest IS NOT NULL
+                                AND typeof(title) = 'text'
+                                AND typeof(body) = 'text'
+                                AND length(CAST(title AS BLOB)) <= ?
+                                AND length(CAST(body AS BLOB)) <= ?
+                            THEN CASE
+                                WHEN {_NOTE_APPROVED_FUNCTION}(
+                                    title,
+                                    body,
+                                    context_digest
+                                )
+                                THEN {_CONTEXT_MATCH_FUNCTION}(title)
+                                    OR {_CONTEXT_MATCH_FUNCTION}(body)
+                                ELSE 0
+                            END
+                            ELSE 0
+                        END
+                    """
+                    parameters: tuple[Any, ...] = (stored_bound, stored_bound)
+                else:
+                    placeholders = ", ".join("?" for _ in identifiers)
+                    condition = f"AND id IN ({placeholders})"
+                    parameters = identifiers
+                rows = connection.execute(
+                    f"""
+                    SELECT
+                        id,
+                        CASE
+                            WHEN length(CAST(title AS BLOB)) <= ? THEN title
+                        END AS title,
+                        CASE
+                            WHEN length(CAST(body AS BLOB)) <= ? THEN body
+                        END AS body,
+                        context_digest
+                    FROM notes
+                    WHERE context_digest IS NOT NULL
+                        AND typeof(title) = 'text'
+                        AND typeof(body) = 'text'
+                        {condition}
+                    ORDER BY id ASC
+                    LIMIT ?
+                    """,
+                    (stored_bound, stored_bound, *parameters, safe_limit),
+                ).fetchall()
+        except sqlite3.Error:
+            failed = True
+        if failed:
+            raise self._fixed_failure(
+                "Failed to read note context.",
+                "Unable to read note context.",
+            )
+        settled = (_bounded_note_row(row, max_text_bytes) for row in rows)
+        return [row for row in settled if row is not None]
 
     def delete_note(self, note_id: int) -> bool:
         """Delete one note by its database id.
@@ -1310,6 +2021,8 @@ class Memory:
         ):
             raise ValueError("Note id must be a positive whole number.")
 
+        deleted = False
+        failed = False
         try:
             with self._connection() as connection:
                 cursor = connection.execute(
@@ -1320,12 +2033,16 @@ class Memory:
                     (note_id,),
                 )
                 deleted = cursor.rowcount == 1
-            if deleted:
-                self.logger.info("Deleted note %s.", note_id)
-            return deleted
-        except sqlite3.Error as exc:
-            self.logger.exception("Failed to delete note.")
-            raise RuntimeError("Unable to delete note.") from exc
+        except sqlite3.Error:
+            failed = True
+        if failed:
+            raise self._fixed_failure(
+                "Failed to delete note.",
+                "Unable to delete note.",
+            )
+        if deleted:
+            self.logger.info("Deleted note %s.", note_id)
+        return deleted
 
     @contextmanager
     def _connection(
@@ -1358,6 +2075,18 @@ class Memory:
             raise
         finally:
             connection.close()
+
+    def _fixed_failure(self, log_line: str, message: str) -> RuntimeError:
+        """Log one fixed line and return the fixed failure to raise.
+
+        SQLite's own message can quote stored text: a text it cannot decode,
+        or whatever a trigger's ``RAISE`` put in it. A caller therefore
+        raises this only after its ``except`` block has ended, so the failure
+        has neither a cause nor a context, and nothing from SQLite reaches
+        the log, the failure, or its traceback.
+        """
+        self.logger.error(log_line)
+        return RuntimeError(message)
 
     def _connect(self) -> sqlite3.Connection:
         """Open a SQLite connection with row dictionaries enabled."""
@@ -1421,6 +2150,171 @@ def _bounded_context_row(row: sqlite3.Row, max_fact_bytes: int) -> dict[str, Any
 def _fact_digest(fact: str) -> str:
     """Return the lowercase hexadecimal SHA-256 of a fact's exact UTF-8 text."""
     return hashlib.sha256(fact.encode("utf-8", "surrogatepass")).hexdigest()
+
+
+def _require_note_id(note_id: object) -> None:
+    """Refuse anything but an exact positive int note id."""
+    if (
+        not isinstance(note_id, int)
+        or isinstance(note_id, bool)
+        or note_id < 1
+    ):
+        raise ValueError("Note id must be a positive whole number.")
+
+
+def _require_record_ids(record_ids: object) -> tuple[int, ...]:
+    """Return 1 to ``SUPPLIED_CONTEXT_MAX_RECORDS`` distinct ids, or refuse.
+
+    Each id must be an exact positive int. The message is fixed and names
+    none of them.
+    """
+    if (
+        not isinstance(record_ids, Sequence)
+        or isinstance(record_ids, (str, bytes))
+        or not 1 <= len(record_ids) <= SUPPLIED_CONTEXT_MAX_RECORDS
+        or any(
+            type(record_id) is not int or record_id < 1
+            for record_id in record_ids
+        )
+        or len(set(record_ids)) != len(record_ids)
+    ):
+        raise ValueError("Record ids must be distinct positive whole numbers.")
+    return tuple(record_ids)
+
+
+def _require_search_terms(terms: object) -> tuple[str, ...]:
+    """Return 1 to ``SEARCH_MAX_TERMS`` search terms, or refuse them.
+
+    Each term must be exact, non-empty text of at most
+    ``SEARCH_TERM_MAX_CHARACTERS`` characters. The message is fixed and
+    repeats none of them.
+    """
+    if (
+        not isinstance(terms, Sequence)
+        or isinstance(terms, (str, bytes))
+        or not 1 <= len(terms) <= SEARCH_MAX_TERMS
+        or any(
+            type(term) is not str
+            or not 0 < len(term) <= SEARCH_TERM_MAX_CHARACTERS
+            for term in terms
+        )
+    ):
+        raise ValueError(
+            f"Search terms must be 1 to {SEARCH_MAX_TERMS} non-empty texts."
+        )
+    return tuple(terms)
+
+
+def _stored_bound(connection: sqlite3.Connection, max_bytes: int) -> int:
+    """Return the stored-size bound that admits every text within max_bytes.
+
+    SQLite measures a text in the file's own encoding. In a UTF-8 database
+    that is the exact bound. A UTF-16 database stores a text in at most twice
+    its UTF-8 size, so twice the bound admits every fitting text - never more
+    than ``max_bytes`` characters - and each admitted text's exact UTF-8 size
+    is settled afterwards, in Python.
+    """
+    encoding = connection.execute("PRAGMA encoding").fetchone()[0]
+    return max_bytes if encoding == "UTF-8" else 2 * max_bytes
+
+
+def _term_matcher(
+    terms: tuple[str, ...],
+    max_bytes: int,
+) -> Callable[[object], int | None]:
+    """Return a context search's matcher for one set of casefolded terms.
+
+    The matcher answers 1 when a term occurs, literally, in the casefolded
+    text and 0 otherwise. SQLite hands it only a text within the stored
+    bound, which in a UTF-16 database can still be over the UTF-8 bound, so
+    it settles the exact UTF-8 size itself first. For anything that is not
+    text within ``max_bytes`` UTF-8 bytes it answers None, SQL NULL, and
+    never casefolds it.
+    """
+
+    def matches(value: object) -> int | None:
+        if not _is_within_bound(value, max_bytes):
+            return None
+        folded = value.casefold()
+        return int(any(term in folded for term in terms))
+
+    return matches
+
+
+def _approved_note_check(max_bytes: int) -> Callable[[object, object, object], int]:
+    """Return the note search's check that a note is still its approved text.
+
+    The check answers 1 only when the title and body are both non-empty text
+    within ``max_bytes`` UTF-8 bytes whose identity, ``note_digest`` of
+    exactly them, is the one the note's consent holds, and 0 otherwise. It
+    runs before the matcher sees either text, so text changed outside Maria
+    is never searched, and a text too large to hash within the bound can
+    never be taken as approved.
+    """
+
+    def approved(title: object, body: object, approved_digest: object) -> int:
+        return int(
+            _is_note_text(title, body)
+            and _is_within_bound(title, max_bytes)
+            and _is_within_bound(body, max_bytes)
+            and type(approved_digest) is str
+            and note_digest(title, body) == approved_digest
+        )
+
+    return approved
+
+
+def _is_within_bound(value: object, max_bytes: int) -> bool:
+    """Return whether value is text of at most ``max_bytes`` UTF-8 bytes.
+
+    Text with more characters than the bound is over it and is never
+    encoded, so a text of any length is never copied to be measured.
+    """
+    return (
+        type(value) is str
+        and len(value) <= max_bytes
+        and _utf8_size(value) <= max_bytes
+    )
+
+
+def _is_note_text(title: object, body: object) -> bool:
+    """Return whether a note's title and body are both non-empty text."""
+    return type(title) is str and type(body) is str and bool(title and body)
+
+
+def _bounded_note_row(
+    row: sqlite3.Row,
+    max_text_bytes: int,
+) -> dict[str, Any] | None:
+    """Return one note context row, or None when it is not the approved text.
+
+    SQLite admitted each text against its stored size; this settles the
+    exact UTF-8 size. A note with a text over the bound comes back by id
+    only, as oversized. A note within the bound comes back whole only while
+    its title and body are still exactly the text whose identity the owner's
+    consent holds, so text changed by any other means is never eligible.
+    """
+    title, body = row["title"], row["body"]
+    if title is not None and _utf8_size(title) > max_text_bytes:
+        title = None
+    if body is not None and _utf8_size(body) > max_text_bytes:
+        body = None
+    record_id = int(row["id"])
+    if title is None or body is None:
+        return {"id": record_id, "title": None, "body": None, "oversized": True}
+    approved = row["context_digest"]
+    if (
+        not _is_note_text(title, body)
+        or type(approved) is not str
+        or note_digest(title, body) != approved
+    ):
+        return None
+    return {"id": record_id, "title": title, "body": body, "oversized": False}
+
+
+def _utf8_size(text: str) -> int:
+    """Return the exact UTF-8 size of text, lone surrogates included."""
+    return len(text.encode("utf-8", "surrogatepass"))
 
 
 def _validate_migration_ladder() -> None:

@@ -38,8 +38,8 @@ MAXIMUM_LIST_LIMIT = 100
 # to evaluate_expression, which rejects a stripped length above this value.
 MAXIMUM_EXPRESSION_LENGTH = 200
 
-# The length of a hexadecimal SHA-256, the fact identity an enable approval
-# carries.
+# The length of a hexadecimal SHA-256, the text identity an enable approval
+# carries: a memory's fact, or a note's title and body together.
 FACT_DIGEST_LENGTH = 64
 
 
@@ -660,7 +660,7 @@ class ActionContractRegistry:
 
 
 def _identifier(required: bool = True) -> ArgumentContract:
-    """Declare the positive row identifier shared by nine lifecycle actions.
+    """Declare the positive row identifier shared by eleven lifecycle actions.
 
     Every tool that takes an ``id`` rejects a bool, a non-int, and anything
     below 1, and none imposes a ceiling.
@@ -904,6 +904,23 @@ BUILT_IN_ACTION_CONTRACTS = ActionContractRegistry(
             ),
         ),
         ActionContract("notes", "delete", (_identifier(),)),
+        ActionContract(
+            "notes",
+            "enable_context",
+            (
+                _identifier(),
+                # Absent from the planner's plan; pinned when confirmation is
+                # offered, so the approved plan names the exact title and body.
+                _text(
+                    "text_digest",
+                    required=False,
+                    allow_blank=False,
+                    minimum_length=FACT_DIGEST_LENGTH,
+                    maximum_length=FACT_DIGEST_LENGTH,
+                ),
+            ),
+        ),
+        ActionContract("notes", "disable_context", (_identifier(),)),
         ActionContract("system", "overview"),
         ActionContract("system", "current_time"),
     )

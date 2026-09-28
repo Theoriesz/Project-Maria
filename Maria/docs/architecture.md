@@ -10,8 +10,10 @@ Maria is organized around a small set of modules with clear ownership.
 2. `session.py` holds the owner's confirmation state and the session's bounded
    conversation, and forwards the request.
 3. `brain.py` coordinates the request. On the model-backed conversational path
-   only, it reads the owner's enabled memory context through the memory layer
-   and `context.py`; it reads no interaction history for planning or reasoning.
+   only, it reads the owner's enabled memory context, and what a bounded
+   literal search finds among enabled memories and notes, through the memory
+   layer and `context.py`; it reads no interaction history for planning or
+   reasoning.
 4. `planner.py` converts explicit commands into structured plan steps.
 5. `action_contracts.py` declares which tool actions exist and which arguments
    each one accepts. Brain validates every step of a plan against it before any
@@ -337,14 +339,19 @@ malformed present arrays stop configuration loading instead of weakening it.
 When an action is both denied and confirmation-required, denial wins.
 
 In the current implementation, the mandatory confirmation baseline is
-ten actions: `filesystem.rename`, `filesystem.move`,
+twelve actions: `filesystem.rename`, `filesystem.move`,
 `history.delete`, `notes.retitle`, `notes.edit`, `notes.delete`,
+`notes.enable_context`, `notes.disable_context`,
 `memory.update`, `memory.forget`, `memory.enable_context`, and
 `memory.disable_context`. The confirmation for `memory.enable_context` also
 carries a fixed notice, from `CONFIRMATION_NOTICES` in `core/permissions.py`,
 that an enabled memory may be sent to the local reasoning model on any
 conversational turn within Maria's memory context limits, and that Maria does
-not choose memories by relevance.
+not choose memories by relevance. The confirmation for `notes.enable_context`
+carries one that the note's entire title and body may be sent on a later
+conversational turn when a word of four or more characters from the request
+appears literally in its title or body, and that Maria does not check the note
+for passwords or other secrets.
 `history.list`, `history.search`, `history.read`, `notes.create`,
 `notes.list`, `notes.read`, `memory.store`, `memory.search`, and `memory.list`
 remain allowed by default. These entries live
@@ -621,7 +628,13 @@ Maria keeps three kinds of persistent data separate:
   title and body are edited through two separate confirmation-gated commands,
   so neither can overwrite the other; both preserve `created_at` and refresh
   `updated_at`. A note may also be deleted by numeric ID. None of those
-  mutations cascade into interaction history or explicit memories.
+  mutations cascade into interaction history or explicit memories. Each note
+  also carries the owner's context consent, off unless the owner enables that
+  one note through a confirmation-gated command; the consent is stored as the
+  identity of exactly the title and body the owner approved, and a retitle or
+  an edit turns it off in the same transaction. Only such notes can reach the
+  reasoning model, through a literal search; see "Tier B Search Context"
+  below.
 - **Explicit memories** are deliberately stored facts. They are created only
   through the strict `remember <fact>` command or the public `Memory` API,
   searched through `recall <query>`, and listed through `memories`. A memory's
@@ -637,7 +650,7 @@ Maria keeps three kinds of persistent data separate:
   one memory through a confirmation-gated command; updating a memory turns its
   consent off in the same transaction, because consent covers the exact text
   the owner approved. Only enabled memories can reach the reasoning model; see
-  "Tier A Memory Context" below.
+  "Tier A Memory Context" and "Tier B Search Context" below.
 
 On the completed paths described above, memory commands and their responses
 also appear in interaction history when recording succeeds. A stored fact can
@@ -661,8 +674,9 @@ guaranteed. There is no compensating rollback, retry, or replay.
 deliberately contains no transport, no model, and no provider. A
 `ReasoningRequest` holds one bounded prompt; in `history`, the earlier
 exchanges of the current conversation, oldest first; and in `context`, the
-Tier A memories Maria selected, each a `ContextItem` from `core/context.py`
-bearing the record id Maria read. Both are empty by default. Each
+records Maria selected — Tier A memories, then Tier B search matches — each a
+`ContextItem` from `core/context.py` bearing the source and record id Maria
+read. Both are empty by default. Each
 `ReasoningExchange` is one user text and one assistant text, exact, non-empty,
 and redacted from every representation, and so is every `ContextItem`. There
 is no field through which a system prompt, a template, or raw interaction
@@ -671,12 +685,15 @@ string.
 
 A request's size is defined once, by `request_content_bytes`: the UTF-8 length
 of the prompt, plus the UTF-8 length of every exchange's user and assistant
-text, plus the fully rendered memory context — Maria's fixed context
-instructions and the delimited data block with every id — which is nothing
-when the context is empty. No role name, message structure, model identifier,
-or transport framing counts. The context is validated again every time it is
-measured, rather than trusted from construction: at most 16 items in strictly
-ascending id order, rendering to at most 2 KiB. Construction bounds that total by the 1 MiB hard
+text, plus the fully rendered context — Maria's fixed context instructions
+and the delimited data block with every header, source, and id — which is
+nothing when the context is empty. No role name, message structure, model
+identifier, or transport framing counts. The context is validated again every
+time it is measured, rather than trusted from construction: at most 16 Tier A
+memories first, rendering on their own to at most 2 KiB, then at most 8 Tier B
+items grouped by source, each group in strictly ascending id order with no
+memory in both tiers, at most 24 items rendering to at most 4,096 bytes in all.
+Construction bounds that total by the 1 MiB hard
 ceiling. `request_reasoning` measures it again against the configured
 `max_input_bytes` before the provider is asked, re-reading every text rather
 than trusting construction and stopping as soon as the total passes the
@@ -748,11 +765,14 @@ The request carries only the model identifier, as an opaque JSON string, and
 the conversation, with `stream` false: each earlier exchange as a `user`
 message followed by an `assistant` message, oldest first, and then the prompt
 as the final `user` message. With no history that is the prompt as one user
-message, byte for byte the request V1-13 sent, and with no memory context the
-request is byte for byte the one V1-14 sent. When the request carries memory
-context, two messages come first: Maria's fixed context instructions as the
-only `system` message, which never contain a stored fact, and the delimited
-memory data block as a `user` message of its own. There is no option, tool, or
+message, byte for byte the request V1-13 sent; with no context the request is
+byte for byte the one V1-14 sent; and with Tier A context alone it is byte for
+byte the one V1-15 sent. When the request carries context, two messages come
+first: Maria's fixed context instructions as the only `system` message, which
+never contain stored text, and the delimited data block as a `user` message of
+its own. The instructions are the V1-15 text unless a Tier B item is present,
+when a fixed variant also says some records were found because they contain a
+word from the current request. There is no option, tool, or
 thinking request. Before anything is serialized, the adapter validates the
 context again and measures the prompt, history, and rendered context together
 against its own `max_input_bytes` with the same `request_content_bytes`
@@ -800,12 +820,14 @@ session's earlier conversational turns. Everything else is exactly as it was.
 
 ```text
 CLI
--> MariaSession (conversation and supplied-memory fingerprints)
+-> MariaSession (conversation and supplied-record fingerprints)
 -> MariaBrain.process(request, *conversation, supplied_context=...)
 -> Planner                               always first, text only
 -> provider, enabled, exact fallback?    otherwise the ordinary path
 -> Memory.list_context_memories(17)      the one Tier A read
--> conversation.converse()               revocation check, budget, notices
+-> Memory.context_*_by_id(...)           recheck of supplied records, if any
+-> Memory.search_context_*(terms, 9)     Tier B reads, only when there are terms
+-> conversation.converse()               recheck, budget, selection, notices
 -> request_reasoning -> ReasoningProvider
 -> zero-step TRANSIENT plan
 -> Brain's ordinary zero-step path       no contract, permission, tool, or row
@@ -830,20 +852,22 @@ original response and its interaction row.
 
 - The budget is 8 KiB (`CONVERSATION_MAX_BYTES`) or the configured
   `max_input_bytes`, whichever is smaller, counted as `request_content_bytes`
-  counts: the current request, the fully rendered memory context, and the
-  UTF-8 text of the retained exchanges' user and assistant halves.
-- The enabled memories are settled first. A failed or untrustworthy Tier A
-  read, or a supplied memory that has since been disabled, changed, or
+  counts: the current request, the fully rendered context, and the UTF-8 text
+  of the retained exchanges' user and assistant halves.
+- Every context read is settled first. A failed or untrustworthy read, or a
+  supplied memory or note that has since been disabled, changed, deleted, or
   forgotten, clears the earlier conversation before anything is sent; see
-  "Tier A Memory Context" below.
+  "Tier A Memory Context" and "Tier B Search Context" below.
 - A request that is over the budget on its own is refused with the fixed
   input-over-budget message before the provider is asked. Text the interface
   cannot carry, such as a lone surrogate, is refused with its own fixed
   message.
-- The request comes first, then as much memory context as the selection rule
-  fits, then the newest earlier exchanges that fit beside both, at most eight
+- The request comes first, then as much Tier A context as its rule fits, then
+  as many Tier B matches as fit, memories before notes, then the newest
+  earlier exchanges that fit beside all of them, at most eight
   (`CONVERSATION_MAX_EXCHANGES`); the oldest are dropped first, whole. Nothing
-  is truncated.
+  is truncated. A conversation that would then carry more than 64 supplied
+  records is cleared before sending instead.
 - The provider is asked exactly once through `request_reasoning`. A typed
   failure, a crash, or a malformed reply becomes that failure's fixed message.
 - A reply is kept only if its whole exchange, request and reply together,
@@ -851,10 +875,11 @@ original response and its interaction row.
   is not shown in part, kept, or recorded.
 - A reply that passes is shown verbatim and becomes the newest exchange. The
   session keeps the result, again bounded to eight exchanges and the budget,
-  with the fingerprints of the memories that request carried.
-- Every outcome then ends with Maria's own notice about memory context, after
-  a blank line. It is built from the ids Maria selected, never from the reply,
-  and it never enters the request or the exchange the session keeps.
+  with the fingerprints of the records that request carried.
+- Every outcome then ends with Maria's own notices about context, after a
+  blank line. They are built from the sources and ids Maria selected, never
+  from the reply, and they never enter the request or the exchange the session
+  keeps.
 
 Every outcome, reply or refusal, is a zero-step plan that `conversation.py`,
 its producer, marks `TRANSIENT`. Brain runs it through its ordinary zero-step
@@ -866,11 +891,12 @@ it, it is never handed to the planner, it cannot become a pending approval,
 and a reply that reads like a command or an approval does nothing.
 
 What the model sees is the current request, the session's own completed
-conversational exchanges, and the explicit memories the owner has enabled for
-context. It never sees a command or its result, a memory the owner has not
-enabled, a note, a file, a stored interaction, or anything from an earlier
-session. A new session starts empty, and ending one discards its conversation
-and its supplied-memory fingerprints.
+conversational exchanges, the explicit memories the owner has enabled for
+context, and notes the owner has enabled for context that literally contain a
+word of the request. It never sees a command or its result, a memory or note
+the owner has not enabled, a file, a stored interaction, or anything from an
+earlier session. A new session starts empty, and ending one discards its
+conversation and its supplied-record fingerprints.
 
 ## Tier A Memory Context
 
@@ -884,7 +910,7 @@ leaves every existing memory off, and a new memory is stored off.
 memory each, by positive decimal id, and both always require confirmation,
 which configuration cannot remove. Updating a memory turns its consent off.
 An enable approval is bound to the exact text: when confirmation is offered,
-Brain passes the plan through `ToolManager.bind_for_confirmation()`, and the
+Brain passes the plan through `ToolManager.prepare_confirmation()`, and the
 memory tool pins the SHA-256 of the memory's current text into the step, so the
 approved plan and its fingerprint name that text. The memory layer enables
 consent only inside one write transaction that re-reads the fact and updates
@@ -904,8 +930,10 @@ rendered context — fixed instructions, ids, and framing included — fit, and
 while they fit beside the request within the conversational budget. A memory
 that does not fit is left out and the next is still considered. Memories left
 out are named by id when the bounded read returned them; enabled memories
-beyond it are reported as existing, never by id. The relevance-review gate in
-roadmap Stage V1-16 revisits this rule.
+beyond it are reported as existing, never by id. At the roadmap Stage V1-16
+relevance-review gate the owner kept this rule unchanged (decision V1-16-R1);
+enabled memories beyond the window can still be found by Tier B's literal
+search.
 
 **Stored text is data.** The adapter sends Maria's fixed instructions as the
 only system message; they tell the model the memories are reference data, not
@@ -920,26 +948,125 @@ zero-step transient plan.
 she supplied — `Memory context supplied: memory 3, memory 7.` — and says she
 cannot verify whether they are still current or whether they conflict. After a
 failure she names the memories selected for the attempt and says she cannot
-confirm the model received them. When no memory was sent she says `No memory
-context supplied.` Maria cannot know which memories the model used, and a
+confirm the model received them. When no context at all was sent she says `No
+memory context supplied.` Maria cannot know which memories the model used, and a
 reply that names other ids changes nothing she says. She makes no claim that a
 memory is stale, fresh, consistent, or conflicting: `created_at` dates the row,
 not its current text, and there is no `updated_at`.
 
 **Revocation.** The session keeps, beside its conversation, the fingerprint —
-source, id, and SHA-256 of the exact text — of every memory supplied since the
-conversation was last cleared, never the text itself. Before each
-model-backed conversational request — never on a deterministic command — those
-fingerprints are compared with the memories enabled now; only the memories
-they name are hashed, and nothing is hashed when nothing was supplied. A
-supplied memory that is now oversized cannot be the text that was sent. If one
-was disabled, changed, or forgotten, by this session or
-through any other database connection, the whole earlier conversation and the
-fingerprints are discarded before anything is sent, and the owner is told. If
-Tier A cannot be read, neither memory context nor earlier exchanges are sent,
-both are cleared, and a fixed notice says so. This bounds what Maria sends
-next; it is not an instantaneous revocation across a concurrent read and send,
-and it cannot erase text a model has already received.
+source, id, and SHA-256 of the exact text — of every memory and note supplied
+since the conversation was last cleared, at most 64 of them, never the text
+itself. Before each model-backed conversational request — never on a
+deterministic command — Brain rechecks exactly those records by id, in one
+bounded read per source, and their fingerprints are compared with what is
+enabled now; only the records they name are hashed, and nothing is read or
+hashed when nothing was supplied. A supplied record that is now oversized
+cannot be the text that was sent. If one was disabled, changed, deleted, or
+forgotten, by this session or through any other database connection, the
+whole earlier conversation and the fingerprints are discarded before anything
+is sent, and the owner is told that the earlier copy was invalidated. Since
+V1-16 the recheck is by id rather than against Tier A's own read, so a memory
+that merely moves past Tier A's 17-row window, unchanged, no longer clears the
+conversation. If any context read fails, neither context nor earlier exchanges
+are sent, both are cleared, and a fixed notice says so. This bounds what Maria
+sends next; it sees current state only, so a record changed away and back to
+the identical text between two checks is indistinguishable from one never
+changed; it is not an instantaneous revocation across a concurrent read and
+send; and it cannot erase text a model has already received.
+
+## Tier B Search Context
+
+Tier B is what a bounded literal search of the current request finds among
+records the owner has enabled for context. In V1-16 it has two sources:
+enabled memories beyond Tier A's window, and notes the owner has enabled with
+`enable note context <id>`. Nothing without that consent is ever searched.
+
+**Note consent.** Every note's consent is off by default: the V1-16
+migration leaves every existing note off, and a new note is stored off.
+`enable note context <id>` and `disable note context <id>` change one note
+each, by positive decimal id, and both always require confirmation, which
+configuration cannot remove. The enable confirmation says the note's entire
+title and body may reach the local model on a later literal match, and that
+Maria does not check the note for passwords or other secrets; consent is not a
+claim that the text holds none. Below that notice the confirmation shows the
+note's current title and body in full, each as one quoted line in which every
+invisible or line-breaking character is escaped, so the owner sees exactly the
+text being approved and no stored text can pose as Maria's own line. The
+approval is bound to that shown title and body: the notes tool reads both once,
+and from that one read both builds the preview and pins their identity, the
+SHA-256 of both together as one JSON array, into the step. Only the identity
+enters the pending plan; the preview is shown through Tool Manager's generic
+`ConfirmationBinding` and is never recorded, logged, retained in the
+conversation, or sent to a model. The memory layer enables consent only inside
+one write transaction that re-reads both and stores that identity as the
+note's `context_digest`, so a title or body changed before the owner confirms
+is refused and nothing is enabled. Retitling or editing the note turns
+it off in the same transaction. Because the stored consent is the approved
+text's identity, a note whose title or body was changed through any other
+connection, even one that left `context_digest` in place, no longer matches it
+and is never eligible, in this session or a later one.
+
+**The search rule.** `context.search_terms()` casefolds the cleaned request,
+splits it on whitespace, strips every non-alphanumeric character from both
+ends of each word, keeps words of 4 to 64 characters, drops repeats in
+first-seen order, and takes the first 8. A short request such as "Jo" or "AI"
+has no terms, and a request with no terms runs no Tier B read at all. Matching
+runs in a Python matcher registered on the one read's connection, which SQLite
+hands a text only after that row's stored size is within the bound, and which
+settles the text's exact UTF-8 size before casefolding it. A memory whose fact
+is within 2 KiB matches when a term occurs literally in its current fact,
+casefolded, so a stored casefolded copy left stale by another connection can
+neither add nor hide the match. A fact too large to supply never leaves SQLite
+and cannot be casefolded, so it is matched against its stored casefolded copy
+instead and can only be named, by id; Maria writes that copy with every fact,
+but a copy changed outside Maria can name an oversized memory that no longer
+holds the term, or miss one that does. A note is searched only while its
+consent is on, both texts are within 2 KiB, and an approval check inside
+SQLite finds they are still exactly the approved text; only then does the
+matcher see either text, and the note matches when a term occurs wholly within
+its casefolded title or wholly within its casefolded body; the two are never
+joined. A note changed outside Maria is therefore never matched and never uses
+up a read's rows, and a note with a text too large to verify is never
+searched. There are no model-generated queries, `LIKE` wildcards, rankings,
+embeddings, or fuzzy or semantic matching.
+
+**Bounded reads.** The memory search covers only enabled memories after the
+16th one Tier A considered, and runs only when Tier A's read found more than
+16, so Tier A's 17th, lookahead, row is its first candidate and a memory Tier
+A left out for size is never retried. Each source's read returns at most 9
+rows in ascending id order; that limit bounds the rows returned, not every row
+SQLite examines to find them. A memory beyond 2 KiB of UTF-8, measured exactly
+whatever the database file's encoding, is returned only by id and an
+oversized flag, so it is named and never supplied, and it counts toward its
+read's rows. A note search never returns a note by id only: a note whose title
+or body is beyond 2 KiB cannot have its approved identity verified, so it is
+neither matched nor named, and a note search result that named one would be
+treated as an unreadable read.
+
+**Selection and bounds.** The first 8 rows of each source are candidates,
+memories before notes, each in ascending id order, and are taken whole while
+fewer than 8 have been taken and everything rendered still fits. Tier A keeps
+its 16 items and 2 KiB; both tiers together are at most 24 items and 4,096
+fully rendered UTF-8 bytes — instructions, headers, source ids, JSON quoting,
+and escaped line separators included — and everything fits beside the request
+within the conversational budget. The request comes first, then Tier A, then
+Tier B memories, then Tier B notes, then earlier exchanges. The limits are
+validated again when a `ReasoningRequest` is constructed and in the adapter
+before any connection.
+
+**Rendering and notices.** Tier B records follow their own header in the same
+data block, each on one line as its source and id and then JSON: a memory's
+fact as a string, a note's title and body as one object, with the same line
+separator escapes as Tier A. After a successful reply Maria names them —
+`Found by search and supplied: memory 21, note 4.` — with the same caveat that
+she cannot verify whether they are current or conflict; after a failure she
+names them as selected; matches the limits left out are named by id when a
+read returned them, and further matches are reported as existing. Notes that
+share exactly a title but have different bodies are named together as
+possible divergent versions; Maria never calls them contradictory, never calls
+a record stale, and treats a note's `updated_at` only as the fact of when it
+was last saved.
 
 ## Boundaries
 

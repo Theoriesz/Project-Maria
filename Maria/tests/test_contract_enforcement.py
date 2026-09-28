@@ -41,7 +41,7 @@ from core.permissions import (
 )
 from core.planner import Plan, PlanArguments, Planner, PlanStep
 from core.session import CONFIRMATION_REFUSED_MESSAGE, MariaSession
-from core.tool_manager import ToolExecutionResult, ToolManager
+from core.tool_manager import PreparedConfirmation, ToolExecutionResult, ToolManager
 from tools.calculator import CalculatorTool
 from tools.filesystem import FilesystemTool
 from tools.history import HistoryTool
@@ -161,7 +161,7 @@ class PipelineTestCase(unittest.TestCase):
         self.tool_manager = Mock(spec=ToolManager)
         # No mocked tool pins confirmation state, so the plan offered
         # for approval is the plan itself.
-        self.tool_manager.bind_for_confirmation.side_effect = lambda plan: plan
+        self.tool_manager.prepare_confirmation.side_effect = PreparedConfirmation
         self.permissions = Mock(spec=PermissionManager)
         self.logger = Mock(spec=logging.Logger)
 
@@ -563,7 +563,7 @@ class ContractPrivacyTests(unittest.TestCase):
         tool_manager = Mock(spec=ToolManager)
         # No mocked tool pins confirmation state, so the plan offered
         # for approval is the plan itself.
-        tool_manager.bind_for_confirmation.side_effect = lambda plan: plan
+        tool_manager.prepare_confirmation.side_effect = PreparedConfirmation
         tool_manager.validate_action.side_effect = (
             BUILT_IN_ACTION_CONTRACTS.validate
         )
@@ -1152,7 +1152,7 @@ class UnsafeMetadataTests(unittest.TestCase):
         tool_manager = Mock(spec=ToolManager)
         # No mocked tool pins confirmation state, so the plan offered
         # for approval is the plan itself.
-        tool_manager.bind_for_confirmation.side_effect = lambda plan: plan
+        tool_manager.prepare_confirmation.side_effect = PreparedConfirmation
         permissions = Mock(spec=PermissionManager)
         memory.get_recent_interactions.return_value = []
         tool_manager.validate_action.side_effect = (
@@ -1334,7 +1334,7 @@ class MalformedIdentifierPipelineTests(unittest.TestCase):
         self.tool_manager = Mock(spec=ToolManager)
         # No mocked tool pins confirmation state, so the plan offered
         # for approval is the plan itself.
-        self.tool_manager.bind_for_confirmation.side_effect = lambda plan: plan
+        self.tool_manager.prepare_confirmation.side_effect = PreparedConfirmation
         self.permissions = Mock(spec=PermissionManager)
         self.memory.get_recent_interactions.return_value = []
         self.tool_manager.validate_action.side_effect = (

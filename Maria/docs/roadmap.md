@@ -182,23 +182,34 @@ bounded.
 
 - **Tier A — automatically usable when relevant:** explicit memories marked
   context-enabled, owner preferences, active tasks and reminders, active-project facts.
-- **Tier B — automatically searchable, bounded, with visible provenance:** notes, saved
-  conversation summaries, older explicit memories, project records.
+- **Tier B — automatically searchable, bounded, with visible provenance:** notes the
+  owner has enabled for context, saved conversation summaries, context-enabled explicit
+  memories beyond Tier A's bounded window, project records. Under Tier A's ascending-id
+  order those additional memories are the newer ones by id, not older ones.
 - **Tier C — requires explicit selection or approved workflow scope:** raw interaction
   history, arbitrary files, logs, credentials, sensitive records, unrelated project
-  data.
+  data. Every memory or note without context consent is treated as a sensitive record:
+  Maria cannot tell sensitive free text from any other, so consent, not inspection, is
+  the boundary.
 
 Every context item included in reasoning carries deterministic provenance produced by
 Maria — a memory, note, task, reminder, or project id, or a file identity — never
-supplied by the model. Maria discloses conflicts, stale information, and uncertainty.
+supplied by the model. Maria discloses uncertainty, and discloses a possible conflict or
+an out-of-date copy only on deterministic evidence: notes that share a title but have
+different bodies are named together as possible divergent versions, never as a proven
+contradiction; a last-saved date is a fact, not proof that a record is stale; and a
+previously supplied copy observed to have changed is reported as invalidated, and the
+conversation that carried it is cleared, without labelling the current record stale.
 
 "When relevant" is not yet implemented as relevance. Under the owner-approved
 transitional rule introduced in Stage V1-15 (decision V1-15-R1), every context-enabled
 explicit memory is eligible to be sent to the owner's local model on **any**
 model-backed conversational turn, in ascending memory id order, subject only to hard
-item and byte bounds. Maria makes no relevance judgement and claims none. That rule
-stands until a later context stage replaces it after an owner-reviewed relevance
-decision; see the relevance-review gate in Stage V1-16.
+item and byte bounds. Maria makes no relevance judgement and claims none. At the Stage
+V1-16 relevance-review gate the owner kept that rule unchanged (decision V1-16-R1). Tier
+B adds only deterministic literal matching against the current request, which is not a
+relevance judgement either. Any later replacement needs a new owner-reviewed relevance
+decision.
 
 Storage existence alone is not consent to unrestricted use.
 
@@ -975,35 +986,112 @@ they find gets its own focused `fix/<topic>` branch, never a release branch.
 
 - Branch: `feature/tier-b-bounded-context-search`
 - Prerequisites: V1-15
-- Purpose: Add the bounded automatic search over notes and older explicit memories that
-  the tiered policy allows, with hard bounds, disclosed sources, and a registration
-  point that later record types extend.
-- Relevance-review gate: this stage's read-only entry audit must review V1-15's
-  transitional Tier A selection rule, under which every enabled memory is eligible on
-  any model-backed conversational turn, and present the owner with the choice of
-  keeping it or replacing it with an explicit relevance rule. Any change to that rule
-  needs the owner's written approval before implementation.
-- Owner-visible result: Maria can find relevant stored material on her own and always
-  shows what she used, where it came from, and where sources conflict or look stale.
-- Architecture affected: the core context module, the memory layer for read-only bounded
-  queries, and `core/brain.py`.
+- Purpose: Add the bounded automatic literal search over consented notes and
+  context-enabled memories beyond Tier A's window that the tiered policy allows, with
+  hard bounds, disclosed sources, and a registration point that later record types
+  extend.
+- Owner-approved amendment (V1-16-R1): the V1-16 read-only entry audit found that this
+  entry described Tier B memories as "older" when, under Tier A's ascending-id order,
+  they are the newer ones; that notes had no way to exclude sensitive text from
+  automatic search; that its conflict and staleness criteria asked for claims Maria has
+  no evidence for; and that it omitted the modules consent, revocation, and the request
+  boundary require. The owner approved the corrections below, and this entry is amended
+  in the V1-16 pull request itself. The permanent safety boundaries are unchanged.
+- Relevance-review gate: this stage's read-only entry audit reviewed V1-15's
+  transitional Tier A selection rule and presented the owner with keeping it or
+  replacing it with an explicit relevance rule. The owner kept it unchanged (decision
+  V1-16-R1): every context-enabled memory is eligible on every model-backed
+  conversational turn, the first 16 in ascending id order are considered, and Tier A
+  renders to at most 2 KiB on its own.
+- Owner-visible result: With reasoning enabled, Maria also supplies, and names, stored
+  records that literally contain a word of the current request: context-enabled memories
+  beyond Tier A's window, and notes the owner has enabled for context with new
+  confirmation-required commands `enable note context <id>` and `disable note context
+  <id>`. Every note starts with consent off. After each response Maria names each record
+  she supplied by source and id, such as `memory 21` or `note 4`, names matches the
+  limits left out, and names same-title notes with different bodies as possible
+  divergent versions; she does not claim the model used any record, and she makes no
+  staleness or contradiction claim.
+- Search rule: the terms are the cleaned current request, casefolded and split on
+  whitespace, each word stripped of non-alphanumeric characters at both ends, kept at 4
+  to 64 characters, de-duplicated in first-seen order, and the first 8 taken; a short
+  request such as "Jo" or "AI" has no terms and triggers no Tier B read. A memory matches
+  when a term occurs literally in its casefolded fact; a note matches when a term occurs
+  wholly within its casefolded title or wholly within its casefolded body, never across
+  the two. There are no model-generated queries, wildcard semantics, rankings,
+  embeddings, or fuzzy or semantic matching. Tier B memory candidates are the enabled
+  memories after the first 16 Tier A considers, so Tier A's 17th, lookahead, row is Tier
+  B's first candidate, and a memory Tier A left out for size is never retried; notes are
+  searched only while their consent covers exactly their current title and body. Each
+  source's read returns at most 9 rows, which bounds the rows returned, not every row
+  SQLite examines. Candidates are taken memories first, then notes, each in ascending id
+  order, whole or omitted, at most 8 in all.
+- Bounds: Tier A stays at 16 items and 2 KiB. Tier A and Tier B together are at most 24
+  items and 4,096 fully rendered UTF-8 bytes, framing, source ids, JSON quoting, and
+  escaped line separators included. The current request comes first, then Tier A, then
+  Tier B memories, then Tier B notes, then retained earlier exchanges, all within the
+  existing conversational input budget. The limits are validated again when a reasoning
+  request is constructed and inside the adapter before any connection. A request with no
+  context keeps V1-14's bytes, and one with Tier A alone keeps V1-15's.
+- Architecture affected: the core context module for source-qualified items, the term
+  rule, Tier B selection, the combined bounds, rendering, and notices; the memory layer
+  for the schema version 4 forward migration, the per-note consent column holding the
+  approved text's identity, the one-id note consent toggle, consent turned off by
+  retitle and edit, and the bounded read-only search and recheck queries;
+  `core/brain.py` for running those reads on the conversational path only;
+  `core/conversation.py` for the budget order, the recheck, the 64-record limit, and the
+  notices; `core/session.py` for holding at most 64 supplied fingerprints;
+  `core/reasoning.py` and `core/ollama_adapter.py` for revalidating and framing the
+  combined context; `tools/notes.py`; `core/planner.py`; the contract registry;
+  `core/permissions.py`.
 - Privacy and security: Hard bounds on result count and total context size, enforced and
   asserted. Tier C sources remain explicit-selection or approved-workflow only, asserted
-  by a test that enumerates them. Provenance is deterministic and cannot be supplied or
-  altered by the model. No silent inclusion: every Tier B item is disclosed with its id.
-  No assembled context is cached across requests or logged.
+  by a test that enumerates them; tests prove source and consent exclusion, and cannot
+  prove an approved free-text note is free of secrets. Enabling a note widens automatic
+  exposure, so both note consent actions are confirmation-required and added to the
+  mandatory set; the enable notice says the entire approved title and body may reach the
+  local model on a later literal match and that Maria does not check the note for
+  secrets. Consent applies to exact text: an enable approval is bound to the title and
+  body shown at confirmation time, retitle and edit turn consent off in the same
+  transaction, and the stored consent is the approved text's identity, so text changed
+  through any other connection is never eligible, in this session or a later one.
+  Provenance is deterministic and cannot be supplied or altered by the model. No silent
+  inclusion: every Tier B item is disclosed with its source and id. Stored text is
+  untrusted, quoted data outside Maria's fixed instructions and grants no authority.
+  Before every model-backed request the session's supplied records are rechecked by id;
+  one that is missing, disabled, changed, oversized, or unreadable clears the earlier
+  conversation and its fingerprints first, a memory merely moved past Tier A's window
+  does not, and at most 64 fingerprints are kept. The recheck sees current state only: a
+  record changed away and back to the identical approved text between two checks is not
+  detectable. An unreadable context read sends the bare current request, as in V1-15. No
+  assembled context is cached across requests or logged, and no fact, title, body,
+  search term, or digest reaches a log or an error.
 - Non-goals: No fuzzy, semantic, ranked, or embedding-based search; the existing literal
-  and casefold comparison policy is extended, not replaced. No file content, log
-  content, credentials, or unrelated project data. No summaries or project records yet;
-  later stages register them as additional Tier B sources.
-- Completion criteria: A test enumerates Tier C sources and asserts none can enter
-  automatic context; result-count and total-size bounds are enforced and asserted at the
-  boundary; two conflicting items are both shown with their ids and the conflict is
-  stated, and a stale item is flagged; a log-sentinel test proves no note body or memory
-  fact reaches a temporary log; deterministic commands are unaffected and still work
-  with no model present.
-- Changelog: one entry — bounded automatic search across notes and older explicit
-  memories, always shown with sources, conflicts, and uncertainty.
+  and casefold comparison policy is extended, not replaced. No change to Tier A's
+  selection rule. No file content, log content, credentials, or unrelated project data.
+  No summaries, project records, tasks, or reminders yet; later stages register them as
+  additional context sources. No `updated_at` for memories and no staleness inference.
+- Deliberate deterministic-command exceptions: every existing command keeps its text and
+  recording behavior, except that the two note consent commands exist, `help` lists
+  them, and retitling or editing a note whose consent was on says that its consent was
+  turned off. Retitling or editing a note whose consent was off answers byte for byte as
+  before.
+- Completion criteria: The migration runs through the V1-09 runner from the frozen
+  v0.2.0 baseline fixture and from versions 1, 2, and 3, is tested for idempotency,
+  atomicity, retry, and drift refusal, and leaves every existing note's consent off; a
+  test enumerates Tier C sources and asserts none can enter automatic context; the
+  result-count, combined-item, and total-size bounds are enforced and asserted at their
+  exact boundaries; every supplied item is disclosed with its source and id; same-title
+  notes with different bodies are disclosed as possible divergent versions with both
+  ids, never as a contradiction, and no record is labelled stale; a previously supplied
+  copy observed changed is reported as invalidated and its conversation cleared; a
+  log-sentinel test proves no note title or body, memory fact, search term, or digest
+  reaches a temporary log; deterministic commands are unaffected apart from the
+  exceptions above and still work with no model present.
+- Changelog: one entry — bounded literal search across notes the owner enables for
+  context and enabled memories beyond Tier A's window, always shown with sources,
+  possible divergent versions, and uncertainty, plus per-note context consent that is
+  off by default and confirmation-required to change.
 
 ### Stage V1-17 — Model-to-plan compilation gate
 

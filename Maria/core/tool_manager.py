@@ -40,15 +40,62 @@ class ToolExecutionResult:
     recorded_message: str | None = None
 
 
+@dataclass(frozen=True, repr=False)
+class ConfirmationBinding:
+    """What a tool pins to one step awaiting approval, and what it shows.
+
+    ``arguments`` are added to the step, and so to the plan the owner
+    approves. ``preview`` is owner-visible text shown with the confirmation
+    request, such as the exact stored text an approval covers, read in the
+    same read as the state ``arguments`` pin. It is never added to the plan,
+    so it is not part of the approval's fingerprint and is never recorded,
+    logged, or kept once the request is shown. Neither is shown by ``repr``.
+    """
+
+    arguments: Mapping[str, Any]
+    preview: str | None = None
+
+    def __post_init__(self) -> None:
+        """Refuse anything but a mapping of arguments and optional text."""
+        if not isinstance(self.arguments, Mapping) or not (
+            self.preview is None or type(self.preview) is str
+        ):
+            raise ValueError(
+                "A confirmation binding must be arguments and optional text."
+            )
+
+    def __repr__(self) -> str:
+        """Name the type without showing the arguments or the preview."""
+        return "ConfirmationBinding(<redacted>)"
+
+
+@dataclass(frozen=True, repr=False)
+class PreparedConfirmation:
+    """A plan pinned for approval, with the previews shown alongside it.
+
+    ``plan`` is what the owner approves and what the approval is bound to.
+    ``previews`` are the tools' owner-visible texts, in plan order, for the
+    confirmation request alone: they never enter the plan. Neither is shown
+    by ``repr``.
+    """
+
+    plan: Plan
+    previews: tuple[str, ...] = ()
+
+    def __repr__(self) -> str:
+        """Name the type without showing the plan or the previews."""
+        return "PreparedConfirmation(<redacted>)"
+
+
 class Tool(Protocol):
     """Minimal interface every Maria tool must provide.
 
     A tool whose action depends on stored state that could change while the
     owner decides may also provide ``confirmation_binding(action,
-    arguments) -> Mapping[str, Any]``, returning arguments that pin that
-    state into the plan the owner approves; see
-    ``ToolManager.bind_for_confirmation``. It is optional and not part of
-    this protocol's required surface.
+    arguments)``, returning a mapping of arguments that pin that state into
+    the plan the owner approves, or a ``ConfirmationBinding`` that also
+    carries text to show the owner; see ``ToolManager.prepare_confirmation``.
+    It is optional and not part of this protocol's required surface.
     """
 
     name: str
@@ -123,7 +170,7 @@ class ToolManager:
         """
         return self.contracts.validate(tool_name, action, arguments)
 
-    def bind_for_confirmation(self, plan: Plan) -> Plan:
+    def prepare_confirmation(self, plan: Plan) -> PreparedConfirmation:
         """Return the plan to present for approval, pinned to its exact targets.
 
         Brain calls this once, when a plan is about to wait for the owner's
@@ -136,6 +183,10 @@ class ToolManager:
         exactly as it was. A plan no tool binds comes back as the very same
         object.
 
+        A ``ConfirmationBinding`` may also carry a preview for the owner.
+        Previews come back beside the plan, in plan order, and never enter
+        it, so the plan holds only what was pinned.
+
         A binding that fails is contained and simply adds nothing. A tool
         that relies on a binding therefore has to treat an unbound step as
         unapproved for the state it would have pinned, which is how every
@@ -143,6 +194,7 @@ class ToolManager:
         validates whatever was added.
         """
         steps: list[PlanStep] = []
+        previews: list[str] = []
         for step in plan.steps:
             binder = getattr(
                 self._tools.get(step.tool_name),
@@ -160,6 +212,10 @@ class ToolManager:
                         step.action,
                     )
                     added = {}
+            if isinstance(added, ConfirmationBinding):
+                if added.preview is not None:
+                    previews.append(added.preview)
+                added = added.arguments
             if not added:
                 steps.append(step)
                 continue
@@ -177,8 +233,8 @@ class ToolManager:
 
         bound = tuple(steps)
         if all(new is old for new, old in zip(bound, plan.steps)):
-            return plan
-        return replace(plan, steps=bound)
+            return PreparedConfirmation(plan, tuple(previews))
+        return PreparedConfirmation(replace(plan, steps=bound), tuple(previews))
 
     def execute_tool(
         self,

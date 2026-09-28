@@ -18,8 +18,18 @@ from unittest.mock import MagicMock, Mock, patch
 
 from core import memory as memory_module
 from core.context import ContextConsentOutcome
+from core.conversation import GENERIC_FALLBACK_RESPONSE
 from core.memory import Memory, MemoryUpdate
 from tests.schema_fixtures import V0_2_0_BASELINE_SCHEMA
+from tests.test_context import (
+    FAILURE_SENTINEL,
+    MALFORMED_TEXT,
+    _FailurePrivacyCase,
+)
+from tests.test_conversation import _Harness
+from tools.history import HistoryTool
+from tools.memory import MemoryTool
+from tools.notes import NotesTool
 
 
 TEST_LOGGER = logging.getLogger("tests.memory")
@@ -298,7 +308,10 @@ class MemoryTests(unittest.TestCase):
             ) as raised:
                 self.memory.get_memory(1)
 
-        self.assertIsInstance(raised.exception.__cause__, sqlite3.OperationalError)
+        # SQLite's text can quote stored text, so none of it travels with
+        # the fixed failure, as a cause or as a context.
+        self.assertIsNone(raised.exception.__cause__)
+        self.assertIsNone(raised.exception.__context__)
 
     def test_connect_passes_explicit_busy_timeout(self) -> None:
         self.memory.initialize()
@@ -372,7 +385,10 @@ class MemoryTests(unittest.TestCase):
             ) as raised:
                 self.memory.list_memories()
 
-        self.assertIs(raised.exception.__cause__, io_error)
+        # SQLite's text can quote stored text, so none of it travels with
+        # the fixed failure, as a cause or as a context.
+        self.assertIsNone(raised.exception.__cause__)
+        self.assertIsNone(raised.exception.__context__)
         mock_connection.rollback.assert_called_once()
         mock_connection.close.assert_called_once()
 
@@ -627,7 +643,10 @@ class MemoryTests(unittest.TestCase):
             ) as raised:
                 self.memory.get_interaction(1)
 
-        self.assertIsInstance(raised.exception.__cause__, sqlite3.OperationalError)
+        # SQLite's text can quote stored text, so none of it travels with
+        # the fixed failure, as a cause or as a context.
+        self.assertIsNone(raised.exception.__cause__)
+        self.assertIsNone(raised.exception.__context__)
 
     def test_search_interactions_matches_user_input_column(self) -> None:
         self.memory.initialize()
@@ -747,7 +766,10 @@ class MemoryTests(unittest.TestCase):
             ) as raised:
                 self.memory.search_interactions("marker")
 
-        self.assertIsInstance(raised.exception.__cause__, sqlite3.OperationalError)
+        # SQLite's text can quote stored text, so none of it travels with
+        # the fixed failure, as a cause or as a context.
+        self.assertIsNone(raised.exception.__cause__)
+        self.assertIsNone(raised.exception.__context__)
 
     def test_delete_interaction_removes_target_and_leaves_others(self) -> None:
         self.memory.initialize()
@@ -839,7 +861,10 @@ class MemoryTests(unittest.TestCase):
             ) as raised:
                 self.memory.delete_interaction(interaction_id)
 
-        self.assertIsInstance(raised.exception.__cause__, sqlite3.OperationalError)
+        # SQLite's text can quote stored text, so none of it travels with
+        # the fixed failure, as a cause or as a context.
+        self.assertIsNone(raised.exception.__cause__)
+        self.assertIsNone(raised.exception.__context__)
 
     def test_delete_interaction_ordinary_failure_rolls_back_and_closes(self) -> None:
         self.memory.initialize()
@@ -1180,7 +1205,10 @@ class MemoryTests(unittest.TestCase):
             ) as raised:
                 self.memory.retitle_note(1, "Replacement title")
 
-        self.assertIs(raised.exception.__cause__, io_error)
+        # SQLite's text can quote the old or new text, so none of it
+        # travels with the fixed failure, as a cause or as a context.
+        self.assertIsNone(raised.exception.__cause__)
+        self.assertIsNone(raised.exception.__context__)
         mock_connection.rollback.assert_called_once()
         mock_connection.close.assert_called_once()
 
@@ -1199,7 +1227,10 @@ class MemoryTests(unittest.TestCase):
             ) as raised:
                 self.memory.edit_note(1, "Replacement body")
 
-        self.assertIs(raised.exception.__cause__, io_error)
+        # SQLite's text can quote the old or new text, so none of it
+        # travels with the fixed failure, as a cause or as a context.
+        self.assertIsNone(raised.exception.__cause__)
+        self.assertIsNone(raised.exception.__context__)
         mock_connection.rollback.assert_called_once()
         mock_connection.close.assert_called_once()
 
@@ -1218,7 +1249,10 @@ class MemoryTests(unittest.TestCase):
             ) as raised:
                 self.memory.delete_note(1)
 
-        self.assertIs(raised.exception.__cause__, io_error)
+        # SQLite's text can quote stored text, so none of it travels with
+        # the fixed failure, as a cause or as a context.
+        self.assertIsNone(raised.exception.__cause__)
+        self.assertIsNone(raised.exception.__context__)
         mock_connection.rollback.assert_called_once()
         mock_connection.close.assert_called_once()
 
@@ -1622,7 +1656,10 @@ class MemoryTests(unittest.TestCase):
             ) as raised:
                 self.memory.update_memory(1, "Replacement fact")
 
-        self.assertIs(raised.exception.__cause__, check_exc)
+        # SQLite's text can quote the old or new text, so none of it
+        # travels with the fixed failure, as a cause or as a context.
+        self.assertIsNone(raised.exception.__cause__)
+        self.assertIsNone(raised.exception.__context__)
         mock_connection.execute.assert_called_once()
         mock_connection.rollback.assert_called_once()
         mock_connection.close.assert_called_once()
@@ -1642,7 +1679,10 @@ class MemoryTests(unittest.TestCase):
             ) as raised:
                 self.memory.update_memory(1, "Replacement fact")
 
-        self.assertIs(raised.exception.__cause__, io_error)
+        # SQLite's text can quote the old or new text, so none of it
+        # travels with the fixed failure, as a cause or as a context.
+        self.assertIsNone(raised.exception.__cause__)
+        self.assertIsNone(raised.exception.__context__)
         mock_connection.rollback.assert_called_once()
         mock_connection.close.assert_called_once()
 
@@ -1742,7 +1782,10 @@ class MemoryTests(unittest.TestCase):
             ) as raised:
                 self.memory.forget_memory(1)
 
-        self.assertIs(raised.exception.__cause__, io_error)
+        # SQLite's text can quote stored text, so none of it travels with
+        # the fixed failure, as a cause or as a context.
+        self.assertIsNone(raised.exception.__cause__)
+        self.assertIsNone(raised.exception.__context__)
         mock_connection.rollback.assert_called_once()
         mock_connection.close.assert_called_once()
 
@@ -2050,7 +2093,7 @@ class MemoryContextConsentTests(unittest.TestCase):
                 memory.initialize()
                 memory.initialize()
 
-                self.assertEqual(memory.schema_version(), 3)
+                self.assertEqual(memory.schema_version(), 4)
                 with closing(sqlite3.connect(path)) as connection:
                     self.assertEqual(
                         connection.execute("PRAGMA encoding").fetchone()[0],
@@ -3277,6 +3320,300 @@ def _write(path: Path, text: str) -> None:
     """Write one file of a temporary fixture tree, creating its directories."""
     path.parent.mkdir(parents=True, exist_ok=True)
     path.write_text(text, encoding="utf-8")
+
+
+class StoredTextReadFailureTests(_FailurePrivacyCase):
+    """Prove every older read that meets malformed stored text fails privately.
+
+    One interaction, one memory, and one note each hold a TEXT value that is
+    not valid UTF-8, so SQLite's decode error quotes the sentinel. Every read
+    that reaches such a value fails with only Maria's fixed text in the log,
+    the failure, its traceback, and what the owner is shown, with no cause
+    and no context, and changes nothing.
+    """
+
+    def setUp(self) -> None:
+        super().setUp()
+        self.memory.record_interaction("malformed request", "plain response")
+        self.memory.store_memory("malformed memory")
+        self.memory.create_note("placeholder", "plain body")
+        self.raw(
+            "UPDATE interactions SET user_input = CAST(? AS TEXT)",
+            (MALFORMED_TEXT,),
+        )
+        self.raw("UPDATE memories SET fact = CAST(? AS TEXT)", (MALFORMED_TEXT,))
+        self.raw("UPDATE notes SET title = CAST(? AS TEXT)", (MALFORMED_TEXT,))
+        self.history = HistoryTool(self.memory, logger=self.logger)
+        self.memories = MemoryTool(self.memory, logger=self.logger)
+        self.notes = NotesTool(self.memory, logger=self.logger)
+
+    def _everything(self) -> list[list[tuple]]:
+        return [
+            self.raw_rows(
+                "SELECT id, CAST(user_input AS BLOB), response, created_at "
+                "FROM interactions ORDER BY id"
+            ),
+            self.raw_rows(
+                "SELECT id, CAST(fact AS BLOB), normalized_fact, created_at, "
+                "context_enabled FROM memories ORDER BY id"
+            ),
+            self.raw_rows(
+                "SELECT id, CAST(title AS BLOB), body, created_at, updated_at, "
+                "context_digest FROM notes ORDER BY id"
+            ),
+        ]
+
+    def test_each_malformed_value_really_puts_the_sentinel_in_sqlite_s_error(
+        self,
+    ) -> None:
+        for statement in (
+            "SELECT user_input FROM interactions",
+            "SELECT fact FROM memories",
+            "SELECT title FROM notes",
+        ):
+            with self.subTest(statement=statement):
+                self.assert_sqlite_quotes_the_sentinel(statement)
+
+    def test_every_older_read_fails_with_fixed_text_only(self) -> None:
+        before = self._everything()
+        for label, call, message, logged, shown, displayed in (
+            (
+                "get_recent_interactions",
+                lambda: self.memory.get_recent_interactions(),
+                "Unable to fetch recent interactions.",
+                "Failed to fetch recent interactions.",
+                lambda: self.history.execute("list", {}),
+                "History listing failed: Unable to fetch recent interactions.",
+            ),
+            (
+                "get_interaction",
+                lambda: self.memory.get_interaction(1),
+                "Unable to read interaction.",
+                "Failed to read interaction.",
+                lambda: self.history.execute("read", {"id": 1}),
+                "History read failed: Unable to read interaction.",
+            ),
+            (
+                "search_interactions",
+                lambda: self.memory.search_interactions("private"),
+                "Unable to search interactions.",
+                "Failed to search interactions.",
+                lambda: self.history.execute("search", {"query": "private"}),
+                "History search failed: Unable to search interactions.",
+            ),
+            (
+                "get_memory",
+                lambda: self.memory.get_memory(1),
+                "Unable to read memory.",
+                "Failed to read memory.",
+                # Storing a duplicate reads the existing memory back.
+                lambda: self.memories.execute("store", {"fact": "MALFORMED memory"}),
+                "Memory storage failed: Unable to read memory.",
+            ),
+            (
+                "search_memories",
+                lambda: self.memory.search_memories("malformed"),
+                "Unable to search memories.",
+                "Failed to search memories.",
+                lambda: self.memories.execute("search", {"query": "malformed"}),
+                "Memory search failed: Unable to search memories.",
+            ),
+            (
+                "list_memories",
+                lambda: self.memory.list_memories(),
+                "Unable to list memories.",
+                "Failed to list memories.",
+                lambda: self.memories.execute("list", {}),
+                "Memory listing failed: Unable to list memories.",
+            ),
+            (
+                "list_notes",
+                lambda: self.memory.list_notes(),
+                "Unable to list notes.",
+                "Failed to list notes.",
+                lambda: self.notes.execute("list", {}),
+                "Note listing failed: Unable to list notes.",
+            ),
+            (
+                "get_note",
+                lambda: self.memory.get_note(note_id=1),
+                "Unable to read note.",
+                "Failed to read note.",
+                lambda: self.notes.execute("read", {"target": "1"}),
+                "Note read failed: Unable to read note.",
+            ),
+        ):
+            with self.subTest(read=label):
+                self.assert_fixed_failure(call, message, logged)
+                self.assert_displayed(shown().message, displayed)
+                self.assertEqual(self._everything(), before)
+
+
+class StoredTextWriteFailureTests(_FailurePrivacyCase):
+    """Prove every older write a trigger refuses fails privately and rolls back.
+
+    Each trigger raises a plain literal message holding the sentinel, and
+    fires only when the text being written or removed holds it too, so every
+    other write still succeeds. Each refused write leaves the database as it
+    was and says only Maria's fixed text in the log, the failure, its
+    traceback, and what the owner is shown, with no cause and no context.
+    """
+
+    def setUp(self) -> None:
+        super().setUp()
+        self.interaction_id = self.memory.record_interaction(
+            f"kept {FAILURE_SENTINEL}",
+            "kept response",
+        )
+        self.memory_id, _ = self.memory.store_memory(f"kept {FAILURE_SENTINEL}")
+        self.note_id = self.memory.create_note("Kept title", f"kept {FAILURE_SENTINEL}")
+        for table, column in (
+            ("interactions", "user_input"),
+            ("memories", "fact"),
+            ("notes", "body"),
+        ):
+            self.refuse_when(
+                f"refuse_{table}_insert",
+                f"INSERT ON {table}",
+                f"instr(NEW.{column}, '{FAILURE_SENTINEL}') > 0",
+            )
+            self.refuse_when(
+                f"refuse_{table}_delete",
+                f"DELETE ON {table}",
+                f"instr(OLD.{column}, '{FAILURE_SENTINEL}') > 0",
+            )
+        self.history = HistoryTool(self.memory, logger=self.logger)
+        self.memories = MemoryTool(self.memory, logger=self.logger)
+        self.notes = NotesTool(self.memory, logger=self.logger)
+
+    def _everything(self) -> list[list[tuple]]:
+        return [
+            self.raw_rows("SELECT * FROM interactions ORDER BY id"),
+            self.raw_rows("SELECT * FROM memories ORDER BY id"),
+            self.raw_rows("SELECT * FROM notes ORDER BY id"),
+            self.raw_rows("SELECT name, seq FROM sqlite_sequence ORDER BY name"),
+        ]
+
+    def test_each_trigger_really_puts_the_sentinel_in_sqlite_s_error(self) -> None:
+        stamp = "2026-09-28T00:00:00+00:00"
+        for statement in (
+            "INSERT INTO interactions (user_input, response, created_at) "
+            f"VALUES ('new {FAILURE_SENTINEL}', 'r', '{stamp}')",
+            f"DELETE FROM interactions WHERE id = {self.interaction_id}",
+            "INSERT INTO memories (fact, normalized_fact, created_at) "
+            f"VALUES ('new {FAILURE_SENTINEL}', 'new {FAILURE_SENTINEL}', '{stamp}')",
+            f"DELETE FROM memories WHERE id = {self.memory_id}",
+            "INSERT INTO notes (title, body, created_at, updated_at) "
+            f"VALUES ('t', 'new {FAILURE_SENTINEL}', '{stamp}', '{stamp}')",
+            f"DELETE FROM notes WHERE id = {self.note_id}",
+        ):
+            with self.subTest(statement=statement[:40]):
+                self.assert_sqlite_quotes_the_sentinel(statement)
+
+    def test_writes_without_the_sentinel_still_succeed(self) -> None:
+        interaction_id = self.memory.record_interaction("plain", "plain")
+        memory_id, created = self.memory.store_memory("plain fact")
+        note_id = self.memory.create_note("Plain", "plain body")
+
+        self.assertTrue(created)
+        self.assertTrue(self.memory.delete_interaction(interaction_id))
+        self.assertTrue(self.memory.forget_memory(memory_id))
+        self.assertTrue(self.memory.delete_note(note_id))
+
+    def test_every_older_write_fails_with_fixed_text_and_rolls_back(self) -> None:
+        before = self._everything()
+        for label, call, message, logged, shown, displayed in (
+            (
+                "record_interaction",
+                lambda: self.memory.record_interaction(f"new {FAILURE_SENTINEL}", "r"),
+                "Unable to record interaction.",
+                "Failed to record interaction.",
+                None,
+                None,
+            ),
+            (
+                "delete_interaction",
+                lambda: self.memory.delete_interaction(self.interaction_id),
+                "Unable to delete interaction.",
+                "Failed to delete interaction.",
+                lambda: self.history.execute("delete", {"id": self.interaction_id}),
+                "History deletion failed: Unable to delete interaction.",
+            ),
+            (
+                "store_memory",
+                lambda: self.memory.store_memory(f"new {FAILURE_SENTINEL}"),
+                "Unable to store memory.",
+                "Failed to store memory.",
+                lambda: self.memories.execute(
+                    "store",
+                    {"fact": f"new {FAILURE_SENTINEL}"},
+                ),
+                "Memory storage failed: Unable to store memory.",
+            ),
+            (
+                "forget_memory",
+                lambda: self.memory.forget_memory(self.memory_id),
+                "Unable to forget memory.",
+                "Failed to forget memory.",
+                lambda: self.memories.execute("forget", {"id": self.memory_id}),
+                "Memory forget failed: Unable to forget memory.",
+            ),
+            (
+                "create_note",
+                lambda: self.memory.create_note("New title", f"new {FAILURE_SENTINEL}"),
+                "Unable to create note.",
+                "Failed to create note.",
+                lambda: self.notes.execute(
+                    "create",
+                    {"title": "New title", "body": f"new {FAILURE_SENTINEL}"},
+                ),
+                "Note creation failed: Unable to create note.",
+            ),
+            (
+                "delete_note",
+                lambda: self.memory.delete_note(self.note_id),
+                "Unable to delete note.",
+                "Failed to delete note.",
+                lambda: self.notes.execute("delete", {"id": self.note_id}),
+                "Note deletion failed: Unable to delete note.",
+            ),
+        ):
+            with self.subTest(write=label):
+                self.assert_fixed_failure(call, message, logged)
+                self.assertEqual(self._everything(), before)
+                if shown is not None:
+                    self.assert_displayed(shown().message, displayed)
+                    self.assertEqual(self._everything(), before)
+
+    def test_a_refused_interaction_row_is_logged_and_shown_only_as_fixed_text(
+        self,
+    ) -> None:
+        harness = _Harness(
+            self,
+            logger=logging.getLogger("maria.tests.memory.refused_recording"),
+        )
+        with closing(sqlite3.connect(harness.database_path)) as connection:
+            connection.execute(
+                "CREATE TRIGGER refuse_recording BEFORE INSERT ON interactions "
+                f"WHEN instr(NEW.user_input, '{FAILURE_SENTINEL}') > 0 "
+                f"BEGIN SELECT RAISE(ABORT, 'refused: {FAILURE_SENTINEL}'); END"
+            )
+            connection.commit()
+
+        with self.assertLogs("maria", level="DEBUG") as captured:
+            response = harness.session().submit(f"unknown words {FAILURE_SENTINEL}")
+
+        self.assertEqual(response.text, GENERIC_FALLBACK_RESPONSE)
+        self.assertEqual(harness.interactions(), [])
+        formatter = logging.Formatter()
+        logged = "\n".join(formatter.format(record) for record in captured.records)
+        self.assertIn("Failed to record interaction.", logged)
+        self.assertIn(
+            "Unable to record interaction: Unable to record interaction.",
+            logged,
+        )
+        self.assertNotIn(FAILURE_SENTINEL, logged)
+        self.assertNotIn("Traceback", logged)
 
 
 if __name__ == "__main__":

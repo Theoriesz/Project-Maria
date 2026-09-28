@@ -2,6 +2,74 @@
 
 ## Unreleased
 
+- Added bounded literal search across notes the owner enables for context and
+  enabled memories beyond Tier A's window, always shown with sources, possible
+  divergent versions, and uncertainty, plus per-note context consent that is
+  off by default and confirmation-required to change. The owner kept V1-15's
+  Tier A rule unchanged: every enabled memory is still eligible on every
+  model-backed turn, the first 16 by id within 2 KiB. The database schema
+  advances to version 4 through the V1-09 migration runner: one atomic step
+  adds a `context_digest` column to `notes` that is empty, meaning consent
+  off, for every existing note, and every new note is stored off too.
+  `enable note context <id>` and `disable note context <id>` turn one note's
+  consent on or off by positive whole-number id; both always require
+  confirmation, which configuration cannot remove, and their recorded rows
+  name the id, never the title or body. The enable confirmation says the
+  note's entire title and body may reach the local model on a later literal
+  match and that Maria does not check the note for passwords or other
+  secrets, and then shows the note's exact current title and body in full,
+  each quoted on one line with invisible and line-breaking characters
+  escaped; that shown text is never recorded, logged, kept in the
+  conversation, or sent to a model. An enable approval is bound to the
+  title and body shown, read in the same read as the identity the pending
+  plan pins, and the stored consent is that text's identity, so a note
+  changed through any other connection is never eligible even if its consent
+  was left in place. Tool Manager's confirmation step now returns such
+  owner-only previews beside the plan it pins, through
+  `ToolManager.prepare_confirmation()`, which replaces
+  `bind_for_confirmation()`. Retitling or editing a note turns its consent
+  off in the same transaction and says so only when consent had been on; the
+  released `Memory.retitle_note` and `Memory.edit_note` still return a plain
+  bool. With reasoning enabled, the words of the current request become at
+  most 8 search terms: casefolded, split on whitespace, stripped of
+  non-alphanumeric characters at each end, 4 to 64 characters long, and
+  de-duplicated in first-seen order, so a short request such as "Jo" or "AI"
+  searches nothing. A note matches when a term occurs literally in its title
+  or in its body, never across the two, and is searched only after SQLite
+  confirms, row by row, that both are still its approved text, so a note
+  changed elsewhere is never matched and never crowds out an approved one; a
+  note whose title or body is too large to verify is never searched or
+  named. A memory within 2 KiB matches when a term occurs literally in its
+  current fact; a larger one never leaves SQLite, is matched against its
+  stored casefolded copy, which a change made outside Maria can leave stale,
+  and is only ever named. Only memories after the 16 Tier A considers are
+  searched, so no memory is sent twice or retried after Tier A left it out.
+  There is no wildcard, ranking, fuzzy, semantic, or model-generated search.
+  Each source's read returns at most 9 rows; at most 8 matches are sent,
+  memories first, then notes, each whole or named as left out, and Tier A and
+  Tier B together are at most 24 items and 4,096 rendered UTF-8 bytes within
+  the existing input budget, after the current request and before earlier
+  turns. Every text's exact UTF-8 size is settled before it is casefolded,
+  in a UTF-16 database too. SQLite's own error text can quote stored text, so
+  every memory-layer method that reads or writes an interaction, memory, or
+  note, the released ones included, now fails with one fixed log line and a
+  fixed error that carries no SQLite exception as its cause or context and no
+  traceback; SQL, transactions, outcomes, owner-visible messages, and
+  busy/locked handling are unchanged. After each response
+  Maria names every record she supplied by source and id, such as `memory 21`
+  or `note 4`, names matches the limits left out, and names notes that share
+  a title but have different bodies as possible divergent versions, never as
+  a contradiction; she labels nothing stale. The session now rechecks every
+  memory and note it supplied, by id, before each model-backed request, and
+  clears its earlier conversation first when one is missing, disabled,
+  changed, oversized, or unreadable, telling the owner the earlier copy was
+  invalidated; a memory merely moved past Tier A's window no longer clears
+  it, and at most 64 supplied records are carried. The recheck sees current
+  state only, so text changed away and back between two checks is not
+  detected. A request with no context, or with Tier A context alone, is byte
+  for byte what it was before. `help` lists the two new commands; every other
+  command's text and recording are unchanged. No dependency, network
+  destination, configuration field, or version change was introduced.
 - Added per-memory context consent, off by default for existing memories and
   confirmation-required to change, plus Tier A context assembly with
   deterministic provenance; raw interaction history is no longer assembled

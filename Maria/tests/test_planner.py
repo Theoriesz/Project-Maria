@@ -192,6 +192,8 @@ class PlannerMemoryTests(unittest.TestCase):
             "- retitle note <id>: <new title>",
             "- edit note <id>: <new body>",
             "- delete note <id>",
+            "- enable note context <id>",
+            "- disable note context <id>",
             "- remember <fact>",
             "- recall <query>",
             "- memories",

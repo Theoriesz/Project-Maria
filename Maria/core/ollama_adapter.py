@@ -20,12 +20,13 @@ string value in the request body.
 Only the model identifier and the conversation are sent: each earlier
 exchange as a user message followed by an assistant message, oldest first,
 then the prompt as the final user message. With no earlier exchange that is
-the prompt alone, exactly as before. When the request carries memory context,
-two messages come first: Maria's fixed context instructions as the system
-message, which never contain a stored fact, and then the delimited memory
-data block as a user message of its own, so stored text is only ever data.
-With no context the request is byte for byte what it was before context
-existed. The whole request, context included, is validated and measured
+the prompt alone, exactly as before. When the request carries context, two
+messages come first: Maria's fixed context instructions as the system
+message, which never contain stored text, and then the delimited data block
+of memories and notes as a user message of its own, so stored text is only
+ever data. With no context the request is byte for byte what it was before
+context existed, and with Tier A context alone it is byte for byte what it
+was in V1-15. The whole request, context included, is validated and measured
 against the input budget again here, before anything is serialized. Only the
 assistant message's ``content`` comes back, as one inert string.
 Thinking text, tool calls, and every other field of the reply are ignored
@@ -63,8 +64,8 @@ from dataclasses import replace
 from typing import NoReturn
 
 from core.context import (
-    CONTEXT_INSTRUCTIONS,
     ContextItem,
+    context_instructions,
     render_context_data,
 )
 from core.failures import Failure, FailureKind, TypedFailureError
@@ -224,13 +225,13 @@ class OllamaReasoningProvider:
 
         Each earlier exchange becomes a user message and then an assistant
         message, oldest first, and the prompt is the final user message.
-        Memory context, when there is any, comes first as two messages:
-        Maria's fixed context instructions as the system message, and the
-        delimited memory data block as a user message, so no stored fact is
-        ever placed in a system-level instruction. With no context there is
-        no system message at all. There is no template, option, tool, or
-        thinking request, and no credential or proxy header. The request
-        line names only the path, never a scheme or host.
+        Context, when there is any, comes first as two messages: Maria's
+        fixed context instructions as the system message, and the delimited
+        data block as a user message, so no stored text is ever placed in a
+        system-level instruction. With no context there is no system message
+        at all. There is no template, option, tool, or thinking request, and
+        no credential or proxy header. The request line names only the path,
+        never a scheme or host.
         """
         messages = [
             message
@@ -242,7 +243,7 @@ class OllamaReasoningProvider:
         ]
         if context:
             messages[:0] = [
-                {"role": "system", "content": CONTEXT_INSTRUCTIONS},
+                {"role": "system", "content": context_instructions(context)},
                 {"role": "user", "content": render_context_data(context)},
             ]
         messages.append({"role": "user", "content": prompt})

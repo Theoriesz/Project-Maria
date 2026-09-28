@@ -55,6 +55,8 @@ read note 1
 retitle note 1: Clearer idea
 edit note 1: Keep the foundation simple and reviewable.
 delete note 1
+enable note context 1
+disable note context 1
 remember My editor is VS Code
 recall editor
 memories
@@ -72,10 +74,11 @@ delete interaction 1
 
 File rename and move operations, `delete interaction <id>`, the three note
 lifecycle commands `retitle note <id>: <new title>`, `edit note <id>: <new
-body>`, and `delete note <id>`, the two memory lifecycle commands `update
-memory <id>: <new fact>` and `forget memory <id>`, and the two memory context
-consent commands `enable memory context <id>` and `disable memory context
-<id>` require explicit confirmation. `delete interaction <id>` targets at most one interaction row by
+body>`, and `delete note <id>`, the two note context consent commands
+`enable note context <id>` and `disable note context <id>`, the two memory
+lifecycle commands `update memory <id>: <new fact>` and `forget memory <id>`,
+and the two memory context consent commands `enable memory context <id>` and
+`disable memory context <id>` require explicit confirmation. `delete interaction <id>` targets at most one interaction row by
 ID and removes it when found; it never cascades to notes or memories. Each note
 lifecycle command likewise targets at most one note by positive whole-number ID
 only, never by title, and never cascades into interaction history or explicit
@@ -231,11 +234,12 @@ never downloads a model, installs software, or starts a process.
 
 It sends only the model identifier and the conversation: the current session's
 earlier conversational exchanges as alternating user and assistant messages,
-then the request as the final user message. When you have enabled memories
-for context, they come first: Maria's fixed instructions as the system
-message, which never contain a memory, and then the memories as a separate,
-clearly marked data message. With no memory enabled the request is exactly
-what it was before memory context existed. It takes back only the answer
+then the request as the final user message. When memories or notes you
+have enabled for context go with a request, they come first: Maria's fixed
+instructions as the system message, which never contain your stored text, and
+then that text as a separate, clearly marked data message. With no context the
+request is exactly what it was before memory context existed. It takes back
+only the answer
 text. Any separate thinking text and any tool
 calls in the reply are ignored after bounded JSON parsing; only
 `message.content` is returned, and an answer is only ever text, never an
@@ -269,11 +273,13 @@ whatever it says. That includes claims to have done something: a reply saying
 
 Within one session the model sees the current request, the earlier
 conversational turns of that session, so a follow-up question is understood,
-and the explicit memories you have enabled for context (see "Memory Context"
-below). It never sees a command or its result, a memory you have not enabled,
-a note, a file, the interaction history, or anything from an earlier session.
-Maria keeps at most the last eight exchanges, and at most 8 KiB of their text
-together with the current request and any memory context, or
+the explicit memories you have enabled for context, and notes you have
+enabled for context that contain a word of your request (see "Memory Context"
+and "Note Context and Search" below). It never sees a command or its result, a
+memory or note you have not enabled, a file, the interaction history, or
+anything from an earlier session. Maria keeps at most the last eight exchanges,
+and at most 8 KiB of their text together with the current request and any
+context, or
 `max_input_bytes` if that is smaller. The oldest exchanges
 are dropped first, whole. A request too large on its own, or a reply too large
 to keep beside its request, is refused with a fixed message rather than cut
@@ -300,8 +306,8 @@ Confirmation required: memory.enable_context requires explicit confirmation. Onc
 That confirmation states the rule exactly. Maria does not pick memories that
 seem relevant: while reasoning is enabled, **every** enabled memory is eligible
 to be sent to your local model on **any** conversational turn. This is a
-deliberate, transitional rule, not a judgement about relevance, and a later
-stage revisits it. Memories are taken in ascending ID order, whole, at most 16
+deliberate rule, not a judgement about relevance, and you kept it when it
+was reviewed. Memories are taken in ascending ID order, whole, at most 16
 of them and at most 2 KiB of context including Maria's framing and the IDs.
 Your current request always comes first, then as much memory context as fits,
 then as many earlier turns as fit. Your approval covers the memory's text as
@@ -335,6 +341,60 @@ carry the old text back, even when the change came from another Maria
 window. If memory context cannot be read, Maria sends neither memory context
 nor earlier turns and says so. This controls what Maria sends next; it cannot
 erase anything the model already received.
+
+### Note Context and Search
+
+Every note is private to the model until you enable it, one note at a time.
+Existing notes and every new note start with context consent off.
+
+```text
+enable note context 4
+Confirmation required: notes.enable_context requires explicit confirmation. Once enabled, this note's entire title and body may be sent to your local reasoning model on a later conversational turn when a word of four or more characters from your request appears literally in its title or its body, within Maria's context limits. Maria does not check the note for passwords or other secrets, and enabling it does not mean it contains none.
+This approval covers note 4 exactly as it is stored now, shown quoted:
+Title: "Trip plan"
+Body: "Book the train on Friday and pack the blue bag."
+```
+
+Only enable a note you are willing to share in full: Maria cannot tell a
+password or other secret from any other text, so consent, not inspection, is
+what keeps a note out. Maria shows you the note's whole title and body before
+you decide, each quoted on one line so that a line break or an invisible
+character in the note is shown as an escape such as `\n` rather than hidden.
+That shown text is not stored in your history or logs and is never sent to the
+model. Your approval covers exactly that title and body; if either changes
+before you confirm, nothing is enabled. `retitle note` and `edit note` turn a
+note's consent off and say so, and a note changed any other way is never sent
+under its old approval. `disable note context <id>` turns consent off again,
+and also asks for confirmation.
+
+While reasoning is enabled, Maria searches the notes you enabled, and any
+enabled memories beyond the 16 that are always eligible, for the words of your
+current request. The search is literal: each word is casefolded, loses
+punctuation at its ends, and counts only at 4 to 64 characters, and at most
+the first 8 distinct words are used. A short request such as "Jo" or "AI"
+searches nothing. A note matches when one of those words appears in its title
+or in its body, never across the two, and only while both are still exactly
+the text you approved; a note whose title or body is over 2 KiB is never
+searched or named, because Maria cannot confirm it is the approved text without
+reading all of it. Nothing is ranked, fuzzy, or chosen by the model. At most 8
+matches are sent, memories before notes, each whole, and
+everything sent is at most 24 records and 4,096 bytes together with your always
+eligible memories.
+
+```text
+Found by search and supplied: memory 21, note 4. Maria cannot verify whether these records are still current or whether they conflict with one another.
+Search matches not included because of the context limits: note 9.
+Possible divergent versions: note 4 and note 7 have the same title and different bodies. Maria cannot tell which, if either, is current.
+```
+
+Maria names every record she sent by its kind and ID, names matches the limits
+left out, and names notes that share a title but differ as possible divergent
+versions; she never calls one of them wrong or stale. If a note or memory sent
+earlier in the session is changed, disabled, deleted, or forgotten, Maria
+clears that session's earlier conversation before sending anything else and
+tells you the earlier copy was invalidated. She rechecks what she sent before
+every conversational request, which sees the current state only: a record
+changed and changed back in between looks unchanged.
 
 ## Persistent Memory
 
@@ -451,8 +511,10 @@ note <id>` each target at most one note row and change or remove it when
 found, after mandatory explicit
 confirmation, with no content preview before confirmation. Retitle replaces
 only the title, edit replaces only the body, and both preserve `created_at`
-while refreshing `updated_at`; delete removes the matching row. An ID that
-matches no note changes or removes nothing and returns a not-found result.
+while refreshing `updated_at`; retitle and edit also turn the note's context
+consent off, and say so only when it had been on. Delete removes the matching
+row. An ID that matches no note changes or removes nothing and returns a
+not-found result.
 None of
 them cascade into interaction history or explicit memories, renumber remaining
 note IDs, or offer bulk, wildcard, clear-all, or automatic deletion, and there
@@ -491,13 +553,17 @@ Maria's shipped runtime has no cloud integration and does not itself transmit
 this history. Its only network-capable code is the local Ollama adapter
 described under "Local Ollama Adapter": it can reach only `127.0.0.1:11434` on
 the same machine, it is disabled by default, and when enabled it receives only
-the current session's conversation and the explicit memories you have enabled
-for context, never stored history, notes, other memories, or files.
+the current session's conversation, the explicit memories you have enabled for
+context, and notes you have enabled for context that contain a word of the
+request, never stored history, a memory or note you have not enabled, or
+files.
 
 `enable memory context <id>` and `disable memory context <id>` change one
-memory's consent flag, after mandatory confirmation; the recorded interaction
-names only the ID, never the fact. Consent is off for every memory until you
-turn it on.
+memory's consent flag, and `enable note context <id>` and `disable note context
+<id>` one note's, after mandatory confirmation; the recorded interaction names
+only the ID, never the fact, title, or body. Consent is off for every memory
+and every note until you turn it on, and enabling one does not check it for
+secrets.
 Configured network-mounted or synchronized paths and operating-system backup
 or sync services remain outside Maria's boundary.
 

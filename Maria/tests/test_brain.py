@@ -18,7 +18,7 @@ from core.permissions import (
     PermissionResult,
 )
 from core.planner import Plan, Planner, PlanStep
-from core.tool_manager import ToolExecutionResult, ToolManager
+from core.tool_manager import PreparedConfirmation, ToolExecutionResult, ToolManager
 
 
 class MariaBrainTests(unittest.TestCase):
@@ -31,7 +31,7 @@ class MariaBrainTests(unittest.TestCase):
         self.tool_manager = Mock(spec=ToolManager)
         # No mocked tool pins confirmation state, so the plan offered
         # for approval is the plan itself.
-        self.tool_manager.bind_for_confirmation.side_effect = lambda plan: plan
+        self.tool_manager.prepare_confirmation.side_effect = PreparedConfirmation
         self.tool_manager.validate_action.return_value = None
         self.permissions = Mock(spec=PermissionManager)
         self.logger = Mock(spec=logging.Logger)

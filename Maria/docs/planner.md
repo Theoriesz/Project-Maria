@@ -303,6 +303,46 @@ title` produces a `filesystem.rename` step from its `<source> to
 <destination>` form and never routes to the notes tool. Retitling is therefore
 spelled `retitle`, which avoids that collision.
 
+## Note Context Consent Grammar
+
+`enable note context <id>` and `disable note context <id>` each create one step
+addressed by id alone:
+
+```text
+PlanStep(
+    tool_name="notes",
+    action="enable_context",   # or "disable_context"
+    arguments={"id": note_id},
+)
+```
+
+They reuse the same `id` grammar and validation as `delete note`: one or more
+ASCII digits with a value of at least 1, leading zeroes accepted, and every
+Unicode digit lookalike, sign, decimal, embedded token, or other character
+rejected with `Note id must be a positive whole number.` A bare command returns
+its usage response:
+
+```text
+Use: enable note context <id>
+Use: disable note context <id>
+```
+
+Keywords are case-insensitive and only a literal ASCII space separates the
+prefix from the id. Near misses such as `enable note <id>`, `enable notes
+context <id>`, and `turn on note context <id>` remain unsupported. Both
+actions require mandatory explicit confirmation. The enable confirmation also
+states the V1-16 rule: the note's entire title and body may be sent to the
+local reasoning model on a later conversational turn when a word of four or
+more characters from the request appears literally in its title or its body,
+within Maria's context limits, and Maria does not check the note for passwords
+or other secrets. Below that notice it shows the note's exact current title and
+body, which the notes tool adds when confirmation is offered; the planner's
+step still names the id alone.
+
+The planner never searches anything itself. The Tier B search terms are
+derived from a conversational request only after the planner has returned its
+generic fallback for it; see "Tier B Search Context" in `docs/architecture.md`.
+
 ## Interaction History Grammar
 
 Interaction-history commands use strict command syntax. Command keywords are

@@ -375,8 +375,8 @@ tool contains no SQL; `core/memory.py` owns all database operations.
 
 ## Notes Tool
 
-The notes tool supports `create`, `list`, `read`, `retitle`, `edit`, and
-`delete`. `list` returns notes newest
+The notes tool supports `create`, `list`, `read`, `retitle`, `edit`,
+`delete`, `enable_context`, and `disable_context`. `list` returns notes newest
 first (by `updated_at`, then descending `id`) and shows at most the newest 20 by
 default. When exactly 20 or fewer notes exist, the output is unchanged. When more
 than 20 notes exist, only the newest 20 are shown and one line is appended:
@@ -409,12 +409,52 @@ short and content-free. `retitle` writes only the title, `edit` writes only the
 body, and both refresh `updated_at` with the current UTC timestamp while
 preserving `created_at`; a value identical to the stored one still counts as a
 successful update and still refreshes `updated_at`. Duplicate note titles remain
-allowed. An ordinary `Memory` failure is wrapped as `Note retitle failed: Unable
+allowed. `retitle` and `edit` also turn the note's context consent off in the
+same transaction, because consent covers the exact title and body the owner
+approved; only when consent had been on does the success message continue
+`Context consent for note <id> was turned off because its title changed.` or
+`... because its body changed.`, and otherwise it is exactly as before. An
+ordinary `Memory` failure is wrapped as `Note retitle failed: Unable
 to retitle note.`, `Note edit failed: Unable to edit note.`, or `Note deletion
 failed: Unable to delete note.`; a busy/locked failure is wrapped the same way,
 for example `Note deletion failed: Database is busy. Try again shortly.`. None
 of the three cascade to `interactions` or `memories`, renumber remaining note
 IDs, or perform bulk, wildcard, or range mutation.
+
+`enable_context` and `disable_context` turn one note's context consent on or
+off by numeric ID, validated the same way. Consent is off for every note until
+the owner turns it on, and it lets the note's entire title and body reach the
+local reasoning model on a later conversational turn when a word of the
+request appears literally in its title or body; see "Tier B Search Context" in
+`docs/architecture.md`. When confirmation is offered, the tool's
+`confirmation_binding` reads the note's current title and body once and, from
+that one read, shows the owner both in full below the exposure notice, each
+quoted on one line with every invisible or line-breaking character escaped,
+and adds `text_digest`, the identity of that title and body together, to the
+step, so the approval covers exactly the text shown:
+
+```text
+This approval covers note <id> exactly as it is stored now, shown quoted:
+Title: "<title>"
+Body: "<body>"
+```
+
+Only `text_digest` enters the pending plan. The shown text is never recorded,
+logged, kept in the conversation, or sent to a model; if the note cannot be
+read, the request is shown without it and the approval pins nothing, so it can
+never enable an existing note. Enabling succeeds only while the note is still
+that text:
+
+```text
+Enabled context for note <id>.
+Context was not enabled for note <id> because its title and body could not be confirmed unchanged since confirmation was requested. Request confirmation again with: enable note context <id>
+Disabled context for note <id>.
+```
+
+Disabling needs no identity, and a missing ID returns `Note not found: <id>.`.
+Neither result carries the title, body, or identity. Enabling does not check a
+note for passwords or other secrets, and consent is not a claim that it holds
+none.
 
 Successful operations log only the numeric note ID and fixed wording, such as
 `Deleted note <id> through notes tool.`; note titles and bodies never appear in
@@ -424,8 +464,9 @@ The tool receives the shared `Memory` instance through dependency injection. It
 is registered as `tools.notes` through Tool Manager's standard `build_tool(...)`
 factory contract and travels through the normal permission path; `notes.create`,
 `notes.list`, and `notes.read` are allowed by default, while `notes.retitle`,
-`notes.edit`, and `notes.delete` always require explicit confirmation. The tool
-contains no SQL; `core/memory.py` owns all database operations.
+`notes.edit`, `notes.delete`, `notes.enable_context`, and
+`notes.disable_context` always require explicit confirmation. The tool contains
+no SQL; `core/memory.py` owns all database operations.
 
 ## Memory Tool
 
@@ -596,9 +637,10 @@ File-modifying actions must be checked by `permissions.py` before execution. Fil
 delete behavior remains unimplemented. Interaction-history
 deletion (`history.delete`) is checked by `permissions.py` and always
 requires explicit confirmation before a row is removed. Note retitling,
-editing, and deletion (`notes.retitle`, `notes.edit`, `notes.delete`) are
-checked by `permissions.py` the same way and always require explicit
-confirmation before a note row is changed or removed. Explicit-memory updating
+editing, and deletion (`notes.retitle`, `notes.edit`, `notes.delete`) and note
+context consent (`notes.enable_context`, `notes.disable_context`) are checked
+by `permissions.py` the same way and always require explicit confirmation
+before a note row is changed or removed. Explicit-memory updating
 and forgetting (`memory.update`, `memory.forget`) are checked the same way and
 always require explicit confirmation before a memory row is changed or removed;
 the memory tool provides no bulk or clear-all action, and no way to select a
