@@ -1150,7 +1150,7 @@ contains no SQL; `core/memory.py` owns all database operations.
 `ActionContractRegistry.validate(tool_name, action, arguments) -> ContractViolation | None`
 
 `core/action_contracts.py` declares `BUILT_IN_ACTION_CONTRACTS`, the immutable
-positive allowlist of all 22 built-in tool actions and their arguments. The
+positive allowlist of all 26 built-in tool actions and their arguments. The
 table is written by hand and is independent of Tool Manager's runtime
 inventory, of `PermissionManager`, and of the planner; it is never generated
 from a tool's `actions` set, read from configuration, or persisted. Declaring
@@ -1169,6 +1169,14 @@ for an unsupported declared type, a numeric bound on a str field, a length bound
 or blank policy on an int field, a root class on an int field, a missing blank
 policy on a str field, a negative length, and a `minimum_length` greater than a
 `maximum_length`.
+
+`ActionContract` also requires the keyword-only `model_eligibility`, a
+`ModelEligibility` member, `MODEL_ELIGIBLE` or `NOT_MODEL_ELIGIBLE`, with no
+default: omitting it raises `TypeError`, and anything but an exact member,
+including a string equal to a member's value, raises `ValueError`. It records
+whether a reasoning model may ever propose the action and decides nothing
+else; `core/plan_compiler.py` compiles a proposal only when it and the
+compiler's own allowlist agree.
 
 A present str value is measured on its stripped form: that is how every tool
 establishes blankness and exactly how `CalculatorTool` measures the
@@ -1209,6 +1217,25 @@ registry creates no `Path`, resolves nothing, selects no root, reads no
 filesystem, consults no configuration or other ambient state, and decides no
 permission. Which named root a path lands in, and whether it is reachable at
 all, are settled later by `FilesystemRoots` and `FilesystemTool`.
+
+## Model-to-Plan Compilation
+
+`compile_proposal(request, response, contracts=BUILT_IN_ACTION_CONTRACTS, logger=None) -> Plan | ProposalRejection`
+
+`core/plan_compiler.py` compiles one reasoning-model proposal into a
+single-step `TRANSIENT` `Plan` whose `original_request` is `request`, or
+returns the `ProposalRejection` saying why it refused. `request` must be exact,
+non-empty text equal to its stripped form, `response` an exact
+`ReasoningResponse`, and `contracts` an exact `ActionContractRegistry`;
+anything else raises `ValueError` with a fixed message. `MODEL_ACTION_ALLOWLIST`
+is the closed allowlist, `MODEL_PROPOSAL_MAX_BYTES` the 4,096-byte cap, and
+`MODEL_PROPOSAL_MAX_NESTING` the eight-container nesting limit.
+`ProposalRejection` has twelve members: `OVERSIZED`, `MALFORMED_OUTPUT`,
+`MALFORMED_PROPOSAL`, `UNKNOWN_TOOL`, `UNKNOWN_ACTION`, `NOT_MODEL_ELIGIBLE`,
+`MISSING_ARGUMENT`, `EXTRA_ARGUMENT`, `WRONG_TYPE`, `OUT_OF_RANGE`,
+`UNSAFE_TEXT`, and `UNSAFE_PATH`; each has a stable `code` and a fixed
+`message` that repeats nothing the model supplied. No production module calls
+it yet; see "Model-to-Plan Compilation Gate" in `docs/architecture.md`.
 
 ## Filesystem Roots
 

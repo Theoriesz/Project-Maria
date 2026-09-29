@@ -1100,6 +1100,29 @@ they find gets its own focused `fix/<topic>` branch, never a release branch.
 - Purpose: Build the positive, deny-by-default allowlist and per-action argument
   validation that D-01 requires and that `PermissionManager` structurally cannot
   provide, and prove it entirely against hostile output before it is wired to anything.
+- Owner-approved amendment (V1-17-R1): the V1-17 read-only entry audit found that no
+  action contract yet declared model eligibility, and that a path argument's named root
+  class is classification metadata only, so compilation cannot rely on it to keep a
+  model-supplied path inside a root or away from Maria's runtime data. The owner
+  approved the following, and this entry is amended in the V1-17 pull request itself.
+  The permanent safety boundaries are unchanged. Every action contract declares its
+  model eligibility explicitly, with no default and independently of permission: only
+  `calculator.calculate`, `filesystem.list`, and `system.current_time` are
+  model-eligible, and the other 23 registered actions are not. The compiler keeps its
+  own closed positive allowlist, and a proposal compiles only when the allowlist and
+  the contract's classification agree. A proposal is exactly one JSON object holding
+  `tool`, `action`, and an `arguments` object, at most 4,096 UTF-8 bytes, parsed
+  strictly and never repaired; argument text may carry no control, format, surrogate,
+  line-separator, or paragraph-separator character; and a compiled plan is the
+  existing single-step `Plan`, carrying the owner's cleaned request and transient
+  recording. Temporary model-path restriction: a model-supplied path must be plain text
+  relative to the default named root, with no root, drive, UNC share, leading `~`,
+  parent traversal, NUL, colon or alternate data stream, or reserved device name under
+  either the Windows or the POSIX reading. That check is a lexical preflight with no
+  filesystem access and cannot establish symlink containment; V1-08's filesystem
+  resolver remains responsible for resolved containment and the permanent exclusions
+  when a plan eventually executes. Widening the restriction, for example to name a
+  non-default root, needs a later owner-approved decision.
 - Owner-visible result: None yet. The gate exists and is proven, but nothing reaches it.
 - Architecture affected: a new core model-to-plan compilation module owning the positive
   allowlist; the action-contract registry, where model-eligibility flags become
@@ -1107,26 +1130,32 @@ they find gets its own focused `fix/<topic>` branch, never a release branch.
 - Privacy and security: Deny-by-default lives here, not in `PermissionManager`: a tool
   and action pair absent from the positive allowlist is refused regardless of what the
   permission layer would return. Registered-action membership is explicitly not accepted
-  as argument validation; every argument is validated against its contract, including
-  the named root class for paths, which by V1-08 already excludes Maria's
-  runtime-sensitive data. The compiler executes nothing: no tool, SQL, filesystem,
-  network, shell, or generated code. Rejection reasons are typed and never echo
-  model-supplied text, so injected content cannot be laundered into a user-facing
-  message or a log line. A compiled plan is made immutable and fingerprinted before it
-  can be rendered.
+  as argument validation; every argument is validated against its contract. A path
+  argument's named root class is classification metadata only and excludes nothing by
+  itself: the compiler applies a lexical preflight to model-supplied path text, and
+  V1-08's filesystem resolver enforces resolved containment and the permanent
+  exclusions of Maria's runtime-sensitive data when a plan eventually executes. The
+  compiler executes nothing: no tool, SQL, filesystem, network, shell, or generated
+  code. Rejection reasons are typed and never echo model-supplied text, so injected
+  content cannot be laundered into a user-facing message or a log line. A compiled plan
+  is made immutable and fingerprinted before it can be rendered.
 - Non-goals: Not wired into Brain, which is V1-18. No real adapter required, because it
   is tested exclusively against the adversarial fake. No multi-step plans, context,
   research, or filesystem mutation eligibility yet. `PermissionManager` is unchanged.
-- Completion criteria: Every hostile category the fake emits is rejected before
+- Completion criteria: Every invalid hostile proposal the fake emits is refused before
   ToolManager could be reached, asserted by zero tool invocations: unknown tool, unknown
   action, registered-but-not-model-eligible action, extra argument, missing argument,
-  wrong type, out-of-range value, path outside a named root, injected instruction text,
-  truncated output, oversized output, and malformed structure; a drift test asserts the
-  allowlist is a strict subset of registered tool actions and fails in both directions,
-  and adding a new action without an explicit model-eligibility decision fails a test; a
-  test asserts the allowlist is consulted before any permission decision; no rejection
-  message or log line contains model-supplied text; compilation output is an immutable
-  plan carrying its fingerprint.
+  wrong type, out-of-range value, path text the lexical preflight refuses, injected
+  instruction text, injected approval or instruction fields, truncated output, oversized
+  output, and malformed structure; a valid filename that merely reads like an
+  instruction is not refused, and compiles only as inert path data in an otherwise
+  unchanged single-step plan, again with zero tool invocations; the path tests are
+  lexical and do not prove symlink containment, which remains the V1-08 resolver's
+  responsibility at execution; a drift test asserts the allowlist is a strict subset of
+  registered tool actions and fails in both directions, and adding a new action without
+  an explicit model-eligibility decision fails a test; a test asserts the allowlist is
+  consulted before any permission decision; no rejection message or log line contains
+  model-supplied text; compilation output is an immutable plan carrying its fingerprint.
 - Changelog: none required — internal logic that is unreachable and adds no new network
   or execution surface. The guarantee is recorded by V1-18.
 

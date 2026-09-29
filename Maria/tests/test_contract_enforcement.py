@@ -24,6 +24,7 @@ from core.action_contracts import (
     ArgumentContract,
     ContractFailure,
     ContractViolation,
+    ModelEligibility,
 )
 from core.brain import BrainResponse, MariaBrain
 from core.config import MariaConfig
@@ -470,7 +471,13 @@ class ContractConfirmationTests(PipelineTestCase):
         self._submit(plan)
         self.events.clear()
         self.registry = ActionContractRegistry(
-            (ActionContract("filesystem", "read"),)
+            (
+                ActionContract(
+                    "filesystem",
+                    "read",
+                    model_eligibility=ModelEligibility.NOT_MODEL_ELIGIBLE,
+                ),
+            )
         )
 
         response = self.session.confirm()
@@ -509,6 +516,7 @@ class ContractConfirmationTests(PipelineTestCase):
                             maximum_length=None,
                         ),
                     ),
+                    model_eligibility=ModelEligibility.NOT_MODEL_ELIGIBLE,
                 ),
             )
         )
@@ -534,7 +542,13 @@ class ContractConfirmationTests(PipelineTestCase):
         plan = _plan("rename old.txt to new.txt", RENAME_STEP)
         self._submit(plan)
         self.registry = ActionContractRegistry(
-            (ActionContract("filesystem", "read"),)
+            (
+                ActionContract(
+                    "filesystem",
+                    "read",
+                    model_eligibility=ModelEligibility.NOT_MODEL_ELIGIBLE,
+                ),
+            )
         )
         self.session.confirm()
 
@@ -903,8 +917,13 @@ class ActiveRegistryTests(unittest.TestCase):
                             maximum_length=None,
                         ),
                     ),
+                    model_eligibility=ModelEligibility.MODEL_ELIGIBLE,
                 ),
-                ActionContract("system", "overview"),
+                ActionContract(
+                    "system",
+                    "overview",
+                    model_eligibility=ModelEligibility.NOT_MODEL_ELIGIBLE,
+                ),
             )
         )
         plan = _plan("synthetic active registry", CALCULATE_STEP, TIME_STEP)
