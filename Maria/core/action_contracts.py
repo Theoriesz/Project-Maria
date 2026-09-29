@@ -12,12 +12,17 @@ arguments the ones it declares? Validation rejects; it never coerces, parses,
 truncates, clamps, inserts a default, or repairs. A path argument declares the
 named root class it belongs to, which is classification metadata only: no path
 is resolved and the filesystem is never touched here.
+
+Every contract also states, with no default, whether a reasoning model may
+ever propose its action. That classification is independent of permission and
+approves nothing by itself: ``core/plan_compiler.py`` keeps its own closed
+allowlist and compiles a proposal only when the two agree.
 """
 
 from __future__ import annotations
 
 from collections.abc import Iterable, Mapping
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from enum import Enum
 from types import MappingProxyType
 from typing import Any
@@ -110,6 +115,18 @@ class RootClass(str, Enum):
     """Named root class a path argument is understood to belong to."""
 
     NAMED_FILESYSTEM_ROOT = "named_filesystem_root"
+
+
+class ModelEligibility(str, Enum):
+    """Whether a reasoning model may ever propose one tool action.
+
+    The classification is decided per action and independently of
+    permission: an action PermissionManager allows can still be closed to the
+    model, and an eligible action still needs every later gate.
+    """
+
+    MODEL_ELIGIBLE = "model_eligible"
+    NOT_MODEL_ELIGIBLE = "not_model_eligible"
 
 
 class ContractFailure(str, Enum):
@@ -408,21 +425,28 @@ class ActionContract:
     Field order is the declared order and validation reports failures in it,
     so the first reported defect of a malformed call never depends on mapping
     iteration order or on hash randomization.
+
+    ``model_eligibility`` is keyword-only and has no default, so a contract
+    cannot be declared without an explicit decision about whether a
+    reasoning model may propose its action.
     """
 
     tool_name: str
     action: str
     arguments: tuple[ArgumentContract, ...] = ()
+    model_eligibility: ModelEligibility = field(kw_only=True)
 
     def __post_init__(self) -> None:
         """Snapshot the declarations and reject an unusable one.
 
         The tool and action names are settled first, before anything reads
         ``identifier``, so a name that could not be looked up safely or
-        displayed safely never reaches a registry. The supplied declarations
-        are then copied into a tuple that nothing else holds, so a caller
-        keeping a list it passed in cannot change this contract, or the
-        registry holding it, after construction.
+        displayed safely never reaches a registry. The eligibility is then
+        settled by exact type, so a plain string that merely equals a
+        member's value cannot stand in for a decision. The supplied
+        declarations are finally copied into a tuple that nothing else holds,
+        so a caller keeping a list it passed in cannot change this contract,
+        or the registry holding it, after construction.
         """
         for label, name in (("tool name", self.tool_name), ("action", self.action)):
             if not _is_safe_label(name):
@@ -430,6 +454,12 @@ class ActionContract:
                     f"A declared {label} must be a plain ASCII identifier no "
                     f"longer than {MAXIMUM_LABEL_LENGTH} characters."
                 )
+
+        if type(self.model_eligibility) is not ModelEligibility:
+            raise ValueError(
+                f"model_eligibility for {self.identifier} must be a "
+                "ModelEligibility member."
+            )
 
         try:
             snapshot = tuple(self.arguments)
@@ -734,6 +764,12 @@ def _named_root_path(name: str, required: bool = True) -> ArgumentContract:
     )
 
 
+# Model eligibility is stated on every declaration below and decided
+# independently of permission. Only three actions are open to a reasoning
+# model: arithmetic, listing a directory beneath the default named root, and
+# reading the clock. Everything that changes state, widens consent, or reads a
+# stored record, interaction history, a file's contents, or a host profile is
+# closed to it.
 BUILT_IN_ACTION_CONTRACTS = ActionContractRegistry(
     (
         ActionContract(
@@ -748,24 +784,37 @@ BUILT_IN_ACTION_CONTRACTS = ActionContractRegistry(
                     maximum_length=MAXIMUM_EXPRESSION_LENGTH,
                 ),
             ),
+            model_eligibility=ModelEligibility.MODEL_ELIGIBLE,
         ),
-        ActionContract("filesystem", "read", (_named_root_path("path"),)),
+        ActionContract(
+            "filesystem",
+            "read",
+            (_named_root_path("path"),),
+            model_eligibility=ModelEligibility.NOT_MODEL_ELIGIBLE,
+        ),
         ActionContract(
             "filesystem",
             "list",
             (_named_root_path("path", required=False),),
+            model_eligibility=ModelEligibility.MODEL_ELIGIBLE,
         ),
         ActionContract(
             "filesystem",
             "rename",
             (_named_root_path("source"), _named_root_path("destination")),
+            model_eligibility=ModelEligibility.NOT_MODEL_ELIGIBLE,
         ),
         ActionContract(
             "filesystem",
             "move",
             (_named_root_path("source"), _named_root_path("destination")),
+            model_eligibility=ModelEligibility.NOT_MODEL_ELIGIBLE,
         ),
-        ActionContract("history", "list"),
+        ActionContract(
+            "history",
+            "list",
+            model_eligibility=ModelEligibility.NOT_MODEL_ELIGIBLE,
+        ),
         ActionContract(
             "history",
             "search",
@@ -778,9 +827,20 @@ BUILT_IN_ACTION_CONTRACTS = ActionContractRegistry(
                     maximum_length=None,
                 ),
             ),
+            model_eligibility=ModelEligibility.NOT_MODEL_ELIGIBLE,
         ),
-        ActionContract("history", "read", (_identifier(),)),
-        ActionContract("history", "delete", (_identifier(),)),
+        ActionContract(
+            "history",
+            "read",
+            (_identifier(),),
+            model_eligibility=ModelEligibility.NOT_MODEL_ELIGIBLE,
+        ),
+        ActionContract(
+            "history",
+            "delete",
+            (_identifier(),),
+            model_eligibility=ModelEligibility.NOT_MODEL_ELIGIBLE,
+        ),
         ActionContract(
             "memory",
             "store",
@@ -793,6 +853,7 @@ BUILT_IN_ACTION_CONTRACTS = ActionContractRegistry(
                     maximum_length=None,
                 ),
             ),
+            model_eligibility=ModelEligibility.NOT_MODEL_ELIGIBLE,
         ),
         ActionContract(
             "memory",
@@ -807,8 +868,14 @@ BUILT_IN_ACTION_CONTRACTS = ActionContractRegistry(
                 ),
                 _listing_limit(),
             ),
+            model_eligibility=ModelEligibility.NOT_MODEL_ELIGIBLE,
         ),
-        ActionContract("memory", "list", (_listing_limit(),)),
+        ActionContract(
+            "memory",
+            "list",
+            (_listing_limit(),),
+            model_eligibility=ModelEligibility.NOT_MODEL_ELIGIBLE,
+        ),
         ActionContract(
             "memory",
             "update",
@@ -822,8 +889,14 @@ BUILT_IN_ACTION_CONTRACTS = ActionContractRegistry(
                     maximum_length=None,
                 ),
             ),
+            model_eligibility=ModelEligibility.NOT_MODEL_ELIGIBLE,
         ),
-        ActionContract("memory", "forget", (_identifier(),)),
+        ActionContract(
+            "memory",
+            "forget",
+            (_identifier(),),
+            model_eligibility=ModelEligibility.NOT_MODEL_ELIGIBLE,
+        ),
         ActionContract(
             "memory",
             "enable_context",
@@ -839,8 +912,14 @@ BUILT_IN_ACTION_CONTRACTS = ActionContractRegistry(
                     maximum_length=FACT_DIGEST_LENGTH,
                 ),
             ),
+            model_eligibility=ModelEligibility.NOT_MODEL_ELIGIBLE,
         ),
-        ActionContract("memory", "disable_context", (_identifier(),)),
+        ActionContract(
+            "memory",
+            "disable_context",
+            (_identifier(),),
+            model_eligibility=ModelEligibility.NOT_MODEL_ELIGIBLE,
+        ),
         ActionContract(
             "notes",
             "create",
@@ -860,8 +939,14 @@ BUILT_IN_ACTION_CONTRACTS = ActionContractRegistry(
                     maximum_length=None,
                 ),
             ),
+            model_eligibility=ModelEligibility.NOT_MODEL_ELIGIBLE,
         ),
-        ActionContract("notes", "list", (_listing_limit(),)),
+        ActionContract(
+            "notes",
+            "list",
+            (_listing_limit(),),
+            model_eligibility=ModelEligibility.NOT_MODEL_ELIGIBLE,
+        ),
         ActionContract(
             "notes",
             "read",
@@ -874,6 +959,7 @@ BUILT_IN_ACTION_CONTRACTS = ActionContractRegistry(
                     maximum_length=None,
                 ),
             ),
+            model_eligibility=ModelEligibility.NOT_MODEL_ELIGIBLE,
         ),
         ActionContract(
             "notes",
@@ -888,6 +974,7 @@ BUILT_IN_ACTION_CONTRACTS = ActionContractRegistry(
                     maximum_length=None,
                 ),
             ),
+            model_eligibility=ModelEligibility.NOT_MODEL_ELIGIBLE,
         ),
         ActionContract(
             "notes",
@@ -902,8 +989,14 @@ BUILT_IN_ACTION_CONTRACTS = ActionContractRegistry(
                     maximum_length=None,
                 ),
             ),
+            model_eligibility=ModelEligibility.NOT_MODEL_ELIGIBLE,
         ),
-        ActionContract("notes", "delete", (_identifier(),)),
+        ActionContract(
+            "notes",
+            "delete",
+            (_identifier(),),
+            model_eligibility=ModelEligibility.NOT_MODEL_ELIGIBLE,
+        ),
         ActionContract(
             "notes",
             "enable_context",
@@ -919,9 +1012,23 @@ BUILT_IN_ACTION_CONTRACTS = ActionContractRegistry(
                     maximum_length=FACT_DIGEST_LENGTH,
                 ),
             ),
+            model_eligibility=ModelEligibility.NOT_MODEL_ELIGIBLE,
         ),
-        ActionContract("notes", "disable_context", (_identifier(),)),
-        ActionContract("system", "overview"),
-        ActionContract("system", "current_time"),
+        ActionContract(
+            "notes",
+            "disable_context",
+            (_identifier(),),
+            model_eligibility=ModelEligibility.NOT_MODEL_ELIGIBLE,
+        ),
+        ActionContract(
+            "system",
+            "overview",
+            model_eligibility=ModelEligibility.NOT_MODEL_ELIGIBLE,
+        ),
+        ActionContract(
+            "system",
+            "current_time",
+            model_eligibility=ModelEligibility.MODEL_ELIGIBLE,
+        ),
     )
 )

@@ -15,6 +15,7 @@ from core.action_contracts import (
     ActionContract,
     ActionContractRegistry,
     ArgumentContract,
+    ModelEligibility,
 )
 from core.config import MariaConfig
 from core.filesystem_roots import (
@@ -64,7 +65,16 @@ def _stub_registry(
     action: str = "run",
 ) -> ActionContractRegistry:
     """Declare one stub tool action so dispatch tests reach the stub."""
-    return ActionContractRegistry((ActionContract(tool_name, action, arguments),))
+    return ActionContractRegistry(
+        (
+            ActionContract(
+                tool_name,
+                action,
+                arguments,
+                model_eligibility=ModelEligibility.NOT_MODEL_ELIGIBLE,
+            ),
+        )
+    )
 
 
 class ToolManagerTests(unittest.TestCase):
@@ -90,7 +100,11 @@ class ToolManagerTests(unittest.TestCase):
             self.memory,
             self.manager_logger,
             contracts=ActionContractRegistry(
-                ActionContract(module_name.removeprefix("tools."), "run")
+                ActionContract(
+                    module_name.removeprefix("tools."),
+                    "run",
+                    model_eligibility=ModelEligibility.NOT_MODEL_ELIGIBLE,
+                )
                 for module_name in EXPECTED_MODULES
             ),
         )

@@ -41,6 +41,9 @@ Maria is organized around a small set of modules with clear ownership.
     returned its exact generic fallback; see "Deterministic-First
     Conversation", "Reasoning Interface and Local Override", and "Local Ollama
     Adapter".
+14. `plan_compiler.py` is the deny-by-default gate that will turn a reasoning
+    model's proposal into a plan. Nothing reaches it yet: Brain does not import
+    it. See "Model-to-Plan Compilation Gate".
 
 An explicit memory request uses the same execution path as every other tool
 request:
@@ -389,6 +392,13 @@ field's blank policy is mandatory, so it can never be omitted by accident.
 Metadata that cannot apply to the declared type — a length bound on an int, a
 numeric bound on a str, a negative or reversed length pair, a root class on an
 int — is rejected when the contract is constructed rather than ignored.
+
+Every contract also declares its model eligibility, `MODEL_ELIGIBLE` or
+`NOT_MODEL_ELIGIBLE`, as a required keyword with no default, so no action can
+be declared without that decision. Only `calculator.calculate`,
+`filesystem.list`, and `system.current_time` are model-eligible. The
+classification is independent of permission and approves nothing by itself;
+see "Model-to-Plan Compilation Gate".
 
 Every str field in the shipped registry rejects blank text, because every tool
 that takes text already refuses it: `FilesystemTool` raises `Path is required.`,
@@ -1068,6 +1078,56 @@ possible divergent versions; Maria never calls them contradictory, never calls
 a record stale, and treats a note's `updated_at` only as the fact of when it
 was last saved.
 
+## Model-to-Plan Compilation Gate
+
+`core/plan_compiler.py` turns one untrusted reasoning-model proposal into a
+plan, or refuses it. It is deny-by-default where `PermissionManager` cannot be:
+`PermissionManager` allows any action absent from its mandatory sets, so the
+positive gate lives here and runs before any permission decision. Nothing
+reaches it yet. Brain does not import it, so no model output can currently
+become an action; wiring it in is Stage V1-18.
+
+`compile_proposal` accepts exactly one JSON object holding `tool`, `action`,
+and an `arguments` object, which is required even when empty, at most 4,096
+UTF-8 bytes measured before parsing. Parsing is strict: a repeated key, `NaN`
+or `Infinity`, nesting deeper than eight containers, surrounding prose, a code
+fence, a second document, and truncated text are all refused, and nothing is
+repaired. The gates run in a fixed order and the first failure decides the
+refusal: the byte cap, strict parsing, the proposal's shape, the allowlist and
+eligibility, the action contract, then a text check and a path check on each
+present argument.
+
+An action is open to the model only when two independent declarations agree:
+the compiler's own closed `MODEL_ACTION_ALLOWLIST` and the contract's
+`MODEL_ELIGIBLE` classification. A test proves they agree in both directions,
+and changing either one alone opens nothing. Every argument is then validated
+against its contract. An argument string may contain no control, format,
+surrogate, line-separator, or paragraph-separator character; such a value is
+refused, never stripped.
+
+A model-supplied path must be plain text relative to the default named root:
+no root, drive, UNC share, leading `~`, parent traversal, NUL, colon, or
+reserved device name, under the Windows and the POSIX reading alike. Parent
+traversal includes the spellings made only of dots and spaces that Windows may
+read as it, such as `...` or `. .`. The path must also name something: a
+standalone `.` or `./` is refused, while a harmless interior `.`, as in
+`a/./b`, is accepted and kept exactly as written. This is a lexical preflight
+with no filesystem access, so it cannot see a symbolic link and establishes
+nothing about the resolved location; `FilesystemRoots` and `FilesystemTool`
+still decide resolved containment and the permanent exclusions when a plan
+runs. It is also a temporary restriction: a model cannot yet name a
+non-default root or an absolute path.
+
+A passing proposal becomes the existing single-step `Plan`. Its step names
+Maria's own declared tool and action and holds the arguments exactly as
+supplied; its `original_request` is the owner's cleaned request, never model
+text; it is recorded as `TRANSIENT`; and it is immutable and fingerprinted
+like every other plan. A refusal is one `ProposalRejection` member with a fixed
+message that names no tool, action, argument, or value the model supplied, and
+no parser or contract error escapes. The gate logs only whether a proposal
+compiled and, when it did not, the refusal code, never the proposal, a plan,
+or a fingerprint.
+
 ## Boundaries
 
 The brain does not run SQL or perform tool work directly. The planner does not
@@ -1086,6 +1146,10 @@ the reasoning interface. `core/conversation.py` reaches only those, the
 logger, and the planner's plan types, never Tool Manager, permissions, or the
 memory layer. A reasoning reply reaches Brain only as the text of a zero-step
 transient plan; no module passes one to the planner or a tool.
+`core/plan_compiler.py` reaches only the action contracts, the planner's plan
+types, the reasoning response type, and the logger, never Tool Manager, a
+tool, permissions, the memory layer, or conversation, and no production module
+imports it.
 `core/ollama_adapter.py` is the only production module that imports a network
 module, and `main.py` is the only one that names or reaches it. An
 import-boundary guard asserts that Brain, the planner, permissions, Tool

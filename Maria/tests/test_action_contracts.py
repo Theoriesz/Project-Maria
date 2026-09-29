@@ -5,6 +5,7 @@ from __future__ import annotations
 import logging
 import unittest
 from collections.abc import Mapping
+from dataclasses import FrozenInstanceError
 from pathlib import Path
 from tempfile import TemporaryDirectory
 from types import MappingProxyType
@@ -22,6 +23,7 @@ from core.action_contracts import (
     ArgumentContract,
     ContractFailure,
     ContractViolation,
+    ModelEligibility,
     RootClass,
 )
 from core.config import MariaConfig
@@ -77,6 +79,17 @@ EXPECTED_PATH_FIELDS = frozenset(
     }
 )
 UNREGISTERED_ACTIONS = ("write", "delete")
+
+# The approved V1-17-R1 classification, written out independently of both
+# the registry and the compiler's allowlist.
+EXPECTED_MODEL_ELIGIBLE = frozenset(
+    {"calculator.calculate", "filesystem.list", "system.current_time"}
+)
+EXPECTED_NOT_MODEL_ELIGIBLE = EXPECTED_ACTION_IDENTIFIERS - EXPECTED_MODEL_ELIGIBLE
+
+# The classification every synthetic contract below states. None of those
+# tests is about eligibility, so each declares the closed one explicitly.
+NOT_ELIGIBLE = ModelEligibility.NOT_MODEL_ELIGIBLE
 
 
 def _temporary_filesystem_protections(root: Path) -> FilesystemProtections:
@@ -280,6 +293,15 @@ class _RootClassSpoof:
     def __class__(self) -> type:
         """Claim to be a RootClass member without being one."""
         return RootClass
+
+
+class _EligibilitySpoof:
+    """An object whose instance-level __class__ claims to be a classification."""
+
+    @property
+    def __class__(self) -> type:
+        """Claim to be a ModelEligibility member without being one."""
+        return ModelEligibility
 
 
 class _ArgumentContractSpoof:
@@ -611,6 +633,114 @@ class RegistryCompletenessTests(unittest.TestCase):
         )
 
 
+class ModelEligibilityClassificationTests(unittest.TestCase):
+    """Verify every action states whether a reasoning model may propose it."""
+
+    def test_the_classification_has_exactly_two_members(self) -> None:
+        self.assertEqual(
+            {member.value for member in ModelEligibility},
+            {"model_eligible", "not_model_eligible"},
+        )
+
+    def test_every_registered_action_is_classified_exactly_as_approved(
+        self,
+    ) -> None:
+        classified = {
+            contract.identifier: contract.model_eligibility
+            for contract in BUILT_IN_ACTION_CONTRACTS.contracts
+        }
+        eligible = {
+            identifier
+            for identifier, decision in classified.items()
+            if decision is ModelEligibility.MODEL_ELIGIBLE
+        }
+        closed = {
+            identifier
+            for identifier, decision in classified.items()
+            if decision is ModelEligibility.NOT_MODEL_ELIGIBLE
+        }
+
+        # Both pinned sets together must name every registered action, so a
+        # new action fails here until someone decides which side it is on.
+        self.assertEqual(
+            EXPECTED_MODEL_ELIGIBLE | EXPECTED_NOT_MODEL_ELIGIBLE,
+            BUILT_IN_ACTION_CONTRACTS.action_identifiers,
+        )
+        self.assertEqual(eligible, EXPECTED_MODEL_ELIGIBLE)
+        self.assertEqual(closed, EXPECTED_NOT_MODEL_ELIGIBLE)
+        self.assertEqual((len(eligible), len(closed)), (3, 23))
+        for identifier, decision in classified.items():
+            with self.subTest(action=identifier):
+                self.assertIs(type(decision), ModelEligibility)
+
+    def test_a_contract_without_a_classification_cannot_be_declared(
+        self,
+    ) -> None:
+        for declaration in (
+            lambda: ActionContract("sample", "run"),
+            lambda: ActionContract("sample", "run", ()),
+        ):
+            with self.subTest():
+                with self.assertRaises(TypeError) as caught:
+                    declaration()
+
+                self.assertIn("model_eligibility", str(caught.exception))
+
+    def test_the_classification_is_keyword_only(self) -> None:
+        with self.assertRaises(TypeError):
+            ActionContract("sample", "run", (), NOT_ELIGIBLE)
+
+    def test_a_classification_must_be_an_exact_member(self) -> None:
+        # A plain string equal to a member's value, a spoofed class, and a
+        # member of another enumeration are each refused by exact type.
+        for value in (
+            "model_eligible",
+            "not_model_eligible",
+            "MODEL_ELIGIBLE",
+            None,
+            True,
+            1,
+            _EligibilitySpoof(),
+            RootClass.NAMED_FILESYSTEM_ROOT,
+        ):
+            with self.subTest(value=type(value).__name__):
+                with self.assertRaises(ValueError) as caught:
+                    ActionContract("sample", "run", model_eligibility=value)
+
+                self.assertEqual(
+                    str(caught.exception),
+                    "model_eligibility for sample.run must be a "
+                    "ModelEligibility member.",
+                )
+
+    def test_names_are_settled_before_the_classification(self) -> None:
+        with self.assertRaises(ValueError) as caught:
+            ActionContract("bad/tool", "run", model_eligibility="eligible")
+
+        self.assertIn("tool name", str(caught.exception))
+        self.assertNotIn("bad/tool", str(caught.exception))
+
+    def test_both_members_are_accepted_and_kept_exactly(self) -> None:
+        for decision in ModelEligibility:
+            with self.subTest(decision=decision.value):
+                contract = ActionContract(
+                    "sample", "run", model_eligibility=decision
+                )
+
+                self.assertIs(contract.model_eligibility, decision)
+
+    def test_the_classification_cannot_be_reassigned(self) -> None:
+        contract = BUILT_IN_ACTION_CONTRACTS.contract_for("memory", "forget")
+
+        with self.assertRaises(FrozenInstanceError):
+            contract.model_eligibility = ModelEligibility.MODEL_ELIGIBLE
+
+        self.assertIs(
+            contract.model_eligibility,
+            ModelEligibility.NOT_MODEL_ELIGIBLE,
+        )
+
+
 class RegistryConstructionTests(unittest.TestCase):
     """Verify duplicate rejection and immutability after construction."""
 
@@ -618,7 +748,7 @@ class RegistryConstructionTests(unittest.TestCase):
         with self.assertRaises(ValueError) as caught:
             ActionContractRegistry(
                 (
-                    ActionContract("sample", "run"),
+                    ActionContract("sample", "run", model_eligibility=NOT_ELIGIBLE),
                     ActionContract(
                         "sample",
                         "run",
@@ -632,6 +762,7 @@ class RegistryConstructionTests(unittest.TestCase):
                                 maximum_length=None,
                             ),
                         ),
+                        model_eligibility=NOT_ELIGIBLE,
                     ),
                 )
             )
@@ -654,6 +785,7 @@ class RegistryConstructionTests(unittest.TestCase):
                             maximum_length=None,
                         ),
                     ),
+                    model_eligibility=NOT_ELIGIBLE,
                 ),
                 ActionContract(
                     "sample",
@@ -668,6 +800,7 @@ class RegistryConstructionTests(unittest.TestCase):
                             maximum_length=None,
                         ),
                     ),
+                    model_eligibility=NOT_ELIGIBLE,
                 ),
             )
         )
@@ -697,12 +830,15 @@ class RegistryConstructionTests(unittest.TestCase):
                     ),
                     ArgumentContract("value", int, required=False),
                 ),
+                model_eligibility=NOT_ELIGIBLE,
             )
 
         self.assertIn("value", str(caught.exception))
 
     def test_registry_refuses_attribute_assignment_and_deletion(self) -> None:
-        registry = ActionContractRegistry((ActionContract("sample", "run"),))
+        registry = ActionContractRegistry(
+            (ActionContract("sample", "run", model_eligibility=NOT_ELIGIBLE),)
+        )
 
         with self.assertRaises(AttributeError):
             registry.extra = "value"
@@ -715,7 +851,7 @@ class RegistryConstructionTests(unittest.TestCase):
 
         with self.assertRaises(TypeError):
             BUILT_IN_ACTION_CONTRACTS._contracts[("sample", "run")] = ActionContract(
-                "sample", "run"
+                "sample", "run", model_eligibility=NOT_ELIGIBLE
             )
 
         self.assertEqual(len(BUILT_IN_ACTION_CONTRACTS.action_identifiers), 26)
@@ -847,7 +983,9 @@ class DeclarationInvariantTests(unittest.TestCase):
 
     def test_retained_argument_list_cannot_alter_a_built_contract(self) -> None:
         declarations = [self._text_argument(name="first")]
-        contract = ActionContract("sample", "run", declarations)
+        contract = ActionContract(
+            "sample", "run", declarations, model_eligibility=NOT_ELIGIBLE
+        )
 
         declarations.append(self._text_argument(name="second"))
         declarations[0] = self._text_argument(name="replaced")
@@ -860,7 +998,11 @@ class DeclarationInvariantTests(unittest.TestCase):
     def test_retained_list_cannot_alter_a_registry_after_construction(self) -> None:
         declarations = [self._text_argument(name="first")]
         registry = ActionContractRegistry(
-            (ActionContract("sample", "run", declarations),)
+            (
+                ActionContract(
+                    "sample", "run", declarations, model_eligibility=NOT_ELIGIBLE
+                ),
+            )
         )
 
         declarations.clear()
@@ -874,7 +1016,9 @@ class DeclarationInvariantTests(unittest.TestCase):
         for element in ("first", 1, None, ("first",)):
             with self.subTest(element=type(element).__name__):
                 with self.assertRaises(ValueError) as caught:
-                    ActionContract("sample", "run", [element])
+                    ActionContract(
+                        "sample", "run", [element], model_eligibility=NOT_ELIGIBLE
+                    )
 
                 self.assertIn("ArgumentContract", str(caught.exception))
 
@@ -888,7 +1032,7 @@ class DeclarationInvariantTests(unittest.TestCase):
 
     def test_a_non_iterable_arguments_declaration_is_rejected(self) -> None:
         with self.assertRaises(ValueError) as caught:
-            ActionContract("sample", "run", 7)
+            ActionContract("sample", "run", 7, model_eligibility=NOT_ELIGIBLE)
 
         self.assertIn("iterable", str(caught.exception))
 
@@ -992,7 +1136,7 @@ class DeclarationIdentifierTests(unittest.TestCase):
         for label, value in self.UNUSABLE:
             with self.subTest(tool_name=label):
                 with self.assertRaises(ValueError) as caught:
-                    ActionContract(value, "run")
+                    ActionContract(value, "run", model_eligibility=NOT_ELIGIBLE)
 
                 self.assertIn("tool name", str(caught.exception))
 
@@ -1000,7 +1144,7 @@ class DeclarationIdentifierTests(unittest.TestCase):
         for label, value in self.UNUSABLE:
             with self.subTest(action=label):
                 with self.assertRaises(ValueError) as caught:
-                    ActionContract("sample", value)
+                    ActionContract("sample", value, model_eligibility=NOT_ELIGIBLE)
 
                 self.assertIn("action", str(caught.exception))
 
@@ -1015,8 +1159,12 @@ class DeclarationIdentifierTests(unittest.TestCase):
         for unsafe in unsafe_names:
             with self.subTest(name=unsafe[:16]):
                 for declaration in (
-                    lambda: ActionContract(unsafe, "run"),
-                    lambda: ActionContract("sample", unsafe),
+                    lambda: ActionContract(
+                        unsafe, "run", model_eligibility=NOT_ELIGIBLE
+                    ),
+                    lambda: ActionContract(
+                        "sample", unsafe, model_eligibility=NOT_ELIGIBLE
+                    ),
                 ):
                     with self.assertRaises(ValueError) as caught:
                         declaration()
@@ -1030,7 +1178,9 @@ class DeclarationIdentifierTests(unittest.TestCase):
         ):
             with self.subTest(subclassed="tool" if action == "run" else "action"):
                 with self.assertRaises(ValueError):
-                    ActionContract(tool_name, action)
+                    ActionContract(
+                        tool_name, action, model_eligibility=NOT_ELIGIBLE
+                    )
 
     def test_ordinary_identifier_declarations_remain_valid(self) -> None:
         for tool_name, action in (
@@ -1041,16 +1191,23 @@ class DeclarationIdentifierTests(unittest.TestCase):
             ("sample", "startup_probe"),
         ):
             with self.subTest(action=f"{tool_name}.{action}"):
-                contract = ActionContract(tool_name, action)
+                contract = ActionContract(
+                    tool_name, action, model_eligibility=NOT_ELIGIBLE
+                )
 
                 self.assertEqual(contract.identifier, f"{tool_name}.{action}")
 
     def test_a_failed_declaration_never_reaches_registry_insertion(self) -> None:
-        accepted = ActionContract("sample", "run")
+        accepted = ActionContract("sample", "run", model_eligibility=NOT_ELIGIBLE)
 
         with self.assertRaises(ValueError):
             ActionContractRegistry(
-                (accepted, ActionContract("bad/tool", "walk"))
+                (
+                    accepted,
+                    ActionContract(
+                        "bad/tool", "walk", model_eligibility=NOT_ELIGIBLE
+                    ),
+                )
             )
 
         registry = ActionContractRegistry((accepted,))
@@ -1597,13 +1754,20 @@ class ExactDeclarationTypeTests(unittest.TestCase):
         )
 
         with self.assertRaises(ValueError) as caught:
-            ActionContract("sample", "run", (subclassed,))
+            ActionContract(
+                "sample", "run", (subclassed,), model_eligibility=NOT_ELIGIBLE
+            )
 
         self.assertIn("exact ArgumentContract", str(caught.exception))
 
     def test_a_class_spoofing_argument_contract_is_rejected(self) -> None:
         with self.assertRaises(ValueError) as caught:
-            ActionContract("sample", "run", (_ArgumentContractSpoof(),))
+            ActionContract(
+                "sample",
+                "run",
+                (_ArgumentContractSpoof(),),
+                model_eligibility=NOT_ELIGIBLE,
+            )
 
         self.assertIn("exact ArgumentContract", str(caught.exception))
 
@@ -1616,7 +1780,13 @@ class ExactDeclarationTypeTests(unittest.TestCase):
                 return None
 
         with self.assertRaises(ValueError) as caught:
-            ActionContractRegistry((_SubclassedContract("sample", "run"),))
+            ActionContractRegistry(
+                (
+                    _SubclassedContract(
+                        "sample", "run", model_eligibility=NOT_ELIGIBLE
+                    ),
+                )
+            )
 
         self.assertIn("exact ActionContract", str(caught.exception))
 
@@ -1634,6 +1804,7 @@ class ExactDeclarationTypeTests(unittest.TestCase):
                 self._text_argument(),
                 ArgumentContract("count", int, required=False, minimum=1),
             ),
+            model_eligibility=NOT_ELIGIBLE,
         )
         registry = ActionContractRegistry((contract,))
 
