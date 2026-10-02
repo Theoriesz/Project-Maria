@@ -17,10 +17,11 @@ from core.config import MariaConfig
 from core.failures import Failure, FailureKind
 from core.logger import get_logger
 from core.memory import Memory
-from core.planner import Plan, PlanStep
+from core.planner import Plan, PlanOrigin, PlanStep
 
 
 BUILT_IN_TOOL_MODULES = (
+    "tools.audit",
     "tools.calculator",
     "tools.filesystem",
     "tools.history",
@@ -192,7 +193,16 @@ class ToolManager:
         unapproved for the state it would have pinned, which is how every
         failure here stays safe. The contract check at confirmation
         validates whatever was added.
+
+        A model-originated plan is never prepared: the owner approves it
+        exactly as the compiler built it, so it is refused here with a fixed
+        ``ValueError`` rather than given anything a binding could add.
         """
+        if plan.origin is not PlanOrigin.DETERMINISTIC:
+            raise ValueError(
+                "A model-originated plan is approved exactly as compiled and "
+                "is never prepared for confirmation."
+            )
         steps: list[PlanStep] = []
         previews: list[str] = []
         for step in plan.steps:

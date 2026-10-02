@@ -25,13 +25,13 @@ becomes `reasoning`. Without a factory, Brain is deterministic only.
 supplied_context: frozenset[ContextFingerprint] = frozenset()) -> BrainResponse`
 
 Plans one request and coordinates it from input to plan, whole-plan permission
-resolution, tool execution, and interaction-history recording. A plan holding a
-step that requires confirmation returns before execution, carrying on the
+resolution, tool execution, and interaction-history recording. A deterministic
+plan holding a step that requires confirmation returns before execution, carrying on the
 response the plan `ToolManager.prepare_confirmation()` returns for it: the same
 plan, unless a tool pinned the exact state a step acts on, in which case the
 approval binds to that pinned plan. Any previews that call returns follow the
 confirmation request's text, each on its own lines, and go nowhere else. The deterministic planner always runs first. The request is
-answered conversationally instead only when all three hold: a reasoning
+answered by the local model instead only when all three hold: a reasoning
 provider was supplied, `config.reasoning.enabled` is true, and the plan is
 exactly the planner's generic no-action fallback. It is then answered in the
 context of `conversation`, the caller's earlier exchanges passed positionally,
@@ -48,9 +48,11 @@ when Tier A's read returned 17 rows, `Memory.search_context_memories(terms,
 after_id=<16th id>, limit=9, max_fact_bytes=2048)`. A read that raises
 `RuntimeError`, or a Tier A read too malformed to start the search from, is
 logged as the fixed line `Unable to read memory context.` and ends every read,
-so the turn fails closed. With disabled settings the fallback keeps its
-original response and interaction row even if a provider was supplied, and no
-context read happens. The planner receives the cleaned
+so the turn fails closed. The model may reply conversationally or propose one
+action, which Brain compiles and then offers for the owner's approval or
+refuses; see "Model-Originated Plans" below. With disabled settings the
+fallback keeps its original response and interaction row even if a provider
+was supplied, and no context read happens. The planner receives the cleaned
 request text alone, and no interaction history is read. `supplied_context` is
 the only keyword accepted; no keyword can approve anything.
 
@@ -58,13 +60,18 @@ the only keyword accepted; no keyword can approve anything.
 supplied_context=frozenset())`
 
 `conversation` is set by a completed conversational reply, to the session's
-conversation as it stands after that reply, and to `()` by a conversational
-turn that had to clear the conversation, whether or not the model then
-answered. `supplied_context` travels with it: the fingerprints of every memory
-and note supplied since that conversation was last cleared, at most 64. Every
-other response,
-including a failed or refused conversational turn that cleared nothing, leaves
-`conversation` `None`.
+conversation as it stands after that reply, and to `()` by a model-backed
+turn that had to clear the conversation, whatever that turn then produced,
+including a refused proposal or a plan awaiting approval. `supplied_context`
+travels with it: the fingerprints of every memory and note supplied since that
+conversation was last cleared, at most 64. Every other response, including a
+failed or refused conversational turn that cleared nothing and every proposal
+turn that cleared nothing, leaves `conversation` `None`, so neither a proposal
+nor the fingerprints of what it was given are ever kept.
+
+A model-originated plan awaiting approval comes back with `needs_confirmation`
+set, `plan` holding that very plan, and as `text` only Maria's notices about
+the turn's context; the session renders the plan above them (see "Session").
 
 `main.build_reasoning_provider(settings: ReasoningSettings) ->
 ReasoningProvider | None` and `main.build_runtime_brain() -> MariaBrain`
@@ -78,24 +85,30 @@ whose own `ValueError` refuses settings it cannot honour.
 `MariaBrain.execute_confirmed_plan(plan: Plan) -> BrainResponse`
 
 Runs a plan whose approval a caller has already bound, resuming the same
-contract, permission, dispatch, and recording flow without retrieving context or
-invoking Planner again. It validates the whole plan against the action contracts
+contract, permission, dispatch, and recording flow without retrieving context,
+invoking Planner again, or asking a reasoning provider anything. It validates
+the whole plan against the action contracts
 and resolves its permissions again before dispatching anything, so a contract or
 a decision that changed since the plan was shown still applies. That recheck is
 not replanning: it revalidates and re-resolves the same immutable plan, and a
 contract failure there dispatches nothing while the approval the session already
 consumed stays spent. There is no raw-text confirmation parameter: an approved
-request is never planned a second time.
+request is never planned a second time. For a model-originated plan the recheck
+also repeats the compiler's gates, and the plan runs only behind a committed
+audit summary; see "Model-Originated Plans".
 
-Both entry points share one internal helper, so zero-step, denied, allowed,
-successful, and failed-result behavior is identical on either path. The request
-half of a recorded interaction is the plan's `original_request`, which Planner
-sets to the cleaned input it was given.
+Both entry points share one internal helper, so for a deterministic plan
+zero-step, denied, allowed, successful, and failed-result behavior is identical
+on either path. A model-originated plan is the exception: through `process`
+even an allowed one only waits for approval, and it runs only through
+`execute_confirmed_plan`. The request half of a recorded interaction is the
+plan's `original_request`, which Planner sets to the cleaned input it was given.
 
 ### Contract Validation, Permission Resolution, and Execution Phases
 
-A plan with at least one step runs in three separate phases, and no phase
-begins while an earlier one is incomplete.
+A deterministic plan with at least one step runs in three separate phases, and
+no phase begins while an earlier one is incomplete. A model-originated plan
+takes the path described in "Model-Originated Plans" instead.
 
 Phase zero validates the plan. Brain checks every step in plan order through
 `ToolManager.validate_action()` and stops at the first violation. Brain holds
@@ -144,7 +157,9 @@ prefix of steps that ran.
 `PermissionManager` is consumed unchanged. Brain coordinates several ordinary
 `check()` calls and never reinterprets an individual result, adds an argument,
 or asks for a bulk decision, and `PermissionManager` remains unaware of
-arguments and contracts. Planner still emits at most one step for every
+arguments and contracts. The approval every model-originated plan needs is a
+separate requirement of Brain's, not a reinterpretation: a denied decision
+still refuses that plan. Planner still emits at most one step for every
 command Maria currently understands, so these guarantees are about plans that a
 later stage may produce rather than about any command available today.
 
@@ -169,6 +184,83 @@ of the plan or its fingerprint, and it is never recorded, logged, retained in
 the conversation, or sent to a model. With no preview the request is exactly
 as before.
 
+These renderings are Brain's, for deterministic plans. A model-originated plan
+gets none: Brain returns only the turn's notices, and the session renders the
+plan itself, naming its declared tool and action and showing every argument
+value exactly (see "Session"). Those values are only what the model proposed,
+never a path Maria resolved, and the compiler admits only plain relative text
+as a path argument. That rendering is likewise never recorded, logged,
+retained in the conversation, or sent to a model.
+
+### Model-Originated Plans
+
+A model-backed turn runs `converse(..., proposals=True)`, so the request
+carries Maria's fixed proposal instructions and the provider is asked at most
+once. A conversational outcome is accepted only when `is_conversational_plan`
+holds, and then takes the ordinary zero-step path; anything else answers
+`Maria could not use that conversational result.`, keeping any clearing the
+turn made. A proposal attempt goes to `compile_proposal(request, proposal,
+self.tool_manager.contracts, self.logger)`: the cleaned request, the reply
+exactly as it arrived, and Tool Manager's one active registry. A
+`ProposalRejection` answers with its fixed message and then the turn's
+notices; nothing is recorded, repaired, or retried, and the model is asked
+nothing more. Brain is the only production module that imports the compiler.
+See "Model-Originated Execution and Audit" in `docs/architecture.md` for the
+boundary as a whole.
+
+A compiled plan has the `MODEL` origin. Brain routes every plan whose origin is
+anything but exactly `DETERMINISTIC` this way, so a plan whose origin was
+altered can only be refused here, never run down the deterministic path.
+Whichever entry point it reaches, Brain checks it in this order:
+
+1. Its shape. A plan that `is_model_plan` refuses is answered with `Maria
+   refused that plan because it is not a well-formed plan compiled from one
+   model proposal.`
+2. `recheck_model_plan` against `self.tool_manager.contracts` as it stands
+   now. A rejection is answered with its fixed message.
+3. `PermissionManager.check()` for its one step. A denied action is answered
+   with `Permission denied: <reason>` before any approval is offered or any
+   audit summary is written.
+
+Each of these refusals carries the plan, with the turn's notices after it when
+it arises in `process`, and none is recorded. Every plan that passes needs
+exactly one approval from the owner, including when its action is allowed
+outright: the requirement is Brain's own, and no permission policy changes.
+Through `process` the plan comes back with `needs_confirmation` set, as the
+very same immutable plan, never passed to `ToolManager.prepare_confirmation()`,
+and with only the turn's notices as text, which the session shows below its
+rendering of the plan.
+
+Through `execute_confirmed_plan` the same checks run again, without reparsing,
+rebuilding, or substituting anything and without asking a provider, and then:
+
+1. The audit summary is committed with
+   `Memory.record_audit_summary(contract.identifier,
+   AuditDecision.OWNER_APPROVED, audit_target(contract))`. If that raises an
+   `Exception`, or returns anything but an exact positive `int`, nothing is
+   dispatched and the answer is `Maria did not run the approved action because
+   its audit summary could not be recorded.`; the approval stays spent.
+2. The step is dispatched exactly once through `ToolManager.execute_tool()`,
+   with the very arguments object the plan holds.
+3. The outcome is appended through `Memory.record_audit_outcome()`:
+   `succeeded` when the result is exactly a `ToolExecutionResult` whose
+   `success` is `True`, and `failed` otherwise. Anything Tool Manager hands
+   back that is not exactly a `ToolExecutionResult`, a subclass included, is
+   neither shown nor trusted: it counts as the shared fixed failure, `Tool
+   execution failed.`
+
+The answer is the tool's message, a blank line, and `Recorded as audit summary
+<id>.`, or, when the outcome could not be recorded, `Recorded as audit summary
+<id>, but its outcome could not be recorded, so that summary shows the outcome
+as unknown.` Nothing is retried, and nothing is recorded as interaction
+history, because a `MODEL` plan is transient. The dispatch step itself refuses
+any call not marked approved with `Maria runs a model-proposed action only
+after you approve it.` Brain's log lines on this path, the compiler's included,
+are fixed text naming at most the declared tool and action, a summary id, or a
+rejection code, never the request, the reply, an argument, or a result, and
+`filesystem.list`, the one model-eligible action that takes a path, logs only
+`Listed a directory.` or `Directory listing failed.`
+
 ## Session
 
 `MariaSession(brain: MariaBrain, logger: Logger | None = None)`
@@ -183,11 +275,19 @@ invalidation, replay prevention, and refusal.
 Discards any approval still pending, then plans the request exactly once,
 handing Brain the session's conversation and, when there are any, its
 supplied-record fingerprints. A confirmation-required response becomes the
-single pending approval. A response carrying a `conversation` replaces the
-session's conversation, held to the retention limits again here, and replaces
-its fingerprints with the response's `supplied_context`, or with nothing when
-the conversation is empty; a response carrying more than 64 fingerprints
-clears both. Every other response leaves both unchanged.
+single pending approval. When its plan's origin is anything but exactly
+`DETERMINISTIC`, the session first replaces the response's text with
+`render_model_approval(plan)`, followed, after a blank line, by Brain's
+notices when there are any, so the owner sees exactly the plan the approval
+then binds; a plan that cannot be rendered, which includes any that is not
+exactly a well-formed model-originated plan, raises `ValueError`, and nothing
+becomes pending. A response carrying a
+`conversation` replaces the session's conversation, held to the retention
+limits again here, and replaces its fingerprints with the response's
+`supplied_context`, or with nothing when the conversation is empty; a response
+carrying more than 64 fingerprints clears both. Every other response leaves
+both unchanged, so a turn that ended in a proposal changes them only when it
+cleared them.
 
 `MariaSession.conversation -> tuple[ReasoningExchange, ...]`
 
@@ -226,13 +326,23 @@ The plan awaiting approval, or `None` when the session is idle.
 
 `PendingApproval` is a frozen value object holding exactly two fields: the
 immutable `plan` and the `fingerprint` captured when that plan became pending.
-It lives only in process memory. It is never written to SQLite, a file, or
-configuration, never serialized, and never logged, because the plan it wraps
-can contain note bodies, memory facts, and file paths.
+It keeps nothing else, neither the text the owner was shown nor the notices
+shown with it, so confirming never shows them again. It lives only in process
+memory. It is never written to SQLite, a file, or configuration, never
+serialized, and never logged, because the plan it wraps can contain note
+bodies, memory facts, and file paths. Its `repr()` is exactly
+`PendingApproval(<redacted>)`, showing neither the request, an argument, what
+was shown, nor the fingerprint.
 
-Confirmation compares the pending plan's current `fingerprint` with the value
-captured when it became pending. A confirmation that binds no pending plan, or
-whose plan no longer matches, executes nothing and returns one fixed message:
+Confirmation first checks that the pending plan is still an exact `Plan` whose
+origin is exactly `DETERMINISTIC`, or that `is_model_plan` still holds for it,
+and only then compares its current `fingerprint` with the value captured when
+it became pending, because the fingerprint reads the origin and every step. A
+confirmation that binds no pending plan, whose plan fails that first check,
+whose plan can no longer be fingerprinted at all, or whose plan no longer
+matches executes nothing. A failure to fingerprint is never raised, the only
+line logged is the fixed `Refused a confirmation that binds no pending plan.`,
+and the owner gets one fixed message:
 
 ```text
 No pending action matches that confirmation. Please make the request again.
@@ -245,13 +355,62 @@ covers a second confirmation after success, a confirmation after cancellation,
 and a confirmation after an intervening request, because all four mean the
 approval binds no executable plan.
 
+`render_model_approval(plan: Plan) -> str`
+
+Renders a model-originated plan for the owner's approval as four lines,
+`MODEL_APPROVAL_HEADER` and then the step's declared tool, its action, and
+every argument through `approval_arguments`, from the plan alone and without
+changing it. Nothing is truncated, omitted, or normalised:
+
+```text
+Maria's local reasoning model proposed this action. It runs only if you approve it.
+Tool: filesystem
+Action: list
+Arguments: {"path": "reports/2026"}
+```
+
+A proposal with no arguments shows `Arguments: {}`. Anything but a plan
+`is_model_plan` accepts, named by a tool and an action that are plain ASCII
+identifiers of at most 64 characters, raises
+`ValueError(MODEL_APPROVAL_MESSAGE)`: `Only a well-formed model-originated plan
+can be shown for approval.`
+
+`approval_arguments(arguments: Mapping[str, str | int]) -> str` and
+`approval_quoted(text: str) -> str`
+
+`approval_arguments` writes the arguments as one JSON object on one line, names
+in sorted order, each name and text value through `approval_quoted` and each
+`int` in full, so decoding it as JSON gives back exactly the arguments; any
+other value type raises `ValueError(MODEL_APPROVAL_MESSAGE)`. `approval_quoted`
+writes text between quotation marks, keeping every printable ASCII character
+as itself except that the quotation mark and the backslash are each preceded
+by a backslash. Every other character is written as a four-digit `\uXXXX`
+escape in lowercase hexadecimal: each control character, DEL, each character
+outside ASCII, a character beyond the Basic Multilingual Plane as its surrogate
+pair, and every space that leads, trails, or stands in a run of two or more. A
+single space between other characters stays a space, so a leading space, `a`,
+two spaces, `b`, U+00E9, U+007F, and a trailing space are shown as
+`"\u0020a\u0020\u0020b\u00e9\u007f\u0020"`. The result is printable ASCII and
+one JSON string literal, so nothing in it can hide, reorder, or start a line,
+and decoding it gives back exactly the original text. Text holding a surrogate
+code point is refused rather than quoted, because a high and a low surrogate
+kept as two separate characters would decode as the one character they
+encode; no compiled plan can hold one, since the compiler refuses that
+category. So both round trips hold for everything the two functions accept.
+Anything but exact text, and text holding a surrogate, raises
+`ValueError(MODEL_APPROVAL_MESSAGE)`, so a plan that cannot be shown exactly
+is never pending. It is the approval's own quoter, separate from
+`quoted_for_owner`.
+
 ## Conversation
 
 `core/conversation.py` settles one conversational turn. It keeps no state; the
 conversation belongs to the caller's session. It imports only the context
 module, the shared failures, the logger, the planner's plan types, and the
-reasoning interface, so it has no path to permissions, tool dispatch, or
-persistence.
+reasoning interface, so it has no path to permissions, tool dispatch,
+persistence, or the compiler. It parses no reply: in proposal mode it only
+recognises a proposal attempt and hands it back untouched for Brain to
+compile.
 
 `GENERIC_FALLBACK_RESPONSE` and `is_generic_fallback(plan: object) -> bool`
 
@@ -260,6 +419,20 @@ recognise that fallback: true only for an exact `Plan` equal to
 `Plan(plan.original_request, (), GENERIC_FALLBACK_RESPONSE)`, so a plan with a
 step, another recording policy, other text, or a `Plan` subtype is never the
 fallback. The planner itself is unchanged.
+
+`JSON_WHITESPACE = " \t\r\n"` and `is_proposal_attempt(text: object) -> bool`
+
+True only for exact text whose first character, once `JSON_WHITESPACE` and
+nothing else is skipped, is `{`. Nothing is parsed, so a reply that starts
+with `[`, or with a no-break space, a vertical tab, a form feed, or U+2028
+before its `{`, stays conversational text. Whether an attempt is a valid
+proposal is the compiler's question.
+
+`is_conversational_plan(plan: object) -> bool`
+
+True only for an exact `Plan` of `DETERMINISTIC` origin with an exact empty
+tuple of steps and the `TRANSIENT` policy, which is all `transient_plan`
+produces. Brain accepts nothing else as a conversational outcome.
 
 `CONVERSATION_MAX_EXCHANGES = 8` and `CONVERSATION_MAX_BYTES = 8192`
 
@@ -271,11 +444,14 @@ hard content limit.
 `CONVERSATION_MAX_BYTES` or the configured `max_input_bytes`, whichever is
 smaller; the hard limit alone for disabled settings.
 
-`fitted_history(request, conversation, budget, context=())` and
+`fitted_history(request, conversation, budget, context=(),
+proposal_instructions=False)` and
 `bounded_conversation(exchanges, budget=CONVERSATION_MAX_BYTES)`
 
 `fitted_history` returns the newest whole exchanges that fit beside the
-request and the rendered `context` within the budget, at most eight. `bounded_conversation` keeps the
+request, the rendered `context`, and any proposal instructions
+`proposal_instructions` selects, all measured by `request_content_bytes`,
+within the budget, at most eight. `bounded_conversation` keeps the
 newest eight and then drops the oldest, whole, until their content fits the
 budget. Neither ever truncates text. Anything but an exact tuple of exact
 exchanges raises `ValueError(REASONING_HISTORY_MESSAGE)`.
@@ -283,14 +459,25 @@ exchanges raises `ValueError(REASONING_HISTORY_MESSAGE)`.
 `transient_plan(request: str, response: str) -> Plan`
 
 `Plan(request, (), response, RecordingPolicy.TRANSIENT)`: the zero-step plan
-every conversational turn produces, so Brain's recording gate writes no row.
+every conversational outcome produces, so Brain's recording gate writes no row.
+A proposal attempt produces no plan here; only the compiler builds its plan.
+
+`with_notices(text, notices) -> str`
+
+`text`, then a blank line and one notice per line; with no notices, `text`
+exactly as it is.
 
 `converse(provider, settings, request, conversation, logger=None, *,
 supplied_context=frozenset(), enabled_memories_read=(),
 supplied_memories_read=(), supplied_notes_read=(), searched_memories_read=(),
-searched_notes_read=()) -> ConversationTurn`
+searched_notes_read=(), proposals=False) -> ConversationTurn`
 
-Answers one request conversationally, as text only. `enabled_memories_read` is
+Answers one request conversationally, or, in proposal mode, hands back a
+proposal attempt. `proposals` must be exactly `True` or `False`, or
+`ValueError(REASONING_PROPOSAL_INSTRUCTIONS_MESSAGE)` is raised; with it off
+the turn is exactly what it was before proposal mode existed. Brain always
+turns it on, so the request selects Maria's fixed proposal instructions (see
+"Reasoning Interface"). `enabled_memories_read` is
 what Brain's bounded Tier A read returned, or `None` when any context read
 failed; the `supplied_*` reads are the rechecks of the records
 `supplied_context` names, and the `searched_*` reads are Tier B's results. All
@@ -298,16 +485,24 @@ are settled first: a failed or malformed read sends no context and no earlier
 exchange and clears the conversation; otherwise, when a fingerprint in
 `supplied_context` is no longer among the enabled records rechecked with the
 same text, the whole earlier conversation is cleared before anything is sent.
-The request then comes first, fitting Tier A context second, fitting Tier B
-matches third, memories before notes, and fitting earlier exchanges fourth. A
-conversation that would then carry more than 64 supplied records is cleared
-before sending, with `CONTEXT_LIMIT_CLEARED_NOTICE`.
+The request, together with the proposal instructions in proposal mode, then
+comes first, and the instructions are never dropped to make it fit. Fitting
+Tier A context comes second and fitting Tier B matches third, memories before
+notes, in what is left, less the two-byte `INSTRUCTION_SEPARATOR` in proposal
+mode; fitting earlier exchanges come fourth. A conversation that would then
+carry more than 64 supplied records is cleared before sending, with
+`CONTEXT_LIMIT_CLEARED_NOTICE`. In proposal mode a reply
+`is_proposal_attempt` recognises is returned untouched as the turn's
+`proposal`, with the turn's notices beside it: it is never kept as an
+exchange, the fingerprints of what it was given are not kept, and the session
+changes only if this turn already cleared it.
 
 | Situation | Response text | Provider asked | Conversation |
 | --- | --- | --- | --- |
 | Request cannot be carried as text (for example a lone surrogate) | `CONVERSATION_UNSENDABLE_MESSAGE` | no | unchanged |
-| Request alone over the budget | the fixed input-over-budget message | no | unchanged |
+| Request, with the proposal instructions in proposal mode, over the budget | the fixed input-over-budget message | no | unchanged |
 | Typed failure, crash, or malformed reply | that failure's fixed message | once | unchanged |
+| Proposal attempt, in proposal mode | none here: the reply goes back as `proposal`, and Brain answers it | once | unchanged; nothing is kept |
 | Request and reply together over the budget | `CONVERSATION_EXCHANGE_TOO_LARGE_MESSAGE` | once | unchanged |
 | Reply that fits | the reply, verbatim | once | fitted history plus the new exchange, bounded |
 
@@ -323,16 +518,26 @@ matching `Found by search and selected for this request: ...` after a failure,
 when Tier B was sent; the search omission notice when a bound left matches
 out; and `Possible divergent versions: note <id> and note <id> have the same
 title and different bodies. ...` for selected notes that share a title. With
-no context at all the one notice is `No memory context supplied.`
+no context at all the one notice is `No memory context supplied.` A proposal
+attempt carries the notices a reply would, in `ConversationTurn.notices`
+rather than after a text; Brain shows them once, after a refusal or with the
+approval request, and they are never kept with an approval or shown again
+when it is confirmed.
 
-`ConversationTurn(plan, conversation=None, supplied_context=None)` carries the
-transient plan and, together, the conversation and fingerprints the session
-should keep; both are `None` when it keeps what it had, and setting only one
+`ConversationTurn(plan, conversation=None, supplied_context=None,
+proposal=None, notices=())` carries exactly one outcome: `plan`, the transient
+plan of a conversational outcome, whose response already ends with the
+notices, or `proposal`, the exact `ReasoningResponse` of a proposal attempt,
+with `notices` an exact tuple of Maria's notice texts. With either it carries,
+together, the conversation and fingerprints the session should keep; both are
+`None` when it keeps what it had, and setting only one raises `ValueError`. A
+plan turn must have no `notices`, and a proposal turn can only keep what the
+session had or clear it, with `()` and an empty frozenset; anything else
 raises `ValueError`. Refusals log a fixed line such as `Conversational request
 refused: over budget.`; the turn also logs `Memory context selected: <n>
-item(s).` and `Search context selected: <n> item(s).`, and clearing logs a
-fixed line. No request, reply, history, stored text, search term, or digest is
-ever logged.
+item(s).` and `Search context selected: <n> item(s).`, a proposal attempt logs
+`Model reply is a proposal attempt.`, and clearing logs a fixed line. No
+request, reply, history, stored text, search term, or digest is ever logged.
 
 ## Context
 
@@ -423,6 +628,10 @@ decoded text is unchanged, and the rendered size counts the escaped bytes.
 `CONTEXT_INSTRUCTIONS`, exactly the V1-15 text, when only Tier A is present,
 and `SEARCH_CONTEXT_INSTRUCTIONS` otherwise; neither contains stored text.
 `rendered_context_bytes` is their combined UTF-8 size, or `0` for no items.
+When a request also selects the proposal instructions, they precede the
+context instructions in the same system message, joined by
+`INSTRUCTION_SEPARATOR` (see `system_instructions` under "Reasoning
+Interface"), and neither they nor that separator count here.
 `context_content_bytes` validates a request's context again — an exact tuple of
 at most 24 exact items, still valid; at most 16 Tier A memories first,
 rendering on their own within `CONTEXT_MAX_BYTES`; at most 8 Tier B items after
@@ -466,6 +675,30 @@ consulted, and any other argument raises `TypeError`.
 plan can be compared, stored in a set, or used as a dictionary key. Step order
 is significant; argument insertion order is not.
 
+`Plan(original_request, steps, response_if_no_action=None,
+recording=RecordingPolicy.RECORD, origin=PlanOrigin.DETERMINISTIC)`
+
+`PlanOrigin` says who produced a plan's steps: `DETERMINISTIC`, the default,
+for every plan Maria's own code builds, the planner's included, or `MODEL`,
+which only `core/plan_compiler.py` sets, on a plan compiled from one
+reasoning-model proposal. The origin must be exactly a `PlanOrigin` member;
+anything else, including a string equal to a member's value, raises
+`TypeError("Plan origin must be a PlanOrigin.")`. A `MODEL` plan must be
+`TRANSIENT`, with exactly one step and no canned response, and any other shape
+raises `ValueError(MODEL_PLAN_SHAPE_MESSAGE)`, `A model-originated plan must be
+transient, with exactly one step and no canned response.`, so
+`dataclasses.replace` cannot produce one either. The origin takes part in
+equality and hashing like every other field.
+
+`is_model_plan(plan: object) -> bool`
+
+True only for an exact `Plan` of `MODEL` origin and `TRANSIENT` policy, with no
+canned response and an exact tuple holding exactly one exact `PlanStep` whose
+tool and action are exact `str` and whose arguments are its `PlanArguments`.
+Every field is read again rather than trusted from construction, because a
+frozen dataclass can still be altered through `object.__setattr__`, so the
+session, Brain, and the compiler ask it again before acting on a model plan.
+
 `PlanStep.arguments` is a read-only `Mapping[str, Any]`. A supplied mapping is
 copied into an immutable `PlanArguments` snapshot on construction, so mutating
 the original mapping afterwards cannot change the step, and no accessor returns
@@ -484,11 +717,13 @@ rejected type, never the value.
 
 Returns a stable lowercase SHA-256 hexadecimal digest of the plan's complete
 logical content: `original_request`, every step in order with its `tool_name`,
-`action`, and complete arguments, `response_if_no_action`, and the recording
-policy when it is not the default `RECORD`. A default plan's serialization
-carries no recording key, so its digest is exactly what it was before the
-policy existed, while an otherwise identical `TRANSIENT` plan has a different
-digest. See `docs/architecture.md`, "Interaction Recording Boundary", for what
+`action`, and complete arguments, `response_if_no_action`, the recording
+policy when it is not the default `RECORD`, and the origin when it is not the
+default `DETERMINISTIC`. A default plan's serialization carries neither key,
+so its digest is exactly what it was before either existed, while an otherwise
+identical `TRANSIENT` plan has a different digest, and a `MODEL` plan's digest
+differs from that of the same plan with the default origin. See
+`docs/architecture.md`, "Interaction Recording Boundary", for what
 the policy does. The digest comes
 from a canonical JSON serialization with sorted mapping keys, fixed separators,
 and ASCII escaping, encoded as UTF-8, so it is deterministic across processes
@@ -517,7 +752,8 @@ busy-timeout window. A failure while opening the connection itself is not
 covered by this fixed message and continues through that method's existing
 operation-specific static `RuntimeError` message. Every other SQLite failure
 likewise continues to raise that method's existing operation-specific
-`RuntimeError` message, unchanged.
+`RuntimeError` message, unchanged. The audit-summary methods classify
+contention themselves, wherever it arises; see "Audit Summaries".
 
 ### Schema
 
@@ -737,15 +973,17 @@ text and `normalized_fact` never appear in log messages.
 **Fixed failures.** SQLite's own error message can quote stored text: a
 `TEXT` value that is not valid UTF-8 makes the decode error repeat it, and a
 trigger's `RAISE` message can hold the text being written or removed. Every
-`Memory` method that reads or writes interactions, memories, or notes
-therefore fails in one fixed way: it catches only `sqlite3.Error`, logs one
+`Memory` method that reads or writes interactions, memories, notes, or audit
+summaries therefore fails in one fixed way: it catches only `sqlite3.Error`, logs one
 fixed line at error level with no traceback, and raises its fixed
 `RuntimeError` only after the `except` block has ended, so the failure has
 neither a `__cause__` nor a `__context__` and nothing from SQLite travels with
 it. SQL, transactions, rollback and closing, success logging, and the
 recognised uniqueness conflicts are unchanged. Busy/locked contention is still
 converted as before, logging and attaching SQLite's busy exception, whose
-message is SQLite's own fixed text. Only `initialize()` and `schema_version()`,
+message is SQLite's own fixed text, except in the audit-summary methods, which
+raise the same busy message with neither a cause nor a context and log only
+their own fixed line. Only `initialize()` and `schema_version()`,
 which never read a stored record's text, keep SQLite's exception as the cause,
 and they log only fixed event codes; see `docs/database.md`.
 
@@ -962,6 +1200,78 @@ All three log only the numeric note ID on success, after their transaction
 commits, and log nothing extra for a benign not-found result. Note titles and
 bodies never appear in log messages.
 
+### Audit Summaries
+
+The `audit_summaries` and `audit_outcomes` tables, added in schema version 5
+by the `create_audit_summaries` migration (see `docs/database.md`), hold the
+content-free summaries of approved model-proposed actions, in the vocabulary
+described under "Audit Vocabulary". Brain alone writes them, through the first
+two methods, and the audit tool alone reads and deletes them. Every method
+validates its arguments before opening a connection, and an invalid summary id
+raises `ValueError(AUDIT_SUMMARY_ID_MESSAGE)`.
+
+`Memory.record_audit_summary(action: str, decision: AuditDecision, target:
+AuditTarget) -> int`
+
+Appends one `audit_summaries` row with Maria's own `audit_timestamp()` and
+commits it before returning the new id, so a caller that dispatches only once
+it holds the id can never run an action whose summary is not stored. `action`
+must be one of `AUDITED_ACTIONS` and `decision` and `target` exact members, and
+the generated timestamp is validated like every other field, or
+`ValueError(AUDIT_SUMMARY_MESSAGE)` is raised. SQLite failing the insert or its
+commit, an insert that added no row, and an id that is not an exact positive
+`int` raise `RuntimeError("Unable to record audit summary.")`, and a database
+still busy or locked once the busy timeout has passed raises
+`RuntimeError("Database is busy. Try again shortly.")`. Success logs `Recorded
+audit summary <id>.`.
+
+`Memory.record_audit_outcome(summary_id: int, outcome: AuditOutcome) -> None`
+
+Appends the one outcome of a summary that still exists, with `INSERT INTO
+audit_outcomes (summary_id, outcome) SELECT ?, ? WHERE EXISTS (SELECT 1 FROM
+audit_summaries WHERE id = ?)`, so no outcome can be stored for a deleted
+summary, and the table's key refuses a second outcome for the same summary. An
+outcome that is not exactly an `AuditOutcome` raises
+`ValueError(AUDIT_SUMMARY_MESSAGE)`. A write that fails, is refused, or adds no
+row, and an id larger than SQLite's largest integer, which no summary can
+have, raise `RuntimeError("Unable to record audit outcome.")`, or the busy
+message. Success logs `Recorded the outcome of audit summary <id>.`.
+
+`Memory.list_audit_summaries(limit: int = 21) -> list[AuditSummary]` and
+`Memory.get_audit_summary(summary_id: int) -> AuditSummary | None`
+
+`list_audit_summaries` returns at most `limit` summaries, newest id first,
+each with its outcome or `None`; `limit` must be an exact `int` from 1 to
+`AUDIT_QUERY_LIMIT`, or `ValueError` is raised. `get_audit_summary` returns one
+summary by id, or `None` when no summary has it; an id larger than SQLite's
+largest integer is answered `None` without opening the database. Every stored
+value is
+validated against the audit vocabulary after it is read, and one outside it
+fails the whole read without that value or any other being repeated or
+logged. Failures raise `RuntimeError("Unable to list audit summaries.")` or
+`RuntimeError("Unable to read audit summary.")`, or the busy message.
+
+`Memory.delete_audit_summary(summary_id: int) -> bool`
+
+Deletes one logical summary, its row and its outcome, in one `BEGIN IMMEDIATE`
+transaction, deleting the outcome only when the summary was deleted. Returns
+`True` when the summary existed, or `False`, changing nothing, when no summary
+has that id, including an id larger than SQLite's largest integer, which is
+answered without opening the database. `AUTOINCREMENT` keeps a deleted
+summary's id from ever being
+reused, so no later summary can take its place. Success logs `Deleted audit
+summary <id>.`, and failures raise `RuntimeError("Unable to delete audit
+summary.")` or the busy message.
+
+Each `RuntimeError` the five raise is raised after any handler has ended, with
+neither a cause nor a context, and is logged as one fixed line, `Failed to
+<operation>: <reason>.`, whose reason is `database busy`, `database error`, `no
+row was inserted`, `no valid id was returned`, or `a stored value is outside
+the audit vocabulary`; an invalid argument's `ValueError` is raised before any
+connection opens and logs nothing. No SQLite text, traceback, or stored value
+is ever logged or raised. There is no update, search, filter, range, bulk
+deletion, retention, or pruning.
+
 ## Tool Execution Result
 
 `ToolExecutionResult(success: bool, message: str, data: Any = None, recorded_message: str | None = None)`
@@ -974,10 +1284,11 @@ honored and persisted as an empty string rather than falling back to
 `message`. Brain applies this generically and never branches on a tool's name
 or action.
 
-In the current implementation, `history.read` is the only result that
-supplies a non-`None` `recorded_message`. Every other current tool result
-leaves the field as `None` and therefore retains the existing
-message-as-recorded behavior.
+In the current implementation, three results supply a non-`None`
+`recorded_message`, each a fixed label with at most an id: a successful
+`history.read`, `audit.list`, or `audit.read` (see "History Tool" and "Audit
+Tool"). Every other current tool result leaves the field as `None` and
+therefore retains the existing message-as-recorded behavior.
 
 ## Memory Tool
 
@@ -1145,12 +1456,73 @@ while `notes.retitle`, `notes.edit`, `notes.delete`, `notes.enable_context`,
 and `notes.disable_context` always require explicit confirmation. The tool
 contains no SQL; `core/memory.py` owns all database operations.
 
+## Audit Tool
+
+`AuditTool.execute(action: str, arguments: Mapping[str, Any]) -> ToolExecutionResult`
+
+The audit tool supports `list`, `read`, and `delete` over the audit summaries
+Brain writes (see "Audit Summaries"). Planner routes `audit`, `read audit
+<id>`, and `delete audit <id>` to them; `docs/planner.md` has the grammar.
+Everything it shows comes from the audit vocabulary.
+
+`list` reads `Memory.list_audit_summaries(21)` and shows at most the newest 20,
+by id, one line each, with `data` the list of `AuditSummary` values shown:
+
+```text
+5: 2026-10-01T09:46:17Z calculator.calculate (target: none). Approved by the owner. Outcome: succeeded.
+```
+
+The target reads `none` or `named filesystem root`, and the line ends
+`Outcome: succeeded.`, `Outcome: failed.`, or, when no outcome was recorded,
+`Outcome not recorded; execution is unknown.` (`OUTCOME_UNKNOWN_TEXT`). When a
+21st row exists, a final line says `Showing the newest 20 audit summaries.
+More audit summaries exist.` An empty table answers `No audit summaries
+found.` with `data=[]`.
+
+`read` shows one summary as a labelled block, with `data` its `AuditSummary`:
+
+```text
+Audit summary 5
+Created at: 2026-10-01T09:46:17Z
+Action: calculator.calculate
+Target: none
+Decision: approved by the owner
+Outcome: succeeded
+```
+
+Its last line is `Outcome: succeeded`, `Outcome: failed`, or `Outcome not
+recorded; execution is unknown.` `delete` removes the summary and its outcome
+together through `Memory.delete_audit_summary()` and returns `Deleted audit
+summary <id>.` with `data={"id": <id>}`.
+
+`read` and `delete` validate an `id` argument (an actual `int`, not a `bool`,
+at least `1`), returning `Audit summary id must be a positive whole number.`
+for an invalid direct value without calling `Memory`, and `Audit summary not
+found: <id>.` when no summary has that id. A `Memory` failure returns the fixed
+`Unable to list audit summaries.`, `Unable to read audit summary.`, or `Unable
+to delete audit summary.`, never the underlying message. Every successful
+`list` sets `recorded_message` to `Listed audit summaries.` and every
+successful `read` to `Displayed audit summary <id>.`, so no summary's fields
+and no listing are copied into interaction history; `delete` leaves it `None`,
+since its message is already short and content-free.
+
+The tool receives the shared `Memory` instance through dependency injection;
+its `build_tool(memory, **_)` factory ignores `config` and `logger`. It is
+registered as `tools.audit` through Tool Manager's standard `build_tool(...)`
+factory contract and travels through the normal permission path: `audit.list`
+and `audit.read` are allowed by default, while `audit.delete` always requires
+explicit confirmation, by id only and with its fixed notice (see
+"Permissions"), even when no summary has that id. None of the three may be
+proposed by a reasoning model, and audit summaries never become model
+context. The tool contains no SQL; `core/memory.py` owns all database
+operations.
+
 ## Action Contracts
 
 `ActionContractRegistry.validate(tool_name, action, arguments) -> ContractViolation | None`
 
 `core/action_contracts.py` declares `BUILT_IN_ACTION_CONTRACTS`, the immutable
-positive allowlist of all 26 built-in tool actions and their arguments. The
+positive allowlist of all 29 built-in tool actions and their arguments. The
 table is written by hand and is independent of Tool Manager's runtime
 inventory, of `PermissionManager`, and of the planner; it is never generated
 from a tool's `actions` set, read from configuration, or persisted. Declaring
@@ -1176,7 +1548,9 @@ default: omitting it raises `TypeError`, and anything but an exact member,
 including a string equal to a member's value, raises `ValueError`. It records
 whether a reasoning model may ever propose the action and decides nothing
 else; `core/plan_compiler.py` compiles a proposal only when it and the
-compiler's own allowlist agree.
+compiler's own allowlist agree. Three actions are `MODEL_ELIGIBLE`:
+`calculator.calculate`, `filesystem.list`, and `system.current_time`. The
+other 26, the three audit actions included, are `NOT_MODEL_ELIGIBLE`.
 
 A present str value is measured on its stripped form: that is how every tool
 establishes blankness and exactly how `CalculatorTool` measures the
@@ -1223,7 +1597,8 @@ all, are settled later by `FilesystemRoots` and `FilesystemTool`.
 `compile_proposal(request, response, contracts=BUILT_IN_ACTION_CONTRACTS, logger=None) -> Plan | ProposalRejection`
 
 `core/plan_compiler.py` compiles one reasoning-model proposal into a
-single-step `TRANSIENT` `Plan` whose `original_request` is `request`, or
+single-step `TRANSIENT` `Plan` of origin `MODEL` whose `original_request` is
+`request`, or
 returns the `ProposalRejection` saying why it refused. `request` must be exact,
 non-empty text equal to its stripped form, `response` an exact
 `ReasoningResponse`, and `contracts` an exact `ActionContractRegistry`;
@@ -1234,8 +1609,81 @@ is the closed allowlist, `MODEL_PROPOSAL_MAX_BYTES` the 4,096-byte cap, and
 `MALFORMED_PROPOSAL`, `UNKNOWN_TOOL`, `UNKNOWN_ACTION`, `NOT_MODEL_ELIGIBLE`,
 `MISSING_ARGUMENT`, `EXTRA_ARGUMENT`, `WRONG_TYPE`, `OUT_OF_RANGE`,
 `UNSAFE_TEXT`, and `UNSAFE_PATH`; each has a stable `code` and a fixed
-`message` that repeats nothing the model supplied. No production module calls
-it yet; see "Model-to-Plan Compilation Gate" in `docs/architecture.md`.
+`message` that repeats nothing the model supplied. Brain is the only
+production module that calls it, for a reply the conversation module
+recognised as a proposal attempt, passing Tool Manager's active registry,
+`tool_manager.contracts`; see "Model-Originated Plans" under "Brain" and
+"Model-to-Plan Compilation Gate" in `docs/architecture.md`.
+
+`recheck_model_plan(plan, contracts, logger=None) -> ProposalRejection | None`
+
+Checks an already compiled plan again, exactly as it stands: its one step
+against the closed allowlist, the model eligibility `contracts` declares now,
+the argument contract, and the text and path checks, in that order, the same
+gates that compiled it, returning the first refusal or `None`. Nothing is
+parsed, rebuilt, repaired, defaulted, or substituted, and no provider is asked
+anything. Brain asks it when it offers a compiled plan for approval and again
+just before the approved plan runs. A registry that is not exactly an
+`ActionContractRegistry` raises `ValueError(COMPILER_CONTRACTS_MESSAGE)`, and
+anything `is_model_plan` refuses raises `ValueError(COMPILER_PLAN_MESSAGE)`:
+`Only a well-formed model-originated plan can be checked again.` A refusal
+logs `Refused a compiled model plan: code=<code>` and nothing else.
+
+## Audit Vocabulary
+
+`core/audit.py` holds everything an audit summary may say, and the memory
+layer, Brain, and the audit tool all take its words from there. It reads
+nothing, stores nothing, and logs nothing, and imports nothing from Maria but
+`core/action_contracts.py`.
+
+`AUDITED_ACTIONS`, `AUDIT_LIST_LIMIT = 20`, `AUDIT_QUERY_LIMIT = 21`, and
+`AUDIT_TIMESTAMP_FORMAT = "%Y-%m-%dT%H:%M:%SZ"`
+
+The actions a summary may name, `calculator.calculate`, `filesystem.list`, and
+`system.current_time`, which are exactly `MODEL_ACTION_ALLOWLIST` but declared
+again here rather than imported; the most summaries a listing shows, and the
+one more it reads to learn that more exist; and Maria's one timestamp form,
+UTC to the second with a literal `Z`, such as `2026-10-01T09:46:17Z`.
+`audit_timestamp()` returns the current time in that form.
+
+`AuditDecision`, `AuditTarget`, and `AuditOutcome`
+
+Closed `str` enums: the decision that authorised an attempt, `OWNER_APPROVED`
+(`owner_approved`); the generalised class of what the action acted on, `NONE`
+(`none`) or `NAMED_FILESYSTEM_ROOT` (`named_filesystem_root`); and what the
+tool's own success flag reported after dispatch, `SUCCEEDED` (`succeeded`) or
+`FAILED` (`failed`).
+
+`AuditSummary(summary_id, created_at, action, decision, target, outcome=None)`
+
+One stored summary with its outcome, as a frozen dataclass. `summary_id` must
+be an exact `int` of at least 1, never a `bool`; `created_at` exact text in the
+timestamp form, every field at its fixed width, naming a real calendar second,
+so the answer is the same on every platform; `action` one of
+`AUDITED_ACTIONS`; and `decision`, `target`, and any
+`outcome` exact members, with `outcome` `None` when none was recorded, which
+means the execution is unknown. Anything else raises
+`ValueError(AUDIT_SUMMARY_MESSAGE)`, `An audit summary may hold only values
+from Maria's audit vocabulary.`, which names no value.
+`AuditSummary.from_stored(...)` builds one from stored values, accepting for
+each enumerated field only exact text spelling one member.
+`is_audit_timestamp`, `is_audited_action`, and `is_audit_summary_id` are the
+field validators, and `AUDIT_SUMMARY_ID_MESSAGE` is `Audit summary id must be
+a positive whole number.`
+
+`audit_target(contract: ActionContract) -> AuditTarget`
+
+`NAMED_FILESYSTEM_ROOT` when the contract declares an argument of root class
+`NAMED_FILESYSTEM_ROOT`, and `NONE` otherwise. It is decided from the contract
+alone, never from an argument value, so `filesystem.list` without a path is
+still `named_filesystem_root`. A path argument of a root class with no audited
+target raises `ValueError`, so such an action could never be audited, or run.
+
+There is deliberately no field for the request, the proposal, an argument, a
+fingerprint, private context, a root's name, a host path, a tool's result, or
+an exception's text. A summary records that the owner approved one
+model-proposed action and that Maria authorised that attempt for dispatch; by
+itself it does not prove the tool ran.
 
 ## Filesystem Roots
 
@@ -1448,7 +1896,8 @@ subprocess module, and it imports nothing from Maria except `core.context`,
 permissions, tool dispatch, or persistence.
 
 `ReasoningRequest(prompt: str, history: tuple[ReasoningExchange, ...] = (),
-context: tuple[ContextItem, ...] = ())` and `ReasoningResponse(text: str)`
+context: tuple[ContextItem, ...] = (), proposal_instructions: bool = False)`
+and `ReasoningResponse(text: str)`
 
 Frozen dataclasses. The prompt and the response text must each be an exact,
 non-empty, UTF-8-encodable `str` of at most 1,048,576 UTF-8 bytes
@@ -1460,14 +1909,20 @@ more characters than a limit is refused without being encoded, so text of any
 length is never copied just to be measured.
 `history` holds the earlier exchanges of the current conversation, oldest
 first, and is empty by default. It must be an exact `tuple` of exact
-`ReasoningExchange` values, and the prompt with every exchange's text must be
-at most `REASONING_MAXIMUM_INPUT_BYTES`, or `ValueError(REASONING_HISTORY_MESSAGE)`
+`ReasoningExchange` values, and the prompt with every exchange's text, the
+rendered context, and any selected instructions must together be at most
+`REASONING_MAXIMUM_INPUT_BYTES`, or `ValueError(REASONING_HISTORY_MESSAGE)`
 is raised. `context` holds the records Maria selected, Tier A memories and
 then Tier B search matches, empty by default, and must satisfy
 `context_content_bytes` (see "Context"), or
-`ValueError(CONTEXT_MESSAGE)` is raised. There is no field for a system
-prompt, a template, raw interaction history, a credential, a header, an
-endpoint, a port, or a model path.
+`ValueError(CONTEXT_MESSAGE)` is raised. `proposal_instructions` selects
+Maria's fixed `PROPOSAL_INSTRUCTIONS` and carries no text of its own; it must
+be exactly `True` or `False`, or
+`ValueError(REASONING_PROPOSAL_INSTRUCTIONS_MESSAGE)` is raised, and it is
+`False` by default, which leaves a request exactly what it was before the flag
+existed. There is no field for a system prompt or a template a caller could
+fill, raw interaction history, a credential, a header, an endpoint, a port, or
+a model path.
 `repr()`, `str()`, and formatting show `<redacted>` rather than any text.
 
 `ReasoningExchange(user: str, assistant: str)`
@@ -1479,16 +1934,42 @@ text within `REASONING_MAXIMUM_INPUT_BYTES`, and `assistant` within
 is raised. It is two strings and nothing more, redacted from every
 representation.
 
-`request_content_bytes(prompt, history, maximum_bytes, context=()) -> int` and
+`PROPOSAL_INSTRUCTIONS`, `INSTRUCTION_SEPARATOR = "\n\n"`,
+`proposal_instruction_bytes(with_context: bool) -> int`, and
+`system_instructions(context, proposal_instructions) -> str | None`
+
+`PROPOSAL_INSTRUCTIONS` is Maria's fixed text, 1,015 ASCII bytes, inviting the
+model to answer a request for an allowed action with exactly one proposal: one
+bare JSON object of `tool`, `action`, and `arguments`. It lists exactly the
+compiler's allowlist, calls earlier conversation and supplied memories or
+notes data rather than authorization, and asks for a conversational reply
+that does not start with `{` when no allowed action fits. It never contains
+stored text, request text, or anything a model wrote. `system_instructions`
+returns the one system message a request carries: `None` with neither the
+flag nor context, the context instructions alone with context only,
+`PROPOSAL_INSTRUCTIONS` alone with the flag only, and with both,
+`PROPOSAL_INSTRUCTIONS`, `INSTRUCTION_SEPARATOR`, and the context
+instructions, in that order. `proposal_instruction_bytes` is what the
+instructions add to a request's size: 1,015 bytes, plus 2 for the separator
+when the request also carries context, whose framing is counted with the
+context.
+
+`request_content_bytes(prompt, history, maximum_bytes, context=(),
+proposal_instructions=False) -> int` and
 `history_content_bytes(history, maximum_bytes) -> int`
 
 The one definition of a request's size: the UTF-8 length of the prompt, plus
 the UTF-8 length of every exchange's `user` and `assistant` text, plus the
-fully rendered context, which is nothing when the context is empty. No role name, message structure, separator, model identifier, or
-transport framing counts. Every text is read again rather than trusted, and
+fully rendered context, which is nothing when the context is empty, plus, when
+`proposal_instructions` is true, `proposal_instruction_bytes`: the fixed
+instructions and, with context, the separator that joins them to the context
+framing. No role name, message structure, other separator, model identifier,
+or transport framing counts. Every text is read again rather than trusted, and
 counting stops as soon as the total passes `maximum_bytes`, so the result is
 then only some value above the bound. A prompt that is not exact, encodable,
-non-empty text raises `ValueError(REASONING_PROMPT_MESSAGE)`; a history that is
+non-empty text raises `ValueError(REASONING_PROMPT_MESSAGE)`; a flag that is
+not exactly `True` or `False`, checked next, raises
+`ValueError(REASONING_PROPOSAL_INSTRUCTIONS_MESSAGE)`; a history that is
 not an exact tuple of exact exchanges holding such text raises
 `ValueError(REASONING_HISTORY_MESSAGE)`. Request construction,
 `request_reasoning`, the adapter, and the conversation module all measure with
@@ -1543,10 +2024,11 @@ provider is reached. Then, in order:
 
 1. Disabled settings return `REASONING_UNAVAILABLE` without asking the
    provider.
-2. A request whose prompt and history together, measured again by
-   `request_content_bytes`, exceed `max_input_bytes` returns
-   `REASONING_INPUT_OVER_BUDGET` without asking the provider. A prompt or
-   history tampered into anything a request cannot hold raises `ValueError`.
+2. A request whose prompt, history, context, and any selected instructions
+   together, measured again by `request_content_bytes`, exceed
+   `max_input_bytes` returns `REASONING_INPUT_OVER_BUDGET` without asking the
+   provider. A prompt, history, context, or flag tampered into anything a
+   request cannot hold raises `ValueError`.
 3. The provider is asked exactly once. A `TypedFailureError` of exactly that
    type, carrying a reasoning kind, returns that kind. Any other typed failure,
    a derived or tampered carrier, and every other `Exception` return
@@ -1564,7 +2046,11 @@ provider is reached. Then, in order:
 6. Otherwise a fresh `ReasoningResponse` holding the same text is returned.
 
 The reply is untrusted, inert text: nothing in this module parses, repairs,
-or acts on it. The log records `Reasoning request completed.` or
+or acts on it. Beyond it, the conversation module only checks, in proposal
+mode and without parsing, whether a reply opens with `{` after JSON
+whitespace, and Brain hands such a proposal attempt to the compiler; see
+"Model-Originated Plans". The log records
+`Reasoning request completed.` or
 `Reasoning request failed: code=<code>`, and nothing else.
 
 ### Reasoning configuration and the local override
@@ -1647,30 +2133,38 @@ Asks the runtime one question over one new connection and returns the
 complete answer, or raises `TypedFailureError`. Anything but an exact
 `ReasoningRequest` raises `ValueError(REASONING_REQUEST_TYPE_MESSAGE)`, a
 prompt altered into anything but non-empty, encodable text raises
-`ValueError(REASONING_PROMPT_MESSAGE)`, and a history altered into anything
+`ValueError(REASONING_PROMPT_MESSAGE)`, a history altered into anything
 but an exact tuple of exact exchanges raises
-`ValueError(REASONING_HISTORY_MESSAGE)`, and a context altered into anything
-invalid raises `ValueError(CONTEXT_MESSAGE)`. Before anything is serialized,
-the prompt, history, and rendered context are measured together against
+`ValueError(REASONING_HISTORY_MESSAGE)`, a context altered into anything
+invalid raises `ValueError(CONTEXT_MESSAGE)`, and a proposal-instructions flag
+altered into anything but exactly `True` or `False` raises
+`ValueError(REASONING_PROPOSAL_INSTRUCTIONS_MESSAGE)`. Before anything is
+serialized, the prompt, history, rendered context, and any selected proposal
+instructions are measured together against
 `max_input_bytes` with `request_content_bytes`. The request is `POST /api/chat HTTP/1.1` with `Host`,
 `Content-Type`, `Content-Length`, and `Connection: close` headers only, and
 the JSON body `{"model": <model>, "messages": [...], "stream": false}`, where
 the messages are each exchange's `{"role": "user", "content": <user>}` then
 `{"role": "assistant", "content": <assistant>}`, oldest first, and finally
-`{"role": "user", "content": <prompt>}`. With no history the body is exactly
+`{"role": "user", "content": <prompt>}`. With the proposal-instructions flag
+off, the body with no history and no context is exactly
 `{"model": <model>, "messages": [{"role": "user", "content": <prompt>}],
 "stream": false}`, byte for byte as before; with no context the body is
 byte for byte what V1-14 sent; and with Tier A context alone it is byte for
-byte what V1-15 sent. When the request carries context, the messages begin
-with `{"role": "system", "content": context_instructions(context)}` and then
+byte what V1-15 sent. When `system_instructions(context,
+proposal_instructions)` returns text, the messages begin with `{"role":
+"system", "content": <that text>}`: `PROPOSAL_INSTRUCTIONS` when the flag is
+on and the context instructions when the request carries context, joined by
+`INSTRUCTION_SEPARATOR` when there are both. Context then follows as
 `{"role": "user", "content": <rendered data block>}`, before the
-conversation; the instructions are `CONTEXT_INSTRUCTIONS` unless a Tier B item
-is present, when they are `SEARCH_CONTEXT_INSTRUCTIONS`, and no stored text is
-ever placed in the system message.
+conversation; the context instructions are `CONTEXT_INSTRUCTIONS` unless a
+Tier B item is present, when they are `SEARCH_CONTEXT_INSTRUCTIONS`, and no
+stored text is ever placed in the system message. Brain's production path
+always turns the flag on.
 
 | Outcome | Result |
 | --- | --- |
-| Prompt, history, and rendered context together over `max_input_bytes` | `REASONING_INPUT_OVER_BUDGET`, before any connection |
+| Prompt, history, rendered context, and any selected proposal instructions together over `max_input_bytes` | `REASONING_INPUT_OVER_BUDGET`, before any connection |
 | Deadline passed while connecting, sending, or receiving | `REASONING_TIMEOUT` |
 | Connection refused or failed before any reply byte, or the connection closed with no reply | `REASONING_UNAVAILABLE` |
 | Any status but `200`, including a missing model (`404`) and every redirect, which is never followed | `REASONING_UNAVAILABLE` |
@@ -1705,7 +2199,7 @@ and failure code.
 
 Returns `PreparedConfirmation(plan, previews)`: the plan to present for
 approval and the owner-visible previews to show beside it. Brain calls it once,
-when a plan is about to wait for the owner's answer, so the approved plan — and
+when a deterministic plan is about to wait for the owner's answer, so the approved plan — and
 the fingerprint the session binds approval to — already names the exact state
 each step acts on. A tool may provide an optional `confirmation_binding(action,
 arguments)` that returns either a mapping of arguments to add or a
@@ -1720,7 +2214,11 @@ step's tool or action, or add or remove a step. A binder that raises is
 contained, logged as the fixed line `Confirmation binding failed:
 <tool>.<action>`, and adds nothing, so a tool relying on a binding must treat
 an unbound step as unapproved. A plan no tool binds is returned as the same
-object. The contract check at confirmation validates whatever was added.
+object. The contract check at confirmation validates whatever was added. A
+model-originated plan is approved exactly as the compiler built it, so Brain
+never passes one here, and a plan whose origin is not `DETERMINISTIC` raises
+`ValueError("A model-originated plan is approved exactly as compiled and is
+never prepared for confirmation.")`.
 
 `ToolManager.execute_tool(tool_name, action, arguments) -> ToolExecutionResult`
 
@@ -1737,7 +2235,10 @@ the violation's fixed message, and no tool is invoked. The registry used is
 injected through the optional `contracts` constructor argument and defaults to
 `BUILT_IN_ACTION_CONTRACTS`. Brain validates a whole plan earlier through
 `validate_action()`, against that same active registry, so that ordering holds
-across a plan; this pass is the defensive one no caller can skip.
+across a plan; this pass is the defensive one no caller can skip. For a
+model-originated plan Brain hands that same registry, `contracts`, to
+`compile_proposal` and `recheck_model_plan` instead, so the model path's
+eligibility and contract checks use no other registry either.
 
 `ToolManager.validate_action(tool_name, action, arguments) -> ContractViolation | None`
 
@@ -1775,7 +2276,10 @@ memories by relevance. `notes.enable_context` has one stating that the note's
 entire title and body may be sent on a later conversational turn when a word
 of four or more characters from the request appears literally in its title or
 its body, within Maria's context limits, and that Maria does not check the
-note for passwords or other secrets.
+note for passwords or other secrets. `audit.delete` has one stating that
+deleting an audit summary removes it from Maria's database, that this does
+not undo the action, and that Maria's operational log may still show that a
+model-proposed action ran.
 
 `load_config` requires a present `[permissions]` value to be a TOML table and
 validates `require_confirmation` and `deny` as arrays of lowercase
@@ -1786,7 +2290,7 @@ one array are rejected, while syntactically valid identifiers for future tools
 are retained. Malformed permission values raise `ValueError`.
 
 Missing permission arrays and explicitly empty arrays use the mandatory secure
-baseline: `filesystem.rename`, `filesystem.move`, `history.delete`,
+baseline: `audit.delete`, `filesystem.rename`, `filesystem.move`, `history.delete`,
 `notes.retitle`, `notes.edit`, `notes.delete`, `notes.enable_context`,
 `notes.disable_context`, `memory.update`, `memory.forget`,
 `memory.enable_context`, and `memory.disable_context` require confirmation,
@@ -1794,3 +2298,9 @@ while `filesystem.delete` and `filesystem.write` are denied.
 Configuration can add restrictions but cannot remove this baseline.
 `PermissionManager` applies the same mandatory policy when constructed
 directly, and denial wins if an action also requires confirmation.
+
+The one approval every model-originated plan needs is Brain's own requirement,
+not an entry here: `PermissionManager` decides `calculator.calculate`,
+`filesystem.list`, and `system.current_time` exactly as before, allowing them
+by default, and a configuration that denies one makes Brain refuse a proposal
+of it before any approval is offered.

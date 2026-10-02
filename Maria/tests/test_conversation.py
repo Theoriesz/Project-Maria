@@ -45,9 +45,11 @@ from core.filesystem_roots import (
 from core.logger import configure_logging, get_logger
 from core.memory import Memory
 from core.permissions import PermissionManager
+from core.plan_compiler import ProposalRejection
 from core.planner import Plan, Planner, PlanStep, RecordingPolicy
 from core.reasoning import (
     DISABLED_REASONING,
+    PROPOSAL_INSTRUCTIONS,
     REASONING_FAILURE_KINDS,
     REASONING_HISTORY_MESSAGE,
     REASONING_MAXIMUM_INPUT_BYTES,
@@ -119,6 +121,10 @@ NO_ACTION_COMMANDS = (
     "read interaction abc",
     "delete interaction",
     "delete interaction -1",
+    "read audit",
+    "read audit abc",
+    "delete audit",
+    "delete audit -1",
 )
 
 # Inputs the planner turns into a plan with a step, including every action
@@ -148,6 +154,9 @@ STEP_COMMANDS = (
     "search history calculate",
     "read interaction 1",
     "delete interaction 1",
+    "audit",
+    "read audit 1",
+    "delete audit 1",
     "system",
     "status",
     "time",
@@ -166,13 +175,45 @@ FILE_SENTINEL = "private-workspace-file-4d18c2a7e3"
 INTERACTION_SENTINEL = "private-stored-interaction-93b0e6c15a"
 EARLIER_SESSION_SENTINEL = "earlier-session-turn-6f2d1b8e40"
 
-ZERO_ROWS = {"interactions": 0, "notes": 0, "memories": 0}
+ZERO_ROWS = {
+    "interactions": 0,
+    "notes": 0,
+    "memories": 0,
+    "audit_summaries": 0,
+    "audit_outcomes": 0,
+}
 
 # Since V1-15 every model-backed conversational response ends with Maria's own
 # notice about memory context, after a blank line and outside the reply the
 # session keeps. With no memory enabled, that notice is this fixed sentence,
 # written out so the owner-facing wording is pinned rather than agreed with.
 NO_MEMORY_CONTEXT_SUFFIX = "\n\nNo memory context supplied."
+
+# Since V1-18 Brain's model path always sends Maria's fixed proposal
+# instructions, reserved together with the request before anything else is
+# fitted. Without context, as in every bounded turn here, they cost exactly
+# their own UTF-8 bytes, so each request boundary below is its V1-14 value
+# moved by this much.
+PROPOSAL_INSTRUCTION_BYTES = len(PROPOSAL_INSTRUCTIONS.encode("utf-8"))
+
+# The fixed hostile payloads that open with "{". Since V1-18 each is a
+# proposal attempt, which the compiler refuses for exactly the reason given
+# here. The others open with "[" or with prose, so none of them is ever a
+# proposal attempt.
+REFUSED_HOSTILE_OUTPUTS = {
+    HostileOutput.UNKNOWN_TOOL: ProposalRejection.UNKNOWN_TOOL,
+    HostileOutput.UNKNOWN_ACTION: ProposalRejection.UNKNOWN_ACTION,
+    HostileOutput.EXTRA_ARGUMENTS: ProposalRejection.EXTRA_ARGUMENT,
+    HostileOutput.OUT_OF_RANGE_VALUES: ProposalRejection.NOT_MODEL_ELIGIBLE,
+    HostileOutput.TRUNCATED_OUTPUT: ProposalRejection.MALFORMED_OUTPUT,
+}
+
+# An action-shaped reply naming a registered action the model may never
+# propose. Since V1-18 it is a proposal attempt, which the compiler refuses
+# as not model-eligible before any permission or tool is consulted.
+CLOSED_ACTION_PROPOSAL = (
+    '{"tool": "notes", "action": "delete", "arguments": {"id": 1}}'
+)
 
 
 def _shown(text: str) -> str:
@@ -371,7 +412,13 @@ class _Harness:
                 table: int(
                     connection.execute(f"SELECT COUNT(*) FROM {table}").fetchone()[0]
                 )
-                for table in ("interactions", "notes", "memories")
+                for table in (
+                    "interactions",
+                    "notes",
+                    "memories",
+                    "audit_summaries",
+                    "audit_outcomes",
+                )
             }
         finally:
             connection.close()
@@ -408,7 +455,7 @@ class GenericFallbackMarkerTests(unittest.TestCase):
             "list",
             "histories",
             COLOUR_QUESTION,
-            "été 漢字",
+            "\xe9t\xe9 \U00006f22\U00005b57",
         ):
             with self.subTest(text=text):
                 plan = self.planner.create_plan(text)
@@ -488,13 +535,13 @@ class ByteAccountingTests(unittest.TestCase):
     ) -> None:
         # UTF-8 bytes, not characters: 2 + (2 + 3) + (1 + 4).
         history = (
-            _exchange("é", "€"),
+            _exchange("\xe9", "\N{EURO SIGN}"),
             _exchange("a", "\U0001f600"),
         )
 
         self.assertEqual(history_content_bytes(history, 1000), 10)
-        self.assertEqual(request_content_bytes("é", history, 1000), 12)
-        self.assertEqual(request_content_bytes("é", (), 1000), 2)
+        self.assertEqual(request_content_bytes("\xe9", history, 1000), 12)
+        self.assertEqual(request_content_bytes("\xe9", (), 1000), 2)
         self.assertEqual(history_content_bytes((), 1000), 0)
 
     def test_the_limits_are_eight_exchanges_and_eight_kib(self) -> None:
@@ -523,16 +570,16 @@ class ByteAccountingTests(unittest.TestCase):
     ) -> None:
         # Four bytes of request and sixty of history fill 64 exactly.
         self.assertEqual(
-            fitted_history("éé", self.history, 64),
+            fitted_history("\xe9\xe9", self.history, 64),
             self.history,
         )
         # One byte more drops the oldest exchange whole, never part of it.
         self.assertEqual(
-            fitted_history("ééa", self.history, 64),
+            fitted_history("\xe9\xe9a", self.history, 64),
             (self.second, self.third),
         )
         # A request that fills the budget alone leaves room for nothing.
-        self.assertEqual(fitted_history("é" * 32, self.history, 64), ())
+        self.assertEqual(fitted_history("\xe9" * 32, self.history, 64), ())
 
     def test_fitting_sends_at_most_eight_exchanges(self) -> None:
         nine = tuple(_exchange(f"u{index}", f"a{index}") for index in range(9))
@@ -657,6 +704,8 @@ class ResolutionOrderTests(unittest.TestCase):
             "history",
             "search history calculate",
             "read interaction 1",
+            "audit",
+            "read audit 1",
             "system",
             "time",
         )
@@ -928,9 +977,15 @@ class ConversationBoundsTests(unittest.TestCase):
         self,
         replies: dict[str, str],
         *,
-        max_input_bytes: int = 64,
+        max_input_bytes: int = 64 + PROPOSAL_INSTRUCTION_BYTES,
     ) -> tuple[_Harness, ScriptedProvider, MariaSession]:
-        """Build a session whose provider answers each prompt from a table."""
+        """Build a session whose provider answers each prompt from a table.
+
+        The default budget leaves exactly 64 bytes beside the proposal
+        instructions, so a request and the history sent with it meet the
+        boundaries they met before the instructions were sent. A finished
+        exchange is still held to the whole budget.
+        """
         provider = ScriptedProvider(lambda request: replies[request.prompt])
         harness = _Harness(
             self,
@@ -942,15 +997,20 @@ class ConversationBoundsTests(unittest.TestCase):
     def test_a_request_at_the_budget_is_sent_and_one_byte_over_is_refused(
         self,
     ) -> None:
-        at_budget = "é" * 32
+        at_budget = "\xe9" * 32
         over_budget = at_budget + "a"
+        # One byte longer than the instructions, so the finished exchange is
+        # one byte over the whole budget.
+        reply = "r" * (PROPOSAL_INSTRUCTION_BYTES + 1)
         harness, provider, session = self._turns(
-            {at_budget: "r", over_budget: "never asked"},
+            {at_budget: reply, over_budget: "never asked"},
         )
 
         sent = session.submit(at_budget)
         self.assertEqual(provider.calls, 1)
         self.assertEqual(provider.requests[0].prompt, at_budget)
+        # The instructions that fill the rest of the budget were really sent.
+        self.assertIs(provider.requests[0].proposal_instructions, True)
         # Sent, but the finished exchange cannot fit beside its reply.
         self.assertEqual(sent.text, _shown(CONVERSATION_EXCHANGE_TOO_LARGE_MESSAGE))
 
@@ -964,7 +1024,10 @@ class ConversationBoundsTests(unittest.TestCase):
     def test_the_eight_kib_limit_holds_when_the_configured_budget_is_larger(
         self,
     ) -> None:
-        at_limit = "é" * 4096
+        # The instructions are reserved first, so the request alone may fill
+        # only what they leave of the 8 KiB limit.
+        room = 8 * 1024 - PROPOSAL_INSTRUCTION_BYTES
+        at_limit = "\xe9" * (room // 2) + "a" * (room % 2)
         over_limit = at_limit + "a"
         harness, provider, session = self._turns(
             {at_limit: "r", over_limit: "never asked"},
@@ -980,7 +1043,8 @@ class ConversationBoundsTests(unittest.TestCase):
 
     def test_an_exchange_exactly_at_the_budget_is_kept(self) -> None:
         request = "q" * 30
-        reply = "é" * 17
+        # The exchange is held to the whole budget, instructions included.
+        reply = "\xe9" * 17 + "r" * PROPOSAL_INSTRUCTION_BYTES
         harness, provider, session = self._turns({request: reply})
 
         response = session.submit(request)
@@ -991,7 +1055,7 @@ class ConversationBoundsTests(unittest.TestCase):
 
     def test_an_exchange_one_byte_over_is_refused_whole(self) -> None:
         request = "q" * 30
-        reply = "é" * 17 + "a"
+        reply = "\xe9" * 17 + "r" * PROPOSAL_INSTRUCTION_BYTES + "a"
         harness, provider, session = self._turns({request: reply})
 
         response = session.submit(request)
@@ -1000,7 +1064,7 @@ class ConversationBoundsTests(unittest.TestCase):
             response.text,
             _shown(CONVERSATION_EXCHANGE_TOO_LARGE_MESSAGE),
         )
-        self.assertNotIn("é", response.text)
+        self.assertNotIn("\xe9", response.text)
         self.assertIsNone(response.conversation)
         self.assertFalse(response.needs_confirmation)
         self.assertEqual(provider.calls, 1)
@@ -1014,16 +1078,18 @@ class ConversationBoundsTests(unittest.TestCase):
             "a" * 10: "b" * 10,
             "c" * 10: "d" * 10,
             "e" * 10: "f" * 10,
-            "éé": "g",
-            "ééa": "h",
+            # One byte longer than the instructions, so keeping all four
+            # exchanges would be one byte over the whole budget.
+            "\xe9\xe9": "g" * (PROPOSAL_INSTRUCTION_BYTES + 1),
+            "\xe9\xe9a": "h",
         }
         first = _exchange("a" * 10, "b" * 10)
         second = _exchange("c" * 10, "d" * 10)
         third = _exchange("e" * 10, "f" * 10)
 
         for request, sent_history in (
-            ("éé", (first, second, third)),
-            ("ééa", (second, third)),
+            ("\xe9\xe9", (first, second, third)),
+            ("\xe9\xe9a", (second, third)),
         ):
             with self.subTest(request=request):
                 _harness, provider, session = self._turns(replies)
@@ -1130,18 +1196,21 @@ class ProviderFailureTests(unittest.TestCase):
 
 
 class HostileReplyTests(unittest.TestCase):
-    """Prove model text is shown as inert text and can never act."""
+    """Prove model text is inert text or a refused proposal, and never acts.
+
+    Since V1-18 a reply opening with "{" is a proposal attempt. Every one
+    here is refused with the compiler's fixed message, so it reaches no
+    permission check or tool, offers no approval, and is never kept.
+    """
 
     def _assert_inert(self, harness: _Harness, turns: int) -> None:
-        """Assert the turns reached no contract, permission, or tool."""
+        """Assert the turns reached no plan validation, permission, or tool."""
         harness.validate_action.assert_not_called()
         harness.check.assert_not_called()
         harness.execute_tool.assert_not_called()
         self.assertEqual(harness.create_plan.call_count, turns)
 
-    def test_hostile_and_action_shaped_replies_are_shown_as_inert_text(
-        self,
-    ) -> None:
+    def test_hostile_replies_are_inert_text_or_refused_proposals(self) -> None:
         for output in HostileOutput:
             if output is HostileOutput.OVERSIZED_OUTPUT:
                 continue
@@ -1152,10 +1221,21 @@ class HostileReplyTests(unittest.TestCase):
 
                 response = session.submit(PROMPT_SENTINEL)
 
-                self.assertEqual(response.text, _shown(hostile_payload(output)))
+                rejection = REFUSED_HOSTILE_OUTPUTS.get(output)
+                if rejection is None:
+                    self.assertEqual(response.text, _shown(hostile_payload(output)))
+                    self.assertEqual(response.plan.steps, ())
+                else:
+                    # The fixed refusal with the turn's notice: the payload
+                    # is neither shown, offered, nor kept.
+                    self.assertEqual(response.text, _shown(rejection.message))
+                    self.assertNotIn(FAKE_PAYLOAD_SENTINEL, response.text)
+                    self.assertIsNone(response.plan)
+                    self.assertIsNone(response.conversation)
+                    self.assertEqual(session.conversation, ())
                 self.assertFalse(response.needs_confirmation)
-                self.assertEqual(response.plan.steps, ())
                 self.assertIsNone(session.pending_approval)
+                self.assertEqual(provider.calls, 1)
                 self._assert_inert(harness, 1)
                 self.assertEqual(harness.row_counts(), ZERO_ROWS)
 
@@ -1189,9 +1269,8 @@ class HostileReplyTests(unittest.TestCase):
             "delete note 1",
             "forget memory 1",
             "rename inbox/a.txt to inbox/b.txt",
-            '{"tool": "notes", "action": "delete", "arguments": {"id": 1}}',
         )
-        provider = ScriptedProvider.replying(*replies)
+        provider = ScriptedProvider.replying(*replies, CLOSED_ACTION_PROPOSAL)
         harness = _Harness(self, provider)
         source = harness.workspace / "inbox" / "a.txt"
         source.write_text("Alpha.", encoding="utf-8")
@@ -1202,11 +1281,20 @@ class HostileReplyTests(unittest.TestCase):
 
         session.submit("rename inbox/a.txt to inbox/b.txt")
         self.assertIsNotNone(session.pending_approval)
-        for _ in replies:
+        rows = harness.row_counts()
+        for _ in (*replies, CLOSED_ACTION_PROPOSAL):
             response = session.submit("sing me an unsupported song")
             self.assertFalse(response.needs_confirmation)
             self.assertIsNone(session.pending_approval)
 
+        # The action-shaped reply came last: refused, and neither retried
+        # nor kept.
+        self.assertEqual(
+            response.text,
+            _shown(ProposalRejection.NOT_MODEL_ELIGIBLE.message),
+        )
+        self.assertIsNone(response.conversation)
+        self.assertEqual(provider.calls, len(replies) + 1)
         self.assertEqual(
             session.confirm(),
             BrainResponse(CONFIRMATION_REFUSED_MESSAGE),
@@ -1215,6 +1303,7 @@ class HostileReplyTests(unittest.TestCase):
         self.assertTrue(source.is_file())
         self.assertEqual(harness.row_counts()["notes"], 1)
         self.assertEqual(harness.row_counts()["memories"], 1)
+        self.assertEqual(harness.row_counts(), rows)
         self.assertEqual(
             [exchange.assistant for exchange in session.conversation],
             list(replies),
@@ -1232,13 +1321,18 @@ class ZeroConversationRowTests(unittest.TestCase):
             if request.prompt == "please fail":
                 raise TypedFailureError(Failure(FailureKind.REASONING_TIMEOUT))
             if request.prompt == "please answer at length":
-                return "x" * 70
+                return "x" * (70 + PROPOSAL_INSTRUCTION_BYTES)
+            if request.prompt == "please propose":
+                return CLOSED_ACTION_PROPOSAL
             return "ok"
 
+        provider = ScriptedProvider(answer)
         harness = _Harness(
             self,
-            ScriptedProvider(answer),
-            settings=enabled_settings(max_input_bytes=64),
+            provider,
+            settings=enabled_settings(
+                max_input_bytes=64 + PROPOSAL_INSTRUCTION_BYTES,
+            ),
         )
         session = harness.session()
         harness.memory.record_interaction("seeded request", "seeded response")
@@ -1249,6 +1343,7 @@ class ZeroConversationRowTests(unittest.TestCase):
             "a second conversational turn",
             "please fail",
             "please answer at length",
+            "please propose",
             "x" * 65,
             "unpaired \ud800 surrogate",
         ):
@@ -1260,6 +1355,11 @@ class ZeroConversationRowTests(unittest.TestCase):
             harness.interactions(),
             [("seeded request", "seeded response")],
         )
+        # Positive controls, so no path above can silently stop running: the
+        # five requests within the budget reached the provider, the
+        # over-budget and unsendable ones did not, and only the two plain
+        # replies were kept.
+        self.assertEqual(provider.calls, 5)
         self.assertEqual(len(session.conversation), 2)
 
 
@@ -1358,13 +1458,21 @@ class ConversationLogPrivacyTests(unittest.TestCase):
             if request.prompt.startswith("fail"):
                 raise RuntimeError(FAKE_EXCEPTION_SENTINEL)
             if request.prompt.startswith("long"):
-                return REPLY_SENTINEL * 3
+                return REPLY_SENTINEL * 3 + "x" * PROPOSAL_INSTRUCTION_BYTES
+            if request.prompt.startswith("propose"):
+                # A refused proposal whose argument value is the sentinel.
+                return (
+                    '{"tool": "memory", "action": "store", '
+                    '"arguments": {"fact": "' + REPLY_SENTINEL + '"}}'
+                )
             return REPLY_SENTINEL
 
         harness = _Harness(
             self,
             ScriptedProvider(answer),
-            settings=enabled_settings(max_input_bytes=96),
+            settings=enabled_settings(
+                max_input_bytes=96 + PROPOSAL_INSTRUCTION_BYTES,
+            ),
             logger=get_logger("tests.conversation.logged"),
         )
         session = harness.session()
@@ -1373,6 +1481,7 @@ class ConversationLogPrivacyTests(unittest.TestCase):
             f"{PROMPT_SENTINEL} again",
             f"fail {PROMPT_SENTINEL}",
             f"long {PROMPT_SENTINEL}",
+            f"propose {PROMPT_SENTINEL}",
             PROMPT_SENTINEL * 4,
             f"unpaired \ud800 {PROMPT_SENTINEL}",
         ):
@@ -1391,6 +1500,8 @@ class ConversationLogPrivacyTests(unittest.TestCase):
             "Reasoning request completed.",
             "Reasoning request failed: code=reasoning_unavailable",
             "Conversational reply discarded: exchange over budget.",
+            "Model reply is a proposal attempt.",
+            "Refused a model proposal: code=not_model_eligible",
             "Conversational request refused: over budget.",
             "Conversational request refused: unsendable.",
             "Session ended.",
@@ -1523,6 +1634,7 @@ class ConversationImportBoundaryTests(unittest.TestCase):
             "core.session",
             "core.brain",
             "core.ollama_adapter",
+            "core.plan_compiler",
             "sqlite3",
         ):
             with self.subTest(module=forbidden):

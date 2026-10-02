@@ -3,8 +3,9 @@
 These prove what the interface itself guarantees: bounded, context-free,
 redacted values; strictly validated settings; and one boundary that returns
 every provider outcome as either inert text or a typed failure. They do not
-prove anything about plan compilation or tool execution, which no reasoning
-path can reach yet.
+prove anything about plan compilation or tool execution: since V1-18 only
+Brain hands a model's proposal attempt to the plan compiler, and that path
+is proven where Brain and the compiler are tested.
 """
 
 from __future__ import annotations
@@ -238,11 +239,15 @@ class ReasoningValueTests(unittest.TestCase):
     ) -> None:
         self.assertEqual(
             [f.name for f in fields(ReasoningRequest)],
-            ["prompt", "history", "context"],
+            ["prompt", "history", "context", "proposal_instructions"],
         )
         self.assertEqual([f.name for f in fields(ReasoningResponse)], ["text"])
         self.assertEqual(ReasoningRequest(PROMPT_SENTINEL).history, ())
         self.assertEqual(ReasoningRequest(PROMPT_SENTINEL).context, ())
+        self.assertIs(
+            ReasoningRequest(PROMPT_SENTINEL).proposal_instructions,
+            False,
+        )
 
     def test_the_request_has_no_system_template_or_raw_history_field(
         self,
@@ -252,6 +257,8 @@ class ReasoningValueTests(unittest.TestCase):
         # "history" left this list in V1-14: it is the conversation's earlier
         # exchanges. "context" left it in V1-15: it is the typed Tier A
         # memory context, and nothing else retrieved on the owner's behalf.
+        # V1-18's "proposal_instructions" is no system field either: it is an
+        # exact bool selecting Maria's fixed text, which no caller can fill.
         for name in ("system", "template", "memories", "interactions"):
             with self.subTest(name=name):
                 self.assertFalse(hasattr(request, name))

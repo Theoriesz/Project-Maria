@@ -38,6 +38,7 @@ from tests.log_assertions import assert_log_omits
 
 
 EXPECTED_MODULES = (
+    "tools.audit",
     "tools.calculator",
     "tools.filesystem",
     "tools.history",
@@ -46,7 +47,7 @@ EXPECTED_MODULES = (
     "tools.system",
 )
 EXPECTED_TOOL_NAMES = frozenset(
-    {"calculator", "filesystem", "history", "memory", "notes", "system"}
+    {"audit", "calculator", "filesystem", "history", "memory", "notes", "system"}
 )
 
 # The one owner-visible sentence an unexpected tool exception produces,
@@ -74,6 +75,18 @@ def _stub_registry(
                 model_eligibility=ModelEligibility.NOT_MODEL_ELIGIBLE,
             ),
         )
+    )
+
+
+def _loaded_tool_names(manager: ToolManager) -> frozenset[str]:
+    """Return the name of every tool a manager actually loaded.
+
+    The contract registry refuses an unknown action before any loaded tool is
+    consulted, so only the loaded inventory proves that a tool was loaded.
+    """
+    return frozenset(
+        identifier.split(".", 1)[0]
+        for identifier in manager.loaded_action_identifiers()
     )
 
 
@@ -160,6 +173,7 @@ class ToolManagerTests(unittest.TestCase):
 
         manager.load_tools()
 
+        self.assertEqual(_loaded_tool_names(manager), EXPECTED_TOOL_NAMES)
         for tool_name in EXPECTED_TOOL_NAMES:
             with self.subTest(tool_name=tool_name):
                 result = manager.execute_tool(tool_name, "not_an_action", {})
@@ -353,6 +367,7 @@ class ToolManagerTests(unittest.TestCase):
         manager.load_tools()
         manager.load_tools()
 
+        self.assertEqual(_loaded_tool_names(manager), EXPECTED_TOOL_NAMES)
         for tool_name in EXPECTED_TOOL_NAMES:
             with self.subTest(tool_name=tool_name):
                 result = manager.execute_tool(tool_name, "not_an_action", {})

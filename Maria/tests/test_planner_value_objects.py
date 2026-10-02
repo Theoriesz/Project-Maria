@@ -9,7 +9,16 @@ import unittest
 from types import MappingProxyType
 from typing import Any
 
-from core.planner import Plan, PlanArguments, Planner, PlanStep, RecordingPolicy
+from core.planner import (
+    MODEL_PLAN_SHAPE_MESSAGE,
+    Plan,
+    PlanArguments,
+    Planner,
+    PlanOrigin,
+    PlanStep,
+    RecordingPolicy,
+    is_model_plan,
+)
 
 
 SENTINEL_REQUEST = "sentinel-request-4f7a21c8e9"
@@ -26,11 +35,14 @@ SINGLE_STEP_FINGERPRINT = (
 TRANSIENT_NO_ACTION_FINGERPRINT = (
     "14bea83058b03660145137c624a08014d7e993c63d3928cff08e837f3a9a286a"
 )
+MODEL_STEP_FINGERPRINT = (
+    "42be365953cb90b6c9dd10f721893e623ddad655236ebb5eb8dcc80e267cc15b"
+)
 
 # The canonical bytes each golden digest above is the SHA-256 of, written
-# out by hand so the recording policy's place in the format is stated rather
-# than inferred from the implementation. A default plan carries no recording
-# key at all.
+# out by hand so the places of the recording policy and the origin in the
+# format are stated rather than inferred from the implementation. A default
+# plan carries neither a recording key nor an origin key at all.
 NO_ACTION_CANONICAL = (
     b'{"original_request":"help",'
     b'"response_if_no_action":"Supported commands","steps":[]}'
@@ -43,6 +55,14 @@ SINGLE_STEP_CANONICAL = (
 TRANSIENT_NO_ACTION_CANONICAL = (
     b'{"original_request":"help","recording":"transient",'
     b'"response_if_no_action":"Supported commands","steps":[]}'
+)
+# A model-originated plan always carries both keys, because its policy is
+# always transient, and "origin" sorts before "original_request".
+MODEL_STEP_CANONICAL = (
+    b'{"origin":"model","original_request":"calculate 2 + 2",'
+    b'"recording":"transient","response_if_no_action":null,'
+    b'"steps":[{"action":"calculate","arguments":{"expression":"2 + 2"},'
+    b'"tool_name":"calculator"}]}'
 )
 
 
@@ -245,6 +265,7 @@ class PlanRecordingPolicyTests(unittest.TestCase):
         self.assertEqual(plan.steps, (self.step,))
         self.assertEqual(plan.response_if_no_action, "unused response")
         self.assertIs(plan.recording, RecordingPolicy.RECORD)
+        self.assertIs(plan.origin, PlanOrigin.DETERMINISTIC)
 
     def test_explicit_record_is_indistinguishable_from_the_default(self) -> None:
         pairs = (
@@ -387,6 +408,386 @@ class PlanRecordingPolicyTests(unittest.TestCase):
 
         self.assertIs(plan.recording, RecordingPolicy.RECORD)
         self.assertEqual(plan.fingerprint, NO_ACTION_FINGERPRINT)
+
+
+class PlanOriginTests(unittest.TestCase):
+    """Verify the plan-level origin as part of the value object."""
+
+    def setUp(self) -> None:
+        self.step = PlanStep("calculator", "calculate", {"expression": "2 + 2"})
+
+    def _model_plan(self) -> Plan:
+        """Return the one shape a model-originated plan may take."""
+        return Plan(
+            "calculate 2 + 2",
+            (self.step,),
+            recording=RecordingPolicy.TRANSIENT,
+            origin=PlanOrigin.MODEL,
+        )
+
+    def test_the_origin_has_exactly_two_members(self) -> None:
+        self.assertEqual(
+            {member.name: member.value for member in PlanOrigin},
+            {"DETERMINISTIC": "deterministic", "MODEL": "model"},
+        )
+
+    def test_the_origin_is_the_last_field_after_the_recording_policy(self) -> None:
+        self.assertEqual(
+            [field.name for field in dataclasses.fields(Plan)],
+            [
+                "original_request",
+                "steps",
+                "response_if_no_action",
+                "recording",
+                "origin",
+            ],
+        )
+
+        plan = Plan(
+            "calculate 2 + 2",
+            (self.step,),
+            None,
+            RecordingPolicy.TRANSIENT,
+            PlanOrigin.MODEL,
+        )
+
+        self.assertIs(plan.origin, PlanOrigin.MODEL)
+        self.assertEqual(plan, self._model_plan())
+
+    def test_default_origin_is_deterministic(self) -> None:
+        for plan in (
+            Plan("help", ()),
+            Plan("help", (), "Supported commands"),
+            Plan("help", (), "Supported commands", RecordingPolicy.TRANSIENT),
+            Plan("calculate 2 + 2", (self.step,)),
+            Plan("calculate 2 + 2", (self.step,), recording=RecordingPolicy.TRANSIENT),
+        ):
+            with self.subTest(plan=plan.original_request, policy=plan.recording):
+                self.assertIs(plan.origin, PlanOrigin.DETERMINISTIC)
+
+    def test_explicit_deterministic_is_indistinguishable_from_the_default(
+        self,
+    ) -> None:
+        pairs = (
+            (
+                Plan("help", (), "Supported commands"),
+                Plan(
+                    "help",
+                    (),
+                    "Supported commands",
+                    origin=PlanOrigin.DETERMINISTIC,
+                ),
+            ),
+            (
+                Plan("calculate 2 + 2", (self.step,)),
+                Plan("calculate 2 + 2", (self.step,), origin=PlanOrigin.DETERMINISTIC),
+            ),
+            (
+                Plan("help", (), "Supported commands", RecordingPolicy.TRANSIENT),
+                Plan(
+                    "help",
+                    (),
+                    "Supported commands",
+                    RecordingPolicy.TRANSIENT,
+                    PlanOrigin.DETERMINISTIC,
+                ),
+            ),
+        )
+
+        for default, explicit in pairs:
+            with self.subTest(plan=default.original_request, policy=default.recording):
+                self.assertEqual(default, explicit)
+                self.assertEqual(hash(default), hash(explicit))
+                self.assertEqual(default.fingerprint, explicit.fingerprint)
+
+    def test_every_existing_golden_digest_is_unchanged_by_the_origin(self) -> None:
+        # The origin joins the canonical bytes only when it is not the
+        # default, so a deterministic plan hashes exactly the bytes written
+        # out above, byte for byte, whether its origin is explicit or not.
+        cases = (
+            (
+                Plan(
+                    "help",
+                    (),
+                    "Supported commands",
+                    origin=PlanOrigin.DETERMINISTIC,
+                ),
+                NO_ACTION_CANONICAL,
+                NO_ACTION_FINGERPRINT,
+            ),
+            (
+                Plan(
+                    "remember My Fact",
+                    (PlanStep("memory", "store", {"fact": "My Fact"}),),
+                    origin=PlanOrigin.DETERMINISTIC,
+                ),
+                SINGLE_STEP_CANONICAL,
+                SINGLE_STEP_FINGERPRINT,
+            ),
+            (
+                Plan(
+                    "help",
+                    (),
+                    "Supported commands",
+                    RecordingPolicy.TRANSIENT,
+                    PlanOrigin.DETERMINISTIC,
+                ),
+                TRANSIENT_NO_ACTION_CANONICAL,
+                TRANSIENT_NO_ACTION_FINGERPRINT,
+            ),
+        )
+
+        for plan, canonical, digest in cases:
+            with self.subTest(digest=digest):
+                self.assertNotIn(b'"origin"', canonical)
+                self.assertEqual(hashlib.sha256(canonical).hexdigest(), digest)
+                self.assertEqual(plan.fingerprint, digest)
+
+    def test_model_fingerprint_matches_its_recorded_canonical_value(self) -> None:
+        self.assertEqual(
+            hashlib.sha256(MODEL_STEP_CANONICAL).hexdigest(),
+            MODEL_STEP_FINGERPRINT,
+        )
+        self.assertEqual(self._model_plan().fingerprint, MODEL_STEP_FINGERPRINT)
+
+    def test_model_plans_differ_from_otherwise_identical_deterministic_plans(
+        self,
+    ) -> None:
+        model = self._model_plan()
+        deterministic = Plan(
+            "calculate 2 + 2",
+            (self.step,),
+            recording=RecordingPolicy.TRANSIENT,
+        )
+
+        self.assertNotEqual(model, deterministic)
+        self.assertNotEqual(model.fingerprint, deterministic.fingerprint)
+        self.assertEqual(len({model, deterministic}), 2)
+
+    def test_structurally_equal_model_plans_share_one_fingerprint(self) -> None:
+        first = self._model_plan()
+        second = self._model_plan()
+
+        self.assertEqual(first, second)
+        self.assertIsNot(first, second)
+        self.assertEqual(hash(first), hash(second))
+        self.assertEqual(first.fingerprint, second.fingerprint)
+
+    def test_values_that_are_not_exactly_an_origin_member_are_refused(self) -> None:
+        spoof = _ClassSpoofingOrigin()
+        refused: tuple[Any, ...] = (
+            "deterministic",
+            "model",
+            "DETERMINISTIC",
+            "MODEL",
+            _TextSubclass("model"),
+            b"model",
+            True,
+            False,
+            None,
+            0,
+            1,
+            PlanOrigin,
+            RecordingPolicy.RECORD,
+            RecordingPolicy.TRANSIENT,
+            spoof,
+        )
+
+        # The spoof defeats an isinstance check, which is why the plan has to
+        # check the exact type instead.
+        self.assertIsInstance(spoof, PlanOrigin)
+        for value in refused:
+            for policy in RecordingPolicy:
+                with self.subTest(value=type(value).__name__, policy=policy):
+                    with self.assertRaises(TypeError) as raised:
+                        Plan("calculate 2 + 2", (self.step,), None, policy, value)
+
+                    self.assertEqual(
+                        str(raised.exception),
+                        "Plan origin must be a PlanOrigin.",
+                    )
+
+    def test_a_model_plan_of_any_other_shape_is_refused(self) -> None:
+        other = PlanStep("system", "current_time", {})
+        shapes: dict[str, dict[str, Any]] = {
+            "recorded": {"steps": (self.step,), "recording": RecordingPolicy.RECORD},
+            "no step": {"steps": ()},
+            "two steps": {"steps": (self.step, other)},
+            "a canned response": {
+                "steps": (self.step,),
+                "response_if_no_action": "Supported commands",
+            },
+            "an empty canned response": {
+                "steps": (self.step,),
+                "response_if_no_action": "",
+            },
+            "a canned response and no step": {
+                "steps": (),
+                "response_if_no_action": "Supported commands",
+            },
+            "steps in a list": {"steps": [self.step]},
+            "a step subclass": {
+                "steps": (
+                    _PlanStepSubclass("calculator", "calculate", {"expression": "1"}),
+                ),
+            },
+            "a tool name subclass": {
+                "steps": (
+                    PlanStep(
+                        _TextSubclass("calculator"),
+                        "calculate",
+                        {"expression": "1"},
+                    ),
+                ),
+            },
+            "an action subclass": {
+                "steps": (
+                    PlanStep(
+                        "calculator",
+                        _TextSubclass("calculate"),
+                        {"expression": "1"},
+                    ),
+                ),
+            },
+        }
+
+        self.assertEqual(
+            MODEL_PLAN_SHAPE_MESSAGE,
+            "A model-originated plan must be transient, with exactly one step "
+            "and no canned response.",
+        )
+        for shape, fields in shapes.items():
+            arguments = {"recording": RecordingPolicy.TRANSIENT, **fields}
+            with self.subTest(shape=shape):
+                with self.assertRaises(ValueError) as raised:
+                    Plan("calculate 2 + 2", origin=PlanOrigin.MODEL, **arguments)
+
+                self.assertEqual(str(raised.exception), MODEL_PLAN_SHAPE_MESSAGE)
+
+                # The same shape with the default origin is an ordinary plan.
+                self.assertIs(
+                    Plan("calculate 2 + 2", **arguments).origin,
+                    PlanOrigin.DETERMINISTIC,
+                )
+
+    def test_a_plan_subclass_can_never_carry_the_model_origin(self) -> None:
+        with self.assertRaises(ValueError) as raised:
+            _PlanSubclass(
+                "calculate 2 + 2",
+                (self.step,),
+                recording=RecordingPolicy.TRANSIENT,
+                origin=PlanOrigin.MODEL,
+            )
+
+        self.assertEqual(str(raised.exception), MODEL_PLAN_SHAPE_MESSAGE)
+
+    def test_rebuilding_a_plan_revalidates_its_origin_and_shape(self) -> None:
+        plan = Plan("calculate 2 + 2", (self.step,))
+        model = self._model_plan()
+
+        with self.assertRaises(TypeError):
+            dataclasses.replace(plan, origin="model")
+        refused: tuple[tuple[Plan, dict[str, Any]], ...] = (
+            (plan, {"origin": PlanOrigin.MODEL}),
+            (model, {"recording": RecordingPolicy.RECORD}),
+            (model, {"steps": ()}),
+            (model, {"steps": (self.step, self.step)}),
+            (model, {"response_if_no_action": "reply"}),
+        )
+        for source, changes in refused:
+            with self.subTest(origin=source.origin, changes=sorted(changes)):
+                with self.assertRaises(ValueError) as raised:
+                    dataclasses.replace(source, **changes)
+
+                self.assertEqual(str(raised.exception), MODEL_PLAN_SHAPE_MESSAGE)
+
+        rebuilt = dataclasses.replace(
+            plan,
+            recording=RecordingPolicy.TRANSIENT,
+            origin=PlanOrigin.MODEL,
+        )
+        self.assertEqual(rebuilt, model)
+        self.assertIs(plan.origin, PlanOrigin.DETERMINISTIC)
+        self.assertIs(
+            dataclasses.replace(model, origin=PlanOrigin.DETERMINISTIC).origin,
+            PlanOrigin.DETERMINISTIC,
+        )
+
+    def test_the_origin_of_a_constructed_plan_cannot_be_reassigned(self) -> None:
+        plan = Plan("help", (), "Supported commands")
+
+        with self.assertRaises(dataclasses.FrozenInstanceError):
+            plan.origin = PlanOrigin.MODEL
+
+        self.assertIs(plan.origin, PlanOrigin.DETERMINISTIC)
+        self.assertEqual(plan.fingerprint, NO_ACTION_FINGERPRINT)
+
+    def test_only_the_exact_model_shape_is_a_model_plan(self) -> None:
+        self.assertTrue(is_model_plan(self._model_plan()))
+        for value in (
+            Plan("calculate 2 + 2", (self.step,)),
+            Plan("calculate 2 + 2", (self.step,), recording=RecordingPolicy.TRANSIENT),
+            Plan("help", (), "Supported commands"),
+            self._model_plan().steps,
+            self.step,
+            None,
+            "calculate 2 + 2",
+        ):
+            with self.subTest(value=type(value).__name__):
+                self.assertFalse(is_model_plan(value))
+
+    def test_a_model_plan_altered_after_construction_is_no_longer_one(self) -> None:
+        # A frozen dataclass can still be altered through object.__setattr__,
+        # which is why every field is read again rather than trusted.
+        alterations: tuple[tuple[str, Any], ...] = (
+            ("origin", PlanOrigin.DETERMINISTIC),
+            ("origin", "model"),
+            ("recording", RecordingPolicy.RECORD),
+            # Equal to the member, as a str enum member is, yet not it.
+            ("recording", "transient"),
+            ("response_if_no_action", ""),
+            ("steps", ()),
+            ("steps", (self.step, self.step)),
+            ("steps", [self.step]),
+        )
+
+        for name, value in alterations:
+            with self.subTest(field=name, value=value):
+                plan = self._model_plan()
+                self.assertTrue(is_model_plan(plan))
+
+                object.__setattr__(plan, name, value)
+
+                self.assertFalse(is_model_plan(plan))
+
+    def test_a_model_plan_whose_step_is_altered_is_no_longer_one(self) -> None:
+        # The step is read again too. None of these alterations changes a
+        # byte the fingerprint covers, so only the exact-type checks on the
+        # step's names and arguments can tell the plan is no longer one.
+        alterations: tuple[tuple[str, Any], ...] = (
+            ("tool_name", _TextSubclass("calculator")),
+            ("action", _TextSubclass("calculate")),
+            ("arguments", {"expression": "2 + 2"}),
+            ("arguments", MappingProxyType({"expression": "2 + 2"})),
+            ("arguments", _MutablePlanArguments({"expression": "2 + 2"})),
+        )
+
+        for name, value in alterations:
+            with self.subTest(field=name, value=type(value).__name__):
+                # A fresh step each time, so no alteration outlives its case.
+                step = PlanStep("calculator", "calculate", {"expression": "2 + 2"})
+                plan = Plan(
+                    "calculate 2 + 2",
+                    (step,),
+                    recording=RecordingPolicy.TRANSIENT,
+                    origin=PlanOrigin.MODEL,
+                )
+                self.assertTrue(is_model_plan(plan))
+
+                object.__setattr__(step, name, value)
+
+                self.assertEqual(plan.fingerprint, MODEL_STEP_FINGERPRINT)
+                self.assertFalse(is_model_plan(plan))
 
 
 class PlanStepImmutabilityTests(unittest.TestCase):
@@ -843,6 +1244,9 @@ class PlannerBranchArgumentTests(unittest.TestCase):
             ("search history trip", "history", "search", {"query": "trip"}),
             ("read interaction 42", "history", "read", {"id": 42}),
             ("delete interaction 42", "history", "delete", {"id": 42}),
+            ("audit", "audit", "list", {}),
+            ("read audit 3", "audit", "read", {"id": 3}),
+            ("delete audit 3", "audit", "delete", {"id": 3}),
             ("system", "system", "overview", {}),
             ("time", "system", "current_time", {}),
         )
@@ -859,6 +1263,9 @@ class PlannerBranchArgumentTests(unittest.TestCase):
                 self.assertIsInstance(step.arguments, PlanArguments)
                 self.assertIsInstance(hash(plan), int)
                 self.assertEqual(len(plan.fingerprint), 64)
+                # The planner is deterministic code, so it never claims a
+                # plan came from the model.
+                self.assertIs(plan.origin, PlanOrigin.DETERMINISTIC)
 
     def test_no_action_branches_stay_hashable_and_fingerprintable(self) -> None:
         for text in ("help", "commands", "remember", "recall", "unsupported request"):
@@ -868,6 +1275,7 @@ class PlannerBranchArgumentTests(unittest.TestCase):
                 self.assertEqual(plan.steps, ())
                 self.assertIsInstance(hash(plan), int)
                 self.assertEqual(len(plan.fingerprint), 64)
+                self.assertIs(plan.origin, PlanOrigin.DETERMINISTIC)
 
 
 class PlanningLogPrivacyTests(unittest.TestCase):
@@ -935,8 +1343,25 @@ class _ClassSpoofingPolicy:
         return RecordingPolicy
 
 
+class _ClassSpoofingOrigin:
+    """An object that claims to be a PlanOrigin through __class__."""
+
+    @property
+    def __class__(self) -> type:
+        """Report PlanOrigin, which is enough to satisfy isinstance."""
+        return PlanOrigin
+
+
 class _TextSubclass(str):
     """A str subclass spelling a policy value."""
+
+
+class _PlanSubclass(Plan):
+    """A plan subtype, which must never pass as an exact plan."""
+
+
+class _PlanStepSubclass(PlanStep):
+    """A plan-step subtype, which must never pass as an exact step."""
 
 
 class _RecordingHandler(logging.Handler):

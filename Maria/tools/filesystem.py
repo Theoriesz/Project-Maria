@@ -224,7 +224,13 @@ class FilesystemTool:
             )
 
     def _list(self, arguments: Mapping[str, Any]) -> ToolExecutionResult:
-        """List a directory inside a reachable root."""
+        """List a directory inside a reachable root.
+
+        A reasoning model may propose this action, so its operational log
+        lines are fixed text: neither the resolved directory, the submitted
+        path, nor an exception's text ever reaches the log. What the owner
+        is shown is unchanged.
+        """
         try:
             resolved = self._safe_path(_path_argument(arguments, "path", "."))
             root, path = resolved.root, resolved.target
@@ -235,13 +241,13 @@ class FilesystemTool:
                 )
 
             entries = self._entries(path, root)
-            self.logger.info("Listed directory: %s", path)
+            self.logger.info("Listed a directory.")
             if not entries:
                 return ToolExecutionResult(True, "Directory is empty.", entries)
             listing = "\n".join(f"{entry['type']}: {entry['name']}" for entry in entries)
             return ToolExecutionResult(True, listing, entries)
         except (OSError, ValueError) as exc:
-            self.logger.warning("Directory listing failed: %s", exc)
+            self.logger.warning("Directory listing failed.")
             return ToolExecutionResult(
                 False,
                 f"Directory listing failed: {_failure_reason(exc)}",

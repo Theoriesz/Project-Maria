@@ -55,14 +55,20 @@ TESTS_DIR = PROJECT_ROOT / "tests"
 # the test instead of agreed with: the stamp the v0.2.0 baseline receives when
 # it is classified, and the current schema every database ends at.
 BASELINE_SCHEMA_VERSION = 2
-EXPECTED_SCHEMA_VERSION = 4
+EXPECTED_SCHEMA_VERSION = 5
 # V1-15's memory consent step, pinned by its own number now that V1-16's
 # note consent step follows it and the current version has moved on.
 MEMORY_CONTEXT_CONSENT_VERSION = 3
 UNVERSIONED = 0
 PRE_MEMORIES_VERSION = 1
 
+# The frozen v0.2.0 fixture's tables. Version 5 adds V1-18's two audit tables
+# beside them, so every database Maria creates or migrates now ends with
+# exactly the current set, while the fixture itself still holds only these.
 BASELINE_TABLES = frozenset({"interactions", "notes", "memories"})
+CURRENT_TABLES = BASELINE_TABLES | frozenset(
+    {"audit_summaries", "audit_outcomes"}
+)
 
 # The two constraints the v0.2.0 ``memories`` table is required to carry,
 # written out as the typed tokens they must reduce to rather than read back
@@ -232,7 +238,7 @@ class NewDatabaseTests(_TemporaryDatabaseTestCase):
         self.memory.initialize()
 
         self.assertEqual(read_schema_version(self.database_path), EXPECTED_SCHEMA_VERSION)
-        self.assertEqual(table_names(self.database_path), BASELINE_TABLES)
+        self.assertEqual(table_names(self.database_path), CURRENT_TABLES)
         self.assertEqual(self.memory.schema_version(), EXPECTED_SCHEMA_VERSION)
 
     def test_an_empty_file_is_a_new_database_rather_than_a_legacy_one(self) -> None:
@@ -244,7 +250,7 @@ class NewDatabaseTests(_TemporaryDatabaseTestCase):
         Memory(self.database_path, logger=recording_logger).initialize()
 
         self.assertEqual(read_schema_version(self.database_path), EXPECTED_SCHEMA_VERSION)
-        self.assertEqual(table_names(self.database_path), BASELINE_TABLES)
+        self.assertEqual(table_names(self.database_path), CURRENT_TABLES)
         # An empty file is created at the current schema in one step. It must
         # not be classified as a legacy database and walked up the ladder.
         logged = [call.args[0] for call in recording_logger.info.call_args_list]
@@ -306,7 +312,7 @@ class BaselineClassificationTests(_TemporaryDatabaseTestCase):
         )
 
     def test_a_valid_unversioned_baseline_is_stamped_then_migrated_once(self) -> None:
-        """Classified as the baseline, it runs only the consent steps."""
+        """Classified as the baseline, it runs only the consent and audit steps."""
         create_v0_2_0_baseline(self.database_path)
         recording_logger = Mock(spec=logging.Logger)
 
@@ -330,7 +336,11 @@ class BaselineClassificationTests(_TemporaryDatabaseTestCase):
         )
         self.assertEqual(
             [args[1] for args in logged if "Applied migration" in args[0]],
-            ["add_memory_context_consent", "add_note_context_consent"],
+            [
+                "add_memory_context_consent",
+                "add_note_context_consent",
+                "create_audit_summaries",
+            ],
         )
 
     def test_baseline_rows_survive_initialization_unchanged(self) -> None:
@@ -400,7 +410,7 @@ class BaselineClassificationTests(_TemporaryDatabaseTestCase):
         self.memory.initialize()
 
         self.assertEqual(read_schema_version(self.database_path), EXPECTED_SCHEMA_VERSION)
-        self.assertEqual(table_names(self.database_path), BASELINE_TABLES)
+        self.assertEqual(table_names(self.database_path), CURRENT_TABLES)
         for identifier, request, response, created_at in BASELINE_INTERACTIONS:
             self.assertEqual(
                 self.memory.get_interaction(identifier),
@@ -896,7 +906,7 @@ class MigrationRunnerTests(_TemporaryDatabaseTestCase):
         retrying.initialize()
 
         self.assertEqual(read_schema_version(self.database_path), EXPECTED_SCHEMA_VERSION)
-        self.assertEqual(table_names(self.database_path), BASELINE_TABLES)
+        self.assertEqual(table_names(self.database_path), CURRENT_TABLES)
         self.assertEqual(
             [
                 call.args[1]
@@ -907,6 +917,7 @@ class MigrationRunnerTests(_TemporaryDatabaseTestCase):
                 "create_memories",
                 "add_memory_context_consent",
                 "add_note_context_consent",
+                "create_audit_summaries",
             ],
         )
         for identifier, request, response, created_at in BASELINE_INTERACTIONS:
@@ -1432,7 +1443,7 @@ class ForeignDatabaseTests(_TemporaryDatabaseTestCase):
 
         self.assertEqual(self.database_path.read_bytes(), before)
         self.assertEqual(read_schema_version(self.database_path), UNVERSIONED)
-        self.assertEqual(table_names(self.database_path) & BASELINE_TABLES, frozenset())
+        self.assertEqual(table_names(self.database_path) & CURRENT_TABLES, frozenset())
         self.assertEqual(set(_object_names(self.database_path)), expected_objects)
 
     def test_a_file_with_no_user_defined_object_becomes_a_new_database(self) -> None:
@@ -1443,7 +1454,7 @@ class ForeignDatabaseTests(_TemporaryDatabaseTestCase):
         self.memory.initialize()
 
         self.assertEqual(read_schema_version(self.database_path), EXPECTED_SCHEMA_VERSION)
-        self.assertEqual(table_names(self.database_path), BASELINE_TABLES)
+        self.assertEqual(table_names(self.database_path), CURRENT_TABLES)
 
     def test_a_file_holding_only_sqlite_internals_is_still_empty(self) -> None:
         """``sqlite_sequence`` outlives the table that created it."""
@@ -1464,7 +1475,7 @@ class ForeignDatabaseTests(_TemporaryDatabaseTestCase):
         self.memory.initialize()
 
         self.assertEqual(read_schema_version(self.database_path), EXPECTED_SCHEMA_VERSION)
-        self.assertEqual(table_names(self.database_path), BASELINE_TABLES)
+        self.assertEqual(table_names(self.database_path), CURRENT_TABLES)
 
     def test_one_unrelated_table_makes_the_file_somebody_elses(self) -> None:
         create_schema(
@@ -2040,7 +2051,7 @@ class AdversarialSchemaTests(_TemporaryDatabaseTestCase):
         self.memory.initialize()
 
         self.assertEqual(read_schema_version(self.database_path), EXPECTED_SCHEMA_VERSION)
-        self.assertEqual(table_names(self.database_path), BASELINE_TABLES)
+        self.assertEqual(table_names(self.database_path), CURRENT_TABLES)
 
 
 class StampedSchemaValidationTests(_TemporaryDatabaseTestCase):
@@ -2115,7 +2126,7 @@ class StampedSchemaValidationTests(_TemporaryDatabaseTestCase):
         self.memory.initialize()
 
         self.assertEqual(read_schema_version(self.database_path), EXPECTED_SCHEMA_VERSION)
-        self.assertEqual(table_names(self.database_path), BASELINE_TABLES)
+        self.assertEqual(table_names(self.database_path), CURRENT_TABLES)
         for identifier, request, response, created_at in BASELINE_INTERACTIONS:
             self.assertEqual(
                 self.memory.get_interaction(identifier),
@@ -2221,6 +2232,26 @@ V4_SCHEMA = tuple(
     for statement in V3_SCHEMA
 )
 
+# The version 5 audit tables, pinned the same way: version 4 with V1-18's
+# audit summaries and the outcome each one may later receive. Both are new
+# tables, so version 5 is version 4 with these two added and nothing changed.
+V5_AUDIT_SUMMARIES_TABLE = """
+    CREATE TABLE audit_summaries (
+        id INTEGER PRIMARY KEY AUTOINCREMENT,
+        created_at TEXT NOT NULL,
+        action TEXT NOT NULL,
+        decision TEXT NOT NULL,
+        target TEXT NOT NULL
+    )
+    """
+V5_AUDIT_OUTCOMES_TABLE = """
+    CREATE TABLE audit_outcomes (
+        summary_id INTEGER PRIMARY KEY,
+        outcome TEXT NOT NULL
+    )
+    """
+V5_SCHEMA = V4_SCHEMA + (V5_AUDIT_SUMMARIES_TABLE, V5_AUDIT_OUTCOMES_TABLE)
+
 
 class MemoryContextConsentMigrationTests(_TemporaryDatabaseTestCase):
     """Verify V1-15's consent column arrives through the V1-09 runner.
@@ -2282,7 +2313,7 @@ class MemoryContextConsentMigrationTests(_TemporaryDatabaseTestCase):
         self.memory.initialize()
 
         self.assertEqual(read_schema_version(self.database_path), EXPECTED_SCHEMA_VERSION)
-        self.assertEqual(self.describe(), memory_module._reference_schema(V4_SCHEMA))
+        self.assertEqual(self.describe(), memory_module._reference_schema(V5_SCHEMA))
         self.assertEqual(
             self._raw_memories(),
             [(*row, 0) for row in BASELINE_MEMORIES],
@@ -2331,6 +2362,7 @@ class MemoryContextConsentMigrationTests(_TemporaryDatabaseTestCase):
                 "create_memories",
                 "add_memory_context_consent",
                 "add_note_context_consent",
+                "create_audit_summaries",
             ],
         )
         self.assertEqual(read_schema_version(self.database_path), EXPECTED_SCHEMA_VERSION)
@@ -2402,7 +2434,11 @@ class MemoryContextConsentMigrationTests(_TemporaryDatabaseTestCase):
                 for call in recording_logger.info.call_args_list
                 if "Applied migration" in call.args[0]
             ],
-            ["add_memory_context_consent", "add_note_context_consent"],
+            [
+                "add_memory_context_consent",
+                "add_note_context_consent",
+                "create_audit_summaries",
+            ],
         )
         self.assertEqual(
             self._raw_memories(),
@@ -2454,8 +2490,10 @@ class NoteContextConsentMigrationTests(_TemporaryDatabaseTestCase):
     """Verify V1-16's note consent column arrives through the V1-09 runner.
 
     Every case starts from the frozen fixtures, reused unchanged, or from the
-    pinned version 3 shape, and ends at version 4 with every existing note's
-    consent off: its ``context_digest`` NULL.
+    pinned version 3 shape, and reaches version 4 with every existing note's
+    consent off: its ``context_digest`` NULL. V1-18's audit step now follows
+    it, so a migrated database passes through exactly that version 4 shape on
+    its way to the current version.
     """
 
     NOTE_CONTEXT_CONSENT_VERSION = 4
@@ -2486,7 +2524,35 @@ class NoteContextConsentMigrationTests(_TemporaryDatabaseTestCase):
             if "Applied migration" in call.args[0]
         ]
 
-    def test_the_pinned_version_four_schema_is_frozen_and_current(self) -> None:
+    def _initialize_describing_each_step(
+        self,
+        memory: Memory,
+    ) -> dict[int, tuple]:
+        """Initialize a database and return the schema each committed step left.
+
+        The real runner applies every step. This only describes the schema on
+        the same connection once each step has committed, keyed by the version
+        that step stamped, so a test can pin a version the database passes
+        through on its way to the current one.
+        """
+        real_runner = memory_module._run_in_one_transaction
+        committed: dict[int, tuple] = {}
+
+        def describe_after_each_step(connection, statements, version):
+            real_runner(connection, statements, version)
+            committed[version] = memory_module._describe_schema(connection)
+
+        with patch.object(
+            memory_module,
+            "_run_in_one_transaction",
+            side_effect=describe_after_each_step,
+        ):
+            memory.initialize()
+        return committed
+
+    def test_the_pinned_version_four_schema_is_frozen_and_version_five_is_current(
+        self,
+    ) -> None:
         pinned = memory_module._reference_schema(V4_SCHEMA)
 
         self.assertEqual(
@@ -2495,22 +2561,38 @@ class NoteContextConsentMigrationTests(_TemporaryDatabaseTestCase):
                 memory_module._frozen_schema(self.NOTE_CONTEXT_CONSENT_VERSION)
             ),
         )
+        # V1-18's audit step now follows this one, so the current schema is
+        # the pinned version 5 shape: this one with the two audit tables.
+        current = memory_module._reference_schema(V5_SCHEMA)
         self.assertEqual(
-            pinned,
+            current,
+            memory_module._reference_schema(
+                memory_module._frozen_schema(EXPECTED_SCHEMA_VERSION)
+            ),
+        )
+        self.assertEqual(
+            current,
             memory_module._reference_schema(memory_module._CURRENT_SCHEMA_STATEMENTS),
         )
-        self.assertEqual(memory_module._MIGRATIONS[-1].name, "add_note_context_consent")
+        (note_step,) = [
+            migration
+            for migration in memory_module._MIGRATIONS
+            if migration.version == self.NOTE_CONTEXT_CONSENT_VERSION
+        ]
+        self.assertEqual(note_step.name, "add_note_context_consent")
         self.assertEqual(
-            memory_module._MIGRATIONS[-1].statements,
+            note_step.statements,
             (memory_module._ADD_NOTE_CONTEXT_CONSENT_COLUMN,),
         )
 
-    def test_a_fresh_database_is_created_directly_at_version_four(self) -> None:
+    def test_a_fresh_database_is_created_directly_at_the_current_version(
+        self,
+    ) -> None:
         self.memory.initialize()
         note_id = self.memory.create_note("Fresh", "body")
 
-        self.assertEqual(read_schema_version(self.database_path), 4)
-        self.assertEqual(self.describe(), memory_module._reference_schema(V4_SCHEMA))
+        self.assertEqual(read_schema_version(self.database_path), EXPECTED_SCHEMA_VERSION)
+        self.assertEqual(self.describe(), memory_module._reference_schema(V5_SCHEMA))
         self.assertIsNone(self._raw_notes()[0][-1])
         self.assertEqual(self._raw_notes()[0][0], note_id)
 
@@ -2520,13 +2602,25 @@ class NoteContextConsentMigrationTests(_TemporaryDatabaseTestCase):
         create_v0_2_0_baseline(self.database_path)
         recording_logger = Mock(spec=logging.Logger)
 
-        Memory(self.database_path, logger=recording_logger).initialize()
+        committed = self._initialize_describing_each_step(
+            Memory(self.database_path, logger=recording_logger)
+        )
 
-        self.assertEqual(read_schema_version(self.database_path), 4)
-        self.assertEqual(self.describe(), memory_module._reference_schema(V4_SCHEMA))
+        self.assertEqual(read_schema_version(self.database_path), EXPECTED_SCHEMA_VERSION)
+        # The note step still leaves exactly version 4, and the audit step
+        # then carries the database on to the current shape.
+        self.assertEqual(
+            committed[self.NOTE_CONTEXT_CONSENT_VERSION],
+            memory_module._reference_schema(V4_SCHEMA),
+        )
+        self.assertEqual(self.describe(), memory_module._reference_schema(V5_SCHEMA))
         self.assertEqual(
             self._applied(recording_logger),
-            ["add_memory_context_consent", "add_note_context_consent"],
+            [
+                "add_memory_context_consent",
+                "add_note_context_consent",
+                "create_audit_summaries",
+            ],
         )
         self.assertEqual(
             self._raw_notes(),
@@ -2555,11 +2649,16 @@ class NoteContextConsentMigrationTests(_TemporaryDatabaseTestCase):
                     "create_memories",
                     "add_memory_context_consent",
                     "add_note_context_consent",
+                    "create_audit_summaries",
                 ],
             ),
             BASELINE_SCHEMA_VERSION: (
                 lambda path: create_v0_2_0_baseline(path),
-                ["add_memory_context_consent", "add_note_context_consent"],
+                [
+                    "add_memory_context_consent",
+                    "add_note_context_consent",
+                    "create_audit_summaries",
+                ],
             ),
             MEMORY_CONTEXT_CONSENT_VERSION: (
                 lambda path: create_schema(
@@ -2568,7 +2667,7 @@ class NoteContextConsentMigrationTests(_TemporaryDatabaseTestCase):
                     with_rows=True,
                     with_memories=True,
                 ),
-                ["add_note_context_consent"],
+                ["add_note_context_consent", "create_audit_summaries"],
             ),
         }
         for version, (create, expected_steps) in starts.items():
@@ -2578,10 +2677,18 @@ class NoteContextConsentMigrationTests(_TemporaryDatabaseTestCase):
                 stamp_schema_version(path, version)
                 recording_logger = Mock(spec=logging.Logger)
 
-                Memory(path, logger=recording_logger).initialize()
+                committed = self._initialize_describing_each_step(
+                    Memory(path, logger=recording_logger)
+                )
 
                 self.assertEqual(self._applied(recording_logger), expected_steps)
-                self.assertEqual(read_schema_version(path), 4)
+                # Each start still reaches exactly version 4 before the audit
+                # step carries it on to the current version.
+                self.assertEqual(
+                    committed[self.NOTE_CONTEXT_CONSENT_VERSION],
+                    memory_module._reference_schema(V4_SCHEMA),
+                )
+                self.assertEqual(read_schema_version(path), EXPECTED_SCHEMA_VERSION)
                 self.assertEqual(self.describe(path), self.describe(fresh_path))
                 self.assertEqual(
                     self._raw_notes(path),
@@ -2606,6 +2713,7 @@ class NoteContextConsentMigrationTests(_TemporaryDatabaseTestCase):
                     "CREATE TABLE never_committed (INVALID",
                 ),
             ),
+            *memory_module._MIGRATIONS[3:],
         )
 
         with patch.object(memory_module, "_MIGRATIONS", broken):
@@ -2627,8 +2735,11 @@ class NoteContextConsentMigrationTests(_TemporaryDatabaseTestCase):
         retrying.initialize()
         retrying.initialize()
 
-        self.assertEqual(read_schema_version(self.database_path), 4)
-        self.assertEqual(self._applied(recording_logger), ["add_note_context_consent"])
+        self.assertEqual(read_schema_version(self.database_path), EXPECTED_SCHEMA_VERSION)
+        self.assertEqual(
+            self._applied(recording_logger),
+            ["add_note_context_consent", "create_audit_summaries"],
+        )
         self.assertEqual(
             self._raw_notes(),
             [(*row, None) for row in BASELINE_NOTES],

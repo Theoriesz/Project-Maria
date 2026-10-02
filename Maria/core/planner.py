@@ -125,6 +125,25 @@ class RecordingPolicy(str, Enum):
     TRANSIENT = "transient"
 
 
+class PlanOrigin(str, Enum):
+    """Who produced a plan's steps.
+
+    DETERMINISTIC is every plan Maria's own code builds, the planner's
+    included. MODEL is set only by ``core/plan_compiler.py``, on a plan
+    compiled from one reasoning-model proposal, and it is what makes Brain
+    require the owner's approval whatever PermissionManager decides.
+    """
+
+    DETERMINISTIC = "deterministic"
+    MODEL = "model"
+
+
+MODEL_PLAN_SHAPE_MESSAGE = (
+    "A model-originated plan must be transient, with exactly one step and no "
+    "canned response."
+)
+
+
 @dataclass(frozen=True)
 class Plan:
     """An executable plan created from user input.
@@ -133,24 +152,35 @@ class Plan:
     has always been recorded. TRANSIENT is a positive choice a plan's
     producer makes explicitly, and it keeps the whole interaction row out of
     history: the request as well as the response.
+
+    The origin defaults to DETERMINISTIC. A MODEL plan always has exactly
+    one step, no canned response, and the TRANSIENT policy, and no other
+    shape can be constructed with that origin.
     """
 
     original_request: str
     steps: tuple[PlanStep, ...]
     response_if_no_action: str | None = None
     recording: RecordingPolicy = RecordingPolicy.RECORD
+    origin: PlanOrigin = PlanOrigin.DETERMINISTIC
 
     def __post_init__(self) -> None:
-        """Refuse any recording policy that is not exactly a RecordingPolicy.
+        """Refuse a policy or origin of the wrong type, and a bad MODEL shape.
 
-        The check is on the exact type, so neither a plain string nor an
+        Both checks are on the exact type, so neither a plain string nor an
         object claiming the class through ``__class__`` passes. A string
         would compare and hash equal to the member it spells while failing
         every identity check made against that member, so it is refused
-        rather than coerced.
+        rather than coerced. A model-originated plan of any shape but its
+        one is refused as well, so ``dataclasses.replace`` cannot produce one
+        either.
         """
         if type(self.recording) is not RecordingPolicy:
             raise TypeError("Plan recording policy must be a RecordingPolicy.")
+        if type(self.origin) is not PlanOrigin:
+            raise TypeError("Plan origin must be a PlanOrigin.")
+        if self.origin is PlanOrigin.MODEL and not is_model_plan(self):
+            raise ValueError(MODEL_PLAN_SHAPE_MESSAGE)
 
     @property
     def fingerprint(self) -> str:
@@ -175,10 +205,11 @@ class Plan:
         in, while step order is preserved because steps stay a list.
         Escaping stays ASCII-only so that the payload always encodes.
 
-        The recording policy joins the payload only when it is not the
-        default. Every default plan therefore keeps exactly the bytes, and
-        the fingerprint, it had before the policy existed, while an otherwise
-        identical transient plan fingerprints differently.
+        The recording policy and the origin each join the payload only when
+        they are not the default. Every default plan therefore keeps exactly
+        the bytes, and the fingerprint, it had before either existed, while
+        an otherwise identical transient or model-originated plan
+        fingerprints differently.
         """
         payload: dict[str, Any] = {
             "original_request": self.original_request,
@@ -194,12 +225,41 @@ class Plan:
         }
         if self.recording is not RecordingPolicy.RECORD:
             payload["recording"] = self.recording.value
+        if self.origin is not PlanOrigin.DETERMINISTIC:
+            payload["origin"] = self.origin.value
         return json.dumps(
             payload,
             sort_keys=True,
             ensure_ascii=True,
             separators=(",", ":"),
         ).encode("utf-8")
+
+
+def is_model_plan(plan: object) -> bool:
+    """Return whether a value is exactly a well-formed model-originated plan.
+
+    That is an exact ``Plan`` whose origin is MODEL and whose policy is
+    TRANSIENT, with no canned response and an exact tuple holding exactly
+    one exact ``PlanStep``, named by exact text, with its immutable
+    ``PlanArguments``. Every field is read again rather than trusted from
+    construction, because a frozen dataclass can still be altered through
+    ``object.__setattr__``, so the boundaries that act on a model plan ask
+    this again before they do.
+    """
+    if type(plan) is not Plan:
+        return False
+    steps = plan.steps
+    return (
+        plan.origin is PlanOrigin.MODEL
+        and plan.recording is RecordingPolicy.TRANSIENT
+        and plan.response_if_no_action is None
+        and type(steps) is tuple
+        and len(steps) == 1
+        and type(steps[0]) is PlanStep
+        and type(steps[0].tool_name) is str
+        and type(steps[0].action) is str
+        and type(steps[0].arguments) is PlanArguments
+    )
 
 
 class Planner:
@@ -515,6 +575,39 @@ class Planner:
                 )
             return self._single_step(text, "history", "delete", {"id": interaction_id})
 
+        if lowered == "audit":
+            return self._single_step(text, "audit", "list", {})
+
+        if lowered == "read audit":
+            return self._no_action(text, "Use: read audit <id>")
+
+        if lowered.startswith("read audit "):
+            operand = text[len("read audit ") :].strip()
+            if not operand:
+                return self._no_action(text, "Use: read audit <id>")
+            summary_id = _parse_positive_ascii_id(operand)
+            if summary_id is None:
+                return self._no_action(
+                    text,
+                    "Audit summary id must be a positive whole number.",
+                )
+            return self._single_step(text, "audit", "read", {"id": summary_id})
+
+        if lowered == "delete audit":
+            return self._no_action(text, "Use: delete audit <id>")
+
+        if lowered.startswith("delete audit "):
+            operand = text[len("delete audit ") :].strip()
+            if not operand:
+                return self._no_action(text, "Use: delete audit <id>")
+            summary_id = _parse_positive_ascii_id(operand)
+            if summary_id is None:
+                return self._no_action(
+                    text,
+                    "Audit summary id must be a positive whole number.",
+                )
+            return self._single_step(text, "audit", "delete", {"id": summary_id})
+
         if lowered in {"system", "system info", "status", "sys", "sys info"}:
             return self._single_step(text, "system", "overview", {})
 
@@ -599,16 +692,30 @@ def _parse_id_and_colon_operand(value: str) -> tuple[str, str] | None:
     return id_text.strip(), operand.strip()
 
 
+# The largest id any stored record can have: every id is a SQLite integer,
+# and SQLite's largest integer is 2**63 - 1.
+_MAXIMUM_ID = 2**63 - 1
+_MAXIMUM_ID_DIGITS = len(str(_MAXIMUM_ID))
+
+
 def _parse_positive_ascii_id(value: str) -> int | None:
     """Return a positive decimal id, or None if invalid.
 
     Accepts ASCII digits only, rejecting Unicode digit lookalikes that
-    str.isdigit() alone would allow through.
+    str.isdigit() alone would allow through. Leading zeroes are stripped
+    however many there are, and more than 19 significant digits are refused
+    before any conversion. At most 19 digits are then converted, and the
+    result is compared with 9223372036854775807, the largest id any record
+    can have. An operand of any length is therefore answered, and Python's
+    limit on converting long digit strings is never reached.
     """
     if not value.isascii() or not value.isdigit():
         return None
-    parsed = int(value)
-    return parsed if parsed >= 1 else None
+    digits = value.lstrip("0")
+    if not digits or len(digits) > _MAXIMUM_ID_DIGITS:
+        return None
+    parsed = int(digits)
+    return parsed if parsed <= _MAXIMUM_ID else None
 
 
 def _help_text() -> str:
@@ -640,5 +747,8 @@ def _help_text() -> str:
         "- history\n"
         "- search history <query>\n"
         "- read interaction <id>\n"
-        "- delete interaction <id>"
+        "- delete interaction <id>\n"
+        "- audit\n"
+        "- read audit <id>\n"
+        "- delete audit <id>"
     )

@@ -1169,6 +1169,93 @@ they find gets its own focused `fix/<topic>` branch, never a release branch.
   approval-gates its entire model-originated execution surface: every compiled plan is
   shown and approved before it runs, with no automatic execution of any kind. The narrow
   read-only automatic-research exception is introduced separately by V1-27.
+- Owner-approved amendment (V1-18-R1). The V1-18 read-only entry audit found one
+  conflict in this entry and several points it left undecided, and the owner approved
+  the resolution below in writing before the branch opened. This entry is amended in the
+  V1-18 pull request itself.
+  - Findings: this entry's approval gate could not coexist with its statement that
+    compiled plans pass through `PermissionManager` unchanged, because
+    `PermissionManager` allows all three model-eligible actions outright. The audit
+    lifecycle, proposal detection, request instructions, and argument rendering were
+    undecided.
+  - Mandatory approval:
+    - Every plan the compiler produces carries the `MODEL` origin, a new plan field whose
+      default is `DETERMINISTIC`.
+    - Brain requires exactly one owner approval for a `MODEL` plan even when its
+      permission decision is `ALLOWED`, and a `DENIED` decision refuses before any
+      approval or audit.
+    - The permission decisions themselves are unchanged and still apply; the approval
+      requirement is Brain's, not a `PermissionManager` entry.
+    - A `MODEL` plan is transient, has exactly one step and no canned response, and
+      bypasses `prepare_confirmation`.
+    - The approved plan is that same immutable plan. At confirmation and dispatch it is
+      checked again against its shape and origin, the allowlist, the current registry's
+      eligibility, its contract, and current permissions, without reparsing, rebuilding,
+      substituting arguments, or calling a provider.
+    - At confirmation the session checks the plan's exact type, its origin, and a model
+      plan's shape before taking its fingerprint, which reads the origin and every
+      step. A plan it cannot fingerprint gets the same fixed refusal as one whose
+      fingerprint no longer matches.
+  - Proposal classification:
+    - A reply is a proposal attempt when its first character after JSON whitespace is
+      `{`; every other reply stays conversational text.
+    - A refused proposal answers with a fixed message and is never repaired or retried.
+    - No proposal, refusal, approval prompt, or model-backed result becomes a retained
+      exchange or an interaction row.
+  - Request instructions and budget:
+    - Each model-backed request carries Maria's fixed proposal instructions. A closed,
+      exactly boolean request flag selects them and is off by default; with it off a
+      request is exactly what it was.
+    - The instructions are merged with the context instructions into one system message.
+    - Budgeting reserves the request and every required instruction and separator byte
+      first, then fits optional context, then earlier exchanges.
+    - A request that cannot fit with its instructions is refused with the existing
+      over-budget failure and no provider call; it is never sent without them.
+  - Execution-attempt semantics:
+    - An audit summary records an approved execution attempt that Maria authorised for
+      dispatch; it does not prove the tool ran.
+    - The summary is committed before dispatch, and the dispatch is refused when it
+      cannot be. The outcome, `succeeded` or `failed`, is appended afterwards.
+    - A summary without an outcome means the execution is unknown, and the tool is never
+      rerun automatically.
+  - Storage and deletion:
+    - Schema version 5 has two tables, `audit_summaries` and `audit_outcomes`, created by
+      one appended migration, `create_audit_summaries`.
+    - Deleting by id removes one logical summary: its summary row and its optional
+      outcome row, together in one transaction. Summary ids are never reused.
+    - The owner approved this deletion of one logical summary under V1-18-R1.
+      "Permanent Safety and Privacy Boundaries" names it as the one exception to
+      the rule that a destructive or lifecycle action targets at most one row,
+      and every other lifecycle action keeps that rule.
+  - Owner-visible surface:
+    - The commands are `audit`, `read audit <id>`, and `delete audit <id>`, and the last
+      always requires confirmation.
+    - No audit action is model-eligible, and no summary becomes model context.
+    - The approval renders the declared tool, the action, and every argument value
+      exactly, through a reversible approval-specific quoter, with no truncation.
+  - Permission-risk assessment for the three new actions, all `NOT_MODEL_ELIGIBLE`:
+    - `audit.list` and `audit.read` are `ALLOWED`. They read only Maria's own
+      content-free audit vocabulary and change nothing. They never reach the model or
+      its context, and history records only a fixed label and an id.
+    - `audit.delete` is `REQUIRES_CONFIRMATION` and joins the mandatory set, so
+      configuration cannot remove it. Deleting a summary removes the record of a
+      model-proposed action and cannot be undone. It also leaves untouched whatever the
+      operational log may still show, which its fixed notice tells the owner.
+  - Footprint: the owner-approved scope is wider than "Architecture affected" names. It
+    adds:
+    - the plan origin in `core/planner.py`;
+    - the request instructions in `core/reasoning.py`, `core/ollama_adapter.py`, and
+      `core/conversation.py`;
+    - rendering and approval in `core/session.py`;
+    - `core/action_contracts.py`, `core/permissions.py`, `core/tool_manager.py`, the
+      schema constant, and the schema migration;
+    - the new `tools/audit.py`;
+    - fixed `filesystem.list` logging in `tools/filesystem.py`.
+  - The closed audit vocabulary and its validation live in a new `core/audit.py`, which
+    the owner kept after reviewing this stage. It holds no SQL, input, output, or
+    logging. The memory layer, Brain, and the audit tool share it, so `core.memory`'s
+    guarded import boundary, under which only `Memory` may be imported from it, does
+    not widen.
 - Owner-visible result: Maria can act on natural language. The owner asks in their own
   words, Maria shows a resolved plan naming the tool, action, and exact arguments, and
   executes it only after approval. Anything not explicitly allowlisted is refused with a
@@ -1181,17 +1268,37 @@ they find gets its own focused `fix/<topic>` branch, never a release branch.
   re-plan, re-call the model, or substitute arguments after approval, and a changed plan
   invalidates approval, asserted by a test counting zero provider invocations between
   approval and execution. Compiled plans still pass through `PermissionManager`
-  unchanged, so denial and confirmation behavior is identical to deterministic plans.
+  unchanged, so a denied action is refused exactly as for a deterministic plan, and
+  under V1-18-R1 every compiled plan also needs the owner's one approval whatever
+  `PermissionManager` decides.
   The audit summary stores action, decision, outcome, and a non-sensitive target only,
   never raw prompts, raw responses, selected private context, or returned private
   content, and sensitive target identity is redacted or generalised. Audit records are
-  append-only; deletion is single-row, by id, and confirmation-required. Existing
-  deterministic commands keep their current recording behavior unchanged.
+  append-only; deletion removes one logical summary, by id, and is
+  confirmation-required. Existing deterministic commands keep their current recording
+  behavior unchanged.
 - Non-goals: No multi-step plans yet, which is V1-19. No model-originated filesystem
   mutation: rename, move, and organization stay deterministic-only until V1-25. No
   research and no network access from the compiler. No tool creation, code generation,
   or code execution. No permission, configuration, or scope change originating from
   model output.
+- Deliberate deterministic-command exceptions: the three audit commands are new, and
+  every existing command keeps its text and recording behavior, with three exceptions:
+  - `help` lists the three new commands.
+  - The filesystem `list` action logs fixed lines without its path or exception text,
+    while what the owner sees from a listing is unchanged.
+  - The thirteen ID-only planner commands share one parser, corrected at the owner's
+    request on reviewing this stage; `read note <id or exact title>` uses its
+    separate, unchanged lookup path. The parser strips leading zeroes however many
+    there are and refuses more than 19 significant digits before any conversion. It
+    then converts at most 19 digits and compares the result with 9223372036854775807,
+    SQLite's largest integer, which no record's id can exceed. Each of the thirteen
+    answers a larger id with its existing invalid-id response before any step,
+    approval, or model call. Because the parser never converts more than 19 digits,
+    Python's limit on converting long digit strings, which stays in force, is never
+    reached. Before, such an id reached the tool and failed, and an operand of more
+    than 4,300 digits, leading zeroes included, stopped the command line with an
+    unhandled error.
 - Completion criteria: The owner has decided in writing, before the branch is opened,
   the owner-visible audit-summary retrieval and lifecycle surface, meaning how audit
   summaries are listed, read, and removed; the exact command grammar is not fixed here.
@@ -1934,7 +2041,10 @@ These hold across every version and are not superseded by any release section.
   disabled.
 - Destructive and lifecycle actions target at most one row, selected by a positive
   decimal integer id with a minimum value of 1, and no cascade between record types
-  exists without a deliberate documented decision.
+  exists without a deliberate documented decision. The one exception, approved by the
+  owner under V1-18-R1, is `audit.delete`: it removes one logical audit summary, its
+  summary row and its optional outcome row together, in one transaction. Every other
+  destructive and lifecycle action still targets at most one row.
 - Bulk, wildcard, clear-all, or date-range mutation, automatic retention or pruning,
   undo or revision history, a secure-erasure guarantee, and encryption at rest are not
   permanently forbidden. None of them may be added without a separate owner-approved

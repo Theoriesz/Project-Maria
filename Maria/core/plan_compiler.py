@@ -19,8 +19,11 @@ something beneath the default named root; resolved containment and the
 permanent exclusions stay with ``FilesystemRoots`` and ``FilesystemTool``
 when a plan eventually runs.
 
-Nothing reaches this module yet. Brain does not import it, so no model output
-can currently become an action.
+Brain is the one production module that reaches this one. It hands a
+proposal attempt to ``compile_proposal``, and it asks ``recheck_model_plan``
+about the compiled plan again when it offers that plan for the owner's
+approval and once more just before the approved plan runs. A compiled plan
+is model-originated, so Brain never runs it without that approval.
 
 Privacy follows ``core/failures.py``. A rejection is an enum member and
 nothing else, so it cannot carry the proposal, a tool, action, or argument
@@ -47,7 +50,14 @@ from core.action_contracts import (
     ModelEligibility,
 )
 from core.logger import get_logger
-from core.planner import Plan, PlanStep, RecordingPolicy
+from core.planner import (
+    Plan,
+    PlanArguments,
+    PlanOrigin,
+    PlanStep,
+    RecordingPolicy,
+    is_model_plan,
+)
 from core.reasoning import ReasoningResponse
 
 
@@ -198,6 +208,9 @@ COMPILER_RESPONSE_MESSAGE = (
 COMPILER_CONTRACTS_MESSAGE = (
     "Model proposals must be checked against an ActionContractRegistry."
 )
+COMPILER_PLAN_MESSAGE = (
+    "Only a well-formed model-originated plan can be checked again."
+)
 
 
 class _StrictJsonError(ValueError):
@@ -224,7 +237,7 @@ def compile_proposal(
     declared order. Only a proposal passing all of them becomes a plan: the
     existing immutable, fingerprinted ``Plan`` holding exactly one step,
     named by Maria's own declared tool and action, with the arguments exactly
-    as supplied, and recorded as ``TRANSIENT``.
+    as supplied, recorded as ``TRANSIENT``, and of origin ``MODEL``.
 
     A caller passing anything but cleaned request text, an exact
     ``ReasoningResponse``, or an exact registry receives ``ValueError`` with
@@ -247,6 +260,43 @@ def compile_proposal(
     return outcome
 
 
+def recheck_model_plan(
+    plan: Plan,
+    contracts: ActionContractRegistry,
+    logger: Logger | None = None,
+) -> ProposalRejection | None:
+    """Check an already compiled plan again, exactly as it stands.
+
+    Brain asks this when it offers a compiled plan for approval and again
+    just before the approved plan runs, because an approval authorises a
+    plan rather than freezing the registry that was current when the plan
+    was shown. Nothing is parsed, rebuilt, repaired, defaulted, or
+    substituted, and no provider is asked anything: the plan's one step is
+    checked as it is against the closed allowlist, the model eligibility
+    ``contracts`` declares now, the argument contract, and the text and path
+    checks, in that order, and the first failure is returned, or None when
+    every gate still passes.
+
+    A value that is not a well-formed model-originated plan, or a registry
+    that is not exactly an ``ActionContractRegistry``, raises ``ValueError``
+    with a fixed message. A refusal logs its code and nothing else.
+    """
+    if type(contracts) is not ActionContractRegistry:
+        raise ValueError(COMPILER_CONTRACTS_MESSAGE)
+    if not is_model_plan(plan):
+        raise ValueError(COMPILER_PLAN_MESSAGE)
+
+    step = plan.steps[0]
+    outcome = _checked_step(step.tool_name, step.action, step.arguments, contracts)
+    if type(outcome) is ProposalRejection:
+        (logger or get_logger(__name__)).warning(
+            "Refused a compiled model plan: code=%s",
+            outcome.code,
+        )
+        return outcome
+    return None
+
+
 def _compile(
     request: str,
     text: object,
@@ -266,11 +316,38 @@ def _compile(
         return ProposalRejection.MALFORMED_PROPOSAL
 
     arguments = proposal["arguments"]
-    contract = _eligible_contract(
+    contract = _checked_step(
         proposal["tool"],
         proposal["action"],
+        arguments,
         contracts,
     )
+    if type(contract) is ProposalRejection:
+        return contract
+
+    return Plan(
+        original_request=request,
+        steps=(PlanStep(contract.tool_name, contract.action, arguments),),
+        recording=RecordingPolicy.TRANSIENT,
+        origin=PlanOrigin.MODEL,
+    )
+
+
+def _checked_step(
+    tool_name: str,
+    action: str,
+    arguments: dict[str, object] | PlanArguments,
+    contracts: ActionContractRegistry,
+) -> ActionContract | ProposalRejection:
+    """Return the contract of a step every gate admits, or the first refusal.
+
+    The gates are the allowlist together with the contract's eligibility,
+    the argument contract, and then the text and path checks on each present
+    argument in declared order. ``compile_proposal`` and
+    ``recheck_model_plan`` both apply exactly these, so a plan is checked
+    again by the same gates that compiled it.
+    """
+    contract = _eligible_contract(tool_name, action, contracts)
     if type(contract) is ProposalRejection:
         return contract
 
@@ -287,11 +364,7 @@ def _compile(
         if argument.is_path and not _is_plain_relative_path(value):
             return ProposalRejection.UNSAFE_PATH
 
-    return Plan(
-        original_request=request,
-        steps=(PlanStep(contract.tool_name, contract.action, arguments),),
-        recording=RecordingPolicy.TRANSIENT,
-    )
+    return contract
 
 
 def _utf8_size(text: object) -> int | None:

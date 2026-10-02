@@ -6,18 +6,22 @@ local model, and this module settles that one conversational turn: it settles
 the owner's enabled memory context and what a bounded search found, fits that
 context and the current session's earlier exchanges beside the request within
 a hard budget, asks the provider once through ``request_reasoning``, and
-produces the plan Brain runs. That plan always has zero steps and is always
-transient, whether it carries the model's reply or a fixed failure message,
-so no conversational request or reply is ever recorded and no tool can be
-reached through it.
+produces what Brain acts on. A conversational outcome is a plan that always
+has zero steps and is always transient, whether it carries the model's reply
+or a fixed failure message, so no conversational request or reply is ever
+recorded and no tool can be reached through it.
 
-The reply is inert text. Nothing here parses it, and it can only ever become
-the no-action response of a zero-step plan or the assistant half of an
-exchange. What the owner is told about context is Maria's own text, built
-from the ids she selected and appended after the reply; it never enters the
-model's request or the exchange the session keeps, and nothing a model writes
-can change it. There is no import path from here to permissions, tool
-dispatch, or persistence.
+Nothing here parses a reply. In proposal mode, which Brain's production path
+turns on and which also sends Maria's fixed proposal instructions, a reply
+whose first character after JSON's own whitespace is ``{`` is a proposal
+attempt: it is handed back untouched, for Brain to give to the compiler, and
+is never kept as an exchange. Every other reply is inert text that can only
+ever become the no-action response of a zero-step plan or the assistant half
+of an exchange. What the owner is told about context is Maria's own text,
+built from the ids she selected and shown after the reply or with whatever
+Brain answers a proposal with; it never enters the model's request or the
+exchange the session keeps, and nothing a model writes can change it. There
+is no import path from here to permissions, tool dispatch, or persistence.
 
 The conversation itself belongs to the caller's session, together with the
 fingerprints of every memory and note supplied since that conversation was
@@ -66,12 +70,15 @@ from core.context import (
 )
 from core.failures import Failure, FailureKind
 from core.logger import get_logger
-from core.planner import Plan, RecordingPolicy
+from core.planner import Plan, PlanOrigin, RecordingPolicy
 from core.reasoning import (
+    INSTRUCTION_SEPARATOR,
     REASONING_HISTORY_MESSAGE,
+    REASONING_PROPOSAL_INSTRUCTIONS_MESSAGE,
     ReasoningExchange,
     ReasoningProvider,
     ReasoningRequest,
+    ReasoningResponse,
     ReasoningSettings,
     history_content_bytes,
     request_content_bytes,
@@ -80,10 +87,11 @@ from core.reasoning import (
 
 
 # The most completed exchanges a session keeps, and the most UTF-8 content
-# bytes a conversational request may carry: the current request, the rendered
-# memory context, and the retained exchanges' user and assistant text,
-# counted as ``request_content_bytes`` counts them. A configured input budget
-# narrower than this narrows it further.
+# bytes a conversational request may carry: the current request, Maria's
+# fixed proposal instructions and their separator when the request selects
+# them, the rendered memory context, and the retained exchanges' user and
+# assistant text, counted as ``request_content_bytes`` counts them. A
+# configured input budget narrower than this narrows it further.
 CONVERSATION_MAX_EXCHANGES = 8
 CONVERSATION_MAX_BYTES = 8 * 1024
 
@@ -105,29 +113,70 @@ CONVERSATION_UNSENDABLE_MESSAGE = (
     "That request cannot be sent to the local reasoning model."
 )
 
+# JSON's own whitespace and nothing else: space, tab, carriage return, and
+# line feed. A reply is a proposal attempt when, after only these, it opens
+# with ``{``; any other leading character keeps it conversational text.
+JSON_WHITESPACE = " \t\r\n"
+
 
 @dataclass(frozen=True)
 class ConversationTurn:
     """What one conversational request produced.
 
-    ``plan`` is the zero-step transient plan Brain runs. ``conversation`` is
-    what the session keeps afterwards and ``supplied_context`` the
-    fingerprints of every memory and note supplied since that conversation
-    was last cleared. Both are None when the session keeps what it had, and both are
-    set together otherwise: an explicitly empty conversation clears the
-    session's exchanges and fingerprints alike.
+    A conversational outcome sets ``plan``, the zero-step transient plan
+    Brain runs, whose response already ends with Maria's notices. A proposal
+    attempt sets ``proposal`` instead, the model's reply exactly as it
+    arrived, with ``notices``, Maria's notices about this turn's context,
+    which Brain shows once with whatever it answers; exactly one of the two
+    is set. ``conversation`` is what the session keeps afterwards and
+    ``supplied_context`` the fingerprints of every memory and note supplied
+    since that conversation was last cleared. Both are None when the session
+    keeps what it had, and both are set together otherwise: an explicitly
+    empty conversation clears the session's exchanges and fingerprints
+    alike. A proposal attempt is never kept, so the most it can do to the
+    session is clear it.
     """
 
-    plan: Plan
+    plan: Plan | None
     conversation: tuple[ReasoningExchange, ...] | None = None
     supplied_context: frozenset[ContextFingerprint] | None = None
+    proposal: ReasoningResponse | None = None
+    notices: tuple[str, ...] = ()
 
     def __post_init__(self) -> None:
-        """Refuse a turn that would change one session structure alone."""
+        """Refuse a turn that is neither one outcome nor the other."""
         if (self.conversation is None) != (self.supplied_context is None):
             raise ValueError(
                 "A conversation turn must set its conversation and its "
                 "supplied context together."
+            )
+        if (self.plan is None) == (self.proposal is None):
+            raise ValueError(
+                "A conversation turn must carry exactly one of a plan and a "
+                "proposal."
+            )
+        if self.proposal is None:
+            if self.notices:
+                raise ValueError(
+                    "A conversational turn's notices belong in its plan."
+                )
+            return
+        leaves_session = self.conversation is None
+        clears_session = (
+            type(self.conversation) is tuple
+            and not self.conversation
+            and type(self.supplied_context) is frozenset
+            and not self.supplied_context
+        )
+        if (
+            type(self.proposal) is not ReasoningResponse
+            or not (leaves_session or clears_session)
+            or type(self.notices) is not tuple
+            or any(type(notice) is not str for notice in self.notices)
+        ):
+            raise ValueError(
+                "A proposal turn must carry an exact reply and its notices, "
+                "and can only leave the session alone or clear it."
             )
 
 
@@ -146,6 +195,34 @@ class _SettledReads:
     supplied_notes: tuple[tuple[int, str | None, str | None], ...] = ()
     searched_memories: tuple[tuple[int, str | None], ...] = ()
     searched_notes: tuple[tuple[int, str | None, str | None], ...] = ()
+
+
+def is_proposal_attempt(text: object) -> bool:
+    """Return whether a reply attempts an action proposal, without parsing it.
+
+    That is exact text whose first character, once ``JSON_WHITESPACE`` and
+    nothing else is skipped, is ``{``. Whether the attempt is a valid
+    proposal is the compiler's question, never this one's, so nothing here
+    reads further.
+    """
+    return type(text) is str and text.lstrip(JSON_WHITESPACE).startswith("{")
+
+
+def is_conversational_plan(plan: object) -> bool:
+    """Return whether a value is a conversational outcome's plan and no more.
+
+    That is an exact deterministic ``Plan`` with no steps and the transient
+    policy, which is all ``transient_plan`` ever produces: it can reach no
+    contract, permission, or tool, and it records nothing. Brain accepts
+    nothing else as a conversational outcome.
+    """
+    return (
+        type(plan) is Plan
+        and type(plan.steps) is tuple
+        and not plan.steps
+        and plan.recording is RecordingPolicy.TRANSIENT
+        and plan.origin is PlanOrigin.DETERMINISTIC
+    )
 
 
 def is_generic_fallback(plan: object) -> bool:
@@ -199,16 +276,24 @@ def fitted_history(
     conversation: tuple[ReasoningExchange, ...],
     budget: int,
     context: tuple[ContextItem, ...] = (),
+    proposal_instructions: bool = False,
 ) -> tuple[ReasoningExchange, ...]:
     """Return the newest whole exchanges that fit beside the request.
 
     The oldest exchanges are dropped, whole, until the request, the rendered
-    ``context``, and what is left fit within ``budget`` together. The request
-    and the context must already fit on their own; if they do not, the
-    result is empty.
+    ``context``, any selected proposal instructions, and what is left fit
+    within ``budget`` together. The request, the context, and the
+    instructions must already fit on their own; if they do not, the result
+    is empty.
     """
     kept = bounded_conversation(conversation, budget)
-    while kept and request_content_bytes(request, kept, budget, context) > budget:
+    while kept and request_content_bytes(
+        request,
+        kept,
+        budget,
+        context,
+        proposal_instructions,
+    ) > budget:
         kept = kept[1:]
     return kept
 
@@ -232,8 +317,10 @@ def with_notices(text: str, notices: Sequence[str]) -> str:
 
     A blank line separates them from the text above, so what the model or a
     fixed message said and what Maria reports about context stay visibly
-    apart.
+    apart. With no notices the text is returned exactly as it is.
     """
+    if not notices:
+        return text
     return f"{text}\n\n" + "\n".join(notices)
 
 
@@ -250,8 +337,9 @@ def converse(
     supplied_notes_read: Sequence[object] = (),
     searched_memories_read: Sequence[object] = (),
     searched_notes_read: Sequence[object] = (),
+    proposals: bool = False,
 ) -> ConversationTurn:
-    """Answer one request conversationally, as text only.
+    """Answer one request conversationally, or hand back a proposal attempt.
 
     ``enabled_memories_read`` is what Brain's bounded Tier A read returned,
     or None when Brain's context reads failed. The ``supplied_*`` reads are
@@ -263,23 +351,40 @@ def converse(
     the enabled records rechecked with the same text, the whole earlier
     conversation is discarded before anything is sent.
 
-    A request that cannot be sent, or that is over the budget on its own, is
-    then refused before the provider is asked anything. Otherwise the
-    request comes first, then as much Tier A context as its rule fits, then
-    as many Tier B search matches as fit, memories before notes, then the
-    newest earlier exchanges that fit, and the provider is asked exactly
-    once. When the conversation would then carry more supplied records than
-    Maria rechecks, it is discarded before sending instead. A typed failure
-    becomes its fixed message. A reply whose exchange, request and reply
-    together, would not fit the budget is discarded whole with a fixed
-    message rather than shown, kept, or cut down. Only a reply that passes
-    all of that is shown, and the session then keeps it as its newest
-    exchange, with the fingerprints of the records it was given.
+    ``proposals`` turns on proposal mode and must be exactly True or False.
+    In proposal mode the request selects Maria's fixed proposal
+    instructions, and they are reserved together with the request before
+    anything optional is fitted.
 
-    Every outcome is a zero-step transient plan, and every one ends with
-    Maria's notices about context: which records were supplied, or selected
-    when delivery cannot be established, or that none was.
+    A request that cannot be sent, or that with any selected instructions is
+    over the budget on its own, is then refused before the provider is asked
+    anything; the instructions are never dropped to make it fit. Otherwise
+    the request and the instructions come first, then as much Tier A context
+    as its rule fits, then as many Tier B search matches as fit, memories
+    before notes, with the separator that joins the instructions to the
+    context framing counted against them, then the newest earlier exchanges
+    that fit, and the provider is asked exactly once. When the conversation
+    would then carry more supplied records than Maria rechecks, it is
+    discarded before sending instead. A typed failure becomes its fixed
+    message.
+
+    In proposal mode a reply ``is_proposal_attempt`` recognises is returned
+    untouched as the turn's proposal, with the turn's notices beside it. It
+    is never kept as an exchange and the fingerprints of what it was given
+    are not kept either, so the session changes only if this turn cleared
+    it. Any other reply whose exchange, request and reply together, would
+    not fit the budget is discarded whole with a fixed message rather than
+    shown, kept, or cut down. Only a reply that passes all of that is shown,
+    and the session then keeps it as its newest exchange, with the
+    fingerprints of the records it was given.
+
+    Every other outcome is a zero-step transient plan, and every outcome
+    carries Maria's notices about context exactly once: which records were
+    supplied, or selected when delivery cannot be established, or that none
+    was.
     """
+    if type(proposals) is not bool:
+        raise ValueError(REASONING_PROPOSAL_INSTRUCTIONS_MESSAGE)
     log = logger or get_logger(__name__)
     budget = conversation_budget(settings)
     supplied = validated_supplied_context(supplied_context)
@@ -331,7 +436,8 @@ def converse(
         )
 
     try:
-        request_size = request_content_bytes(request, (), budget)
+        # The request and every instruction it requires, measured together.
+        request_size = request_content_bytes(request, (), budget, (), proposals)
     except ValueError:
         # Text the interface cannot carry, such as a lone surrogate. The
         # refusal is not bound to a name, so nothing about it is kept.
@@ -344,12 +450,18 @@ def converse(
             (NO_MEMORY_CONTEXT_NOTICE,),
         )
 
-    selection = select_memory_context(reads.enabled, budget - request_size)
+    # Context fits in what the request and its instructions leave. In
+    # proposal mode the context framing joins the instructions in one system
+    # message, so the separator between them is part of what context costs.
+    context_budget = budget - request_size
+    if proposals:
+        context_budget -= len(INSTRUCTION_SEPARATOR.encode("utf-8"))
+    selection = select_memory_context(reads.enabled, context_budget)
     search = select_search_context(
         selection.items,
         reads.searched_memories,
         reads.searched_notes,
-        budget - request_size,
+        context_budget,
     )
     context = selection.items + search.items
     if len(_records(supplied) | _records(context)) > SUPPLIED_CONTEXT_MAX_RECORDS:
@@ -360,13 +472,13 @@ def converse(
         cleared = True
         conversation = ()
         supplied = frozenset()
-    history = fitted_history(request, conversation, budget, context)
+    history = fitted_history(request, conversation, budget, context, proposals)
     log.info("Memory context selected: %s item(s).", len(selection.items))
     log.info("Search context selected: %s item(s).", len(search.items))
 
     outcome = request_reasoning(
         provider,
-        ReasoningRequest(request, history, context),
+        ReasoningRequest(request, history, context, proposals),
         settings,
         log,
     )
@@ -379,6 +491,19 @@ def converse(
         )
 
     notices = _context_notices(selection, search, delivered=True)
+    if proposals and is_proposal_attempt(outcome.text):
+        # Handed back untouched for the compiler. A proposal is never kept as
+        # an exchange, so the fingerprints of what this request supplied are
+        # not kept either; only a clearing this turn already made stands.
+        log.info("Model reply is a proposal attempt.")
+        return ConversationTurn(
+            None,
+            () if cleared else None,
+            frozenset() if cleared else None,
+            proposal=outcome,
+            notices=(*before, *notices),
+        )
+
     exchange = ReasoningExchange(request, outcome.text)
     if history_content_bytes((exchange,), budget) > budget:
         log.warning("Conversational reply discarded: exchange over budget.")

@@ -24,11 +24,15 @@ the prompt alone, exactly as before. When the request carries context, two
 messages come first: Maria's fixed context instructions as the system
 message, which never contain stored text, and then the delimited data block
 of memories and notes as a user message of its own, so stored text is only
-ever data. With no context the request is byte for byte what it was before
-context existed, and with Tier A context alone it is byte for byte what it
-was in V1-15. The whole request, context included, is validated and measured
-against the input budget again here, before anything is serialized. Only the
-assistant message's ``content`` comes back, as one inert string.
+ever data. When the request selects Maria's fixed proposal instructions,
+they open the one system message, followed by the context instructions when
+there is context; with no context they are the system message alone. With
+the flag off and no context the request is byte for byte what it was before
+context existed, and with the flag off and Tier A context alone it is byte
+for byte what it was in V1-15. The whole request, context and instructions
+included, is validated and measured against the input budget again here,
+before anything is serialized. Only the assistant message's ``content`` comes
+back, as one inert string.
 Thinking text, tool calls, and every other field of the reply are ignored
 after bounded JSON parsing; only ``message.content`` is returned. This module
 has no import path to planning, permissions, tool dispatch, or persistence,
@@ -63,11 +67,7 @@ import time
 from dataclasses import replace
 from typing import NoReturn
 
-from core.context import (
-    ContextItem,
-    context_instructions,
-    render_context_data,
-)
+from core.context import ContextItem, render_context_data
 from core.failures import Failure, FailureKind, TypedFailureError
 from core.reasoning import (
     REASONING_REQUEST_TYPE_MESSAGE,
@@ -78,6 +78,7 @@ from core.reasoning import (
     ReasoningSettings,
     ReasoningTransport,
     request_content_bytes,
+    system_instructions,
 )
 
 
@@ -167,8 +168,9 @@ class OllamaReasoningProvider:
         """Ask the local runtime one question and return its complete answer.
 
         Raises ``TypedFailureError`` carrying one reasoning kind: input over
-        budget, when the prompt, history, and rendered context together
-        exceed the input budget, before any connection is opened; timeout
+        budget, when the prompt, history, rendered context, and any selected
+        instructions together exceed the input budget, before any connection
+        is opened; timeout
         when the deadline passes at any stage; unavailable when nothing
         answers, or the answer is not success; truncated when the reply ends early or says it is
         incomplete; malformed when it is not the expected shape; and output
@@ -190,25 +192,33 @@ class OllamaReasoningProvider:
         """Run one bounded exchange and settle it as a reply or a failure."""
         deadline = time.monotonic() + self._deadline_seconds
 
-        # The prompt, the history, and the context are read again rather than
-        # trusted from construction, and the whole request is validated and
-        # measured against this adapter's own budget, without being copied
-        # when it is plainly too long, before any of it is serialized.
+        # The prompt, the history, the context, and the instructions flag are
+        # read again rather than trusted from construction, and the whole
+        # request is validated and measured against this adapter's own
+        # budget, without being copied when it is plainly too long, before
+        # any of it is serialized.
         prompt = request.prompt
         history = getattr(request, "history", None)
         context = getattr(request, "context", None)
+        proposal_instructions = getattr(request, "proposal_instructions", None)
         size = request_content_bytes(
             prompt,
             history,
             self._max_input_bytes,
             context,
+            proposal_instructions,
         )
         if size > self._max_input_bytes:
             return Failure(FailureKind.REASONING_INPUT_OVER_BUDGET)
 
         try:
             body = self._converse(
-                self._request_bytes(prompt, history, context),
+                self._request_bytes(
+                    prompt,
+                    history,
+                    context,
+                    proposal_instructions,
+                ),
                 deadline,
             )
         except TypedFailureError as stopped:
@@ -220,18 +230,21 @@ class OllamaReasoningProvider:
         prompt: str,
         history: tuple[ReasoningExchange, ...],
         context: tuple[ContextItem, ...] = (),
+        proposal_instructions: bool = False,
     ) -> bytes:
         """Return the one HTTP request: the model and the conversation.
 
         Each earlier exchange becomes a user message and then an assistant
         message, oldest first, and the prompt is the final user message.
-        Context, when there is any, comes first as two messages: Maria's
-        fixed context instructions as the system message, and the delimited
-        data block as a user message, so no stored text is ever placed in a
-        system-level instruction. With no context there is no system message
-        at all. There is no template, option, tool, or thinking request, and
-        no credential or proxy header. The request line names only the path,
-        never a scheme or host.
+        Maria's fixed instructions, when there are any, come first as the one
+        system message: the proposal instructions when the request selects
+        them, then the context instructions when there is context. Context
+        then follows as the delimited data block in a user message of its
+        own, so no stored text is ever placed in a system-level instruction.
+        With neither there is no system message at all. There is no
+        template, option, tool, or thinking request, and no credential or
+        proxy header. The request line names only the path, never a scheme
+        or host.
         """
         messages = [
             message
@@ -243,9 +256,11 @@ class OllamaReasoningProvider:
         ]
         if context:
             messages[:0] = [
-                {"role": "system", "content": context_instructions(context)},
                 {"role": "user", "content": render_context_data(context)},
             ]
+        instructions = system_instructions(context, proposal_instructions)
+        if instructions is not None:
+            messages[:0] = [{"role": "system", "content": instructions}]
         messages.append({"role": "user", "content": prompt})
         body = json.dumps(
             {

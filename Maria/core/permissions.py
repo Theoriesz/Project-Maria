@@ -12,6 +12,7 @@ from core.logger import get_logger
 
 MANDATORY_CONFIRMATION_ACTIONS = frozenset(
     {
+        "audit.delete",
         "filesystem.rename",
         "filesystem.move",
         "history.delete",
@@ -32,6 +33,11 @@ MANDATORY_CONFIRMATION_ACTIONS = frozenset(
 # text and interpolates nothing, so no stored content can reach it.
 CONFIRMATION_NOTICES = MappingProxyType(
     {
+        "audit.delete": (
+            "Deleting an audit summary removes it from Maria's database. It "
+            "does not undo the action, and Maria's operational log may still "
+            "show that a model-proposed action ran."
+        ),
         "memory.enable_context": (
             "Once enabled, this memory may be sent to your local reasoning "
             "model on any conversational turn, within Maria's memory context "

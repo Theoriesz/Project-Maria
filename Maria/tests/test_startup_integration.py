@@ -112,7 +112,13 @@ class StartupIntegrationTests(unittest.TestCase):
 
         table_names = {str(row[0]) for row in rows}
         self.assertTrue(
-            {"interactions", "notes", "memories"}.issubset(table_names)
+            {
+                "interactions",
+                "notes",
+                "memories",
+                "audit_summaries",
+                "audit_outcomes",
+            }.issubset(table_names)
         )
 
     def test_clean_start_stamps_the_database_with_the_current_schema(self) -> None:
@@ -180,6 +186,7 @@ class StartupIntegrationTests(unittest.TestCase):
 
     def test_real_tools_load_and_calculator_executes(self) -> None:
         expected_tool_names = {
+            "audit",
             "calculator",
             "filesystem",
             "history",

@@ -5,9 +5,10 @@ from __future__ import annotations
 import inspect
 import logging
 import unittest
-from unittest.mock import Mock, patch
+from unittest.mock import Mock, call, patch
 
 import core.session as session_module
+from core.action_contracts import BUILT_IN_ACTION_CONTRACTS
 from core.brain import BrainResponse, MariaBrain
 from core.config import MariaConfig
 from core.memory import Memory
@@ -16,13 +17,14 @@ from core.permissions import (
     PermissionManager,
     PermissionResult,
 )
-from core.planner import Plan, Planner, PlanStep
+from core.planner import Plan, Planner, PlanOrigin, PlanStep, RecordingPolicy
 from core.session import (
     CONFIRMATION_REFUSED_MESSAGE,
     MariaSession,
     PendingApproval,
 )
 from core.tool_manager import PreparedConfirmation, ToolExecutionResult, ToolManager
+from tests.test_reasoning import rendered
 
 
 ALLOWED = PermissionResult(PermissionDecision.ALLOWED, "allowed")
@@ -41,6 +43,9 @@ RENAME_REQUEST = "rename old.txt to new.txt"
 RENAME_ARGUMENTS = {"source": "old.txt", "destination": "new.txt"}
 SENTINEL_REQUEST = "session-sentinel-request-a31f9c"
 SENTINEL_ARGUMENT = "session-sentinel-argument-7d40be"
+# The whole repr of every pending approval, written out so it is pinned
+# rather than agreed with.
+REDACTED_APPROVAL = "PendingApproval(<redacted>)"
 
 
 def _rename_plan(
@@ -57,6 +62,19 @@ def _rename_plan(
                 {"source": "old.txt", "destination": destination},
             ),
         ),
+    )
+
+
+def _model_plan(
+    request: str = SENTINEL_REQUEST,
+    path: str = SENTINEL_ARGUMENT,
+) -> Plan:
+    """Return a well-formed model-originated plan, as the compiler builds one."""
+    return Plan(
+        original_request=request,
+        steps=(PlanStep("filesystem", "list", {"path": path}),),
+        recording=RecordingPolicy.TRANSIENT,
+        origin=PlanOrigin.MODEL,
     )
 
 
@@ -198,6 +216,62 @@ class PlanBindingTests(SessionTestCase):
             pending.plan = _rename_plan("a different request")
 
 
+class PendingApprovalRedactionTests(SessionTestCase):
+    """Verify a pending approval's repr names its type and nothing it holds."""
+
+    def test_the_repr_is_exactly_the_redacted_type_name(self) -> None:
+        plan = self._pend(
+            _rename_plan(SENTINEL_REQUEST, destination=SENTINEL_ARGUMENT)
+        )
+        pending = self.session.pending_approval
+
+        self.assertEqual(repr(pending), REDACTED_APPROVAL)
+        # Only what is displayed is redacted: the plan and the fingerprint
+        # captured with it are both still held.
+        self.assertIs(pending.plan, plan)
+        self.assertEqual(pending.fingerprint, plan.fingerprint)
+
+    def test_no_formatting_route_shows_the_plan_or_its_fingerprint(self) -> None:
+        for plan in (
+            _rename_plan(SENTINEL_REQUEST, destination=SENTINEL_ARGUMENT),
+            _model_plan(),
+        ):
+            shown = rendered(PendingApproval(plan, plan.fingerprint))
+            for secret in (
+                SENTINEL_REQUEST,
+                SENTINEL_ARGUMENT,
+                plan.fingerprint,
+                plan.steps[0].tool_name,
+                plan.steps[0].action,
+                "Plan(",
+                "PlanStep(",
+                "PlanArguments(",
+                "original_request",
+                "fingerprint",
+            ):
+                with self.subTest(origin=plan.origin.value, secret=secret):
+                    self.assertNotIn(secret, shown)
+
+    def test_a_pending_model_plan_is_redacted_the_same_way(self) -> None:
+        # Brain re-checks a model plan against the registry Tool Manager
+        # holds, which a spec'd mock does not carry until it is given one.
+        self.tool_manager.contracts = BUILT_IN_ACTION_CONTRACTS
+        plan = _model_plan()
+        self.planner.create_plan.return_value = plan
+
+        response = self.session.submit(SENTINEL_REQUEST)
+        pending = self.session.pending_approval
+
+        self.assertTrue(response.needs_confirmation)
+        self.assertIs(pending.plan, plan)
+        self.assertEqual(pending.fingerprint, plan.fingerprint)
+        self.assertEqual(repr(pending), REDACTED_APPROVAL)
+        # The owner is shown the argument; the approval held for it is not.
+        self.assertIn(SENTINEL_ARGUMENT, response.text)
+        self.assertNotIn(SENTINEL_ARGUMENT, rendered(pending))
+        self.tool_manager.execute_tool.assert_not_called()
+
+
 class MismatchRefusalTests(SessionTestCase):
     """Verify a plan that no longer matches its approval runs nothing."""
 
@@ -260,6 +334,51 @@ class MismatchRefusalTests(SessionTestCase):
         self.assertEqual(refusal.text, CONFIRMATION_REFUSED_MESSAGE)
         self.planner.create_plan.assert_not_called()
         self.tool_manager.execute_tool.assert_not_called()
+
+    def test_a_plan_that_can_no_longer_be_fingerprinted_is_refused(self) -> None:
+        tampers = (
+            ("no steps at all", lambda plan: object.__setattr__(plan, "steps", None)),
+            (
+                "an argument value JSON cannot hold",
+                lambda plan: object.__setattr__(
+                    plan.steps[0],
+                    "arguments",
+                    {"source": object(), "destination": "new.txt"},
+                ),
+            ),
+        )
+        for label, tamper in tampers:
+            with self.subTest(tamper=label):
+                plan = self._pend()
+                tamper(plan)
+                self.assertRaises(TypeError, getattr, plan, "fingerprint")
+
+                refusal = self.session.confirm()
+
+                self.assertEqual(refusal, BrainResponse(CONFIRMATION_REFUSED_MESSAGE))
+                self.assertIsNone(self.session.pending_approval)
+
+        self.tool_manager.execute_tool.assert_not_called()
+        self.memory.record_interaction.assert_not_called()
+        self.memory.record_audit_summary.assert_not_called()
+        # Only the fixed line is logged: nothing of the failure itself.
+        self.assertEqual(
+            self.session_logger.warning.call_args_list,
+            [call("Refused a confirmation that binds no pending plan.")] * 2,
+        )
+
+    def test_a_pending_approval_holding_no_plan_is_refused(self) -> None:
+        self._pend()
+        # PendingApproval is frozen, so only code reaching past it could
+        # leave it holding anything but a Plan.
+        self.session._pending = PendingApproval(object(), "0" * 64)
+
+        refusal = self.session.confirm()
+
+        self.assertEqual(refusal, BrainResponse(CONFIRMATION_REFUSED_MESSAGE))
+        self.assertIsNone(self.session.pending_approval)
+        self.tool_manager.execute_tool.assert_not_called()
+        self.memory.record_interaction.assert_not_called()
 
 
 class ReplayAndCancellationTests(SessionTestCase):
@@ -627,6 +746,42 @@ class SessionLoggingPrivacyTests(unittest.TestCase):
         self.session.confirm()
 
         self.assertTrue(self.records)
+        self._assert_logs_are_clean()
+
+    def test_model_plan_lifecycles_log_no_plan_or_request_content(self) -> None:
+        # Brain re-checks a model plan against the registry Tool Manager
+        # holds, and runs it only behind a recorded audit summary, so the
+        # spec'd mocks are given both.
+        self.tool_manager.contracts = BUILT_IN_ACTION_CONTRACTS
+        self.memory.record_audit_summary.return_value = 7
+        self.plan = _model_plan()
+        self.planner.create_plan.return_value = self.plan
+
+        shown = self.session.submit(SENTINEL_REQUEST)
+        confirmed = self.session.confirm()
+        self.session.submit(SENTINEL_REQUEST)
+        self.session.cancel()
+
+        # The owner saw the argument, and the approved plan really ran.
+        self.assertTrue(shown.needs_confirmation)
+        self.assertIn(SENTINEL_ARGUMENT, shown.text)
+        self.tool_manager.execute_tool.assert_called_once_with(
+            "filesystem",
+            "list",
+            {"path": SENTINEL_ARGUMENT},
+        )
+        self.assertEqual(confirmed.text, "done\n\nRecorded as audit summary 7.")
+        # The capture is live on the model path itself: its offer and its
+        # dispatch were both logged here, by declared names and summary id.
+        logged = "\n".join(self.records)
+        for line in (
+            "Owner approval required for model-proposed action: filesystem.list",
+            "Dispatching approved model-proposed action filesystem.list under "
+            "audit summary 7.",
+            "Pending approval cancelled.",
+        ):
+            with self.subTest(line=line):
+                self.assertIn(line, logged)
         self._assert_logs_are_clean()
 
 

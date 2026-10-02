@@ -13,6 +13,19 @@ from logging import Logger
 from pathlib import Path
 from typing import Any
 
+from core.audit import (
+    AUDIT_QUERY_LIMIT,
+    AUDIT_SUMMARY_ID_MESSAGE,
+    AUDIT_SUMMARY_MESSAGE,
+    AuditDecision,
+    AuditOutcome,
+    AuditSummary,
+    AuditTarget,
+    audit_timestamp,
+    is_audit_summary_id,
+    is_audit_timestamp,
+    is_audited_action,
+)
 from core.constants import (
     DATABASE_SCHEMA_VERSION,
     DEFAULT_DATABASE_BUSY_TIMEOUT_SECONDS,
@@ -64,12 +77,14 @@ _UNVERSIONED_SCHEMA = 0
 # Maria ever created, before explicit memories existed. Version 2 adds the
 # ``memories`` table and is the published v0.2.0 baseline. Version 3 adds the
 # per-memory context-consent column. Version 4 adds the per-note context
-# consent column, which holds the approved text's identity. The current
-# version lives in ``core.constants`` as ``DATABASE_SCHEMA_VERSION``.
+# consent column, which holds the approved text's identity. Version 5 adds the
+# two audit-summary tables. The current version lives in ``core.constants`` as
+# ``DATABASE_SCHEMA_VERSION``.
 _SCHEMA_BEFORE_EXPLICIT_MEMORIES = 1
 _SCHEMA_V0_2_BASELINE = 2
 _SCHEMA_MEMORY_CONTEXT_CONSENT = 3
 _SCHEMA_NOTE_CONTEXT_CONSENT = 4
+_SCHEMA_AUDIT_SUMMARIES = 5
 
 # The live schema. These statements describe the database this build expects
 # and are what a brand-new database is created from, so they move whenever the
@@ -117,6 +132,29 @@ _CREATE_MEMORIES_TABLE = """
     )
 """
 
+# ``audit_summaries`` holds one row for each approved model-proposed execution
+# attempt Maria authorised for dispatch, and ``audit_outcomes`` the outcome
+# appended after dispatch, at most one per summary, keyed by the summary's id.
+# Every stored value is Maria's own, from the closed vocabulary in
+# ``core/audit.py``. AUTOINCREMENT keeps a deleted summary's id from ever
+# being reused, so an outcome can never attach to a later summary.
+_CREATE_AUDIT_SUMMARIES_TABLE = """
+    CREATE TABLE IF NOT EXISTS audit_summaries (
+        id INTEGER PRIMARY KEY AUTOINCREMENT,
+        created_at TEXT NOT NULL,
+        action TEXT NOT NULL,
+        decision TEXT NOT NULL,
+        target TEXT NOT NULL
+    )
+"""
+
+_CREATE_AUDIT_OUTCOMES_TABLE = """
+    CREATE TABLE IF NOT EXISTS audit_outcomes (
+        summary_id INTEGER PRIMARY KEY,
+        outcome TEXT NOT NULL
+    )
+"""
+
 _CREATE_INTERACTIONS_INDEX = """
     CREATE INDEX IF NOT EXISTS idx_interactions_created_at
         ON interactions (created_at)
@@ -131,6 +169,8 @@ _CURRENT_SCHEMA_STATEMENTS: tuple[str, ...] = (
     _CREATE_INTERACTIONS_TABLE,
     _CREATE_NOTES_TABLE,
     _CREATE_MEMORIES_TABLE,
+    _CREATE_AUDIT_SUMMARIES_TABLE,
+    _CREATE_AUDIT_OUTCOMES_TABLE,
     _CREATE_INTERACTIONS_INDEX,
     _CREATE_NOTES_INDEX,
 )
@@ -229,6 +269,25 @@ _ADD_NOTE_CONTEXT_CONSENT_COLUMN = """
         CHECK (context_digest IS NULL OR length(context_digest) = 64)
 """
 
+# The two tables the version 5 step creates, frozen with the version 5
+# schema. Both start empty, and the step touches no existing table or row.
+_HISTORICAL_AUDIT_SUMMARIES_TABLE = """
+    CREATE TABLE audit_summaries (
+        id INTEGER PRIMARY KEY AUTOINCREMENT,
+        created_at TEXT NOT NULL,
+        action TEXT NOT NULL,
+        decision TEXT NOT NULL,
+        target TEXT NOT NULL
+    )
+"""
+
+_HISTORICAL_AUDIT_OUTCOMES_TABLE = """
+    CREATE TABLE audit_outcomes (
+        summary_id INTEGER PRIMARY KEY,
+        outcome TEXT NOT NULL
+    )
+"""
+
 # Every version's complete schema, newest first. A marker is never taken at
 # its word: whatever version a database claims, its structure is checked
 # against the entry for that version before anything is migrated, so a file
@@ -237,6 +296,18 @@ _ADD_NOTE_CONTEXT_CONSENT_COLUMN = """
 # one up to DATABASE_SCHEMA_VERSION therefore needs an entry here, and the
 # migration ladder refuses to run if one is missing.
 _FROZEN_SCHEMAS: tuple[tuple[int, tuple[str, ...]], ...] = (
+    (
+        _SCHEMA_AUDIT_SUMMARIES,
+        (
+            _HISTORICAL_INTERACTIONS_TABLE,
+            _HISTORICAL_NOTES_TABLE_WITH_CONTEXT_CONSENT,
+            _HISTORICAL_MEMORIES_TABLE_WITH_CONTEXT_CONSENT,
+            _HISTORICAL_AUDIT_SUMMARIES_TABLE,
+            _HISTORICAL_AUDIT_OUTCOMES_TABLE,
+            _HISTORICAL_INTERACTIONS_INDEX,
+            _HISTORICAL_NOTES_INDEX,
+        ),
+    ),
     (
         _SCHEMA_NOTE_CONTEXT_CONSENT,
         (
@@ -334,6 +405,14 @@ _MIGRATIONS: tuple[_Migration, ...] = (
         name="add_note_context_consent",
         statements=(_ADD_NOTE_CONTEXT_CONSENT_COLUMN,),
     ),
+    _Migration(
+        version=_SCHEMA_AUDIT_SUMMARIES,
+        name="create_audit_summaries",
+        statements=(
+            _HISTORICAL_AUDIT_SUMMARIES_TABLE,
+            _HISTORICAL_AUDIT_OUTCOMES_TABLE,
+        ),
+    ),
 )
 
 
@@ -348,6 +427,24 @@ _FACT_DIGEST_PATTERN = re.compile(r"[0-9a-f]{64}")
 # other tests whether a note's title and body are still its approved text.
 _CONTEXT_MATCH_FUNCTION = "maria_context_match"
 _NOTE_APPROVED_FUNCTION = "maria_note_approved"
+
+# The reasons an audit call's log line may give. Each is this module's own
+# fixed phrase: nothing SQLite reports and nothing a stored row holds ever
+# joins one, so an audit failure logs no stored value and no SQLite text.
+_AUDIT_DATABASE_BUSY = "database busy"
+_AUDIT_DATABASE_ERROR = "database error"
+_AUDIT_NO_ROW_INSERTED = "no row was inserted"
+_AUDIT_INVALID_ID = "no valid id was returned"
+_AUDIT_UNEXPECTED_VALUE = "a stored value is outside the audit vocabulary"
+_AUDIT_LIMIT_MESSAGE = (
+    "An audit summary listing limit must be a whole number from 1 to "
+    f"{AUDIT_QUERY_LIMIT}."
+)
+
+# The largest value SQLite can store as an INTEGER, and so the largest id any
+# row can have. A larger id names no row, so it is answered without being
+# handed to SQLite, which could not even bind it.
+_SQLITE_MAXIMUM_INTEGER = 2**63 - 1
 
 
 @dataclass(frozen=True)
@@ -2044,6 +2141,250 @@ class Memory:
             self.logger.info("Deleted note %s.", note_id)
         return deleted
 
+    def record_audit_summary(
+        self,
+        action: str,
+        decision: AuditDecision,
+        target: AuditTarget,
+    ) -> int:
+        """Append one audit summary, commit it, and return its new id.
+
+        ``action`` must be an audited action's canonical identifier, and
+        ``decision`` and ``target`` exact members of their vocabularies;
+        anything else raises ``ValueError`` with a fixed message before the
+        database is opened. The timestamp is Maria's own, and it is
+        validated against the audit vocabulary too. The summary is
+        committed before this returns, so a caller that dispatches only once
+        it holds the id can never run an action whose summary is not stored.
+
+        Every failure raises ``RuntimeError`` with a fixed message and with
+        no cause or context: SQLite refusing or failing the insert or its
+        commit, a database still busy or locked once the busy timeout has
+        passed, an insert that added no row, and an id that is not an exact
+        positive int. The log records one fixed line and nothing stored.
+        """
+        if not (
+            is_audited_action(action)
+            and type(decision) is AuditDecision
+            and type(target) is AuditTarget
+        ):
+            raise ValueError(AUDIT_SUMMARY_MESSAGE)
+
+        # Maria's own timestamp is validated like every other field, so no
+        # value outside the vocabulary is ever written.
+        created_at = audit_timestamp()
+        if not is_audit_timestamp(created_at):
+            raise ValueError(AUDIT_SUMMARY_MESSAGE)
+        summary_id: object = None
+        inserted = False
+        failure: str | None = None
+        try:
+            with self._connection(classify_contention=False) as connection:
+                cursor = connection.execute(
+                    """
+                    INSERT INTO audit_summaries (created_at, action, decision, target)
+                    VALUES (?, ?, ?, ?)
+                    """,
+                    (created_at, action, decision.value, target.value),
+                )
+                inserted = cursor.rowcount == 1
+                summary_id = cursor.lastrowid
+        except sqlite3.Error as exc:
+            failure = _audit_failure_reason(exc)
+        if failure is None and not inserted:
+            failure = _AUDIT_NO_ROW_INSERTED
+        if failure is None and not is_audit_summary_id(summary_id):
+            failure = _AUDIT_INVALID_ID
+        if failure is not None:
+            raise self._audit_failure("record audit summary", failure)
+        self.logger.info("Recorded audit summary %s.", summary_id)
+        return summary_id
+
+    def record_audit_outcome(
+        self,
+        summary_id: int,
+        outcome: AuditOutcome,
+    ) -> None:
+        """Append the one outcome of an audit summary that still exists.
+
+        The outcome is inserted only while its summary exists, in the same
+        statement that checks it, so no outcome can be stored for a summary
+        that was deleted, and a second outcome for one summary is refused by
+        its key. An id that is not an exact positive int, or an outcome that
+        is not exactly an ``AuditOutcome``, raises ``ValueError`` before the
+        database is opened. A failed or refused write, a write that added no
+        row, and an id larger than any row can have, raise ``RuntimeError``
+        with a fixed message and with no cause or context.
+        """
+        if not is_audit_summary_id(summary_id):
+            raise ValueError(AUDIT_SUMMARY_ID_MESSAGE)
+        if type(outcome) is not AuditOutcome:
+            raise ValueError(AUDIT_SUMMARY_MESSAGE)
+        if summary_id > _SQLITE_MAXIMUM_INTEGER:
+            raise self._audit_failure(
+                "record audit outcome",
+                _AUDIT_NO_ROW_INSERTED,
+            )
+
+        inserted = False
+        failure: str | None = None
+        try:
+            with self._connection(classify_contention=False) as connection:
+                cursor = connection.execute(
+                    """
+                    INSERT INTO audit_outcomes (summary_id, outcome)
+                    SELECT ?, ?
+                    WHERE EXISTS (
+                        SELECT 1 FROM audit_summaries WHERE id = ?
+                    )
+                    """,
+                    (summary_id, outcome.value, summary_id),
+                )
+                inserted = cursor.rowcount == 1
+        except sqlite3.Error as exc:
+            failure = _audit_failure_reason(exc)
+        if failure is None and not inserted:
+            failure = _AUDIT_NO_ROW_INSERTED
+        if failure is not None:
+            raise self._audit_failure("record audit outcome", failure)
+        self.logger.info("Recorded the outcome of audit summary %s.", summary_id)
+
+    def list_audit_summaries(
+        self,
+        limit: int = AUDIT_QUERY_LIMIT,
+    ) -> list[AuditSummary]:
+        """Return at most ``limit`` audit summaries, newest id first.
+
+        Each comes with its outcome, or None when none was recorded. Every
+        stored value is validated against the audit vocabulary after it is
+        read; one that is outside it fails the whole read with a fixed
+        message, and neither that value nor any other is repeated or logged.
+        A limit that is not an exact int from 1 to ``AUDIT_QUERY_LIMIT``
+        raises ``ValueError``; a failed read raises ``RuntimeError`` with a
+        fixed message and with no cause or context.
+        """
+        if type(limit) is not int or not 1 <= limit <= AUDIT_QUERY_LIMIT:
+            raise ValueError(_AUDIT_LIMIT_MESSAGE)
+
+        rows: list[sqlite3.Row] = []
+        failure: str | None = None
+        try:
+            with self._connection(classify_contention=False) as connection:
+                rows = connection.execute(
+                    """
+                    SELECT summary.id, summary.created_at, summary.action,
+                           summary.decision, summary.target, result.outcome
+                    FROM audit_summaries AS summary
+                    LEFT JOIN audit_outcomes AS result
+                        ON result.summary_id = summary.id
+                    ORDER BY summary.id DESC
+                    LIMIT ?
+                    """,
+                    (limit,),
+                ).fetchall()
+        except sqlite3.Error as exc:
+            failure = _audit_failure_reason(exc)
+        if failure is not None:
+            raise self._audit_failure("list audit summaries", failure)
+
+        summaries = _settled_audit_summaries(rows)
+        if summaries is None:
+            raise self._audit_failure(
+                "list audit summaries",
+                _AUDIT_UNEXPECTED_VALUE,
+            )
+        return summaries
+
+    def get_audit_summary(self, summary_id: int) -> AuditSummary | None:
+        """Return one audit summary with its outcome, or None if absent.
+
+        Validation and failures are exactly those of
+        ``list_audit_summaries``, and an id that is not an exact positive int
+        raises ``ValueError``. An id larger than any row can have is absent
+        and is answered without opening the database.
+        """
+        if not is_audit_summary_id(summary_id):
+            raise ValueError(AUDIT_SUMMARY_ID_MESSAGE)
+        if summary_id > _SQLITE_MAXIMUM_INTEGER:
+            return None
+
+        row: sqlite3.Row | None = None
+        failure: str | None = None
+        try:
+            with self._connection(classify_contention=False) as connection:
+                row = connection.execute(
+                    """
+                    SELECT summary.id, summary.created_at, summary.action,
+                           summary.decision, summary.target, result.outcome
+                    FROM audit_summaries AS summary
+                    LEFT JOIN audit_outcomes AS result
+                        ON result.summary_id = summary.id
+                    WHERE summary.id = ?
+                    """,
+                    (summary_id,),
+                ).fetchone()
+        except sqlite3.Error as exc:
+            failure = _audit_failure_reason(exc)
+        if failure is not None:
+            raise self._audit_failure("read audit summary", failure)
+        if row is None:
+            return None
+
+        summaries = _settled_audit_summaries([row])
+        if summaries is None:
+            raise self._audit_failure(
+                "read audit summary",
+                _AUDIT_UNEXPECTED_VALUE,
+            )
+        return summaries[0]
+
+    def delete_audit_summary(self, summary_id: int) -> bool:
+        """Delete one audit summary and its outcome together, by id.
+
+        Returns True when the summary existed and was deleted, and False when
+        no summary has that id, in which case nothing changes. The summary
+        and its outcome are removed in one write transaction, so neither can
+        outlive the other, and because the summary's id is never reused, no
+        later summary can take its place. An id larger than any row can have
+        deletes nothing and is answered without opening the database. An id
+        that is not an exact positive int raises ``ValueError``; a failed
+        delete raises ``RuntimeError`` with a fixed message and with no cause
+        or context.
+        """
+        if not is_audit_summary_id(summary_id):
+            raise ValueError(AUDIT_SUMMARY_ID_MESSAGE)
+        if summary_id > _SQLITE_MAXIMUM_INTEGER:
+            return False
+
+        deleted = False
+        failure: str | None = None
+        try:
+            with self._connection(classify_contention=False) as connection:
+                connection.execute("BEGIN IMMEDIATE")
+                cursor = connection.execute(
+                    """
+                    DELETE FROM audit_summaries
+                    WHERE id = ?
+                    """,
+                    (summary_id,),
+                )
+                deleted = cursor.rowcount == 1
+                if deleted:
+                    connection.execute(
+                        """
+                        DELETE FROM audit_outcomes
+                        WHERE summary_id = ?
+                        """,
+                        (summary_id,),
+                    )
+        except sqlite3.Error as exc:
+            failure = _audit_failure_reason(exc)
+        if failure is not None:
+            raise self._audit_failure("delete audit summary", failure)
+        if deleted:
+            self.logger.info("Deleted audit summary %s.", summary_id)
+        return deleted
+
     @contextmanager
     def _connection(
         self,
@@ -2054,11 +2395,11 @@ class Memory:
 
         Contention is normally recognised and converted here, so every method
         answers a busy database with the same message. ``classify_contention``
-        turns that off for the initialization boundary, which classifies the
-        error itself: the conversion carries an exception log with it, and
-        that boundary records a fixed event code instead. Rollback and close
-        are unaffected either way, and every other error still propagates
-        unchanged.
+        turns that off for the initialization boundary and for every audit
+        method, which classify the error themselves: the conversion carries
+        an exception log with it, and those callers record a fixed event code
+        or reason instead. Rollback and close are unaffected either way, and
+        every other error still propagates unchanged.
         """
         connection = self._connect()
         try:
@@ -2087,6 +2428,21 @@ class Memory:
         """
         self.logger.error(log_line)
         return RuntimeError(message)
+
+    def _audit_failure(self, operation: str, reason: str) -> RuntimeError:
+        """Log one fixed line and return the failure an audit call raises.
+
+        ``operation`` and ``reason`` are always this module's own fixed
+        phrases, never anything SQLite or a stored row supplied. Contention
+        keeps the shared busy message, which says that retrying may help;
+        every other failure names the operation that could not complete. A
+        caller raises the result only after its ``except`` block has ended,
+        so the failure has neither a cause nor a context.
+        """
+        self.logger.error("Failed to %s: %s.", operation, reason)
+        if reason == _AUDIT_DATABASE_BUSY:
+            return RuntimeError(_DATABASE_BUSY_MESSAGE)
+        return RuntimeError(f"Unable to {operation}.")
 
     def _connect(self) -> sqlite3.Connection:
         """Open a SQLite connection with row dictionaries enabled."""
@@ -2315,6 +2671,40 @@ def _bounded_note_row(
 def _utf8_size(text: str) -> int:
     """Return the exact UTF-8 size of text, lone surrogates included."""
     return len(text.encode("utf-8", "surrogatepass"))
+
+
+def _audit_failure_reason(exc: sqlite3.Error) -> str:
+    """Return the fixed reason an audit call gives for a SQLite failure."""
+    if _is_busy_or_locked(exc):
+        return _AUDIT_DATABASE_BUSY
+    return _AUDIT_DATABASE_ERROR
+
+
+def _settled_audit_summaries(
+    rows: Sequence[sqlite3.Row],
+) -> list[AuditSummary] | None:
+    """Return stored audit rows as validated summaries, or None for any bad row.
+
+    A row holding any value outside the audit vocabulary makes the whole
+    result None rather than raising, so the caller's fixed failure is raised
+    outside every handler and the refused value travels nowhere.
+    """
+    summaries: list[AuditSummary] = []
+    for row in rows:
+        try:
+            summaries.append(
+                AuditSummary.from_stored(
+                    row["id"],
+                    row["created_at"],
+                    row["action"],
+                    row["decision"],
+                    row["target"],
+                    row["outcome"],
+                )
+            )
+        except ValueError:
+            return None
+    return summaries
 
 
 def _validate_migration_ladder() -> None:

@@ -5,7 +5,7 @@ Tools are small modules that expose controlled capabilities to Maria.
 ## Declared Argument Contracts
 
 Every built-in tool action is declared once in `core/action_contracts.py`,
-which is the positive allowlist of the 24 supported tool actions and of the
+which is the positive allowlist of the 29 supported tool actions and of the
 arguments each one accepts. A tool's `actions` set answers only whether an
 action is registered; the contract answers which arguments it takes, whether
 each is required, its exact type, any numeric bound, and, for a path field, the
@@ -42,8 +42,24 @@ canonical resolution, safe-root containment, symlink handling, and collisions.
 longer the acceptance policy: it sits below the Brain, Tool Manager, and tool
 gates as defence in depth and is unchanged.
 
+Every contract also states, with no default, whether a reasoning model may
+ever propose its action. Only three of the 29 actions are model-eligible:
+`calculator.calculate`, `filesystem.list`, and `system.current_time`. The
+other 26, including all three audit actions, are closed to the model. The
+classification is independent of permission and approves nothing by itself:
+`core/plan_compiler.py` keeps its own closed allowlist and compiles a proposal
+only when the two agree and every argument satisfies the action's contract.
+The compiled plan meets the same gates again when it is offered for approval
+and again before it runs. A refused proposal receives one fixed message that
+names no tool, action, argument, or value the model supplied. A compiled plan
+always needs exactly one approval from the owner, even when `PermissionManager`
+allows its action outright; see "Model-to-Plan Compilation Gate" and
+"Model-Originated Execution and Audit" in `docs/architecture.md`.
+
 ## Built-in Tools
 
+- `audit`: list, read, and delete content-free audit summaries of approved
+  model-proposed actions
 - `calculator`: basic arithmetic
 - `filesystem`: read, list, rename, and move inside Maria's named filesystem roots
 - `history`: list, search, read, and delete SQLite-backed interaction-history
@@ -75,6 +91,13 @@ The filesystem tool supports `read`, `list`, `rename`, and `move` inside Maria's
 filesystem roots. Rename and move always require explicit confirmation. There is no
 write, delete, copy, overwrite, glob, recursion, bulk, or archive action, and none is
 reachable by argument.
+
+`list` is the only filesystem action a reasoning model may propose, and the compiler
+accepts a proposed `path` only as plain text relative to the default root: never
+absolute, never beginning with `~`, and never stepping up through `..`; see
+"Model-to-Plan Compilation Gate" in `docs/architecture.md` for the full rule. Once the
+owner approves it, the proposed listing goes through the same resolution, exclusions,
+and repository barrier as the owner's own `list` command.
 
 ### Named Roots
 
@@ -291,9 +314,13 @@ Rename failed: This filesystem root is read-only.
 Move failed: The operating system reported an unspecified error.
 ```
 
-Path-bearing tool result `data` and the operational log are unchanged and still contain
-canonical absolute paths and full raw exception diagnostics, which is where the
-per-filename detail omitted from responses remains available.
+Path-bearing tool result `data` is unchanged and still contains canonical absolute
+paths. The operational log lines of `read`, `rename`, and `move` are unchanged too and
+still contain canonical absolute paths and full raw exception diagnostics, which is
+where the per-filename detail omitted from responses remains available. `list` is the
+exception: because a reasoning model may propose it, it logs only the fixed lines
+`Listed a directory.` and `Directory listing failed.`, never the directory, the
+submitted path, or exception text. What a listing shows the owner is unchanged.
 
 Two limits are worth stating plainly. Recorded request text is not sanitized, so an
 absolute path a user typed explicitly can still be retained in interaction history. The
@@ -583,6 +610,113 @@ default, while `memory.update`, `memory.forget`, `memory.enable_context`, and
 `memory.disable_context` always require explicit confirmation. The tool contains no SQL; `core/memory.py` owns all database
 operations.
 
+## Audit Tool
+
+The audit tool supports exactly three actions:
+
+- `list`: list the newest audit summaries
+- `read`: display one audit summary by numeric ID
+- `delete`: remove one audit summary, together with its outcome, by numeric ID
+
+An audit summary records that the owner approved one action the local
+reasoning model proposed and that Maria authorised that attempt for dispatch.
+Brain commits the summary before the action is dispatched and does not run the
+action at all if it cannot. After the tool returns, Brain appends the outcome
+and follows the action's result with `Recorded as audit summary <id>.`, or with
+a notice that the outcome could not be recorded. A model-proposed action is
+never recorded as interaction history, so its summary is its only record in
+Maria's database; see "Model-Originated Execution and Audit" in
+`docs/architecture.md`.
+
+A summary holds only its numeric ID and values Maria generates from the closed
+vocabulary in `core/audit.py`: a UTC timestamp to the second in the form
+`YYYY-MM-DDTHH:MM:SSZ`, the action's canonical identifier, the owner's
+approval, a generalised target, and, once the tool has returned, the outcome
+the tool's own success flag reported. The target is shown as
+`named filesystem root` for an action whose contract declares a path argument,
+whether or not a path was supplied, and as `none` otherwise. No request,
+proposal, argument, root name, path, tool result, or exception text is ever
+stored, so the tool can never show one. Summaries live in the
+`audit_summaries` and `audit_outcomes` tables that schema version 5 added; see
+`docs/database.md`.
+
+`list` shows at most the newest 20 summaries, newest ID first, one per line:
+
+```text
+3: 2026-10-01T09:46:17Z system.current_time (target: none). Approved by the owner. Outcome not recorded; execution is unknown.
+2: 2026-10-01T09:45:02Z filesystem.list (target: named filesystem root). Approved by the owner. Outcome: failed.
+1: 2026-10-01T09:44:10Z calculator.calculate (target: none). Approved by the owner. Outcome: succeeded.
+```
+
+When more than 20 summaries exist, only the newest 20 are shown and one line
+is appended:
+
+```text
+Showing the newest 20 audit summaries. More audit summaries exist.
+```
+
+An empty result is a successful operation with the message `No audit summaries
+found.`.
+
+`read` displays one summary, one field per line:
+
+```text
+Audit summary <id>
+Created at: <created_at>
+Action: <action>
+Target: <target>
+Decision: approved by the owner
+<outcome>
+```
+
+`<target>` is `none` or `named filesystem root`, and `<outcome>` is `Outcome:
+succeeded`, `Outcome: failed`, or `Outcome not recorded; execution is
+unknown.`. A summary without an outcome means nothing is known about whether
+the action ran: Maria may have stopped after authorising the attempt or during
+the tool's run, or the outcome may not have been written. A summary alone
+never proves that the action ran, and Maria never reruns it.
+
+`read` and `delete` validate their `id` argument the same way as the history
+tool (an actual `int`, not a `bool`, at least `1`), returning `Audit summary id
+must be a positive whole number.` for an invalid direct value without calling
+`Memory`. A missing ID returns `Audit summary not found: <id>.`. A successful
+deletion returns `Deleted audit summary <id>.` with `data={"id": <id>}`. It
+removes the summary and its outcome together in one transaction, never
+cascades to `interactions`, `notes`, or `memories`, and never performs bulk,
+wildcard, or range deletion. Summary IDs are never reused, so a later summary
+can never take a deleted one's ID.
+
+A failure in the memory layer is reported as one fixed message that repeats
+nothing from the database or the exception, even when the database is busy:
+`Unable to list audit summaries.`, `Unable to read audit summary.`, or `Unable
+to delete audit summary.`. A stored value outside the audit vocabulary fails
+the whole listing or read the same way rather than being shown.
+
+What the tool gives interaction history to record as a command's response is
+fixed text and IDs alone. `list` sets `ToolExecutionResult.recorded_message`
+to `Listed audit summaries.` for every successful listing, including an empty
+one, and `read` sets it to `Displayed audit summary <id>.`, so no summary's
+fields are recorded again. `delete` leaves `recorded_message` unset (`None`),
+since `Deleted audit summary <id>.` is already short and content-free.
+Successful operations log only fixed wording and, for `read` and `delete`, the
+numeric ID, such as `Deleted audit summary <id> through audit tool.`.
+
+The tool receives the shared `Memory` instance through dependency injection.
+It is registered as `tools.audit` through Tool Manager's standard
+`build_tool(...)` factory contract and travels through the normal permission
+path; `audit.list` and `audit.read` are allowed by default, while
+`audit.delete` always requires explicit confirmation, which configuration
+cannot remove. The confirmation is asked for even when no summary has that ID,
+and it adds this notice:
+
+```text
+Deleting an audit summary removes it from Maria's database. It does not undo the action, and Maria's operational log may still show that a model-proposed action ran.
+```
+
+None of the three actions is model-eligible, so only the owner's own commands
+reach them, and audit summaries are never sent to the model as context. The
+tool contains no SQL; `core/memory.py` owns all database operations.
+
 ## System Tool
 
 The system tool supports exactly two actions:
@@ -644,4 +778,10 @@ before a note row is changed or removed. Explicit-memory updating
 and forgetting (`memory.update`, `memory.forget`) are checked the same way and
 always require explicit confirmation before a memory row is changed or removed;
 the memory tool provides no bulk or clear-all action, and no way to select a
-memory by its fact text.
+memory by its fact text. Audit-summary deletion (`audit.delete`) is checked the
+same way and always requires explicit confirmation before a summary and its
+outcome are removed. An action a reasoning model proposes needs exactly one
+approval from the owner before it runs, even when `permissions.py` allows it
+outright; a denied one is refused before any approval is offered, and an
+approved one does not run at all unless its audit summary is committed first.
+No audit action can be proposed by a model.
