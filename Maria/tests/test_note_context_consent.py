@@ -1045,24 +1045,33 @@ class NoteConsentSessionTests(unittest.TestCase):
 
         with self.assertLogs("maria", level="DEBUG") as captured:
             shown = session.submit("enable note context 1").text
-            pending = repr(session.pending_approval)
+            held = session.pending_approval
             session.cancel()
             session.submit("hello there friend")
             session.submit("enable note context 1")
             confirmed = session.confirm().text
             session.submit("hello again friend")
         digest = note_digest(TITLE_SENTINEL, BODY_SENTINEL)
+        pending = repr(held)
 
         self.assertIn(f'Title: "{TITLE_SENTINEL}"', shown)
         self.assertIn(f'Body: "{BODY_SENTINEL}"', shown)
         self.assertEqual(confirmed, "Enabled context for note 1.")
-        self.assertIn(digest, pending)
+        # The approval binds the identity of the shown text, never the text:
+        # the digest is pinned in the held plan's one step, while the held
+        # approval's own repr names its type and nothing it holds.
+        self.assertEqual(
+            dict(held.plan.steps[0].arguments),
+            {"id": 1, "text_digest": digest},
+        )
+        self.assertEqual(pending, "PendingApproval(<redacted>)")
         self.assertEqual(provider.calls, 2)
         kept = "".join(
             f"{exchange.user}{exchange.assistant}" for exchange in session.conversation
         )
         places = {
-            "pending plan": pending,
+            "pending approval": pending,
+            "pending plan": repr(held.plan),
             "interaction history": repr(harness.interactions()),
             "log": _logged(captured.records),
             "model requests": everything_sent(provider.requests),
@@ -1072,6 +1081,10 @@ class NoteConsentSessionTests(unittest.TestCase):
             for private in (TITLE_SENTINEL, BODY_SENTINEL):
                 with self.subTest(place=place, private=private):
                     self.assertNotIn(private, text)
+        # The held plan's rendering is live: it shows the digest it binds, so
+        # the absence of the title and body from it above is not vacuous.
+        self.assertIn(digest, places["pending plan"])
+        self.assertNotIn(digest, places["pending approval"])
         self.assertNotIn(digest, places["log"])
         self.assertNotIn(digest, places["interaction history"])
 

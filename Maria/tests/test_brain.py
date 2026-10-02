@@ -573,6 +573,13 @@ class MariaBrainTests(unittest.TestCase):
             source,
             r"(?:action|step\.action)\s*==\s*['\"]delete['\"]",
         )
+        # Auditing a model-proposed action stays generic too: Brain never
+        # compares a tool name or a contract identifier with the audit tool's.
+        self.assertNotRegex(
+            source,
+            r"(?:tool_name|step\.tool_name|identifier)\s*==\s*"
+            r"['\"]audit(?:\.\w+)?['\"]",
+        )
 
 
 def _single_step_plan(

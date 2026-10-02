@@ -84,7 +84,10 @@ HELP_TEXT = (
     "- history\n"
     "- search history <query>\n"
     "- read interaction <id>\n"
-    "- delete interaction <id>"
+    "- delete interaction <id>\n"
+    "- audit\n"
+    "- read audit <id>\n"
+    "- delete audit <id>"
 )
 UNSUPPORTED_RESPONSE = (
     "I do not have an executable plan for that yet. "
@@ -327,6 +330,24 @@ COMMAND_CORPUS: tuple[CorpusEntry, ...] = (
     _records("enable note context 1", "Enabled context for note 1.", CONFIRM),
     _records("disable note context 1", "Disabled context for note 1.", CONFIRM),
     _records("disable note context 99", "Note not found: 99.", CONFIRM),
+    # V1-18's audit commands run after V1-16's, so every id listed above is
+    # unchanged. No reasoning model runs here, so no audit summary exists and
+    # each command meets an empty audit table. Every recorded row is fixed
+    # text naming at most an id, and a listing records only that it happened.
+    _records("audit", "Listed audit summaries."),
+    _records("read audit", "Use: read audit <id>"),
+    _records(
+        "read audit x",
+        "Audit summary id must be a positive whole number.",
+    ),
+    _records("read audit 1", "Audit summary not found: 1."),
+    _records("delete audit", "Use: delete audit <id>"),
+    _records(
+        "delete audit 0",
+        "Audit summary id must be a positive whole number.",
+    ),
+    _records_nothing("delete audit 1", CANCEL),
+    _records("delete audit 1", "Audit summary not found: 1.", CONFIRM),
     _records_nothing("   ", RUN),
     _records_nothing("", REFUSE),
 )

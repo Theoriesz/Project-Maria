@@ -40,6 +40,9 @@ from core.tool_manager import ToolManager
 
 EXPECTED_ACTION_IDENTIFIERS = frozenset(
     {
+        "audit.list",
+        "audit.read",
+        "audit.delete",
         "calculator.calculate",
         "filesystem.read",
         "filesystem.list",
@@ -81,7 +84,8 @@ EXPECTED_PATH_FIELDS = frozenset(
 UNREGISTERED_ACTIONS = ("write", "delete")
 
 # The approved V1-17-R1 classification, written out independently of both
-# the registry and the compiler's allowlist.
+# the registry and the compiler's allowlist. V1-18-R1 keeps it: every audit
+# action is closed to the model.
 EXPECTED_MODEL_ELIGIBLE = frozenset(
     {"calculator.calculate", "filesystem.list", "system.current_time"}
 )
@@ -403,7 +407,7 @@ class RegistryCompletenessTests(unittest.TestCase):
             BUILT_IN_ACTION_CONTRACTS.action_identifiers,
             EXPECTED_ACTION_IDENTIFIERS,
         )
-        self.assertEqual(len(EXPECTED_ACTION_IDENTIFIERS), 26)
+        self.assertEqual(len(EXPECTED_ACTION_IDENTIFIERS), 29)
 
     def test_registry_and_loaded_tool_inventory_agree_in_both_directions(self) -> None:
         with TemporaryDirectory() as name:
@@ -441,7 +445,7 @@ class RegistryCompletenessTests(unittest.TestCase):
         ]
 
         self.assertEqual(len(identifiers), len(set(identifiers)))
-        self.assertEqual(len(identifiers), 26)
+        self.assertEqual(len(identifiers), 29)
 
     def test_no_contract_exists_for_a_mandatorily_denied_filesystem_action(
         self,
@@ -569,6 +573,8 @@ class RegistryCompletenessTests(unittest.TestCase):
 
     def test_declared_identifier_and_limit_bounds_are_the_expected_ones(self) -> None:
         identifier_actions = (
+            ("audit", "read"),
+            ("audit", "delete"),
             ("history", "read"),
             ("history", "delete"),
             ("memory", "update"),
@@ -668,7 +674,7 @@ class ModelEligibilityClassificationTests(unittest.TestCase):
         )
         self.assertEqual(eligible, EXPECTED_MODEL_ELIGIBLE)
         self.assertEqual(closed, EXPECTED_NOT_MODEL_ELIGIBLE)
-        self.assertEqual((len(eligible), len(closed)), (3, 23))
+        self.assertEqual((len(eligible), len(closed)), (3, 26))
         for identifier, decision in classified.items():
             with self.subTest(action=identifier):
                 self.assertIs(type(decision), ModelEligibility)
@@ -854,7 +860,7 @@ class RegistryConstructionTests(unittest.TestCase):
                 "sample", "run", model_eligibility=NOT_ELIGIBLE
             )
 
-        self.assertEqual(len(BUILT_IN_ACTION_CONTRACTS.action_identifiers), 26)
+        self.assertEqual(len(BUILT_IN_ACTION_CONTRACTS.action_identifiers), 29)
 
     def test_unsupported_declared_type_is_rejected(self) -> None:
         with self.assertRaises(ValueError):
@@ -2114,6 +2120,9 @@ class TypeAndCoercionTests(unittest.TestCase):
 
     def test_every_planner_emitted_shape_satisfies_its_contract(self) -> None:
         emitted = (
+            ("audit", "list", {}),
+            ("audit", "read", {"id": 1}),
+            ("audit", "delete", {"id": 1}),
             ("calculator", "calculate", {"expression": "2 + 2"}),
             ("filesystem", "list", {"path": "docs"}),
             ("filesystem", "read", {"path": "notes.txt"}),
@@ -2138,7 +2147,7 @@ class TypeAndCoercionTests(unittest.TestCase):
             ("system", "current_time", {}),
         )
 
-        self.assertEqual(len(emitted), 22)
+        self.assertEqual(len(emitted), 25)
         for tool_name, action, arguments in emitted:
             with self.subTest(action=f"{tool_name}.{action}"):
                 self.assertIsNone(

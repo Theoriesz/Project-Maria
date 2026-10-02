@@ -3,7 +3,9 @@
 Maria is a modular personal AI assistant foundation written in Python.
 
 Maria focuses on architecture, safety, and maintainability. It is not a
-prototype of the final assistant and does not include advanced AI features.
+prototype of the final assistant. Its optional use of a local language model
+is deliberately narrow and off by default, and nothing the model proposes runs
+without the owner's approval.
 
 ## Requirements
 
@@ -70,6 +72,9 @@ history
 search history editor
 read interaction 1
 delete interaction 1
+audit
+read audit 1
+delete audit 1
 ```
 
 File rename and move operations, `delete interaction <id>`, the three note
@@ -77,17 +82,30 @@ lifecycle commands `retitle note <id>: <new title>`, `edit note <id>: <new
 body>`, and `delete note <id>`, the two note context consent commands
 `enable note context <id>` and `disable note context <id>`, the two memory
 lifecycle commands `update memory <id>: <new fact>` and `forget memory <id>`,
-and the two memory context consent commands `enable memory context <id>` and
-`disable memory context <id>` require explicit confirmation. `delete interaction <id>` targets at most one interaction row by
+the two memory context consent commands `enable memory context <id>` and
+`disable memory context <id>`, and `delete audit <id>` require explicit
+confirmation. `delete interaction <id>` targets at most one interaction row by
 ID and removes it when found; it never cascades to notes or memories. Each note
 lifecycle command likewise targets at most one note by positive whole-number ID
 only, never by title, and never cascades into interaction history or explicit
 memories. Each memory lifecycle command targets at most one memory by positive
 whole-number ID only, never by fact text, and never cascades into interaction
-history or notes.
+history or notes. `delete audit <id>` targets at most one audit summary by
+positive whole-number ID only and removes it together with its recorded
+outcome; it never cascades into interaction history, notes, or memories.
+The thirteen ID-only planner commands (the eleven `<id>` commands above, plus
+`read interaction <id>` and `read audit <id>`) accept a whole number from 1 to
+9223372036854775807, the largest integer SQLite stores, with any number of
+leading zeroes; each answers a larger number with its invalid-ID reply before
+anything is planned or confirmed. `read note <id or exact title>` uses its
+separate, unchanged lookup path.
 Retitling and editing are deliberately separate commands, so neither can
 overwrite the other's field. Filesystem delete functionality remains
 intentionally unimplemented.
+
+With reasoning enabled, every action the local model proposes also needs your
+approval before it runs, even when the matching command would not ask; see
+"Model-Proposed Actions".
 
 ## Filesystem Access
 
@@ -175,9 +193,11 @@ Filesystem delete and write functionality remains intentionally unimplemented.
 
 With the shipped configuration Maria uses no language model, and every command
 works exactly as it always has. Reasoning is off until the owner enables it in
-a private local override. Maria then answers input that matches no command with
-a conversational reply from the owner's local Ollama model; see "Conversation"
-and "Local Ollama Adapter" below.
+a private local override. Maria then answers input that matches no command
+with the owner's local Ollama model, which may reply conversationally or
+propose one of three allowed actions; a proposed action runs only if the owner
+approves it. See "Local Ollama Adapter", "Conversation", and "Model-Proposed
+Actions" below.
 
 The tracked `config/config.toml` keeps reasoning disabled:
 
@@ -232,22 +252,23 @@ tagged `cloud` or ending `-cloud`. It never resolves a host name, uses a
 proxy, follows a redirect, retries, or falls back to anything else, and it
 never downloads a model, installs software, or starts a process.
 
-It sends only the model identifier and the conversation: the current session's
-earlier conversational exchanges as alternating user and assistant messages,
-then the request as the final user message. When memories or notes you
-have enabled for context go with a request, they come first: Maria's fixed
-instructions as the system message, which never contain your stored text, and
-then that text as a separate, clearly marked data message. With no context the
-request is exactly what it was before memory context existed. It takes back
-only the answer
-text. Any separate thinking text and any tool
-calls in the reply are ignored after bounded JSON parsing; only
-`message.content` is returned, and an answer is only ever text, never an
-action. One hard deadline covers connecting, sending, and receiving
-the whole reply; the reply is size-bounded before it is parsed, and the answer
-must fit within `max_output_bytes` or is discarded whole. Every failure is one
-fixed, typed message, and no request, answer, address, model identifier, or
-Ollama error text reaches Maria's log.
+It sends only the model identifier, Maria's fixed instructions, and the
+conversation. The instructions come first, as the one system message, and
+never contain your stored text: Maria's proposal instructions, which every
+request carries (see "Model-Proposed Actions"), followed by her context
+instructions when memories or notes you have enabled for context go with the
+request. That stored text then follows as a separate, clearly marked data
+message. Next come the current session's earlier conversational exchanges as
+alternating user and assistant messages, and then the request as the final
+user message. It takes back only the answer text. Any separate thinking text
+and any tool calls in the reply are ignored after bounded JSON parsing; only
+`message.content` is returned, as text, and the adapter never acts on it.
+What Maria does with an answer that proposes an action is described under
+"Model-Proposed Actions". One hard deadline covers connecting, sending, and
+receiving the whole reply; the reply is size-bounded before it is parsed, and
+the answer must fit within `max_output_bytes` or is discarded whole. Every
+failure is one fixed, typed message, and no request, answer, address, model
+identifier, or Ollama error text reaches Maria's log.
 
 Maria constructs the adapter only when the private override enables reasoning,
 and reasoning stays disabled by default. Before the adapter is ever used with a
@@ -266,31 +287,41 @@ Input that begins like a command is always that command, even when phrased
 conversationally: `remember when we ...` stores a memory, and
 `move on to ...` is read as a file move and asks for confirmation.
 
-A reply is text only. Maria never treats it as a command, an approval, or an
-action, and it cannot run a tool, change a record, or confirm anything,
-whatever it says. That includes claims to have done something: a reply saying
-"I saved that" saves nothing. Use the commands above to act.
+A reply is conversational text unless its first character, after only spaces,
+tabs, carriage returns, and line feeds, is `{`: such a reply is a proposed
+action, handled as described under "Model-Proposed Actions", and is never
+shown or kept as conversation. Maria never treats a reply as a command or an
+approval, and no reply can change a record or a file or confirm anything,
+whatever it says; a proposed action runs only if you approve it. That includes
+claims to have done something: a reply saying "I saved that" saves nothing.
+Use the commands above to act.
 
-Within one session the model sees the current request, the earlier
-conversational turns of that session, so a follow-up question is understood,
-the explicit memories you have enabled for context, and notes you have
-enabled for context that contain a word of your request (see "Memory Context"
-and "Note Context and Search" below). It never sees a command or its result, a
-memory or note you have not enabled, a file, the interaction history, or
-anything from an earlier session. Maria keeps at most the last eight exchanges,
-and at most 8 KiB of their text together with the current request and any
-context, or
-`max_input_bytes` if that is smaller. The oldest exchanges
-are dropped first, whole. A request too large on its own, or a reply too large
-to keep beside its request, is refused with a fixed message rather than cut
-short. The conversation lives only in memory and is discarded when the session
-ends, on `exit`, end of input, Ctrl+C at the prompt, or any other way the CLI
-stops.
+Within one session the model sees Maria's fixed instructions, the current
+request, the earlier conversational turns of that session, so a follow-up
+question is understood, the explicit memories you have enabled for context,
+and notes you have enabled for context that contain a word of your request
+(see "Memory Context" and "Note Context and Search" below). It never sees a
+command or its result, an earlier proposal or what became of it, a memory or
+note you have not enabled, a file, an audit summary, the interaction history,
+or anything from an earlier session. Maria keeps at most the last eight
+exchanges, and at most 8 KiB of their text together with the current request,
+Maria's fixed proposal instructions, and any context, or `max_input_bytes` if
+that is smaller. The request and the instructions are fitted first, then any
+context, then the newest exchanges; the instructions take 1,015 bytes and are
+never left out, and the oldest exchanges are dropped first, whole. A request
+too large to send beside the instructions, or a reply too large to keep beside
+its request, is refused with a fixed message rather than cut short, and an
+over-large request is never sent to the model. The conversation lives only in
+memory and is discarded when the session ends, on `exit`, end of input,
+Ctrl+C at the prompt, or any other way the CLI stops.
 
 Conversation is never recorded: no conversational request or reply is written
-to interaction history or anywhere else. When the model is unavailable, too
-slow, or answers with something unusable, Maria shows a fixed message such as
-`The local reasoning model is unavailable.`, and every command keeps working.
+to interaction history or anywhere else, and neither is a proposal, its
+refusal, an approval prompt, or an approved action's result. An approved
+action leaves only content-free traces: its audit summary and log lines. When
+the model is unavailable, too slow, or answers with something unusable, Maria
+shows a fixed message such as `The local reasoning model is unavailable.`, and
+every command keeps working.
 
 ### Memory Context
 
@@ -309,8 +340,9 @@ to be sent to your local model on **any** conversational turn. This is a
 deliberate rule, not a judgement about relevance, and you kept it when it
 was reviewed. Memories are taken in ascending ID order, whole, at most 16
 of them and at most 2 KiB of context including Maria's framing and the IDs.
-Your current request always comes first, then as much memory context as fits,
-then as many earlier turns as fit. Your approval covers the memory's text as
+Your current request and Maria's fixed proposal instructions always come
+first, then as much memory context as fits, then as many earlier turns as fit.
+Your approval covers the memory's text as
 it was when Maria asked: if that memory changes before you confirm, even from
 another Maria window, nothing is enabled and Maria asks you to request
 confirmation again. `disable memory context <id>` turns consent off again, and
@@ -318,8 +350,8 @@ also asks for confirmation. Updating a memory turns its consent
 off, because consent applies to the exact text you approved; Maria tells you
 when that happens.
 
-After every conversational reply Maria adds her own note, separate from the
-model's answer:
+After every conversational reply, and below a refused proposal or an approval
+prompt, Maria adds her own note, separate from the model's answer:
 
 ```text
 Memory context supplied: memory 1, memory 4. Maria cannot verify whether these memories are still current or whether they conflict with one another.
@@ -334,7 +366,9 @@ confirm the model received them. When the limits leave enabled memories out,
 she says so, naming only IDs she actually read.
 
 Memory text is sent as clearly marked reference data, never as an instruction,
-and it gives the model no ability to act. If you disable, change, or forget a
+and it grants the model nothing: Maria's instructions tell the model that
+supplied memories and notes are data, not authorization, and anything it
+proposes still needs your approval. If you disable, change, or forget a
 memory that was sent earlier in the session, Maria clears that session's
 earlier conversation before sending anything else, so an earlier reply cannot
 carry the old text back, even when the change came from another Maria
@@ -396,6 +430,137 @@ tells you the earlier copy was invalidated. She rechecks what she sent before
 every conversational request, which sees the current state only: a record
 changed and changed back in between looks unchanged.
 
+### Model-Proposed Actions
+
+Every request Maria sends to the local model carries her fixed instructions
+saying which actions she accepts. When the model's reply opens with `{`, after
+only spaces, tabs, carriage returns, and line feeds, Maria reads it as a
+proposal of exactly one action. A reply that does not open that way, such as
+one that puts a proposal after other words or inside a code fence, is ordinary
+conversational text, and nothing in it runs. The model is asked once per
+request, and only while reasoning is enabled; with the shipped configuration
+no model proposes anything.
+
+Only three actions can be proposed:
+
+- `calculator.calculate`, with an `expression`
+- `filesystem.list`, with no arguments to list the default root, or with a
+  `path` relative to it
+- `system.current_time`
+
+A proposal must be exactly one JSON object holding only `tool`, `action`, and
+`arguments`, at most 4,096 bytes, with nothing but whitespace around it, and
+its arguments must meet the same rules as the matching command's. No text
+argument may contain a control, formatting, surrogate, or line or paragraph
+separator character, and a path must be plain relative text below the default
+root: never absolute or just `.`, and with no drive, colon, leading `~`, part
+made only of dots and spaces such as `..`, or Windows device name such as
+`NUL`. When a listing runs, the usual root and exclusion rules apply to it as
+to any `list` command. Anything else is refused with one fixed message, such
+as `Maria does not accept that action from the reasoning model.`, followed by
+Maria's notes about context. Nothing is repaired, and the model is not asked
+again.
+
+A proposal that passes is shown to you, and it runs only if you approve it
+with `y` or `yes` at the usual confirmation prompt. That holds for all three
+actions, even though the shipped `calculate`, `list`, and `time` commands run
+without asking. Each proposal needs exactly one approval, whatever your
+configuration says about confirming that action, and an action your
+configuration denies is refused before any approval is asked for. For
+example, if the model answers the request below by proposing a calculation,
+Maria shows:
+
+```text
+What is six times seven?
+Maria's local reasoning model proposed this action. It runs only if you approve it.
+Tool: calculator
+Action: calculate
+Arguments: {"expression": "6 * 7"}
+
+No memory context supplied.
+```
+
+Once you approve it, Maria runs it and shows:
+
+```text
+6 * 7 = 42
+
+Recorded as audit summary 1.
+```
+
+The approval names the tool and the action and shows every argument exactly,
+as one JSON object with the names sorted, and `{}` when there are none;
+nothing is shortened. A quotation mark or backslash inside a text value is
+preceded by a backslash, and every character outside printable ASCII, and
+every space that leads, trails, or repeats, is written as an escape: an `e`
+with an acute accent appears as `\u00e9`, and a doubled space as
+`\u0020\u0020`. What you see is therefore plain, printable text that decodes
+as JSON to exactly the value Maria will use.
+
+Your approval covers exactly the plan you were shown. Nothing asks the model
+again or plans the request again: just before the action runs, Maria checks
+that same plan once more against the three allowed actions, their argument
+rules, and your current permissions, and it runs at most once. Cancelling at
+the prompt runs and records nothing. Maria's notes about context are shown
+once, with the approval prompt or the refusal, and are not repeated when you
+approve.
+
+Immediately before an approved action runs, Maria commits its audit summary
+(see "Audit Summaries"). If that summary cannot be recorded, for example
+because the database stays busy, the action does not run, Maria says so, and
+your approval is used up: make the request again if you still want it. After
+the action runs, Maria adds whether it succeeded or failed to that summary and
+follows the result with `Recorded as audit summary N.`; if that outcome cannot
+be recorded, she says so instead, and the summary shows the outcome as
+unknown. Nothing is retried. The request, the proposal, the refusal or
+approval prompt, and the result never become conversation or interaction
+history, so on a later turn the model sees neither the proposal nor its
+result.
+
+## Audit Summaries
+
+An audit summary is Maria's record of one approved model-proposed action. It
+holds only values Maria generates herself: the UTC time she authorized the
+attempt; the action, such as `calculator.calculate`; that you approved it; a
+target of `named filesystem root` for a directory listing or `none`
+otherwise, never which root or path; and, once the action has run, whether it
+succeeded or failed by the tool's own report. It never holds your request,
+the model's reply, an argument such as an expression or a path, a root's
+name, a host path, the result, or any memory or note.
+
+- `audit` lists the newest 20 summaries, newest first, and says when more
+  exist.
+- `read audit <id>` shows one summary.
+- `delete audit <id>` removes one summary together with its outcome, after
+  confirmation.
+
+```text
+audit
+2: 2026-10-01T09:47:02Z filesystem.list (target: named filesystem root). Approved by the owner. Outcome not recorded; execution is unknown.
+1: 2026-10-01T09:46:17Z calculator.calculate (target: none). Approved by the owner. Outcome: succeeded.
+
+read audit 1
+Audit summary 1
+Created at: 2026-10-01T09:46:17Z
+Action: calculator.calculate
+Target: none
+Decision: approved by the owner
+Outcome: succeeded
+
+delete audit 1
+Confirmation required: audit.delete requires explicit confirmation. Deleting an audit summary removes it from Maria's database. It does not undo the action, and Maria's operational log may still show that a model-proposed action ran.
+```
+
+A summary is committed before its action runs, so on its own it does not
+prove the action ran. `Outcome not recorded; execution is unknown.` means
+Maria may have stopped after recording the summary but before or during the
+run, or could not record how it ended; she never reruns it. Command keywords
+are case-insensitive, IDs are positive whole numbers, and `audit` must be the
+complete command; `list audits` still lists a directory named `audits`.
+There is no search, filtering, range, editing, or bulk deletion. No audit
+command can be proposed by the model, and summaries are never sent to it.
+Retention and deletion are described under "Data Retention and Privacy".
+
 ## Persistent Memory
 
 Maria stores deliberately remembered facts in SQLite, so they remain available
@@ -437,8 +602,9 @@ contextual selection, no bulk, wildcard, or clear-all deletion, no automatic
 pruning, and no undo, recovery, or memory revision history. Neither command
 cascades into interaction history or notes, and remaining memory IDs are never
 renumbered. Conversational forms such as `please remember ...` are not memory
-commands. With reasoning enabled they receive a conversational reply instead,
-and that reply stores nothing, whatever it says.
+commands. With reasoning enabled they go to the local model instead, and
+nothing it answers stores anything, whatever it says: storing a memory is not
+an action the model may propose, so such a proposal is refused.
 
 ```text
 remember My editor is VS Code
@@ -468,20 +634,23 @@ behavior described below, so a fact can appear in both places.
 
 Maria stores most non-empty requests it processes and their final response
 text as persistent interaction history in its configured SQLite database,
-located inside the project directory by default. Conversational requests and
-replies, when reasoning is enabled, are the exception: they are never stored,
-and the conversation is discarded when the session ends. This can retain file contents
-returned by `read file`, note titles and bodies, note creation, retitle, and
-edit requests,
+located inside the project directory by default. Requests that go to the
+local model, when reasoning is enabled, are the exception: no conversational
+request or reply, proposal, refusal, approval prompt, or result of a
+model-proposed action is ever stored as interaction history, and the
+conversation is discarded when the session ends. Stored history can retain
+file contents returned by `read file`, note titles and bodies, note creation,
+retitle, and edit requests,
 calculator expressions and results, explicit memory facts from both `remember`
 and `update memory` requests and from their recall/list output, filesystem
 paths, system information, and failure or denial
 messages. Asking Maria to display a sensitive file or note can therefore copy
 that returned content into interaction history.
 
-Interaction history, notes, and facts deliberately saved with `remember` are
-three separate record types in the same SQLite database, although the same text
-can appear in more than one table. The configured operational log
+Interaction history, notes, facts deliberately saved with `remember`, and the
+audit summaries of approved model-proposed actions are four separate record
+types in the same SQLite database, although the same text can appear in more
+than one table. The configured operational log
 (`logs/maria.log` by default) is a separate store for application events,
 warnings, and failures rather than the interaction store. Avoiding full content
 in an operational log message does not mean that content is absent from SQLite
@@ -496,9 +665,9 @@ after mandatory explicit confirmation, with no cascade to notes or memories
 and no content preview before confirmation. Deletion commits independently,
 and Maria then separately attempts to record the short response `Deleted
 interaction <id>.` as a new interaction-history row; when that later
-recording succeeds, deleting one old row and adding that audit row may leave
+recording succeeds, deleting one old row and adding that new row may leave
 the total interaction-row count unchanged, and if it fails, the deletion
-remains committed with no audit row guaranteed. There is still no CLI
+remains committed with no such row guaranteed. There is still no CLI
 command to clear, bulk-delete, or prune interaction history. Retrieval limits
 affect only how many
 rows are read; they do not
@@ -522,10 +691,11 @@ is no undo, recovery, or note revision history. Each mutation commits
 independently, and Maria then separately attempts to record a short,
 content-free response (`Retitled note <id>.`, `Edited note <id>.`, or `Deleted
 note <id>.`); if that later recording fails, the mutation remains committed
-with no audit row guaranteed. The command text itself is still recorded as the
-request half of interaction history, so a retitle command retains its new
-title and an edit command retains its new body there, and a prior `read note`
-may already have copied that note's content into interaction history.
+with no such history row guaranteed. The command text itself is still
+recorded as the request half of interaction history, so a retitle command
+retains its new title and an edit command retains its new body there, and a
+prior `read note` may already have copied that note's content into
+interaction history.
 Afterwards changing or deleting the note does not rewrite or erase those
 independent interaction rows; they can be removed separately with `delete
 interaction <id>`. As elsewhere, Maria promises no secure erasure from SQLite
@@ -540,23 +710,46 @@ offers bulk, wildcard, clear-all, or automatic deletion, and there is no undo,
 recovery, or memory revision history. Each mutation commits independently, and
 Maria then separately attempts to record a short, content-free response
 (`Updated memory <id>.` or `Forgot memory <id>.`); if that later recording
-fails, the mutation remains committed with no audit row guaranteed. The command
-text itself is still recorded as the request half of interaction history, so an
-update command retains its new fact there, and an earlier `remember`, `recall`,
-or `memories` response may already have copied that fact into interaction
-history. Forgetting or afterwards changing the memory does not rewrite or erase
-those independent interaction rows; they can be removed separately with `delete
-interaction <id>`. As elsewhere, Maria promises no secure erasure from SQLite
-file pages, database or filesystem backups, Git history, or external copies.
+fails, the mutation remains committed with no such history row guaranteed.
+The command text itself is still recorded as the request half of interaction
+history, so an update command retains its new fact there, and an earlier
+`remember`, `recall`, or `memories` response may already have copied that fact
+into interaction history. Forgetting or afterwards changing the memory does
+not rewrite or erase those independent interaction rows; they can be removed
+separately with `delete interaction <id>`. As elsewhere, Maria promises no
+secure erasure from SQLite file pages, database or filesystem backups, Git
+history, or external copies.
+
+Audit summaries are kept until you delete them, with no automatic retention
+period or pruning, and hold only the content-free values described under
+"Audit Summaries". `audit` and `read audit <id>` only read them, and
+interaction history records each only as the command you typed and a fixed
+reply such as `Listed audit summaries.` or `Displayed audit summary <id>.`,
+never what it showed. `delete audit <id>` targets at most one summary and
+removes it together with its outcome, in one transaction, when found, after
+mandatory explicit confirmation, with no content preview beforehand; an ID
+that matches no summary removes nothing and returns a not-found result.
+Deleting a summary does not undo its action, cascades into no other record,
+and removes nothing from the operational log, and no other command changes or
+removes a summary. There is no bulk, wildcard, clear-all, or automatic
+deletion and no undo or recovery, and a deleted summary's ID is never reused.
+As with the other deletions, it commits independently, and Maria then
+separately attempts to record the short response `Deleted audit summary <id>.`
+as interaction history. The operational log records a model-proposed action
+only by its action name and audit summary ID, never its arguments or result,
+and a directory listing, whether you or the model asked for it, is logged
+without its path or any error text. As elsewhere, Maria promises no secure
+erasure.
 
 Maria's shipped runtime has no cloud integration and does not itself transmit
 this history. Its only network-capable code is the local Ollama adapter
 described under "Local Ollama Adapter": it can reach only `127.0.0.1:11434` on
 the same machine, it is disabled by default, and when enabled it receives only
-the current session's conversation, the explicit memories you have enabled for
-context, and notes you have enabled for context that contain a word of the
-request, never stored history, a memory or note you have not enabled, or
-files.
+Maria's fixed instructions, the current session's conversation, the explicit
+memories you have enabled for context, and notes you have enabled for context
+that contain a word of the request, never stored history, an audit summary, a
+memory or note you have not enabled, files, or the result of an action it
+proposed.
 
 `enable memory context <id>` and `disable memory context <id>` change one
 memory's consent flag, and `enable note context <id>` and `disable note context
@@ -587,15 +780,18 @@ production runtime files are not required and no test creates or reads a real
 `~/MariaWorkspace`. The suite covers the CLI, configuration, permissions,
 calculator, memory, Logger, Tool Manager, notes, interaction history,
 filesystem, filesystem roots and permanent exclusions, system information,
-Brain, Planner, the reasoning interface, the local Ollama adapter, and clean
-startup wiring. The adapter's tests run only against a local stub on a socket
-pair inside the test process, so the suite needs no Ollama, no model, and no
-network.
+Brain, Planner, the reasoning interface, the local Ollama adapter,
+model-proposed actions with their approval and audit summaries, the audit
+commands, database schema upgrades, and clean startup wiring. The adapter's
+tests run only against a local stub on a socket pair inside the test process,
+and every other model reply is scripted, so the suite needs no Ollama, no
+model, and no network.
 
 ## Project Layout
 
 - `core/`: application coordination, planning, memory, permissions, logging,
-  configuration, constants, and the local reasoning interface and adapter
+  configuration, constants, the local reasoning interface and adapter, the
+  compiler that checks model proposals, and the audit-summary vocabulary
 - `tools/`: built-in tools
 - `database/`: SQLite database
 - `config/`: TOML configuration, including the named filesystem roots and the

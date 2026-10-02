@@ -690,7 +690,7 @@ class ActionContractRegistry:
 
 
 def _identifier(required: bool = True) -> ArgumentContract:
-    """Declare the positive row identifier shared by eleven lifecycle actions.
+    """Declare the positive row identifier shared by thirteen actions.
 
     Every tool that takes an ``id`` rejects a bool, a non-int, and anything
     below 1, and none imposes a ceiling.
@@ -768,10 +768,27 @@ def _named_root_path(name: str, required: bool = True) -> ArgumentContract:
 # independently of permission. Only three actions are open to a reasoning
 # model: arithmetic, listing a directory beneath the default named root, and
 # reading the clock. Everything that changes state, widens consent, or reads a
-# stored record, interaction history, a file's contents, or a host profile is
-# closed to it.
+# stored record, interaction history, an audit summary, a file's contents, or
+# a host profile is closed to it.
 BUILT_IN_ACTION_CONTRACTS = ActionContractRegistry(
     (
+        ActionContract(
+            "audit",
+            "list",
+            model_eligibility=ModelEligibility.NOT_MODEL_ELIGIBLE,
+        ),
+        ActionContract(
+            "audit",
+            "read",
+            (_identifier(),),
+            model_eligibility=ModelEligibility.NOT_MODEL_ELIGIBLE,
+        ),
+        ActionContract(
+            "audit",
+            "delete",
+            (_identifier(),),
+            model_eligibility=ModelEligibility.NOT_MODEL_ELIGIBLE,
+        ),
         ActionContract(
             "calculator",
             "calculate",

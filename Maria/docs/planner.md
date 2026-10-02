@@ -14,6 +14,7 @@ Supported command families:
 - Notes commands
 - Explicit persistent-memory commands
 - Interaction-history commands
+- Audit-summary commands
 - Read-only system information commands
 
 Input that matches no command receives the planner's generic no-action
@@ -24,10 +25,20 @@ I do not have an executable plan for that yet. Type 'help' to see supported comm
 ```
 
 The planner knows nothing about conversation or memory context. When
-reasoning is enabled, Brain answers exactly that generic fallback with a
-text-only reply from the local model instead of showing it, and records
-nothing; help, every usage response, and every command are unaffected. See
-"Deterministic-First Conversation" in `docs/architecture.md`.
+reasoning is enabled, Brain answers exactly that generic fallback with the
+local model's reply instead of showing it. A reply whose first character after
+any spaces, tabs, carriage returns, or line feeds is `{` is treated as a
+proposal of one action, which Brain, never the planner, hands to
+`core/plan_compiler.py`: it either becomes a one-step model-originated plan
+that runs only after the owner approves it, or is refused with a fixed
+message. Any other reply stays a conversational text reply. Nothing from such
+a turn, its request included, is recorded as interaction history, and an
+approved proposal runs only after Maria has committed a content-free audit
+summary for it, the only trace it leaves in Maria's database. Help, every
+usage response, and every command never reach the model. See
+"Deterministic-First Conversation", "Model-to-Plan Compilation Gate", and
+"Model-Originated Execution and Audit" in `docs/architecture.md`, and "Plan
+Shape" below.
 
 ## Memory Command Grammar
 
@@ -77,9 +88,10 @@ Use: recall <query>
 The planner receives the request text and nothing else: no interaction
 history, stored record, or memory context. Requests such as `please remember
 ...`, `what do you remember about ...`, and `memories extra` remain
-unsupported. With reasoning enabled they receive a conversational reply, which
-stores nothing and can draw only on memories the owner has enabled for
-context.
+unsupported. With reasoning enabled they go to the local model instead, whose
+reply can draw only on memories and notes the owner has enabled for context.
+That reply never stores a memory: no memory action is open to the model, so a
+proposal naming one is refused with a fixed message.
 
 ## Memory Lifecycle Grammar
 
@@ -109,8 +121,9 @@ PlanStep(
 
 Both take a positive numeric ID only, never fact text, and reuse `read
 interaction`'s exact `id` grammar and validation, unmodified: `id` must be one
-or more ASCII digits (`0`-`9`) with a resulting value of at least 1, and
-leading zeroes are accepted (`007` parses to `7`). Unicode digit lookalikes
+or more ASCII digits (`0`-`9`) with a resulting value from 1 to
+9223372036854775807, and leading zeroes are accepted however many there are
+(`007` parses to `7`). A larger value, Unicode digit lookalikes
 (including full-width `１２`, Arabic-Indic `١٢`, and superscript `²`), signs,
 decimals, embedded whitespace, and any other non-digit character are rejected.
 There is no fact-text lookup, recent-context inference, or fuzzy matching for
@@ -176,10 +189,10 @@ PlanStep(
 ```
 
 They reuse the same `id` grammar and validation as `forget memory`: one or more
-ASCII digits with a value of at least 1, leading zeroes accepted, and every
-Unicode digit lookalike, sign, decimal, embedded token, or other character
-rejected with `Memory id must be a positive whole number.` A bare command
-returns its usage response:
+ASCII digits with a value from 1 to 9223372036854775807, any number of leading
+zeroes accepted, and every larger value, Unicode digit lookalike, sign,
+decimal, embedded token, or other character rejected with `Memory id must be a
+positive whole number.` A bare command returns its usage response:
 
 ```text
 Use: enable memory context <id>
@@ -254,9 +267,10 @@ PlanStep(
 
 All three take a positive numeric ID only, never a title, and reuse `read
 interaction`'s exact `id` grammar and validation, unmodified: `id` must be one
-or more ASCII digits (`0`-`9`) with a resulting value of at least 1, and
-leading zeroes are accepted (`007` parses to `7`). Unicode digit lookalikes,
-signs, decimals, embedded whitespace, and any other non-digit character are
+or more ASCII digits (`0`-`9`) with a resulting value from 1 to
+9223372036854775807, and leading zeroes are accepted however many there are
+(`007` parses to `7`). A larger value, Unicode digit lookalikes, signs,
+decimals, embedded whitespace, and any other non-digit character are
 rejected. There is no title lookup, recent-context inference, or fuzzy matching
 for these mutations.
 
@@ -317,10 +331,10 @@ PlanStep(
 ```
 
 They reuse the same `id` grammar and validation as `delete note`: one or more
-ASCII digits with a value of at least 1, leading zeroes accepted, and every
-Unicode digit lookalike, sign, decimal, embedded token, or other character
-rejected with `Note id must be a positive whole number.` A bare command returns
-its usage response:
+ASCII digits with a value from 1 to 9223372036854775807, any number of leading
+zeroes accepted, and every larger value, Unicode digit lookalike, sign,
+decimal, embedded token, or other character rejected with `Note id must be a
+positive whole number.` A bare command returns its usage response:
 
 ```text
 Use: enable note context <id>
@@ -379,10 +393,18 @@ PlanStep(
 )
 ```
 
-`id` must be one or more ASCII digits (`0`-`9`) with a resulting value of at
-least 1; leading zeroes are accepted (`007` parses to `7`). Unicode digit
-lookalikes, signs, decimals, embedded whitespace, and any other non-digit
-character are rejected. A bare or whitespace-only `search history` returns:
+`id` must be one or more ASCII digits (`0`-`9`) with a resulting value from 1
+to 9223372036854775807, the largest integer SQLite stores and so the largest
+id any record can have; leading zeroes are accepted however many there are
+(`007` parses to `7`). Unicode digit lookalikes, signs, decimals, embedded
+whitespace, and any other non-digit character are rejected, and so is a larger
+value, with the same invalid-ID response and before any step is planned or any
+confirmation is asked for. The planner strips the leading zeroes and refuses
+more than 19 significant digits before any conversion, then converts at most 19
+digits and compares the result with 9223372036854775807. An operand of any
+length therefore gets an answer, and Python's limit on converting long digit
+strings to an integer, which stays in force, is never reached. A bare or
+whitespace-only `search history` returns:
 
 ```text
 Use: search history <query>
@@ -436,6 +458,99 @@ Near-prefix and plural variants such as `histories`, `history list`,
 and `delete interaction1` remain unsupported and receive the planner's
 existing generic unsupported-command response.
 
+## Audit Summary Grammar
+
+Audit-summary commands use strict command syntax, and their keywords are
+case-insensitive. They show and remove the content-free audit summaries Maria
+commits when the owner approves an action the local reasoning model proposed;
+see "Audit Tool" in `docs/tools.md` and "Model-Originated Execution and Audit"
+in `docs/architecture.md`.
+
+The exact command `audit` creates this step:
+
+```text
+PlanStep(
+    tool_name="audit",
+    action="list",
+    arguments={},
+)
+```
+
+`read audit <id>` creates this step:
+
+```text
+PlanStep(
+    tool_name="audit",
+    action="read",
+    arguments={"id": summary_id},
+)
+```
+
+`delete audit <id>` creates this step:
+
+```text
+PlanStep(
+    tool_name="audit",
+    action="delete",
+    arguments={"id": summary_id},
+)
+```
+
+`read audit` and `delete audit` take a positive numeric ID only and reuse
+`read interaction`'s exact `id` grammar and validation, unmodified: `id` must
+be one or more ASCII digits (`0`-`9`) with a resulting value from 1 to
+9223372036854775807, and leading zeroes are accepted however many there are
+(`007` parses to `7`). A larger value, Unicode digit lookalikes, signs,
+decimals, embedded whitespace, and any other non-digit character are rejected.
+A bare or whitespace-only `read audit` or `delete audit` returns the matching
+usage response:
+
+```text
+Use: read audit <id>
+Use: delete audit <id>
+```
+
+An invalid ID returns:
+
+```text
+Audit summary id must be a positive whole number.
+```
+
+Because the operand after each fixed prefix is parsed as one value, an
+embedded extra token (for example `delete audit 1 extra`) is an invalid ID,
+not a separate unsupported command. Each prefix is matched exactly, with one
+ASCII space between its words and one after it. A tab in place of either
+space, as in `read audit\t5`, or a second space between the words leaves the
+command unsupported; any further whitespace before the ID is ignored.
+
+`audit.delete` requires mandatory explicit confirmation before it executes;
+see `docs/architecture.md`'s Permission Policy section. The confirmation also
+states that deleting an audit summary does not undo the action and that
+Maria's operational log may still show that a model-proposed action ran. It is
+asked for even when no summary has that ID, because Maria does not look the
+summary up before asking; the confirmed deletion then answers `Audit summary
+not found: <id>.` An ID above 9223372036854775807 is different: no summary can
+have one, so it gets the invalid-ID response and no confirmation is asked for.
+
+Near-prefix and plural variants such as `audits`, `audit list`, `audit 1`,
+`read audits <id>`, `delete audits <id>`, and `delete audit1` remain
+unsupported and receive the planner's existing generic unsupported-command
+response. `list audits` is not an audit command: it keeps its existing
+meaning, a `filesystem.list` step for the path `audits`.
+
+`help` lists the three commands last, after `delete interaction <id>`:
+
+```text
+- audit
+- read audit <id>
+- delete audit <id>
+```
+
+Only these owner commands reach the audit actions. None of the three is
+model-eligible, so a reasoning model's proposal naming one is refused with
+`Maria does not accept that action from the reasoning model.`, and audit
+summaries are never sent to the model as context.
+
 ## Plan Shape
 
 A plan contains:
@@ -444,16 +559,33 @@ A plan contains:
 - Zero or more steps
 - An optional response when no action should run
 - A recording policy, `RECORD` by default; the planner never sets any other
+- An origin, `DETERMINISTIC` by default; the planner never sets any other
 
 Each step names a tool, an action, and its arguments.
+
+The origin is a `PlanOrigin`. The only other one is `MODEL`, and only
+`core/plan_compiler.py` sets it, on the plan it compiles from one local-model
+proposal after the planner has returned its generic fallback. A `MODEL` plan
+always has exactly one step and the `TRANSIENT` recording policy, and never a
+response for when no action should run; `Plan` refuses to construct one of any
+other shape, and `is_model_plan()` reports whether a value is exactly such a
+plan. The planner never sees a model's reply or a compiled plan, and an
+approved compiled plan runs as compiled, never planned again. Brain requires
+exactly one approval from the owner for every `MODEL` plan, even when its
+action is allowed outright, and refuses one whose action is denied before
+offering it; see "Model-Originated Execution and Audit" in
+`docs/architecture.md`.
 
 `Plan` and `PlanStep` are immutable, hashable value objects. `PlanStep`
 arguments are a read-only mapping snapshotted at construction, whose keys are
 strings and whose values are strings or integers; any other key or value type
 is refused. `Plan.fingerprint` returns a stable SHA-256 digest of the plan's
 complete logical content, so structurally equal plans share one fingerprint
-while a differing step order or a single differing character does not. See
-`docs/api.md` for the full contract.
+while a differing step order or a single differing character does not. The
+origin joins that content only when it is `MODEL`, so every deterministic plan
+keeps the fingerprint it had before origins existed, while a model-originated
+plan fingerprints differently from an otherwise identical deterministic one.
+See `docs/api.md` for the full contract.
 
 ## Future Direction
 

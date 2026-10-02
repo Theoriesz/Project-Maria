@@ -62,6 +62,8 @@ from core.permissions import PermissionManager
 from core.session import CONFIRMATION_REFUSED_MESSAGE
 from core.reasoning import (
     DISABLED_REASONING,
+    INSTRUCTION_SEPARATOR,
+    PROPOSAL_INSTRUCTIONS,
     REASONING_MAXIMUM_INPUT_BYTES,
     ReasoningExchange,
     ReasoningRequest,
@@ -110,6 +112,14 @@ MEMORY_SENTINEL = "private-context-memory-5b0e7c21d4"
 OTHER_SENTINEL = "private-context-memory-other-8f13a6e92c"
 INTERACTION_SENTINEL = "private-stored-interaction-c4e1f7a903"
 REPLY = "A conversational reply."
+
+# Since V1-18 Brain asks the local model in proposal mode, so every
+# model-backed request also carries Maria's fixed proposal instructions and,
+# with context, the separator joining them to the context framing. Both are
+# measured from the exported text, so a budget built on them still falls on
+# the exact byte it is meant to.
+PROPOSAL_INSTRUCTION_BYTES = len(PROPOSAL_INSTRUCTIONS.encode("utf-8"))
+SEPARATOR_BYTES = len(INSTRUCTION_SEPARATOR.encode("utf-8"))
 
 
 def _item(record_id: int, text: str) -> ContextItem:
@@ -856,9 +866,16 @@ class SuppliedContextTests(unittest.TestCase):
         exchange_size = 200
         request = "a" * 100
 
-        # With room for the request, the context, and two exchanges, the
-        # oldest exchange is dropped and the context is sent whole.
-        budget = len(request) + context_size + 2 * exchange_size
+        # With room for the request and its proposal instructions, the
+        # context with the separator before its framing, and two exchanges,
+        # the oldest exchange is dropped and the context is sent whole.
+        budget = (
+            len(request)
+            + PROPOSAL_INSTRUCTION_BYTES
+            + SEPARATOR_BYTES
+            + context_size
+            + 2 * exchange_size
+        )
         provider = ScriptedProvider(lambda sent: "b" * 100)
         harness = _Harness(self, provider, settings=enabled_settings(max_input_bytes=budget))
         _enable(harness, fact)
@@ -866,18 +883,35 @@ class SuppliedContextTests(unittest.TestCase):
         for _ in range(4):
             session.submit(request)
 
+        # Every turn is sent: the fourth fits because its history is fitted
+        # beside the instructions it carries, rather than refused as over
+        # budget after fitting.
+        self.assertEqual(provider.calls, 4)
         last = provider.requests[-1]
+        self.assertIs(last.proposal_instructions, True)
         self.assertEqual(last.context, (_item(1, fact),))
         self.assertEqual(len(last.history), 2)
         self.assertLessEqual(
-            request_content_bytes(last.prompt, last.history, budget, last.context),
+            request_content_bytes(
+                last.prompt,
+                last.history,
+                budget,
+                last.context,
+                last.proposal_instructions,
+            ),
             budget,
         )
 
     def test_context_is_kept_before_any_earlier_exchange(self) -> None:
         fact = "f" * 100
         request = "a" * 100
-        budget = len(request) + rendered_context_bytes((_item(1, fact),)) + 199
+        budget = (
+            len(request)
+            + PROPOSAL_INSTRUCTION_BYTES
+            + SEPARATOR_BYTES
+            + rendered_context_bytes((_item(1, fact),))
+            + 199
+        )
         provider = ScriptedProvider(lambda sent: "b" * 100)
         harness = _Harness(self, provider, settings=enabled_settings(max_input_bytes=budget))
         _enable(harness, fact)
@@ -886,12 +920,22 @@ class SuppliedContextTests(unittest.TestCase):
         session.submit(request)
         session.submit(request)
 
+        # The second request is sent, without the exchange one byte too large.
+        self.assertEqual(provider.calls, 2)
         self.assertEqual(provider.requests[-1].context, (_item(1, fact),))
         self.assertEqual(provider.requests[-1].history, ())
 
     def test_the_request_is_kept_before_any_context(self) -> None:
         request = "a" * 100
-        budget = len(request) + rendered_context_bytes((_item(1, "fact"),)) - 1
+        # One byte short of the context with the separator before its
+        # framing, after the request and its proposal instructions.
+        budget = (
+            len(request)
+            + PROPOSAL_INSTRUCTION_BYTES
+            + SEPARATOR_BYTES
+            + rendered_context_bytes((_item(1, "fact"),))
+            - 1
+        )
         provider = ScriptedProvider(lambda sent: REPLY)
         harness = _Harness(self, provider, settings=enabled_settings(max_input_bytes=budget))
         _enable(harness, "fact")
@@ -905,6 +949,22 @@ class SuppliedContextTests(unittest.TestCase):
             _no_context(REPLY)
             + "\nNot included because of the memory context limits: memory 1.",
         )
+
+        # One byte more holds the context and its separator exactly, so the
+        # same request carries memory 1 and the owner is told it was supplied.
+        provider = ScriptedProvider(lambda sent: REPLY)
+        harness = _Harness(
+            self,
+            provider,
+            settings=enabled_settings(max_input_bytes=budget + 1),
+        )
+        _enable(harness, "fact")
+
+        response = harness.session().submit(request)
+
+        self.assertEqual(provider.requests[0].prompt, request)
+        self.assertEqual(provider.requests[0].context, (_item(1, "fact"),))
+        self.assertEqual(response.text, _supplied(REPLY, "memory 1"))
 
     def test_a_failed_request_names_selected_memories_without_claiming_delivery(
         self,

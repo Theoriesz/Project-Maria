@@ -11,6 +11,16 @@ memories and what Tier B's bounded search finds among enabled memories and
 notes - read through the memory layer's bounded context queries only on the
 conversational path; interaction history is never read for planning or
 reasoning.
+
+A model reply the conversation module recognises as a proposal attempt is
+compiled here, through ``core/plan_compiler.py`` and against Tool Manager's
+active contract registry, into a model-originated plan or a fixed refusal.
+Such a plan never runs without exactly one approval from the owner, whatever
+PermissionManager decides for its action, and a denied action is refused
+before any approval is offered. The approved plan is the same immutable
+plan: it is checked again, never rebuilt or reparsed, no provider is asked
+anything, and it runs at most once, only after its content-free audit
+summary is committed.
 """
 
 from __future__ import annotations
@@ -19,7 +29,8 @@ from collections.abc import Callable, Sequence
 from dataclasses import dataclass, replace
 from logging import Logger
 
-from core.action_contracts import ContractViolation
+from core.action_contracts import ActionContract, ContractViolation
+from core.audit import AuditDecision, AuditOutcome, audit_target
 from core.config import MariaConfig, load_config
 from core.constants import LOCAL_CONFIG_PATH
 from core.context import (
@@ -34,7 +45,13 @@ from core.context import (
     supplied_record_ids,
     validated_supplied_context,
 )
-from core.conversation import converse, is_generic_fallback
+from core.conversation import (
+    converse,
+    is_conversational_plan,
+    is_generic_fallback,
+    with_notices,
+)
+from core.failures import Failure, FailureKind
 from core.filesystem_roots import prepare_roots
 from core.logger import configure_logging, get_logger
 from core.memory import Memory
@@ -43,13 +60,58 @@ from core.permissions import (
     PermissionManager,
     PermissionResult,
 )
-from core.planner import Plan, Planner, PlanStep, RecordingPolicy
+from core.plan_compiler import (
+    ProposalRejection,
+    compile_proposal,
+    recheck_model_plan,
+)
+from core.planner import (
+    Plan,
+    PlanOrigin,
+    Planner,
+    PlanStep,
+    RecordingPolicy,
+    is_model_plan,
+)
 from core.reasoning import (
     ReasoningExchange,
     ReasoningProvider,
+    ReasoningResponse,
     ReasoningSettings,
 )
 from core.tool_manager import ToolExecutionResult, ToolManager
+
+
+# Fixed replies for what goes wrong around a model-originated plan. None
+# interpolates anything a request, a model, a tool, or a stored record
+# supplied.
+CONVERSATION_RESULT_REFUSED_MESSAGE = (
+    "Maria could not use that conversational result."
+)
+MODEL_PLAN_REFUSED_MESSAGE = (
+    "Maria refused that plan because it is not a well-formed plan compiled "
+    "from one model proposal."
+)
+MODEL_PLAN_UNAPPROVED_MESSAGE = (
+    "Maria runs a model-proposed action only after you approve it."
+)
+AUDIT_SUMMARY_UNRECORDED_MESSAGE = (
+    "Maria did not run the approved action because its audit summary could "
+    "not be recorded."
+)
+
+
+def audit_recorded_notice(summary_id: int) -> str:
+    """Return the notice that follows a result whose outcome was recorded."""
+    return f"Recorded as audit summary {summary_id}."
+
+
+def audit_outcome_unrecorded_notice(summary_id: int) -> str:
+    """Return the notice for a recorded summary whose outcome was not."""
+    return (
+        f"Recorded as audit summary {summary_id}, but its outcome could not be "
+        "recorded, so that summary shows the outcome as unknown."
+    )
 
 
 @dataclass(frozen=True)
@@ -58,12 +120,17 @@ class BrainResponse:
 
     ``conversation`` is set by a completed conversational reply, to the
     session's conversation as it stands after that reply, and to an empty
-    conversation by a conversational turn that had to clear it. Every other
-    response leaves it None, so no command, its result, or a failed
-    conversational turn ever becomes conversation. ``supplied_context``
-    travels with it: the fingerprints of every memory and note supplied
-    since that conversation was last cleared, which the session keeps
-    beside it.
+    conversation by a conversational turn that had to clear it, whatever
+    else that turn produced. Every other response leaves it None, so no
+    command, its result, a proposal, or a failed conversational turn ever
+    becomes conversation. ``supplied_context`` travels with it: the
+    fingerprints of every memory and note supplied since that conversation
+    was last cleared, which the session keeps beside it.
+
+    A model-originated plan awaiting approval comes back with
+    ``needs_confirmation`` set, the plan itself, and as ``text`` only
+    Maria's notices about that turn's context. The session renders the plan
+    above them, from the very plan it then binds the approval to.
     """
 
     text: str
@@ -234,14 +301,15 @@ class MariaBrain:
         The deterministic planner always answers first, from the request text
         alone. Only when a reasoning provider was supplied, the configured
         reasoning settings are enabled, and the planner returned its exact
-        generic no-action fallback, is the request answered conversationally
-        instead, in the context of ``conversation``: the caller's earlier
-        exchanges, oldest first, with ``supplied_context``, the fingerprints
-        of the memories and notes supplied since they began. With reasoning
-        disabled the fallback is answered and recorded exactly as it always
-        was, whether or not a provider is present. Every other plan runs
-        exactly as it always has and never sees the conversation or any
-        stored context.
+        generic no-action fallback, is the request answered by the local
+        model instead, in the context of ``conversation``: the caller's
+        earlier exchanges, oldest first, with ``supplied_context``, the
+        fingerprints of the memories and notes supplied since they began.
+        The model may answer conversationally or propose one action; see
+        ``_converse``. With reasoning disabled the fallback is answered and
+        recorded exactly as it always was, whether or not a provider is
+        present. Every other plan runs exactly as it always has and never
+        sees the conversation or any stored context.
         """
         cleaned_input = user_input.strip()
         if not cleaned_input:
@@ -266,21 +334,25 @@ class MariaBrain:
         conversation: tuple[ReasoningExchange, ...],
         supplied_context: frozenset[ContextFingerprint],
     ) -> BrainResponse:
-        """Answer one unrecognised request with the local model, as text.
+        """Answer one unrecognised request with the local model.
 
         This is the only place context is read, and only after every gate
         above has passed; ``_read_context`` says which bounded reads run.
         When any of them fails, the conversation module sends no context and
         no earlier exchange.
 
-        The conversation module settles the whole turn and produces a
-        zero-step plan that it, as the plan's producer, made transient. That
-        plan takes the ordinary zero-step path, which returns before any
-        contract, permission, or tool is consulted and records nothing. The
-        conversation and supplied-context fingerprints it returns are handed
-        back for the session to keep, and nothing else is: no interaction
-        history, no other stored record, and no earlier command reaches the
-        model through here.
+        The conversation module settles the whole turn in proposal mode, so
+        the request carries Maria's fixed proposal instructions and the
+        provider is asked exactly once. A conversational outcome is a
+        zero-step plan that it, as the plan's producer, made transient, and
+        Brain accepts nothing else as one. That plan takes the ordinary
+        zero-step path, which returns before any contract, permission, or
+        tool is consulted and records nothing. A proposal attempt goes to
+        ``_consider_proposal`` instead, with the turn's notices. The
+        conversation and supplied-context fingerprints the turn returns are
+        handed back for the session to keep, and nothing else is: no
+        interaction history, no other stored record, and no earlier command
+        reaches the model through here.
         """
         self.logger.info("Answering request conversationally.")
         reads = self._read_context(
@@ -300,8 +372,30 @@ class MariaBrain:
             supplied_notes_read=reads.supplied_notes,
             searched_memories_read=reads.searched_memories,
             searched_notes_read=reads.searched_notes,
+            proposals=True,
         )
-        response = self._run_plan(turn.plan, confirmed=False)
+        if turn.proposal is not None:
+            response = self._consider_proposal(
+                request,
+                turn.proposal,
+                turn.notices,
+            )
+        elif is_conversational_plan(turn.plan):
+            response = self._run_plan(turn.plan, confirmed=False)
+        else:
+            self.logger.error(
+                "Refused a conversational result that was not a zero-step "
+                "transient plan."
+            )
+            if turn.conversation is None:
+                return BrainResponse(CONVERSATION_RESULT_REFUSED_MESSAGE)
+            # Nothing from a refused result is kept, but whatever this turn
+            # cleared stays cleared.
+            return BrainResponse(
+                CONVERSATION_RESULT_REFUSED_MESSAGE,
+                conversation=(),
+                supplied_context=frozenset(),
+            )
         if turn.conversation is None:
             return response
         return replace(
@@ -309,6 +403,31 @@ class MariaBrain:
             conversation=turn.conversation,
             supplied_context=turn.supplied_context,
         )
+
+    def _consider_proposal(
+        self,
+        request: str,
+        proposal: ReasoningResponse,
+        notices: tuple[str, ...],
+    ) -> BrainResponse:
+        """Compile one proposal attempt, then offer or refuse the plan.
+
+        The compiler is handed the owner's cleaned request, the reply exactly
+        as it arrived, and Tool Manager's active contract registry. A refused
+        proposal answers with its fixed message and nothing is repaired,
+        retried, or asked of the model again. A compiled plan is offered for
+        approval through ``_run_model_plan``. Either way the turn's notices
+        are shown exactly once, with that answer, and are kept nowhere.
+        """
+        outcome = compile_proposal(
+            request,
+            proposal,
+            self.tool_manager.contracts,
+            self.logger,
+        )
+        if type(outcome) is ProposalRejection:
+            return BrainResponse(with_notices(outcome.message, notices))
+        return self._run_model_plan(outcome, confirmed=False, notices=notices)
 
     def _read_context(
         self,
@@ -387,28 +506,37 @@ class MariaBrain:
         """Run an already-approved plan without planning the request again.
 
         The caller has bound the owner's approval to this exact plan, so
-        Brain retrieves no context and invokes no planner. It validates the
-        same plan against the action contracts again and resolves its
-        permissions again before dispatching anything, because an approval
-        authorises a plan rather than freezing the contract and the decisions
-        that were current when that plan was shown, then resumes the ordinary
-        dispatch and recording flow.
+        Brain retrieves no context, invokes no planner, and asks no reasoning
+        provider anything. It validates the same plan against the action
+        contracts again and resolves its permissions again before dispatching
+        anything, because an approval authorises a plan rather than freezing
+        the contract and the decisions that were current when that plan was
+        shown, then resumes the ordinary dispatch and recording flow. A
+        model-originated plan is also checked again against the compiler's
+        gates and runs only behind its audit summary; see
+        ``_run_model_plan``.
         """
         return self._run_plan(plan, confirmed=True)
 
     def _run_plan(self, plan: Plan, *, confirmed: bool) -> BrainResponse:
         """Validate, resolve, then dispatch a whole plan generically.
 
-        Three phases run in a fixed order. Every step is first validated
-        against the declared action contracts, then every step's permission
-        is decided, and only then is anything dispatched. A contract failure
-        anywhere refuses the plan before PermissionManager is consulted at
-        all. A denial anywhere denies the entire plan, and an outstanding
-        confirmation anywhere holds the entire plan, so neither outcome can
-        arrive after a step already ran. Every outcome that records goes
-        through _record_interaction, which honours the plan's recording
-        policy.
+        A plan whose origin is anything but exactly DETERMINISTIC takes
+        ``_run_model_plan`` instead, where only a well-formed model-originated
+        plan can proceed, and every other plan the path below. Three phases
+        run in a fixed order. Every
+        step is first validated against the declared action contracts, then
+        every step's permission is decided, and only then is anything
+        dispatched. A contract failure anywhere refuses the plan before
+        PermissionManager is consulted at all. A denial anywhere denies the
+        entire plan, and an outstanding confirmation anywhere holds the
+        entire plan, so neither outcome can arrive after a step already ran.
+        Every outcome that records goes through _record_interaction, which
+        honours the plan's recording policy.
         """
+        if plan.origin is not PlanOrigin.DETERMINISTIC:
+            return self._run_model_plan(plan, confirmed=confirmed)
+
         if not plan.steps:
             response = plan.response_if_no_action or "I do not know how to handle that yet."
             self._record_interaction(plan, response)
@@ -548,6 +676,197 @@ class MariaBrain:
             self._format_recorded_results(results),
         )
         return BrainResponse(response, plan=resolved.plan)
+
+    def _run_model_plan(
+        self,
+        plan: Plan,
+        *,
+        confirmed: bool,
+        notices: tuple[str, ...] = (),
+    ) -> BrainResponse:
+        """Offer, refuse, or run one model-originated plan.
+
+        The same gates run whether the plan is being offered or has been
+        approved: its shape and origin, then ``recheck_model_plan`` against
+        Tool Manager's current registry, then PermissionManager. A plan that
+        fails any of them is refused, and a denied action is refused before
+        any approval is offered, so neither can ever reach an audit summary
+        or a tool. Every other plan needs exactly one approval from the
+        owner, including when its action is allowed outright: an unapproved
+        plan comes back for approval, as the very same immutable plan and
+        never prepared or rebound, with ``notices`` as its whole text, and
+        an approved one goes to ``_dispatch_model_plan``. ``notices`` are
+        shown with an offer or a refusal; an approved plan has none.
+        """
+        refusal = self._model_plan_refusal(plan)
+        if refusal is not None:
+            return BrainResponse(with_notices(refusal, notices), plan=plan)
+
+        step = plan.steps[0]
+        permission = self.permissions.check(step.tool_name, step.action)
+        decision = permission.decision
+        if decision is not PermissionDecision.ALLOWED and (
+            decision is not PermissionDecision.REQUIRES_CONFIRMATION
+        ):
+            self.logger.warning(
+                "Denied model-proposed action: %s.%s",
+                step.tool_name,
+                step.action,
+            )
+            return BrainResponse(
+                with_notices(f"Permission denied: {permission.reason}", notices),
+                plan=plan,
+            )
+
+        if not confirmed:
+            self.logger.info(
+                "Owner approval required for model-proposed action: %s.%s",
+                step.tool_name,
+                step.action,
+            )
+            return BrainResponse(
+                "\n".join(notices),
+                needs_confirmation=True,
+                plan=plan,
+            )
+        return self._dispatch_model_plan(plan, confirmed=confirmed)
+
+    def _model_plan_refusal(self, plan: Plan) -> str | None:
+        """Return why a model-originated plan cannot proceed, or None.
+
+        The plan must still be exactly a well-formed model-originated plan,
+        and its one step must still pass every compiler gate against the
+        registry Tool Manager holds now. Nothing is parsed or rebuilt, and
+        the reason is fixed text that repeats nothing the model supplied.
+        """
+        if not is_model_plan(plan):
+            self.logger.error(
+                "Refused a model-originated plan that is not well formed."
+            )
+            return MODEL_PLAN_REFUSED_MESSAGE
+        rejection = recheck_model_plan(
+            plan,
+            self.tool_manager.contracts,
+            self.logger,
+        )
+        if rejection is not None:
+            return rejection.message
+        return None
+
+    def _dispatch_model_plan(
+        self,
+        plan: Plan,
+        *,
+        confirmed: bool,
+    ) -> BrainResponse:
+        """Run one approved model-originated plan, at most once, under audit.
+
+        An unapproved plan is refused here whatever called this. Otherwise
+        the plan's audit summary is inserted and committed first; when it
+        cannot be, nothing is dispatched and the attempt is refused, and the
+        approval is not given back. The step then runs exactly once, with
+        exactly the immutable arguments the owner approved, and its outcome,
+        succeeded or failed by the tool's own success flag, is appended to
+        that summary. The tool's result is always shown, followed by which
+        summary records it, or by a notice that the outcome could not be
+        recorded. Nothing is retried, and nothing is recorded as interaction
+        history, because a model-originated plan is transient.
+        """
+        if confirmed is not True:
+            self.logger.error(
+                "Refused to dispatch a model-proposed action without approval."
+            )
+            return BrainResponse(MODEL_PLAN_UNAPPROVED_MESSAGE, plan=plan)
+
+        step = plan.steps[0]
+        contract = self.tool_manager.contracts.contract_for(
+            step.tool_name,
+            step.action,
+        )
+        summary_id = self._authorize_dispatch(contract)
+        if summary_id is None:
+            return BrainResponse(AUDIT_SUMMARY_UNRECORDED_MESSAGE, plan=plan)
+
+        self.logger.info(
+            "Dispatching approved model-proposed action %s under audit "
+            "summary %s.",
+            contract.identifier,
+            summary_id,
+        )
+        result = self.tool_manager.execute_tool(
+            step.tool_name,
+            step.action,
+            step.arguments,
+        )
+        if type(result) is not ToolExecutionResult:
+            # Anything but a real result is neither shown nor trusted: it
+            # counts as the shared fixed tool failure.
+            result = ToolExecutionResult(
+                False,
+                Failure(FailureKind.TOOL_EXECUTION_FAILED).message,
+            )
+        succeeded = result.success is True
+        outcome = AuditOutcome.SUCCEEDED if succeeded else AuditOutcome.FAILED
+        if self._record_audit_outcome(summary_id, outcome):
+            notice = audit_recorded_notice(summary_id)
+        else:
+            notice = audit_outcome_unrecorded_notice(summary_id)
+        return BrainResponse(f"{result.message}\n\n{notice}", plan=plan)
+
+    def _authorize_dispatch(self, contract: ActionContract | None) -> int | None:
+        """Commit the audit summary that authorises one dispatch, or refuse.
+
+        The summary holds only the contract's canonical identifier, the
+        owner's approval, and the target class the contract implies. Any
+        failure to commit it, and any id that is not an exact positive int,
+        returns None, which refuses the dispatch; the failure itself is
+        never bound, so nothing of it reaches the log or the owner.
+        """
+        if contract is None:
+            self.logger.error(
+                "Refused a model-proposed action: its contract is missing."
+            )
+            return None
+        try:
+            summary_id = self.memory.record_audit_summary(
+                contract.identifier,
+                AuditDecision.OWNER_APPROVED,
+                audit_target(contract),
+            )
+        except Exception:  # noqa: BLE001 - no recorded summary, no dispatch.
+            self.logger.error(
+                "Refused a model-proposed action: its audit summary was not "
+                "recorded."
+            )
+            return None
+        if type(summary_id) is not int or summary_id < 1:
+            self.logger.error(
+                "Refused a model-proposed action: its audit summary id was "
+                "not valid."
+            )
+            return None
+        return summary_id
+
+    def _record_audit_outcome(
+        self,
+        summary_id: int,
+        outcome: AuditOutcome,
+    ) -> bool:
+        """Append one outcome to its summary, returning whether it was stored.
+
+        The tool has already run, so a failure here changes nothing about
+        its result: it is reported to the owner, never retried, and never
+        bound, so nothing of it reaches the log.
+        """
+        try:
+            self.memory.record_audit_outcome(summary_id, outcome)
+        except Exception:  # noqa: BLE001 - the result is shown either way.
+            self.logger.error(
+                "The outcome of audit summary %s could not be recorded.",
+                summary_id,
+            )
+            return False
+        return True
 
     def _record_interaction(self, plan: Plan, response: str) -> None:
         """Store a plan's interaction unless its producer made it transient.

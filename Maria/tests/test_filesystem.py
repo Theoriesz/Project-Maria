@@ -12,7 +12,7 @@ from contextlib import contextmanager
 from pathlib import Path
 from tempfile import TemporaryDirectory
 from typing import Any, Iterator
-from unittest.mock import Mock, patch
+from unittest.mock import Mock, call, patch
 
 import core.filesystem_roots as filesystem_roots_module
 import tools.filesystem as filesystem_module
@@ -29,9 +29,11 @@ from core.filesystem_roots import (
     RootPolicy,
 )
 from core.tool_manager import ToolExecutionResult
+from tests.log_assertions import assert_log_omits
 from tools.filesystem import (
     CROSS_ROOT_MESSAGE,
     PATH_EXCLUDED_MESSAGE,
+    PATH_NOT_TEXT_MESSAGE,
     PATH_OUTSIDE_ROOT_MESSAGE,
     PATH_READ_ONLY_ROOT_MESSAGE,
     PATH_REQUIRED_MESSAGE,
@@ -40,6 +42,20 @@ from tools.filesystem import (
     FilesystemTool,
     build_tool,
 )
+
+
+# The only two lines a listing may log, written out so they are pinned
+# rather than agreed with.
+LISTED_LOG_LINE = "Listed a directory."
+LIST_FAILED_LOG_LINE = "Directory listing failed."
+
+# Distinctive names for the listing log tests. None of them occurs in either
+# fixed line above, so finding one in a log can only mean it leaked.
+LIST_DIRECTORY_SENTINEL = "list-log-directory-sentinel-6a90c3"
+LIST_CHILD_SENTINEL = "list-log-child-sentinel-2f18d7.txt"
+LIST_EMPTY_SENTINEL = "list-log-empty-sentinel-c57e14"
+LIST_OUTSIDE_SENTINEL = "list-log-outside-sentinel-b4e051"
+LIST_ERROR_SENTINEL = "list-log-oserror-sentinel-9d3c62"
 
 
 def organizing_roots(
@@ -1044,6 +1060,337 @@ class FilesystemFailureSanitizationTests(unittest.TestCase):
         # escaped form of each absolute path.
         self.assertIn(repr(error.filename), logged)
         self.assertIn(repr(error.filename2), logged)
+
+
+class FilesystemListLoggingTests(unittest.TestCase):
+    """Prove a listing logs only fixed lines while the owner's view is unchanged.
+
+    A reasoning model may propose ``filesystem.list``, so its operational log
+    lines name neither the resolved directory, the submitted path, nor an
+    exception's text. ``read``, ``rename``, and ``move`` are not model
+    eligible and deliberately keep their path-bearing lines. That
+    deterministic exception is pinned here too, so neither rule can drift
+    into the other unnoticed.
+    """
+
+    def setUp(self) -> None:
+        self.temporary_directory = TemporaryDirectory()
+        self.addCleanup(self.temporary_directory.cleanup)
+        self.temporary_path = Path(self.temporary_directory.name)
+        self.root = self.temporary_path / "safe root"
+        self.root.mkdir()
+        self.root_path = self.root.resolve()
+        self.directory = self.root / LIST_DIRECTORY_SENTINEL
+        self.directory.mkdir()
+        self.child = self.directory / LIST_CHILD_SENTINEL
+        self.child.write_text("child", encoding="utf-8")
+        (self.directory / LIST_EMPTY_SENTINEL).mkdir()
+        self.roots = organizing_roots(self.root)
+        self.protections = unreachable_protections(self.root)
+        self.logger = Mock(spec=logging.Logger)
+        self.tool = FilesystemTool(self.roots, self.protections, logger=self.logger)
+
+    def _sentinel_error(self) -> OSError:
+        """Build an OSError whose every text field is distinctive."""
+        return OSError(
+            errno.EACCES,
+            f"{LIST_ERROR_SENTINEL} at {self.directory.resolve()}",
+            str(self.child.resolve()),
+            None,
+            str((self.root / LIST_OUTSIDE_SENTINEL).resolve()),
+        )
+
+    def _logged(self) -> str:
+        """Return every call made on the tool's logger as one text."""
+        return " ".join(str(entry) for entry in self.logger.method_calls)
+
+    def _assert_nothing_identifying_was_logged(self, *extra: str) -> None:
+        """Assert no path, name, or exception text reached the tool's logger."""
+        logged = self._logged()
+        for private in (
+            str(self.root_path),
+            self.root_path.as_posix(),
+            LIST_DIRECTORY_SENTINEL,
+            LIST_CHILD_SENTINEL,
+            LIST_EMPTY_SENTINEL,
+            LIST_OUTSIDE_SENTINEL,
+            LIST_ERROR_SENTINEL,
+            *extra,
+        ):
+            with self.subTest(private=private):
+                self.assertNotIn(private, logged)
+
+    def test_a_successful_listing_logs_one_fixed_line(self) -> None:
+        listed = f"file: {LIST_CHILD_SENTINEL}\ndirectory: {LIST_EMPTY_SENTINEL}"
+        listed_data = [
+            {"name": LIST_CHILD_SENTINEL, "type": "file"},
+            {"name": LIST_EMPTY_SENTINEL, "type": "directory"},
+        ]
+        cases = (
+            (
+                "relative path",
+                {"path": LIST_DIRECTORY_SENTINEL},
+                ToolExecutionResult(True, listed, listed_data),
+            ),
+            (
+                "absolute path",
+                {"path": str(self.directory.resolve())},
+                ToolExecutionResult(True, listed, listed_data),
+            ),
+            (
+                "default root",
+                {},
+                ToolExecutionResult(
+                    True,
+                    f"directory: {LIST_DIRECTORY_SENTINEL}",
+                    [{"name": LIST_DIRECTORY_SENTINEL, "type": "directory"}],
+                ),
+            ),
+            (
+                "empty directory",
+                {"path": f"{LIST_DIRECTORY_SENTINEL}/{LIST_EMPTY_SENTINEL}"},
+                ToolExecutionResult(True, "Directory is empty.", []),
+            ),
+        )
+
+        for name, arguments, expected in cases:
+            with self.subTest(listing=name):
+                self.logger.reset_mock()
+
+                result = self.tool.execute("list", arguments)
+
+                # What the owner is shown is unchanged, names included.
+                self.assertEqual(result, expected)
+                self.assertEqual(
+                    self.logger.method_calls,
+                    [call.info(LISTED_LOG_LINE)],
+                )
+                self._assert_nothing_identifying_was_logged()
+
+    def test_a_failed_listing_logs_one_fixed_line_and_no_exception_text(
+        self,
+    ) -> None:
+        error = self._sentinel_error()
+        original_resolve = Path.resolve
+
+        def failing_child_resolve(path: Path, *args: Any, **kwargs: Any) -> Path:
+            if path.name == LIST_CHILD_SENTINEL:
+                raise error
+            return original_resolve(path, *args, **kwargs)
+
+        failures = (
+            (
+                "the directory cannot be read",
+                lambda: patch.object(Path, "iterdir", side_effect=error),
+            ),
+            (
+                "a child cannot be resolved",
+                lambda: patch.object(Path, "resolve", failing_child_resolve),
+            ),
+        )
+
+        for name, patcher in failures:
+            with self.subTest(failure=name):
+                self.logger.reset_mock()
+
+                with patcher():
+                    result = self.tool.execute(
+                        "list",
+                        {"path": LIST_DIRECTORY_SENTINEL},
+                    )
+
+                self.assertEqual(
+                    result,
+                    ToolExecutionResult(
+                        False,
+                        f"Directory listing failed: {os.strerror(errno.EACCES)}",
+                    ),
+                )
+                self.assertEqual(
+                    self.logger.method_calls,
+                    [call.warning(LIST_FAILED_LOG_LINE)],
+                )
+                self._assert_nothing_identifying_was_logged(
+                    error.strerror,
+                    error.filename,
+                    error.filename2,
+                )
+
+    def test_a_refused_path_logs_the_same_fixed_line_without_the_path(
+        self,
+    ) -> None:
+        refusals: tuple[tuple[Any, str], ...] = (
+            ("", PATH_REQUIRED_MESSAGE),
+            (f"../{LIST_OUTSIDE_SENTINEL}", PATH_OUTSIDE_ROOT_MESSAGE),
+            (
+                str((self.temporary_path / LIST_OUTSIDE_SENTINEL).resolve()),
+                PATH_OUTSIDE_ROOT_MESSAGE,
+            ),
+            (7, PATH_NOT_TEXT_MESSAGE),
+        )
+
+        for value, reason in refusals:
+            with self.subTest(path=value):
+                self.logger.reset_mock()
+
+                result = self.tool.execute("list", {"path": value})
+
+                self.assertEqual(
+                    result,
+                    ToolExecutionResult(
+                        False,
+                        f"Directory listing failed: {reason}",
+                    ),
+                )
+                self.assertEqual(
+                    self.logger.method_calls,
+                    [call.warning(LIST_FAILED_LOG_LINE)],
+                )
+                self._assert_nothing_identifying_was_logged(reason)
+
+    def test_a_path_that_is_not_a_directory_is_shown_but_never_logged(
+        self,
+    ) -> None:
+        for value in (
+            f"{LIST_DIRECTORY_SENTINEL}/{LIST_CHILD_SENTINEL}",
+            f"{LIST_DIRECTORY_SENTINEL}/{LIST_OUTSIDE_SENTINEL}",
+        ):
+            with self.subTest(path=value):
+                self.logger.reset_mock()
+
+                result = self.tool.execute("list", {"path": value})
+
+                self.assertEqual(
+                    result,
+                    ToolExecutionResult(False, f"Not a directory: {value}"),
+                )
+                # Unchanged: this answer has never written a log line at all.
+                self.assertEqual(self.logger.method_calls, [])
+                self._assert_nothing_identifying_was_logged()
+
+    def test_a_real_log_file_holds_only_the_fixed_list_lines(self) -> None:
+        log_directory = self.temporary_path / "logs"
+        log_directory.mkdir()
+        log_file = log_directory / "maria-test.log"
+        file_logger = logging.getLogger("maria-filesystem-list-logging-test")
+        file_logger.setLevel(logging.DEBUG)
+        file_logger.propagate = False
+        handler = logging.FileHandler(log_file, encoding="utf-8")
+        handler.setFormatter(logging.Formatter("%(levelname)s | %(message)s"))
+        file_logger.addHandler(handler)
+        self.addCleanup(file_logger.removeHandler, handler)
+        self.addCleanup(handler.close)
+        tool = FilesystemTool(self.roots, self.protections, logger=file_logger)
+        error = self._sentinel_error()
+
+        listed = tool.execute("list", {"path": LIST_DIRECTORY_SENTINEL})
+        with patch.object(Path, "iterdir", side_effect=error):
+            failed = tool.execute("list", {"path": LIST_DIRECTORY_SENTINEL})
+        refused = tool.execute("list", {"path": f"../{LIST_OUTSIDE_SENTINEL}"})
+        handler.flush()
+
+        self.assertEqual(
+            listed.message,
+            f"file: {LIST_CHILD_SENTINEL}\ndirectory: {LIST_EMPTY_SENTINEL}",
+        )
+        self.assertEqual(
+            failed.message,
+            f"Directory listing failed: {os.strerror(errno.EACCES)}",
+        )
+        self.assertEqual(
+            refused.message,
+            f"Directory listing failed: {PATH_OUTSIDE_ROOT_MESSAGE}",
+        )
+        self.assertEqual(
+            log_file.read_text(encoding="utf-8").splitlines(),
+            [
+                f"INFO | {LISTED_LOG_LINE}",
+                f"WARNING | {LIST_FAILED_LOG_LINE}",
+                f"WARNING | {LIST_FAILED_LOG_LINE}",
+            ],
+        )
+        assert_log_omits(
+            self,
+            log_file,
+            (
+                str(self.root_path),
+                self.root_path.as_posix(),
+                LIST_DIRECTORY_SENTINEL,
+                LIST_CHILD_SENTINEL,
+                LIST_EMPTY_SENTINEL,
+                LIST_OUTSIDE_SENTINEL,
+                LIST_ERROR_SENTINEL,
+                error.filename,
+                error.filename2,
+                PATH_OUTSIDE_ROOT_MESSAGE,
+            ),
+        )
+
+    def test_read_rename_and_move_keep_their_path_bearing_log_lines(self) -> None:
+        # The deliberate deterministic exception: none of these actions is
+        # model eligible, so each keeps the log line it had before listing
+        # lost its path, resolved path and exception included.
+        source = self.directory / "source.txt"
+        source.write_text("source", encoding="utf-8")
+        resolved_source = source.resolve()
+        renamed = (self.directory / "renamed.txt").resolve()
+        moved = (self.directory / "nested" / "moved.txt").resolve()
+        inside = LIST_DIRECTORY_SENTINEL
+
+        read = self.tool.execute("read", {"path": f"{inside}/source.txt"})
+        rename = self.tool.execute(
+            "rename",
+            {"source": f"{inside}/source.txt", "destination": f"{inside}/renamed.txt"},
+        )
+        move = self.tool.execute(
+            "move",
+            {
+                "source": f"{inside}/renamed.txt",
+                "destination": f"{inside}/nested/moved.txt",
+            },
+        )
+
+        self.assertEqual(
+            read,
+            ToolExecutionResult(True, "source", {"path": str(resolved_source)}),
+        )
+        self.assertTrue(rename.success)
+        self.assertTrue(move.success)
+        self.assertEqual(
+            self.logger.method_calls,
+            [
+                call.info("Read file: %s", resolved_source),
+                call.info("Renamed %s to %s", resolved_source, renamed),
+                call.info("Moved %s to %s", renamed, moved),
+            ],
+        )
+        self.assertIn(LIST_DIRECTORY_SENTINEL, self._logged())
+
+        error = self._sentinel_error()
+        moved_argument = f"{inside}/nested/moved.txt"
+        self.logger.reset_mock()
+        with patch.object(Path, "read_text", side_effect=error):
+            self.tool.execute("read", {"path": moved_argument})
+        with patch.object(Path, "rename", side_effect=error):
+            self.tool.execute(
+                "rename",
+                {"source": moved_argument, "destination": f"{inside}/again.txt"},
+            )
+        with patch.object(filesystem_module.shutil, "move", side_effect=error):
+            self.tool.execute(
+                "move",
+                {"source": moved_argument, "destination": f"{inside}/again.txt"},
+            )
+
+        self.assertEqual(
+            self.logger.method_calls,
+            [
+                call.warning("File read failed: %s", error),
+                call.warning("Rename failed: %s", error),
+                call.warning("Move failed: %s", error),
+            ],
+        )
+        self.assertIn(LIST_ERROR_SENTINEL, self._logged())
 
 
 class FilesystemRootPolicyTests(unittest.TestCase):

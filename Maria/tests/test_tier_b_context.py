@@ -70,6 +70,8 @@ from tests.test_context import (
     CLEARED_NOTICE,
     MALFORMED_TEXT,
     NO_CONTEXT_NOTICE,
+    PROPOSAL_INSTRUCTION_BYTES,
+    SEPARATOR_BYTES,
     SPLITLINES_SEPARATORS,
     UNCERTAINTY,
     UNREADABLE_NOTICE,
@@ -1273,7 +1275,13 @@ class TierBSupplyTests(unittest.TestCase):
     ) -> None:
         request = "zebra " + "a" * 94
         tier_a = (_memory(1, "f" * 100),)
-        budget = len(request) + rendered_context_bytes(tier_a) + 150
+        budget = (
+            len(request)
+            + PROPOSAL_INSTRUCTION_BYTES
+            + SEPARATOR_BYTES
+            + rendered_context_bytes(tier_a)
+            + 150
+        )
         provider, harness = _harness(self, lambda sent: "b" * 60, budget=budget)
         _enable(harness, "f" * 100)
         _note(harness.memory, "zebra", "x" * 400)
@@ -1282,6 +1290,9 @@ class TierBSupplyTests(unittest.TestCase):
         first = session.submit(request)
         session.submit(request)
 
+        # Both requests are sent; the second has no room for the earlier
+        # exchange beside the request, its instructions, and Tier A.
+        self.assertEqual(provider.calls, 2)
         last = provider.requests[-1]
         self.assertEqual(last.context, tier_a)
         self.assertEqual(last.history, ())

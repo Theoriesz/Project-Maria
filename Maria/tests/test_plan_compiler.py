@@ -1,13 +1,16 @@
-"""Tests for the V1-17 model-to-plan compilation gate.
+"""Tests for the model-to-plan compilation gate, from V1-17 and V1-18.
 
 The gate is proven entirely against hostile output: the V1-12 adversarial
 fake's eight categories, the compiler-focused proposals beside them, and
 hand-written variations. Every refusal is asserted by its exact category, and
 every argument refusal is shown on an action the model may propose, beside a
 valid counterpart that compiles, so none can pass merely because the
-allowlist refused first. Compiling reaches no tool, dispatch, permission
-check, memory layer, network, or filesystem API; nothing reaches the gate
-from Brain; and nothing the model supplied survives into a refusal or a log.
+allowlist refused first. A compiled plan is model-originated, and checking it
+again applies the same gates to its existing step exactly as it stands.
+Compiling and checking again reach no tool, dispatch, permission check,
+memory layer, network, or filesystem API; Brain is the only production module
+that reaches the gate; and nothing the model supplied survives into a refusal
+or a log.
 """
 
 from __future__ import annotations
@@ -35,6 +38,7 @@ from core.action_contracts import (
     MAXIMUM_EXPRESSION_LENGTH,
     ActionContract,
     ActionContractRegistry,
+    ArgumentContract,
     ContractFailure,
     ModelEligibility,
 )
@@ -45,6 +49,7 @@ from core.memory import Memory
 from core.permissions import PermissionDecision, PermissionManager
 from core.plan_compiler import (
     COMPILER_CONTRACTS_MESSAGE,
+    COMPILER_PLAN_MESSAGE,
     COMPILER_REQUEST_MESSAGE,
     COMPILER_RESPONSE_MESSAGE,
     MODEL_ACTION_ALLOWLIST,
@@ -53,10 +58,19 @@ from core.plan_compiler import (
     UNSAFE_TEXT_CATEGORIES,
     ProposalRejection,
     compile_proposal,
+    recheck_model_plan,
 )
-from core.planner import Plan, PlanArguments, PlanStep, RecordingPolicy
+from core.planner import (
+    MODEL_PLAN_SHAPE_MESSAGE,
+    Plan,
+    PlanArguments,
+    PlanOrigin,
+    PlanStep,
+    RecordingPolicy,
+    is_model_plan,
+)
 from core.reasoning import ReasoningRequest, ReasoningResponse, request_reasoning
-from core.tool_manager import ToolManager
+from core.tool_manager import BUILT_IN_TOOL_MODULES, ToolManager
 from tests.log_assertions import assert_log_omits
 from tests.reasoning_fakes import (
     FAKE_NAME_SENTINEL,
@@ -73,9 +87,11 @@ from tests.test_reasoning import (
     enabled_settings,
     forbidden_calls,
     forbidden_imports,
+    own_imports,
     peak_allocation,
     rendered,
 )
+from tools.audit import AuditTool
 from tools.calculator import CalculatorTool
 from tools.filesystem import FilesystemTool
 from tools.history import HistoryTool
@@ -97,9 +113,12 @@ EXPECTED_ALLOWLIST = frozenset(
 )
 
 # The actions PermissionManager allows with an empty configuration that the
-# model may nevertheless never propose.
+# model may nevertheless never propose. Deleting an audit summary is absent
+# only because it always requires confirmation.
 PERMITTED_BUT_CLOSED = frozenset(
     {
+        "audit.list",
+        "audit.read",
         "filesystem.read",
         "history.list",
         "history.search",
@@ -135,6 +154,9 @@ DIGEST = "0" * 64
 
 # One contract-valid argument mapping for every registered action.
 VALID_ARGUMENTS: dict[str, dict[str, Any]] = {
+    "audit.list": {},
+    "audit.read": {"id": 1},
+    "audit.delete": {"id": 1},
     "calculator.calculate": {"expression": "2 + 2"},
     "filesystem.read": {"path": "notes.txt"},
     "filesystem.list": {"path": "docs"},
@@ -317,17 +339,30 @@ def _compile(
     )
 
 
+def _recheck(
+    plan: Plan,
+    contracts: ActionContractRegistry = BUILT_IN_ACTION_CONTRACTS,
+) -> ProposalRejection | None:
+    """Check one plan again with a quiet logger."""
+    return recheck_model_plan(plan, contracts, logger=Mock(spec=logging.Logger))
+
+
 def _hand_built(
     tool_name: str,
     action: str,
     arguments: dict[str, Any],
     request: str = REQUEST,
 ) -> Plan:
-    """Return, built by hand, the plan a correct compilation must equal."""
+    """Return, built by hand, the model plan a correct compilation must equal.
+
+    Nothing stops code from building such a plan around any step, so the
+    same helper also supplies steps the compiler itself would have refused.
+    """
     return Plan(
         original_request=request,
         steps=(PlanStep(tool_name, action, arguments),),
         recording=RecordingPolicy.TRANSIENT,
+        origin=PlanOrigin.MODEL,
     )
 
 
@@ -350,6 +385,19 @@ def _registry_without(*identifiers: str) -> ActionContractRegistry:
         contract
         for contract in BUILT_IN_ACTION_CONTRACTS.contracts
         if contract.identifier not in identifiers
+    )
+
+
+def _registry_declaring(
+    identifier: str,
+    *arguments: ArgumentContract,
+) -> ActionContractRegistry:
+    """Return the shipped registry with one action's arguments redeclared."""
+    return ActionContractRegistry(
+        replace(contract, arguments=arguments)
+        if contract.identifier == identifier
+        else contract
+        for contract in BUILT_IN_ACTION_CONTRACTS.contracts
     )
 
 
@@ -377,6 +425,7 @@ _TRIPWIRE_TARGETS = (
     (ToolManager, "validate_action"),
     (ToolManager, "prepare_confirmation"),
     (ToolManager, "load_tools"),
+    (AuditTool, "execute"),
     (CalculatorTool, "execute"),
     (FilesystemTool, "execute"),
     (HistoryTool, "execute"),
@@ -559,6 +608,7 @@ class AllowlistTests(unittest.TestCase):
                     outcome,
                     _hand_built(*_split(identifier), arguments),
                 )
+                self.assertIs(outcome.origin, PlanOrigin.MODEL)
 
 
 class PermissionOrderTests(unittest.TestCase):
@@ -1375,6 +1425,7 @@ class PathRuleTests(unittest.TestCase):
             ("filesystem", "list"),
         )
         self.assertIs(outcome.recording, RecordingPolicy.TRANSIENT)
+        self.assertIs(outcome.origin, PlanOrigin.MODEL)
         self.assertEqual(MODEL_ACTION_ALLOWLIST, EXPECTED_ALLOWLIST)
 
 
@@ -1472,6 +1523,17 @@ class NoExecutionTests(unittest.TestCase):
 
         mocks["PermissionManager.check"].assert_called_once()
 
+    def test_every_built_in_tool_is_wired(self) -> None:
+        """Positive control, so no built-in tool can run without a tripwire."""
+        wired = {
+            owner.__module__
+            for owner, name in _TRIPWIRE_TARGETS
+            if name == "execute"
+        }
+
+        self.assertEqual(wired, set(BUILT_IN_TOOL_MODULES))
+        self.assertIn("tools.audit", wired)
+
 
 class CompiledPlanTests(unittest.TestCase):
     """Prove a compiled plan is the existing immutable, fingerprinted Plan."""
@@ -1501,6 +1563,8 @@ class CompiledPlanTests(unittest.TestCase):
                 self.assertEqual(dict(compiled.steps[0].arguments), arguments)
                 self.assertIsNone(compiled.response_if_no_action)
                 self.assertIs(compiled.recording, RecordingPolicy.TRANSIENT)
+                self.assertIs(compiled.origin, PlanOrigin.MODEL)
+                self.assertTrue(is_model_plan(compiled))
                 self.assertEqual(compiled.original_request, REQUEST)
 
     def test_the_fingerprint_binds_request_arguments_and_transience(
@@ -1519,9 +1583,26 @@ class CompiledPlanTests(unittest.TestCase):
             first.fingerprint,
             _compile(text.replace("6 * 7", "6 * 8")).fingerprint,
         )
+
+        # A model-originated plan cannot be made a recorded one at all.
+        with self.assertRaises(ValueError) as caught:
+            replace(first, recording=RecordingPolicy.RECORD)
+        self.assertEqual(str(caught.exception), MODEL_PLAN_SHAPE_MESSAGE)
+
+        # Its deterministic twins are plans Maria's own code could build, and
+        # none shares a fingerprint with it or with the other, so both the
+        # origin and the transience are bound, and an approval of one can
+        # never be spent on another.
+        transient_twin = replace(first, origin=PlanOrigin.DETERMINISTIC)
+        recorded_twin = replace(
+            transient_twin,
+            recording=RecordingPolicy.RECORD,
+        )
+        self.assertNotEqual(first.fingerprint, transient_twin.fingerprint)
+        self.assertNotEqual(first.fingerprint, recorded_twin.fingerprint)
         self.assertNotEqual(
-            first.fingerprint,
-            replace(first, recording=RecordingPolicy.RECORD).fingerprint,
+            transient_twin.fingerprint,
+            recorded_twin.fingerprint,
         )
 
     def test_a_compiled_plan_cannot_be_changed(self) -> None:
@@ -1540,7 +1621,10 @@ class CompiledPlanTests(unittest.TestCase):
             plan.steps = ()
         with self.assertRaises(FrozenInstanceError):
             plan.recording = RecordingPolicy.RECORD
+        with self.assertRaises(FrozenInstanceError):
+            plan.origin = PlanOrigin.DETERMINISTIC
 
+        self.assertIs(plan.origin, PlanOrigin.MODEL)
         self.assertEqual(plan, _hand_built("filesystem", "list", {"path": "docs"}))
 
     def test_the_step_names_the_declared_tool_and_action(self) -> None:
@@ -1563,6 +1647,289 @@ class CompiledPlanTests(unittest.TestCase):
         )
 
         self.assertEqual(plan.original_request, REQUEST_SENTINEL)
+
+
+class ModelPlanRecheckTests(unittest.TestCase):
+    """Prove a compiled plan is checked again exactly as it stands."""
+
+    def test_a_valid_compiled_plan_passes_again_unchanged(self) -> None:
+        logger = Mock(spec=logging.Logger)
+        for tool_name, action, arguments in CompiledPlanTests.CASES:
+            with self.subTest(action=f"{tool_name}.{action}"):
+                plan = _compile(_proposal(tool_name, action, arguments))
+                fingerprint = plan.fingerprint
+
+                self.assertIsNone(
+                    recheck_model_plan(
+                        plan,
+                        BUILT_IN_ACTION_CONTRACTS,
+                        logger=logger,
+                    )
+                )
+                self.assertEqual(plan, _hand_built(tool_name, action, arguments))
+                self.assertEqual(plan.fingerprint, fingerprint)
+
+        self.assertEqual(logger.mock_calls, [])
+
+    def test_a_plan_its_registry_no_longer_opens_is_refused(self) -> None:
+        for identifier in sorted(MODEL_ACTION_ALLOWLIST):
+            plan = _compile(
+                _proposal(*_split(identifier), VALID_ARGUMENTS[identifier])
+            )
+            closed = _registry_with(
+                identifier,
+                ModelEligibility.NOT_MODEL_ELIGIBLE,
+            )
+            with self.subTest(action=identifier):
+                self.assertIsNone(_recheck(plan))
+                self.assertIs(
+                    _recheck(plan, closed),
+                    ProposalRejection.NOT_MODEL_ELIGIBLE,
+                )
+
+        listing = _compile(_proposal("filesystem", "list", {"path": "docs"}))
+        arithmetic = _compile(
+            _proposal("calculator", "calculate", {"expression": "1"})
+        )
+        self.assertIs(
+            _recheck(listing, _registry_without("filesystem.list")),
+            ProposalRejection.UNKNOWN_ACTION,
+        )
+        self.assertIs(
+            _recheck(arithmetic, _registry_without("calculator.calculate")),
+            ProposalRejection.UNKNOWN_TOOL,
+        )
+
+    def test_a_model_plan_for_a_closed_action_is_refused(self) -> None:
+        # The compiler never builds these, so each is built by hand, and the
+        # allowlist refuses it even where the registry's flag was widened.
+        closed = [
+            identifier
+            for identifier in VALID_ARGUMENTS
+            if identifier not in MODEL_ACTION_ALLOWLIST
+        ]
+        self.assertIn("audit.delete", closed)
+        for identifier in closed:
+            plan = _hand_built(*_split(identifier), VALID_ARGUMENTS[identifier])
+            widened = _registry_with(identifier, ModelEligibility.MODEL_ELIGIBLE)
+            with self.subTest(action=identifier):
+                self.assertIs(_recheck(plan), ProposalRejection.NOT_MODEL_ELIGIBLE)
+                self.assertIs(
+                    _recheck(plan, widened),
+                    ProposalRejection.NOT_MODEL_ELIGIBLE,
+                )
+
+    def test_a_changed_contract_refuses_the_existing_step(self) -> None:
+        cases = (
+            (
+                ("calculator", "calculate", {"expression": "6 * 7"}),
+                _registry_declaring(
+                    "calculator.calculate",
+                    ArgumentContract(
+                        "expression",
+                        str,
+                        required=True,
+                        allow_blank=False,
+                        maximum_length=3,
+                    ),
+                ),
+                ProposalRejection.OUT_OF_RANGE,
+            ),
+            (
+                ("calculator", "calculate", {"expression": "6 * 7"}),
+                _registry_declaring(
+                    "calculator.calculate",
+                    ArgumentContract("expression", int, required=True),
+                ),
+                ProposalRejection.WRONG_TYPE,
+            ),
+            (
+                ("filesystem", "list", {"path": "docs"}),
+                _registry_declaring("filesystem.list"),
+                ProposalRejection.EXTRA_ARGUMENT,
+            ),
+            (
+                ("system", "current_time", {}),
+                _registry_declaring(
+                    "system.current_time",
+                    ArgumentContract("zone", str, required=True, allow_blank=False),
+                ),
+                ProposalRejection.MISSING_ARGUMENT,
+            ),
+        )
+        for (tool_name, action, arguments), changed, expected in cases:
+            plan = _compile(_proposal(tool_name, action, arguments))
+            with self.subTest(action=f"{tool_name}.{action}", code=expected.code):
+                self.assertIsNone(_recheck(plan))
+                self.assertIs(_recheck(plan, changed), expected)
+
+    def test_unsafe_text_in_an_existing_step_is_refused(self) -> None:
+        for name, character in UNSAFE_CHARACTERS:
+            for identifier, field, value in (
+                ("calculator.calculate", "expression", "1 +" + character + " 1"),
+                ("filesystem.list", "path", "do" + character + "cs"),
+            ):
+                with self.subTest(character=name, action=identifier):
+                    plan = _hand_built(*_split(identifier), {field: value})
+
+                    self.assertIs(_recheck(plan), ProposalRejection.UNSAFE_TEXT)
+
+        # Without the character each step passes, so nothing was refused for
+        # any other reason.
+        self.assertIsNone(
+            _recheck(_hand_built("calculator", "calculate", {"expression": "1 + 1"}))
+        )
+        self.assertIsNone(
+            _recheck(_hand_built("filesystem", "list", {"path": "docs"}))
+        )
+
+    def test_an_unsafe_path_in_an_existing_step_is_refused(self) -> None:
+        for path in UNSAFE_PATHS:
+            with self.subTest(path=ascii(path)):
+                plan = _hand_built("filesystem", "list", {"path": path})
+
+                self.assertIs(_recheck(plan), ProposalRejection.UNSAFE_PATH)
+        for path in SAFE_PATHS:
+            with self.subTest(safe=ascii(path)):
+                plan = _hand_built("filesystem", "list", {"path": path})
+
+                self.assertIsNone(_recheck(plan))
+
+    def test_the_first_failing_gate_decides_a_check_again(self) -> None:
+        longest = "1" * MAXIMUM_EXPRESSION_LENGTH
+        cases = (
+            # Closed and out of range: the allowlist answers.
+            (
+                ("memory", "update", {"id": 0, "fact": "x"}),
+                ProposalRejection.NOT_MODEL_ELIGIBLE,
+            ),
+            # Closed and holding unsafe text: the allowlist answers.
+            (
+                ("memory", "store", {"fact": "x" + chr(0x1B)}),
+                ProposalRejection.NOT_MODEL_ELIGIBLE,
+            ),
+            # Too long and holding unsafe text: the contract answers.
+            (
+                ("calculator", "calculate", {"expression": longest + chr(0x1B)}),
+                ProposalRejection.OUT_OF_RANGE,
+            ),
+            # An extra field and an unsafe path: the contract answers.
+            (
+                ("filesystem", "list", {"path": "../x", "extra": "1"}),
+                ProposalRejection.EXTRA_ARGUMENT,
+            ),
+            # Unsafe text in an unsafe path: the text check answers.
+            (
+                ("filesystem", "list", {"path": "../x" + chr(0x1B)}),
+                ProposalRejection.UNSAFE_TEXT,
+            ),
+        )
+        # The contract alone would refuse the first step too, so only the
+        # order decides which gate answers.
+        self.assertIs(
+            BUILT_IN_ACTION_CONTRACTS.validate(*cases[0][0]).kind,
+            ContractFailure.OUT_OF_RANGE,
+        )
+        for (tool_name, action, arguments), expected in cases:
+            with self.subTest(action=f"{tool_name}.{action}", code=expected.code):
+                self.assertIs(
+                    _recheck(_hand_built(tool_name, action, arguments)),
+                    expected,
+                )
+                # The same gates compiled it, so compiling refuses it alike.
+                self.assertIs(
+                    _compile(_proposal(tool_name, action, arguments)),
+                    expected,
+                )
+
+    def test_a_step_changed_after_compiling_is_judged_as_it_now_stands(
+        self,
+    ) -> None:
+        plan = _compile(_proposal("filesystem", "list", {"path": "docs"}))
+        step = plan.steps[0]
+        self.assertIsNone(_recheck(plan))
+
+        # A frozen step can still be altered underneath, so nothing about it
+        # is trusted from when it was compiled.
+        object.__setattr__(step, "arguments", PlanArguments({"path": "../x"}))
+        self.assertIs(_recheck(plan), ProposalRejection.UNSAFE_PATH)
+
+        object.__setattr__(step, "arguments", PlanArguments({"path": "docs"}))
+        object.__setattr__(step, "action", "read")
+        self.assertIs(_recheck(plan), ProposalRejection.NOT_MODEL_ELIGIBLE)
+
+    def test_checking_again_parses_builds_and_reaches_nothing(self) -> None:
+        plans = [
+            _compile(_proposal(*_split(identifier), VALID_ARGUMENTS[identifier]))
+            for identifier in sorted(MODEL_ACTION_ALLOWLIST)
+        ]
+        plans += [
+            _hand_built("filesystem", "list", {"path": path})
+            for path in UNSAFE_PATHS[:5]
+        ]
+        plans += [
+            _hand_built(*_split(identifier), arguments)
+            for identifier, arguments in VALID_ARGUMENTS.items()
+            if identifier not in MODEL_ACTION_ALLOWLIST
+        ]
+        fingerprints = [plan.fingerprint for plan in plans]
+        logger = Mock(spec=logging.Logger)
+
+        with (
+            patch.object(
+                plan_compiler_module.json,
+                "loads",
+                side_effect=AssertionError("a proposal was parsed"),
+            ) as loads,
+            patch.object(
+                plan_compiler_module,
+                "Plan",
+                side_effect=AssertionError("a plan was built"),
+            ) as plan_class,
+            patch.object(
+                plan_compiler_module,
+                "PlanStep",
+                side_effect=AssertionError("a step was built"),
+            ) as step_class,
+            _tripwires() as mocks,
+        ):
+            outcomes = [
+                recheck_model_plan(plan, BUILT_IN_ACTION_CONTRACTS, logger=logger)
+                for plan in plans
+            ]
+
+        # Positive controls: plans passed and plans were refused, under the
+        # wires, and each plan was left exactly as it was.
+        self.assertEqual(
+            outcomes,
+            [None] * len(MODEL_ACTION_ALLOWLIST)
+            + [ProposalRejection.UNSAFE_PATH] * 5
+            + [ProposalRejection.NOT_MODEL_ELIGIBLE]
+            * (len(VALID_ARGUMENTS) - len(MODEL_ACTION_ALLOWLIST)),
+        )
+        self.assertEqual([plan.fingerprint for plan in plans], fingerprints)
+        mocks.update({"json.loads": loads, "Plan": plan_class, "PlanStep": step_class})
+        for name, mock in mocks.items():
+            with self.subTest(tripwire=name):
+                mock.assert_not_called()
+
+    def test_a_refusal_logs_only_its_code(self) -> None:
+        plan = _hand_built(
+            "filesystem",
+            "list",
+            {"path": "../" + FAKE_PAYLOAD_SENTINEL},
+            request=REQUEST_SENTINEL,
+        )
+        logger = Mock(spec=logging.Logger)
+
+        outcome = recheck_model_plan(plan, BUILT_IN_ACTION_CONTRACTS, logger=logger)
+
+        self.assertIs(outcome, ProposalRejection.UNSAFE_PATH)
+        logger.warning.assert_called_once_with(
+            "Refused a compiled model plan: code=%s",
+            "unsafe_path",
+        )
+        self.assertEqual(len(logger.mock_calls), 1)
 
 
 class CallerContractTests(unittest.TestCase):
@@ -1633,6 +2000,95 @@ class CallerContractTests(unittest.TestCase):
                     lambda logger: compile_proposal(
                         REQUEST,
                         response,
+                        contracts,
+                        logger=logger,
+                    ),
+                    COMPILER_CONTRACTS_MESSAGE,
+                )
+
+    def test_only_a_well_formed_model_plan_can_be_checked_again(self) -> None:
+        self.assertEqual(
+            COMPILER_PLAN_MESSAGE,
+            "Only a well-formed model-originated plan can be checked again.",
+        )
+        text = _proposal("system", "current_time", {})
+        compiled = _compile(text)
+        self.assertIsNone(_recheck(compiled))
+
+        def altered(name: str, value: object) -> Plan:
+            """Compile the plan again and change one field underneath."""
+            plan = _compile(text)
+            object.__setattr__(plan, name, value)
+            return plan
+
+        def altered_step(name: str, value: object) -> Plan:
+            """Compile the plan again and change one step field underneath."""
+            plan = _compile(text)
+            object.__setattr__(plan.steps[0], name, value)
+            return plan
+
+        # A subclass cannot be built with the model origin, so it is given
+        # that origin underneath; only its type then differs.
+        subclassed = _PlanSubclass(
+            REQUEST,
+            compiled.steps,
+            recording=RecordingPolicy.TRANSIENT,
+        )
+        object.__setattr__(subclassed, "origin", PlanOrigin.MODEL)
+        self.assertEqual(vars(subclassed), vars(compiled))
+
+        cases = {
+            "deterministic twin": replace(compiled, origin=PlanOrigin.DETERMINISTIC),
+            "recorded deterministic": Plan(REQUEST, compiled.steps),
+            "recorded": altered("recording", RecordingPolicy.RECORD),
+            "canned response": altered("response_if_no_action", "Done."),
+            "step list": altered("steps", list(compiled.steps)),
+            "two steps": altered("steps", compiled.steps * 2),
+            "no steps": altered("steps", ()),
+            "origin text": altered("origin", "model"),
+            "recording text": altered("recording", "transient"),
+            "step subclass": altered(
+                "steps",
+                (_StepSubclass("system", "current_time", {}),),
+            ),
+            "tool text subclass": altered_step(
+                "tool_name",
+                _TextSubclass("system"),
+            ),
+            "action text subclass": altered_step(
+                "action",
+                _TextSubclass("current_time"),
+            ),
+            "plain arguments": altered_step("arguments", {}),
+            "plan subclass": subclassed,
+            "lookalike": SimpleNamespace(**vars(compiled)),
+            "step": compiled.steps[0],
+            "none": None,
+        }
+        for case, plan in cases.items():
+            with self.subTest(case=case):
+                self._assert_refused(
+                    lambda logger: recheck_model_plan(
+                        plan,
+                        BUILT_IN_ACTION_CONTRACTS,
+                        logger=logger,
+                    ),
+                    COMPILER_PLAN_MESSAGE,
+                )
+
+    def test_a_check_again_needs_an_exact_registry(self) -> None:
+        plan = _compile(_proposal("system", "current_time", {}))
+        for contracts in (
+            None,
+            {},
+            BUILT_IN_ACTION_CONTRACTS.contracts,
+            SimpleNamespace(contract_for=lambda *_: None),
+            _RegistrySubclass(BUILT_IN_ACTION_CONTRACTS.contracts),
+        ):
+            with self.subTest(contracts=type(contracts).__name__):
+                self._assert_refused(
+                    lambda logger: recheck_model_plan(
+                        plan,
                         contracts,
                         logger=logger,
                     ),
@@ -1819,9 +2275,86 @@ class CompilerLogPrivacyTests(unittest.TestCase):
             ),
         )
 
+    def test_a_check_again_logs_its_code_and_nothing_private(self) -> None:
+        configure_logging(self.log_dir, level="DEBUG")
+        refused = {
+            "unknown_tool": _hand_built(
+                FAKE_NAME_SENTINEL,
+                "run",
+                {},
+                request=REQUEST_SENTINEL,
+            ),
+            "unknown_action": _hand_built(
+                "system",
+                FAKE_NAME_SENTINEL,
+                {},
+                request=REQUEST_SENTINEL,
+            ),
+            "not_model_eligible": _hand_built(
+                "memory",
+                "store",
+                {"fact": FAKE_PAYLOAD_SENTINEL},
+                request=REQUEST_SENTINEL,
+            ),
+            "extra_argument": _hand_built(
+                "calculator",
+                "calculate",
+                {"expression": "1", FAKE_NAME_SENTINEL: FAKE_PAYLOAD_SENTINEL},
+                request=REQUEST_SENTINEL,
+            ),
+            "unsafe_text": _hand_built(
+                "calculator",
+                "calculate",
+                {"expression": FAKE_PAYLOAD_SENTINEL + chr(0x2028)},
+                request=REQUEST_SENTINEL,
+            ),
+            "unsafe_path": _hand_built(
+                "filesystem",
+                "list",
+                {"path": "../" + FAKE_PAYLOAD_SENTINEL},
+                request=REQUEST_SENTINEL,
+            ),
+        }
+        passing = _hand_built(
+            "calculator",
+            "calculate",
+            {"expression": FAKE_PAYLOAD_SENTINEL},
+            request=REQUEST_SENTINEL,
+        )
+
+        outcomes = {
+            code: recheck_model_plan(plan, BUILT_IN_ACTION_CONTRACTS)
+            for code, plan in refused.items()
+        }
+        self.assertIsNone(recheck_model_plan(passing, BUILT_IN_ACTION_CONTRACTS))
+
+        log_file = self.log_dir / "maria.log"
+        for handler in self.maria_logger.handlers:
+            handler.flush()
+        log_text = log_file.read_text(encoding="utf-8")
+
+        # Positive controls: every refusal was logged by its code, so an empty
+        # log cannot pass for a private one.
+        for code, outcome in outcomes.items():
+            with self.subTest(code=code):
+                self.assertIs(outcome, ProposalRejection(code))
+                self.assertIn(f"Refused a compiled model plan: code={code}", log_text)
+
+        assert_log_omits(
+            self,
+            log_file,
+            (
+                FAKE_PAYLOAD_SENTINEL,
+                FAKE_NAME_SENTINEL,
+                REQUEST_SENTINEL,
+                passing.fingerprint,
+                *(plan.fingerprint for plan in refused.values()),
+            ),
+        )
+
 
 class CompilerImportBoundaryTests(unittest.TestCase):
-    """Guard what the compiler can reach, and that nothing reaches it."""
+    """Guard what the compiler can reach, and that only Brain reaches it."""
 
     PERMITTED = frozenset(
         {
@@ -1912,20 +2445,48 @@ class CompilerImportBoundaryTests(unittest.TestCase):
                 self.assertNotIn("sqlite3", _direct_imports(source))
                 self.assertNotIn("subprocess", _direct_imports(source))
 
-    def test_nothing_in_production_reaches_the_compiler(self) -> None:
+    def test_only_brain_reaches_the_compiler(self) -> None:
         compiler_path = Path(plan_compiler_module.__file__).resolve()
         scanned = 0
+        reaching = set()
         for path in PRODUCTION_SOURCES:
             if path.resolve() == compiler_path:
                 continue
             scanned += 1
-            with self.subTest(module=path.name):
-                source = path.read_text(encoding="utf-8")
-                self.assertNotIn("core.plan_compiler", _direct_imports(source))
-                self.assertNotIn("compile_proposal", source)
+            if _reaches_the_compiler(path.read_text(encoding="utf-8")):
+                reaching.add(path.relative_to(PROJECT_ROOT).as_posix())
 
         self.assertGreater(scanned, 10)
-        for entry in ("brain.py", "session.py", "conversation.py"):
+        self.assertEqual(reaching, {"core/brain.py"})
+
+        # Positive controls: Brain imports the gate itself and names both of
+        # its entry points, and the detector sees every spelling of the
+        # import but not a prose mention of the compiler's file.
+        brain = (PROJECT_ROOT / "core" / "brain.py").read_text("utf-8")
+        self.assertIn("core.plan_compiler", _direct_imports(brain))
+        self.assertIn("compile_proposal", brain)
+        self.assertIn("recheck_model_plan", brain)
+        for spelling in (
+            "import core.plan_compiler",
+            "import core.plan_compiler as gate",
+            "from core.plan_compiler import MODEL_ACTION_ALLOWLIST",
+            "from core import plan_compiler",
+            "from . import plan_compiler",
+            "from .plan_compiler import MODEL_ACTION_ALLOWLIST",
+            "import core\ncore.plan_compiler.MODEL_ACTION_ALLOWLIST",
+            "gate.compile_proposal(request, reply)",
+            "gate.recheck_model_plan(plan, contracts)",
+        ):
+            with self.subTest(spelling=ascii(spelling)):
+                self.assertTrue(_reaches_the_compiler(spelling))
+        for spelling in (
+            '"""See core/plan_compiler.py."""',
+            "from core.planner import Plan",
+        ):
+            with self.subTest(unreached=spelling):
+                self.assertFalse(_reaches_the_compiler(spelling))
+
+        for entry in ("session.py", "conversation.py"):
             with self.subTest(entry=entry):
                 source = (PROJECT_ROOT / "core" / entry).read_text("utf-8")
                 self.assertNotIn("plan_compiler", source)
@@ -1937,6 +2498,18 @@ class _TextSubclass(str):
 
 class _ResponseSubclass(ReasoningResponse):
     """A response subclass, which is never an exact ReasoningResponse."""
+
+
+class _PlanSubclass(Plan):
+    """A Plan subclass, which is never the exact plan a model plan must be."""
+
+
+class _StepSubclass(PlanStep):
+    """A PlanStep subclass, which is never the exact step a model plan holds."""
+
+
+class _RegistrySubclass(ActionContractRegistry):
+    """A registry subclass, which is never the exact registry a check needs."""
 
 
 def _tampered(text: object) -> ReasoningResponse:
@@ -1955,6 +2528,29 @@ def _direct_imports(source: str) -> set[str]:
         elif isinstance(node, ast.ImportFrom):
             names.add(node.module or "")
     return names
+
+
+def _reaches_the_compiler(source: str) -> bool:
+    """Return whether a source imports the compiler or names an entry point.
+
+    Every spelling of the import counts, ``from core import plan_compiler``
+    and relative imports included, and so does reaching the module as an
+    attribute of its package or naming either entry point anywhere. A prose
+    mention of the compiler's file, such as a docstring may make, does not.
+    """
+    imported = any(
+        "plan_compiler" in name.split(".") for name in own_imports(source)
+    )
+    attribute = any(
+        isinstance(node, ast.Attribute) and node.attr == "plan_compiler"
+        for node in ast.walk(ast.parse(source))
+    )
+    return (
+        imported
+        or attribute
+        or "compile_proposal" in source
+        or "recheck_model_plan" in source
+    )
 
 
 def _module_path(module: str) -> Path:

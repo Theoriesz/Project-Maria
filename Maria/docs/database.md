@@ -25,7 +25,8 @@ counter over Maria's schema history rather than a release number:
 | 1 | The earliest schema Maria created: `interactions`, `notes`, and the two secondary indexes. |
 | 2 | The published v0.2.0 baseline, which adds `memories`. |
 | 3 | Adds the per-memory `context_enabled` consent column to `memories`, off for every row. |
-| 4 | Adds the per-note `context_digest` consent column to `notes`, off (NULL) for every row. This is the current schema. |
+| 4 | Adds the per-note `context_digest` consent column to `notes`, off (NULL) for every row. |
+| 5 | Adds the `audit_summaries` and `audit_outcomes` tables, both empty, which hold the audit summaries of approved model-proposed actions. This is the current schema. |
 
 Versions 1 and 2 are the only shapes that can exist without a marker, because
 every database Maria creates or migrates from this build onwards is stamped.
@@ -51,7 +52,7 @@ is known.
 | Database state | What happens |
 | --- | --- |
 | No marker, no user-defined object at all (including a zero-byte file) | Created directly at the current schema, with the marker, in one transaction. It is never mistaken for a migrated owner database. |
-| No marker, structure matches version 2 | Classified as the v0.2.0 baseline and stamped `2`. No schema statement runs and no row is touched. |
+| No marker, structure matches version 2 | Classified as the v0.2.0 baseline and stamped `2`, with no schema statement run and no row touched, then migrated forward. |
 | No marker, structure matches version 1 | Classified as the pre-`memories` baseline, stamped `1`, then migrated forward. |
 | Marker below the current version | The structure is confirmed against the frozen schema for that version, then every missing migration runs in ascending order. |
 | Marker equal to the current version | The structure is confirmed against the frozen current schema. Nothing runs and nothing is written; the file is left byte for byte as it was. |
@@ -209,7 +210,7 @@ database. Both boundaries classify contention themselves rather than
 inheriting the shared conversion, because that conversion logs the exception
 on its way past and these record a fixed event code instead.
 
-There are three migrations. `create_memories` brings a version 1 database to
+There are four migrations. `create_memories` brings a version 1 database to
 version 2 by adding the `memories` table; Maria does not copy or infer explicit
 memories from existing interaction rows. `add_memory_context_consent` brings a
 version 2 database to version 3 with one statement:
@@ -232,7 +233,29 @@ ALTER TABLE notes ADD COLUMN context_digest TEXT
 
 With no `DEFAULT` the new column is NULL, meaning consent off, for every note
 that already exists, and the resulting definition fingerprints exactly as a
-newly created version 4 table does. No step rewrites a row or deletes anything.
+newly created version 4 table does. `create_audit_summaries` brings a version
+4 database to version 5 with two statements:
+
+```sql
+CREATE TABLE audit_summaries (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    created_at TEXT NOT NULL,
+    action TEXT NOT NULL,
+    decision TEXT NOT NULL,
+    target TEXT NOT NULL
+);
+CREATE TABLE audit_outcomes (
+    summary_id INTEGER PRIMARY KEY,
+    outcome TEXT NOT NULL
+);
+```
+
+Both tables start empty, and the step touches no existing table or row. The
+frozen version 5 schema is the frozen version 4 schema plus these same two
+statements, and a database created new at version 5 fingerprints exactly as a
+migrated one does. Adding them changed neither the frozen schemas of versions
+1 through 4 nor the statements of the earlier steps. No step rewrites a row or
+deletes anything.
 
 Every step runs its own frozen historical statements, never the live schema
 statements a new database is created from. The version 2 step therefore creates
@@ -246,9 +269,10 @@ and requires the frozen successor, so no step can drift that way again.
 ### No pre-migration backup
 
 V1-09 writes no backup copy before migrating, and that is a decision rather
-than an omission; V1-15's and V1-16's steps keep it true. Every step is additive schema
-change plus the version stamp, committed in a single transaction that SQLite
-rolls back in full on any failure, so the failure a backup would protect
+than an omission; V1-15's, V1-16's, and V1-18's steps keep it true. Every
+step is additive schema change plus the version stamp, committed in a single
+transaction that SQLite rolls back in full on any failure, so the failure a
+backup would protect
 against — a half-applied migration — cannot be reached. No step reads, rewrites,
 transforms, or removes an owner record, so there is nothing for a copy to
 preserve that the original does not still hold. Writing one anyway would place
@@ -333,11 +357,16 @@ remembered or retrieved facts, filesystem paths and failure messages,
 system-information output, and unsupported, malformed, denied, or failed
 request responses. Blank input, CLI-only exit and cancellation paths, startup
 failures, and the initial confirmation-required response are not recorded.
-With reasoning enabled, unsupported input is answered conversationally instead,
-and no conversational request, reply, or controlled failure is recorded; the
-conversation lives only in the session's memory. An
-approved confirmation is processed again and its completed result follows the
-normal recording path.
+With reasoning enabled, unsupported input goes to the local reasoning model
+instead, which may reply conversationally or propose one action, and no
+conversational request, reply, or controlled failure is recorded; the
+conversation lives only in the session's memory. A proposal, its refusal, its
+approval prompt, and the result of an approved model-proposed action are not
+recorded either. A compiled model-originated plan is transient, so neither its
+request nor its result becomes an interaction row, and running an approved one
+writes only its audit summary (see "Audit Summaries" below). An approved
+confirmation of any other plan is processed again and its completed result
+follows the normal recording path.
 
 Successful writes are committed to the configured SQLite file and remain
 available across normal restarts until the database is removed or altered
@@ -398,10 +427,11 @@ and without reading the row first. It does not cascade to `interactions` or
 inserts, SQLite AUTOINCREMENT does not automatically reuse an ID from a
 previously committed row, even after the table has been emptied. Each of the
 three mutations commits independently first; Maria then
-separately attempts to record a short, content-free audit interaction
-(`Retitled note <id>.`, `Edited note <id>.`, or `Deleted note <id>.`) as its
-own transaction. If that later recording fails, the mutation remains
-committed and no audit row is guaranteed. Because the original command is
+separately attempts to record the interaction, with a short, content-free
+response (`Retitled note <id>.`, `Edited note <id>.`, or `Deleted note
+<id>.`), as its own transaction. If that later recording fails, the mutation
+remains committed and no such interaction row is guaranteed. Because the
+original command is
 stored as the request half of an interaction, a retitle or edit command
 retains its new title or body in the `interactions` table, and a prior `read
 note` may already have copied that note's content there; changing or deleting
@@ -479,10 +509,11 @@ returned. It does not cascade to `interactions` or `notes` and does not
 renumber remaining rows' IDs. For Maria's implicit-ID inserts, SQLite
 AUTOINCREMENT does not automatically reuse an ID from a previously committed
 row, even after the table has been emptied. Both mutations commit
-independently first; Maria then separately attempts to record a short,
-content-free audit interaction (`Updated memory <id>.` or `Forgot memory
-<id>.`) as its own transaction. If that later recording fails, the mutation
-remains committed and no audit row is guaranteed. Because the original command
+independently first; Maria then separately attempts to record the
+interaction, with a short, content-free response (`Updated memory <id>.` or
+`Forgot memory <id>.`), as its own transaction. If that later recording
+fails, the mutation remains committed and no such interaction row is
+guaranteed. Because the original command
 is stored as the request half of an interaction, an update command retains its
 new fact in the `interactions` table, and an earlier `remember`, `recall`, or
 `memories` response may already have copied a fact there; updating or
@@ -492,6 +523,35 @@ no memory mutation by fact text, no fuzzy or contextual selection, no bulk,
 wildcard, range, or automatic deletion, no undo or revision history, and no
 guarantee of secure erasure from SQLite file pages, backups, database copies,
 or external storage.
+
+### audit_summaries
+
+Stores one audit summary for each model-proposed action that the owner
+approved and Maria authorised for dispatch; see "Audit Summaries" below. Every
+value is Maria's own, from the closed vocabulary in `core/audit.py`.
+
+| Column | Type and constraints | Purpose |
+| --- | --- | --- |
+| id | INTEGER PRIMARY KEY AUTOINCREMENT | Stable summary identifier, never reused |
+| created_at | TEXT NOT NULL | Maria's own UTC timestamp to the second, always in the form `YYYY-MM-DDTHH:MM:SSZ`, unlike the other tables' timestamps |
+| action | TEXT NOT NULL | Canonical identifier of the approved action: `calculator.calculate`, `filesystem.list`, or `system.current_time` |
+| decision | TEXT NOT NULL | What authorised the attempt: always `owner_approved` |
+| target | TEXT NOT NULL | Generalised class of what the action acts on: `named_filesystem_root` when its contract declares a path argument, whether or not a path was supplied, otherwise `none` |
+
+### audit_outcomes
+
+Stores the outcome Maria appends to an audit summary after its tool returns.
+
+| Column | Type and constraints | Purpose |
+| --- | --- | --- |
+| summary_id | INTEGER PRIMARY KEY | The `audit_summaries.id` the outcome belongs to; as the primary key it admits at most one outcome per summary |
+| outcome | TEXT NOT NULL | `succeeded` or `failed`, as the tool's own success flag reported |
+
+Neither table has a `CHECK` constraint, a foreign key, a trigger, or a
+secondary index. The vocabulary is enforced by the memory layer instead, when
+a value is written and again when it is read, and the link between the two
+tables is kept by the statements that write and delete them, as described
+under "Audit Summaries".
 
 ## Interaction Retrieval
 
@@ -518,7 +578,7 @@ stating that more results exist. This does not delete, expire, or prune any
 row.
 
 `read interaction <id>` displays the complete stored request, response, and
-timestamp for one row, but records only a fixed, content-free audit summary
+timestamp for one row, but records only a fixed, content-free response
 (`Displayed interaction <id>.`) instead of the historical content it
 redisplayed, so repeatedly reading old rows does not duplicate their content
 into new interaction rows. `list`, `search`, and `read` are all read-only:
@@ -532,11 +592,12 @@ first, does not cascade to `notes` or `memories`, and does not renumber
 remaining rows' IDs. For Maria's implicit-ID inserts, SQLite AUTOINCREMENT
 does not automatically reuse an ID from a previously committed row, even
 after the table has been emptied. The deletion commits independently first;
-Maria then separately attempts to record a short, content-free audit
-interaction (`Deleted interaction <id>.`) as its own transaction. When that
-later recording succeeds, the total interaction row count may remain
+Maria then separately attempts to record the interaction, with a short,
+content-free response (`Deleted interaction <id>.`), as its own transaction.
+When that later recording succeeds, the total interaction row count may remain
 unchanged even though the selected historical content is gone; if it fails,
-the deletion remains committed and no audit row is guaranteed. There is no
+the deletion remains committed and no such interaction row is guaranteed.
+There is no
 bulk, wildcard, range, or automatic deletion, and no guarantee of secure
 erasure from SQLite file pages, backups, database copies, or external
 storage.
@@ -720,27 +781,159 @@ for a small personal database. `update memory <id>: <new fact>` and `forget
 memory <id>` change or remove one memory by numeric ID; both are described
 under the `memories` table above.
 
+## Audit Summaries
+
+An audit summary is one logical record kept in two tables: its
+`audit_summaries` row and, once known, its `audit_outcomes` row. It records
+that the owner approved one action the local reasoning model proposed, and
+that Maria authorised that attempt for dispatch; by itself it does not prove
+that the tool ran. Every model-proposed action needs exactly one approval from
+the owner, even when its permission decision is `ALLOWED`, which is why
+`decision` has the single value `owner_approved`. Brain adds summaries and
+outcomes only when it dispatches an approved model-proposed action. A
+deterministic command, a refused proposal, a denied action (refused before any
+approval is offered), and a plan that is cancelled, never approved, or refused
+when it is checked again at confirmation add nothing to either table.
+
+Every stored value is Maria's own, from the closed vocabulary in
+`core/audit.py`, and there is deliberately no column for anything else. A
+summary never holds the request, the model's reply or proposal, an argument
+value, a plan fingerprint, memory or note text supplied as context, a root's
+name, a path, a tool's result, or exception text. A directory listing is
+recorded as `named_filesystem_root` whichever directory it listed. The owner
+sees the exact arguments when approving and the tool's result when it runs;
+neither is stored here, and neither becomes interaction history.
+
+The write order is fixed. Once the owner approves and the plan passes its
+checks again, Brain calls `record_audit_summary(action, decision, target)`,
+which inserts the summary with Maria's own timestamp, validated like every
+other field, and commits it before returning the new id. Only then is the tool
+dispatched, exactly once. If the
+summary cannot be committed, or the returned id is not an exact positive int,
+nothing is dispatched, the approval stays spent, and the owner sees `Maria did
+not run the approved action because its audit summary could not be
+recorded.` After the tool returns, `record_audit_outcome(summary_id,
+outcome)` appends `succeeded` or `failed`, from the tool's own success flag,
+with one statement:
+
+```sql
+INSERT INTO audit_outcomes (summary_id, outcome)
+SELECT ?, ?
+WHERE EXISTS (SELECT 1 FROM audit_summaries WHERE id = ?);
+```
+
+The existence check and the insert are the same statement, so no outcome is
+ever stored for a summary that no longer exists, and because `summary_id` is
+the primary key, a second outcome for one summary is refused. The tool's
+result is then shown, followed by `Recorded as audit summary <id>.` or, when
+the outcome could not be appended, by `Recorded as audit summary <id>, but its
+outcome could not be recorded, so that summary shows the outcome as
+unknown.` Nothing is retried. A summary without an outcome, because that write
+failed or because Maria stopped before or during the tool's run, reads as
+`Outcome not recorded; execution is unknown.`, and Maria never reruns the
+tool to find out. No statement updates a summary or an outcome once it is
+written; the only later change is deletion.
+
+`list_audit_summaries(limit)` returns summaries newest id first, each with its
+outcome or None, through a `LEFT JOIN` of `audit_outcomes` onto
+`audit_summaries`, and `get_audit_summary(id)` returns one summary the same
+way, or None when no summary has that id; an id larger than SQLite's largest
+integer, which no row can have, is answered None without opening the
+database. Ordering is by `id` alone. The limit
+must be an exact int from 1 to 21 and is never clamped; `audit` asks for 21 so
+that it can show the newest 20 and add one line saying that more exist,
+without counting them. Every value read back is validated again: the id must
+be an exact positive int, the timestamp exact text in the one form naming a
+real calendar second, the action one of the three identifiers, and the
+decision, target, and outcome exact text spelling a member of their
+vocabulary, or no outcome at all. One value outside it fails the whole read
+with `Unable to list audit summaries.` or `Unable to read audit summary.`, and
+neither that value nor any other is returned, shown, or logged.
+
+`delete audit <id>` removes one logical summary, after mandatory explicit
+confirmation that configuration cannot remove, and with no preview of stored
+content beforehand; its fixed notice says that the deletion does not undo the
+action and that Maria's operational log may still show that a model-proposed
+action ran. `delete_audit_summary(id)` runs one `BEGIN IMMEDIATE`
+transaction: `DELETE FROM audit_summaries WHERE id = ?`, then, only when that
+removed a row, `DELETE FROM audit_outcomes WHERE summary_id = ?`. The summary
+and its outcome are removed together or, on any failure, not at all. A
+missing id returns False and changes nothing, and the tool reports `Audit
+summary not found: <id>.`; an id larger than SQLite's largest integer is
+answered the same way without opening the database, though the planner
+already refuses such an id before any step, so only a direct caller can pass
+one. For Maria's implicit-id
+inserts, SQLite
+AUTOINCREMENT does not reuse the id of a previously committed summary, even
+after the newest summary or every summary has been deleted, so a later
+summary can never inherit an earlier one's outcome, and an outcome written
+after its summary was deleted is refused by the existence check above. This
+is the one deletion that spans two tables, because an outcome is part of its
+summary rather than a separate record type; it never cascades into
+`interactions`, `notes`, or `memories`. Neither table declares a foreign key,
+so these guarantees rest on Maria's own statements: a change made outside
+Maria is not prevented, but an outcome row with no summary is never listed or
+read.
+
+The audit tool, `tools/audit.py`, reaches these tables only through those
+`Memory` methods. `audit` and `read audit <id>` change no audit summary and
+are allowed without confirmation by default. No audit action can be proposed
+by the model, and audit summaries are never read for planning or reasoning or
+supplied as model context. The three commands are ordinary deterministic
+commands, recorded as interactions like any other, but no recorded response
+repeats a summary beyond its id: `audit` records `Listed audit summaries.`
+and `read audit <id>` records `Displayed audit summary <id>.` in place of
+what they showed, a deletion records its reply, `Deleted audit summary <id>.`,
+and a failure records its fixed message. Deleting an audit summary leaves
+those interaction rows in place, and deleting an interaction leaves every
+audit summary in place.
+
+Each audit method validates its arguments before it opens the database. An
+action, decision, target, or outcome outside the vocabulary raises
+`ValueError("An audit summary may hold only values from Maria's audit
+vocabulary.")`, an id that is not an exact positive int, including `True`,
+raises `ValueError("Audit summary id must be a positive whole number.")`, and
+a listing limit that is not an exact int from 1 to 21 raises its own fixed
+`ValueError`. Every database failure raises a fixed `RuntimeError` with no
+cause and no context: `Database is busy. Try again shortly.` for busy or
+locked contention, and otherwise `Unable to record audit summary.`, `Unable to
+record audit outcome.`, `Unable to list audit summaries.`, `Unable to read
+audit summary.`, or `Unable to delete audit summary.` An insert that adds no
+row, and a summary insert that returns no valid id, fail the same way. The log
+receives one fixed line, `Failed to <operation>: <reason>.`, whose reason is
+`database busy`, `database error`, `no row was inserted`, `no valid id was
+returned`, or `a stored value is outside the audit vocabulary`, with no
+traceback and no SQLite text. A successful write logs only its id: `Recorded
+audit summary <id>.`, `Recorded the outcome of audit summary <id>.`, or
+`Deleted audit summary <id>.`
+
 ## Data Considerations
 
-Interaction history, notes, and explicit memories are distinct persistent
-concepts and use separate tables in the same configured database. The same
+Interaction history, notes, explicit memories, and audit summaries are
+distinct persistent concepts and use separate tables in the same configured
+database; an audit summary spans two of them, `audit_summaries` and
+`audit_outcomes`. The same
 text may nevertheless appear more than once: an explicit fact can occur in its
 `remember` request, the `memories` table, and later recall or list responses;
 a note body can remain in an interaction response as well as the `notes` table.
 Likewise, file or note content returned in a response remains independent of
 its original source. Removing or changing source data outside Maria does not
-automatically remove matching text from existing interaction rows. All three
-tables share one database file; external removal or replacement affects all
-three datasets.
+automatically remove matching text from existing interaction rows. An audit
+summary holds none of that text. All of these tables share one database file;
+external removal or replacement affects all four datasets.
 
 In the current implementation, `delete interaction <id>`,
 `delete note <id>`, and `forget memory <id>` each target at most one row by ID
-and remove it when found, and `retitle note <id>`, `edit note <id>`, and
-`update memory <id>` each change one stored field; Maria still exposes no API
-or CLI operation to prune or bulk-delete interaction history, bulk-delete or
-clear notes, or bulk-delete or clear explicit memories. Removing one record
-never cascades into another table, so forgetting a memory leaves any copy of
-its text that already exists in `interactions` untouched. It also provides
+and remove it when found, `delete audit <id>` removes at most one audit
+summary, its summary row together with any outcome row, and `retitle note
+<id>`, `edit note <id>`, and `update memory <id>` each change one stored
+field; Maria still exposes no API or CLI operation to prune or bulk-delete
+interaction history, bulk-delete or clear notes, bulk-delete or clear explicit
+memories, or bulk-delete or clear audit summaries. Removing one record never
+cascades into another record type, so forgetting a memory leaves any copy of
+its text that already exists in `interactions` untouched, and deleting an
+audit summary leaves the rows the audit commands recorded in `interactions`
+untouched. It also provides
 no application-level database encryption. Protection depends on access to the
 machine, user account, and database file and on any storage encryption in use;
 local storage alone is not a confidentiality guarantee. Maria's persistence
@@ -752,7 +945,9 @@ The configured operational log (`logs/maria.log` by default) is separate from
 SQLite interaction history. The log records application events, warnings, and
 failures; the `interactions` table records request and response text. Omitting
 full content from an operational log entry does not mean the content is absent
-from an interaction row.
+from an interaction row. In the other direction, deleting an audit summary
+removes nothing from the log, which may still show that a model-proposed
+action ran, naming its action and the summary's id.
 
 Do not submit or request display of passwords, API keys, access tokens, private
 keys, recovery codes, confidential credentials, or other highly sensitive
@@ -811,15 +1006,24 @@ method), and the note methods (`create_note`, `list_notes`, `get_note`,
 `retitle_note`, `edit_note`, `delete_note`, and every note consent and context
 method), with their `_reporting_consent` forms. Their SQL, transactions,
 rollback and closing, success logging, recognised uniqueness conflicts, and
-owner-visible messages are unchanged.
+owner-visible messages are unchanged. The audit methods
+(`record_audit_summary`, `record_audit_outcome`, `list_audit_summaries`,
+`get_audit_summary`, and `delete_audit_summary`) follow the same rule, as
+described under "Audit Summaries" above.
 
-Busy/locked contention is still converted as described above, and that
-conversion still logs SQLite's busy exception and attaches it, because its
-message is SQLite's own fixed text. Initialization and `schema_version()`
+Busy/locked contention is still converted as described above, and outside the
+audit methods that conversion still logs SQLite's busy exception and attaches
+it, because its message is SQLite's own fixed text. The audit methods
+classify contention themselves: they raise the same busy message, but log
+only their fixed line and attach nothing. Initialization and `schema_version()`
 never read a stored record's text; they record only their fixed event codes,
 as described under "What initialization logs", and keep SQLite's exception as
 the cause for a caller that needs it.
 
 ## Ownership
 
-Only `core/memory.py` should open SQLite connections or execute SQL.
+Only `core/memory.py` should open SQLite connections or execute SQL. Brain
+writes audit summaries, and `tools/audit.py` lists, reads, and deletes them,
+only through `Memory`'s audit methods; `core/audit.py` holds the audit
+vocabulary that the memory layer, Brain, and the audit tool share, and
+executes no SQL.

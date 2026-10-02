@@ -13,6 +13,57 @@ UNSUPPORTED_RESPONSE = (
     "Type 'help' to see supported commands."
 )
 
+MEMORY_ID_RESPONSE = "Memory id must be a positive whole number."
+NOTE_ID_RESPONSE = "Note id must be a positive whole number."
+INTERACTION_ID_RESPONSE = "Interaction id must be a positive whole number."
+AUDIT_ID_RESPONSE = "Audit summary id must be a positive whole number."
+
+# The largest id any record can have, because every id is a SQLite integer.
+LARGEST_ID = 2**63 - 1
+# More zeroes than the 4,300 digits Python converts from text by default, so
+# an operand padded with them raises ValueError if int() is handed it whole.
+LONG_ZEROES = "0" * 5000
+
+# The thirteen ID-only planner commands, which share one id parser: each
+# one's request template, the tool, action, and other arguments of the step
+# it plans, and the response it gives an id it cannot use. The command
+# "read note <id or exact title>" is not among them; it uses its separate,
+# unchanged lookup path.
+ID_COMMANDS: tuple[tuple[str, str, str, dict[str, str], str], ...] = (
+    (
+        "update memory {}: New fact",
+        "memory",
+        "update",
+        {"fact": "New fact"},
+        MEMORY_ID_RESPONSE,
+    ),
+    ("forget memory {}", "memory", "forget", {}, MEMORY_ID_RESPONSE),
+    ("enable memory context {}", "memory", "enable_context", {}, MEMORY_ID_RESPONSE),
+    ("disable memory context {}", "memory", "disable_context", {}, MEMORY_ID_RESPONSE),
+    (
+        "retitle note {}: New title",
+        "notes",
+        "retitle",
+        {"title": "New title"},
+        NOTE_ID_RESPONSE,
+    ),
+    ("edit note {}: New body", "notes", "edit", {"body": "New body"}, NOTE_ID_RESPONSE),
+    ("delete note {}", "notes", "delete", {}, NOTE_ID_RESPONSE),
+    ("enable note context {}", "notes", "enable_context", {}, NOTE_ID_RESPONSE),
+    ("disable note context {}", "notes", "disable_context", {}, NOTE_ID_RESPONSE),
+    ("read interaction {}", "history", "read", {}, INTERACTION_ID_RESPONSE),
+    ("delete interaction {}", "history", "delete", {}, INTERACTION_ID_RESPONSE),
+    ("read audit {}", "audit", "read", {}, AUDIT_ID_RESPONSE),
+    ("delete audit {}", "audit", "delete", {}, AUDIT_ID_RESPONSE),
+)
+
+
+def _shown(request: str) -> str:
+    """Return a short printable label for a request that may be very long."""
+    if len(request) <= 60:
+        return ascii(request)
+    return f"{ascii(request[:30])}...{ascii(request[-20:])} ({len(request)} chars)"
+
 
 class PlannerRegressionTests(unittest.TestCase):
     """Verify strict command mappings outside the focused memory suite."""
@@ -806,6 +857,9 @@ class PlannerRegressionTests(unittest.TestCase):
             "- search history <query>",
             "- read interaction <id>",
             "- delete interaction <id>",
+            "- audit",
+            "- read audit <id>",
+            "- delete audit <id>",
         )
 
         self.assertEqual(plan.steps, ())
@@ -917,6 +971,69 @@ class PlannerRegressionTests(unittest.TestCase):
                 response_if_no_action=UNSUPPORTED_RESPONSE,
             ),
         )
+
+
+class SharedIdGrammarTests(unittest.TestCase):
+    """Verify the shared id parser of the thirteen ID-only planner commands.
+
+    It strips leading zeroes however many there are and refuses more than
+    19 significant digits before any conversion, then converts at most 19
+    digits and compares the result with 9223372036854775807, the largest
+    integer SQLite stores, which no record's id can exceed. It therefore
+    reads an operand of any length safely, and no operand reaches Python's
+    limit on converting long digit strings.
+    """
+
+    def setUp(self) -> None:
+        logger = logging.Logger("tests.planner_regression.shared_id")
+        logger.addHandler(logging.NullHandler())
+        self.planner = Planner(logger=logger)
+
+    def test_the_long_operands_here_exceed_pythons_conversion_limit(self) -> None:
+        # The limit stays in force, so each operand below would raise if it
+        # were converted whole. The parser must never convert one that way.
+        for operand in (LONG_ZEROES + "7", "9" * len(LONG_ZEROES)):
+            with self.subTest(length=len(operand)):
+                with self.assertRaises(ValueError):
+                    int(operand)
+
+    def test_leading_zeroes_of_any_length_name_the_same_id(self) -> None:
+        for template, tool, action, other_arguments, _response in ID_COMMANDS:
+            for operand, record_id in (
+                ("7", 7),
+                ("007", 7),
+                (LONG_ZEROES + "7", 7),
+                (str(LARGEST_ID), LARGEST_ID),
+                (LONG_ZEROES + str(LARGEST_ID), LARGEST_ID),
+            ):
+                request = template.format(operand)
+                step = PlanStep(tool, action, {"id": record_id, **other_arguments})
+                with self.subTest(request=_shown(request)):
+                    self.assertEqual(
+                        self.planner.create_plan(request),
+                        Plan(original_request=request, steps=(step,)),
+                    )
+
+    def test_an_id_no_record_can_have_gets_the_invalid_id_response(self) -> None:
+        for template, _tool, _action, _other_arguments, response in ID_COMMANDS:
+            for operand in (
+                str(LARGEST_ID + 1),
+                "9" * 20,
+                "9" * len(LONG_ZEROES),
+                "1" + LONG_ZEROES,
+                LONG_ZEROES + str(LARGEST_ID + 1),
+                LONG_ZEROES,
+            ):
+                request = template.format(operand)
+                with self.subTest(request=_shown(request)):
+                    self.assertEqual(
+                        self.planner.create_plan(request),
+                        Plan(
+                            original_request=request,
+                            steps=(),
+                            response_if_no_action=response,
+                        ),
+                    )
 
 
 if __name__ == "__main__":

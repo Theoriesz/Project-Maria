@@ -2093,7 +2093,7 @@ class MemoryContextConsentTests(unittest.TestCase):
                 memory.initialize()
                 memory.initialize()
 
-                self.assertEqual(memory.schema_version(), 4)
+                self.assertEqual(memory.schema_version(), 5)
                 with closing(sqlite3.connect(path)) as connection:
                     self.assertEqual(
                         connection.execute("PRAGMA encoding").fetchone()[0],

@@ -55,6 +55,12 @@ ENABLE_NOTE_CONTEXT_NOTICE = (
     "passwords or other secrets, and enabling it does not mean it contains "
     "none."
 )
+# V1-18's audit summary deletion notice, pinned the same way.
+DELETE_AUDIT_NOTICE = (
+    "Deleting an audit summary removes it from Maria's database. It does not "
+    "undo the action, and Maria's operational log may still show that a "
+    "model-proposed action ran."
+)
 
 
 class PermissionManagerTests(unittest.TestCase):
@@ -349,6 +355,7 @@ class PermissionManagerTests(unittest.TestCase):
             MANDATORY_CONFIRMATION_ACTIONS,
             frozenset(
                 {
+                    "audit.delete",
                     "filesystem.rename",
                     "filesystem.move",
                     "history.delete",
@@ -364,7 +371,7 @@ class PermissionManagerTests(unittest.TestCase):
                 }
             ),
         )
-        self.assertEqual(len(MANDATORY_CONFIRMATION_ACTIONS), 12)
+        self.assertEqual(len(MANDATORY_CONFIRMATION_ACTIONS), 13)
         self.assertEqual(
             MANDATORY_DENIED_ACTIONS,
             frozenset({"filesystem.delete", "filesystem.write"}),
@@ -542,6 +549,8 @@ class PermissionManagerTests(unittest.TestCase):
                 for action_id in sorted(MANDATORY_CONFIRMATION_ACTIONS):
                     tool_name, action = action_id.split(".")
                     reason = f"{action_id} requires explicit confirmation."
+                    if action_id == "audit.delete":
+                        reason = f"{reason} {DELETE_AUDIT_NOTICE}"
                     if action_id == "memory.enable_context":
                         reason = f"{reason} {ENABLE_CONTEXT_NOTICE}"
                     if action_id == "notes.enable_context":
