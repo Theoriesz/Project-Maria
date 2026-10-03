@@ -1,14 +1,17 @@
 """The gate that turns one untrusted model proposal into a Maria plan.
 
 A reasoning model's output is untrusted, so this module is deny-by-default. A
-proposal is compiled only when its tool action is in the closed allowlist
-declared here, its action contract separately classifies it as
-model-eligible, and every argument satisfies that contract and the text and
-path checks below. Anything else is refused with one fixed
-``ProposalRejection``. Nothing here repairs a proposal, and nothing here
-decides permission: PermissionManager allows any action absent from its
-mandatory sets, so it cannot be the positive gate, and a compiled plan still
-has to pass it later, unchanged.
+proposal names one action, or, inside a ``steps`` envelope, two to
+``PLAN_MAX_STEPS`` actions run in order. It is compiled only when every
+proposed tool action is in the closed allowlist declared here, its action
+contract separately classifies it as model-eligible, and every argument
+satisfies that contract and the text and path checks below. Compilation is
+all or nothing: anything else is refused with one fixed
+``ProposalRejection``, and no part of a refused proposal becomes a plan.
+Nothing here repairs a proposal, and nothing here decides permission:
+PermissionManager allows any action absent from its mandatory sets, so it
+cannot be the positive gate, and a compiled plan still has to pass it later,
+unchanged.
 
 The compiler executes nothing. It calls no tool, Tool Manager, permission
 check, memory layer, conversation, network, shell, or SQL, and it performs no
@@ -51,6 +54,7 @@ from core.action_contracts import (
 )
 from core.logger import get_logger
 from core.planner import (
+    PLAN_MAX_STEPS,
     Plan,
     PlanArguments,
     PlanOrigin,
@@ -74,16 +78,27 @@ MODEL_ACTION_ALLOWLIST = frozenset(
 )
 
 # The largest proposal considered at all, in UTF-8 bytes, measured before any
-# parsing. One single-step proposal for an allowlisted action is far smaller.
+# parsing. The cap covers the whole reply, however many actions it proposes:
+# a proposal for allowlisted actions is far smaller, and one whose arguments
+# make it larger is refused, never cut down.
 MODEL_PROPOSAL_MAX_BYTES = 4096
 
 # The deepest container nesting considered, checked before parsing. A proposal
-# needs two levels, the proposal object and its arguments object; the rest is
-# room for a wrongly shaped proposal to be refused by its shape, while the
-# parser never recurses into pathological nesting.
+# for one action needs two levels, the proposal object and its arguments
+# object, and a steps envelope four: the envelope, its list, each action, and
+# each action's arguments. The rest is room for a wrongly shaped proposal to
+# be refused by its shape, while the parser never recurses into pathological
+# nesting.
 MODEL_PROPOSAL_MAX_NESTING = 8
 
 PROPOSAL_FIELDS = frozenset({"tool", "action", "arguments"})
+
+# A proposal for several actions is one object holding exactly this field: a
+# list of at least this many, and at most PLAN_MAX_STEPS, action objects, each
+# shaped exactly as a proposal for one action. One action is always proposed
+# in its own shape, so no plan can be spelled two ways.
+STEPS_ENVELOPE_FIELDS = frozenset({"steps"})
+MODEL_PROPOSAL_MIN_STEPS = 2
 
 # Unicode categories an argument string may not contain at all: control,
 # format, surrogate, line separator, and paragraph separator. Any of them can
@@ -116,6 +131,7 @@ class ProposalRejection(str, Enum):
     OVERSIZED = "oversized"
     MALFORMED_OUTPUT = "malformed_output"
     MALFORMED_PROPOSAL = "malformed_proposal"
+    MALFORMED_PLAN = "malformed_plan"
     UNKNOWN_TOOL = "unknown_tool"
     UNKNOWN_ACTION = "unknown_action"
     NOT_MODEL_ELIGIBLE = "not_model_eligible"
@@ -137,8 +153,9 @@ class ProposalRejection(str, Enum):
         return _REJECTION_MESSAGES[self]
 
 
-# Every message is fixed and interpolates nothing, so a refusal can never
-# repeat a tool, action, or argument name the model supplied, or a value.
+# Every message is fixed when this module loads, built from nothing but
+# Maria's own constants, so a refusal can never repeat a tool, action, or
+# argument name the model supplied, or a value.
 _REJECTION_MESSAGES = MappingProxyType(
     {
         ProposalRejection.OVERSIZED: (
@@ -150,6 +167,11 @@ _REJECTION_MESSAGES = MappingProxyType(
         ProposalRejection.MALFORMED_PROPOSAL: (
             "The proposed action did not have exactly a tool, an action, and "
             "an arguments object."
+        ),
+        ProposalRejection.MALFORMED_PLAN: (
+            "The proposed plan did not have exactly a steps list of "
+            f"{MODEL_PROPOSAL_MIN_STEPS} to {PLAN_MAX_STEPS} actions, "
+            "each with exactly a tool, an action, and an arguments object."
         ),
         ProposalRejection.UNKNOWN_TOOL: (
             "The proposed action named a tool Maria does not have."
@@ -223,7 +245,7 @@ def compile_proposal(
     contracts: ActionContractRegistry = BUILT_IN_ACTION_CONTRACTS,
     logger: Logger | None = None,
 ) -> Plan | ProposalRejection:
-    """Compile one model proposal into a single-step plan, or refuse it.
+    """Compile one model proposal into a plan of 1 to 5 steps, or refuse it.
 
     ``request`` is the owner's cleaned request and becomes the plan's
     ``original_request``; no model text ever does. ``response`` is the
@@ -231,13 +253,18 @@ def compile_proposal(
     ``contracts`` is the registry the eventual dispatch would use.
 
     The gates run in a fixed order and the first failure decides the
-    rejection: the byte cap, strict parsing, the proposal's shape, the
-    allowlist together with the contract's eligibility, the argument
-    contract, then the text and path checks on each present argument in
-    declared order. Only a proposal passing all of them becomes a plan: the
-    existing immutable, fingerprinted ``Plan`` holding exactly one step,
-    named by Maria's own declared tool and action, with the arguments exactly
-    as supplied, recorded as ``TRANSIENT``, and of origin ``MODEL``.
+    rejection: the byte cap, strict parsing, the proposal's shape, which is
+    either one action or a ``steps`` envelope of 2 to ``PLAN_MAX_STEPS``
+    actions, and then, for each action in order, the allowlist together
+    with the contract's eligibility, the argument contract, and the text and
+    path checks on each present argument in declared order. Only a proposal
+    whose every action passes all of them becomes a plan: the existing
+    immutable, fingerprinted ``Plan`` holding one step per proposed action,
+    in the proposed order, each named by Maria's own declared tool and
+    action, with the arguments exactly as supplied, recorded as
+    ``TRANSIENT``, and of origin ``MODEL``. Nothing is repaired, reordered,
+    defaulted, or substituted, and a reference-like value such as ``$1`` is
+    only literal text.
 
     A caller passing anything but cleaned request text, an exact
     ``ReasoningResponse``, or an exact registry receives ``ValueError`` with
@@ -271,29 +298,35 @@ def recheck_model_plan(
     just before the approved plan runs, because an approval authorises a
     plan rather than freezing the registry that was current when the plan
     was shown. Nothing is parsed, rebuilt, repaired, defaulted, or
-    substituted, and no provider is asked anything: the plan's one step is
-    checked as it is against the closed allowlist, the model eligibility
-    ``contracts`` declares now, the argument contract, and the text and path
-    checks, in that order, and the first failure is returned, or None when
-    every gate still passes.
+    substituted, and no provider is asked anything: every step of the plan
+    is checked, in order, as it is, against the closed allowlist, the model
+    eligibility ``contracts`` declares now, the argument contract, and the
+    text and path checks, in that order, and the first failure is returned,
+    or None when every step still passes every gate.
 
-    A value that is not a well-formed model-originated plan, or a registry
-    that is not exactly an ``ActionContractRegistry``, raises ``ValueError``
-    with a fixed message. A refusal logs its code and nothing else.
+    A value that is not a well-formed model-originated plan, including one
+    holding more steps than ``PLAN_MAX_STEPS``, or a registry that is not
+    exactly an ``ActionContractRegistry``, raises ``ValueError`` with a
+    fixed message. A refusal logs its code and nothing else.
     """
     if type(contracts) is not ActionContractRegistry:
         raise ValueError(COMPILER_CONTRACTS_MESSAGE)
     if not is_model_plan(plan):
         raise ValueError(COMPILER_PLAN_MESSAGE)
 
-    step = plan.steps[0]
-    outcome = _checked_step(step.tool_name, step.action, step.arguments, contracts)
-    if type(outcome) is ProposalRejection:
-        (logger or get_logger(__name__)).warning(
-            "Refused a compiled model plan: code=%s",
-            outcome.code,
+    for step in plan.steps:
+        outcome = _checked_step(
+            step.tool_name,
+            step.action,
+            step.arguments,
+            contracts,
         )
-        return outcome
+        if type(outcome) is ProposalRejection:
+            (logger or get_logger(__name__)).warning(
+                "Refused a compiled model plan: code=%s",
+                outcome.code,
+            )
+            return outcome
     return None
 
 
@@ -312,22 +345,36 @@ def _compile(
     proposal = _parse(text)
     if proposal is _NOT_ONE_DOCUMENT:
         return ProposalRejection.MALFORMED_OUTPUT
-    if not _is_proposal(proposal):
+    if _is_steps_envelope(proposal):
+        actions = proposal["steps"]
+        if not _is_step_list(actions):
+            return ProposalRejection.MALFORMED_PLAN
+    elif _is_proposal(proposal):
+        actions = [proposal]
+    else:
         return ProposalRejection.MALFORMED_PROPOSAL
 
-    arguments = proposal["arguments"]
-    contract = _checked_step(
-        proposal["tool"],
-        proposal["action"],
-        arguments,
-        contracts,
-    )
-    if type(contract) is ProposalRejection:
-        return contract
+    # Every action passes every gate before any step is built, so a refusal
+    # anywhere leaves nothing behind.
+    checked: list[tuple[ActionContract, dict[str, object]]] = []
+    for action in actions:
+        arguments = action["arguments"]
+        contract = _checked_step(
+            action["tool"],
+            action["action"],
+            arguments,
+            contracts,
+        )
+        if type(contract) is ProposalRejection:
+            return contract
+        checked.append((contract, arguments))
 
     return Plan(
         original_request=request,
-        steps=(PlanStep(contract.tool_name, contract.action, arguments),),
+        steps=tuple(
+            PlanStep(contract.tool_name, contract.action, arguments)
+            for contract, arguments in checked
+        ),
         recording=RecordingPolicy.TRANSIENT,
         origin=PlanOrigin.MODEL,
     )
@@ -465,6 +512,31 @@ def _is_proposal(value: object) -> bool:
         and type(value["tool"]) is str
         and type(value["action"]) is str
         and type(value["arguments"]) is dict
+    )
+
+
+def _is_steps_envelope(value: object) -> bool:
+    """Return whether a parsed document is an object of exactly ``steps``.
+
+    Such an object is a proposal for several actions however its list turns
+    out, so a malformed list is refused as a malformed plan rather than as a
+    malformed single action.
+    """
+    return type(value) is dict and set(value) == STEPS_ENVELOPE_FIELDS
+
+
+def _is_step_list(value: object) -> bool:
+    """Return whether an envelope's ``steps`` is a well-formed action list.
+
+    That is an exact list of ``MODEL_PROPOSAL_MIN_STEPS`` to
+    ``PLAN_MAX_STEPS`` items, each exactly the shape of a proposal for one
+    action. A nested list, a nested envelope, or any other field is
+    refused, so no step can hold another step.
+    """
+    return (
+        type(value) is list
+        and MODEL_PROPOSAL_MIN_STEPS <= len(value) <= PLAN_MAX_STEPS
+        and all(_is_proposal(item) for item in value)
     )
 
 

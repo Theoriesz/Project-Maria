@@ -623,10 +623,14 @@ reasoning model proposed and that Maria authorised that attempt for dispatch.
 Brain commits the summary before the action is dispatched and does not run the
 action at all if it cannot. After the tool returns, Brain appends the outcome
 and follows the action's result with `Recorded as audit summary <id>.`, or with
-a notice that the outcome could not be recorded. A model-proposed action is
-never recorded as interaction history, so its summary is its only record in
-Maria's database; see "Model-Originated Execution and Audit" in
-`docs/architecture.md`.
+a notice that the outcome could not be recorded. A model-proposed plan of two
+to five steps has one summary for each step Maria reached for dispatch, each
+committed before its own step runs, and none for a step after the plan
+stopped; each step's block in the plan's report names its own summary. The
+listing shows every summary on its own line, and nothing links the summaries
+of one plan. A model-proposed action is never recorded as interaction
+history, so its summary is its only record in Maria's database; see
+"Model-Originated Execution and Audit" in `docs/architecture.md`.
 
 A summary holds only its numeric ID and values Maria generates from the closed
 vocabulary in `core/audit.py`: a UTC timestamp to the second in the form

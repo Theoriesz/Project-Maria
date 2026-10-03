@@ -10,8 +10,9 @@ from __future__ import annotations
 import hashlib
 import json
 from collections.abc import Iterator, Mapping
-from dataclasses import dataclass
+from dataclasses import dataclass, fields as dataclass_fields
 from enum import Enum
+from itertools import islice
 from logging import Logger
 from types import MappingProxyType
 from typing import Any
@@ -138,9 +139,18 @@ class PlanOrigin(str, Enum):
     MODEL = "model"
 
 
+# The most steps any plan may hold, whatever produced it. A plan is one flat,
+# ordered sequence of steps: a step holds only a tool name, an action name,
+# and text or whole-number arguments, so no step can hold a plan or another
+# step, and nothing a step returns can add one. That is the whole of a plan's
+# depth.
+PLAN_MAX_STEPS = 5
+
+PLAN_STEP_LIMIT_MESSAGE = f"A plan may hold at most {PLAN_MAX_STEPS} steps."
+
 MODEL_PLAN_SHAPE_MESSAGE = (
-    "A model-originated plan must be transient, with exactly one step and no "
-    "canned response."
+    "A model-originated plan must be transient, with 1 to "
+    f"{PLAN_MAX_STEPS} steps and no canned response."
 )
 
 
@@ -153,9 +163,15 @@ class Plan:
     producer makes explicitly, and it keeps the whole interaction row out of
     history: the request as well as the response.
 
-    The origin defaults to DETERMINISTIC. A MODEL plan always has exactly
-    one step, no canned response, and the TRANSIENT policy, and no other
-    shape can be constructed with that origin.
+    No plan holds more than ``PLAN_MAX_STEPS`` steps. The origin defaults to
+    DETERMINISTIC. A MODEL plan always has exact text as its request, 1 to
+    ``PLAN_MAX_STEPS`` steps in an exact tuple, no canned response, and the
+    TRANSIENT policy, and no other shape can be constructed with that origin.
+
+    Every field is set on the plan itself when it is built. The boundaries
+    that route, confirm, or run a plan read its fields from the plan itself,
+    through ``own_origin`` and ``plan_snapshot``, so a field deleted later is
+    missing there rather than read as its class default.
     """
 
     original_request: str
@@ -165,22 +181,35 @@ class Plan:
     origin: PlanOrigin = PlanOrigin.DETERMINISTIC
 
     def __post_init__(self) -> None:
-        """Refuse a policy or origin of the wrong type, and a bad MODEL shape.
+        """Refuse a wrong type, a bad MODEL shape, or too many steps.
 
-        Both checks are on the exact type, so neither a plain string nor an
-        object claiming the class through ``__class__`` passes. A string
-        would compare and hash equal to the member it spells while failing
-        every identity check made against that member, so it is refused
-        rather than coerced. A model-originated plan of any shape but its
-        one is refused as well, so ``dataclasses.replace`` cannot produce one
-        either.
+        Both type checks are on the exact type, so neither a plain string
+        nor an object claiming the class through ``__class__`` passes. A
+        string would compare and hash equal to the member it spells while
+        failing every identity check made against that member, so it is
+        refused rather than coerced. A model-originated plan of any shape but
+        its own is refused as well, so ``dataclasses.replace`` cannot produce
+        one either. Any other plan is refused when reading its steps finds
+        more than ``PLAN_MAX_STEPS``: they are read, at most one past the
+        bound, rather than counted by the length their container reports, so
+        a container that understates its length is refused too. The
+        container itself is kept as it is, and steps that cannot be read,
+        such as one-shot steps that reading would consume, are not refused
+        here; the steps are otherwise exactly as free as they always were.
+        Construction is not the only check: the boundaries that confirm or
+        run a plan read its steps again.
         """
         if type(self.recording) is not RecordingPolicy:
             raise TypeError("Plan recording policy must be a RecordingPolicy.")
         if type(self.origin) is not PlanOrigin:
             raise TypeError("Plan origin must be a PlanOrigin.")
-        if self.origin is PlanOrigin.MODEL and not is_model_plan(self):
-            raise ValueError(MODEL_PLAN_SHAPE_MESSAGE)
+        if self.origin is PlanOrigin.MODEL:
+            if not is_model_plan(self):
+                raise ValueError(MODEL_PLAN_SHAPE_MESSAGE)
+        else:
+            read = _read_steps(self.steps)
+            if read is not None and len(read) > PLAN_MAX_STEPS:
+                raise ValueError(PLAN_STEP_LIMIT_MESSAGE)
 
     @property
     def fingerprint(self) -> str:
@@ -235,31 +264,189 @@ class Plan:
         ).encode("utf-8")
 
 
+# Every field a plan holds itself, each set on it when it is built, read from
+# the dataclass so a field added later is required and copied too.
+_PLAN_FIELDS = tuple(field.name for field in dataclass_fields(Plan))
+
+
 def is_model_plan(plan: object) -> bool:
     """Return whether a value is exactly a well-formed model-originated plan.
 
     That is an exact ``Plan`` whose origin is MODEL and whose policy is
-    TRANSIENT, with no canned response and an exact tuple holding exactly
-    one exact ``PlanStep``, named by exact text, with its immutable
-    ``PlanArguments``. Every field is read again rather than trusted from
-    construction, because a frozen dataclass can still be altered through
-    ``object.__setattr__``, so the boundaries that act on a model plan ask
-    this again before they do.
+    TRANSIENT, with exact text as its request, no canned response, and an
+    exact tuple of 1 to ``PLAN_MAX_STEPS`` exact ``PlanStep`` values, each
+    named by exact text and holding its immutable ``PlanArguments``. Every
+    field is read again rather than trusted from construction, because a
+    frozen dataclass can still be altered through ``object.__setattr__`` and
+    ``object.__delattr__``, so the boundaries that act on a model plan ask
+    this again before they do. The plan's fields are read from the plan
+    itself, as ``own_origin`` reads them, so a plan missing any of its own
+    fields, or holding a step missing one, is no model plan, and the
+    question is answered rather than raised.
     """
     if type(plan) is not Plan:
         return False
-    steps = plan.steps
-    return (
-        plan.origin is PlanOrigin.MODEL
-        and plan.recording is RecordingPolicy.TRANSIENT
-        and plan.response_if_no_action is None
-        and type(steps) is tuple
-        and len(steps) == 1
-        and type(steps[0]) is PlanStep
-        and type(steps[0].tool_name) is str
-        and type(steps[0].action) is str
-        and type(steps[0].arguments) is PlanArguments
-    )
+    fields = _own_fields(plan)
+    if fields is None:
+        return False
+    steps = fields["steps"]
+    try:
+        return (
+            fields["origin"] is PlanOrigin.MODEL
+            and fields["recording"] is RecordingPolicy.TRANSIENT
+            and fields["response_if_no_action"] is None
+            and type(fields["original_request"]) is str
+            and type(steps) is tuple
+            and 1 <= len(steps) <= PLAN_MAX_STEPS
+            and all(
+                type(step) is PlanStep
+                and type(step.tool_name) is str
+                and type(step.action) is str
+                and type(step.arguments) is PlanArguments
+                for step in steps
+            )
+        )
+    except AttributeError:
+        # A field deleted from one of its steps, none of which has a default.
+        return False
+
+
+def own_origin(plan: object) -> PlanOrigin | None:
+    """Return the origin a plan holds itself, or None unless it is whole.
+
+    The origin is read from the plan's own fields, never through attribute
+    lookup: a field deleted from a built plan would otherwise read as its
+    class default, which for the origin is DETERMINISTIC. None means the
+    value is not a ``Plan``, does not hold its fields in an exact
+    dictionary, lacks any of its own fields, or holds a policy or an origin
+    that is not exactly one of their members. Brain refuses a plan without
+    one before it chooses a path, and only a plan holding exactly
+    DETERMINISTIC itself takes the deterministic path. An origin reassigned
+    to DETERMINISTIC is a real member, so nothing left in the plan can show
+    that it was changed; the fingerprint captured when approval was offered
+    is what detects a change made after that.
+    """
+    fields = _own_fields(plan)
+    return None if fields is None else fields["origin"]
+
+
+def plan_snapshot(plan: object) -> Plan | None:
+    """Return a plan exactly as one bounded read finds it, or None.
+
+    Every field is read from the plan itself, so a deleted field is missing
+    rather than its class default, and no copy can restore it. A model plan
+    must already be exactly well formed, and is its own snapshot; it is
+    never repaired by copying. A deterministic plan's steps are read once,
+    by the same rule as ``bounded_steps``: an exact ``Plan`` already holding
+    them in an exact tuple is its own snapshot, and otherwise the snapshot
+    is a new ``Plan`` holding the read as a tuple and every other field
+    exactly as the plan holds it, each passed explicitly. A snapshot's
+    sequence of steps is a tuple, which no later read can change; the step
+    objects in it are the plan's own, not copies. None means the value is
+    not whole, as ``own_origin`` describes, a model plan is not well
+    formed, or a deterministic plan's steps cannot be read within
+    ``PLAN_MAX_STEPS``.
+    """
+    fields = _own_fields(plan)
+    if fields is None:
+        return None
+    if fields["origin"] is PlanOrigin.MODEL:
+        return plan if is_model_plan(plan) else None
+    steps = _bounded_read(fields["steps"])
+    if steps is None:
+        return None
+    if type(plan) is Plan and type(fields["steps"]) is tuple:
+        return plan
+    return Plan(**{**fields, "steps": steps})
+
+
+def _own_fields(plan: object) -> dict[str, Any] | None:
+    """Return every field a plan holds itself, or None unless it is whole.
+
+    The fields come from the plan's own instance dictionary, so none can
+    fall back to a class default. That dictionary must be exactly a
+    ``dict``: one of a subclass could show other values here than the
+    attribute reads every other reader of the plan makes. The policy and
+    the origin must be exactly their enum members.
+    """
+    if not issubclass(type(plan), Plan):
+        return None
+    held = vars(plan)
+    if type(held) is not dict:
+        return None
+    if any(name not in held for name in _PLAN_FIELDS):
+        return None
+    if (
+        type(held["recording"]) is not RecordingPolicy
+        or type(held["origin"]) is not PlanOrigin
+    ):
+        return None
+    return {name: held[name] for name in _PLAN_FIELDS}
+
+
+def bounded_steps(plan: object) -> tuple[PlanStep, ...] | None:
+    """Return a plan's steps as one bounded read, or None past the bound.
+
+    The steps are read afresh, by iterating them and stopping one step past
+    ``PLAN_MAX_STEPS``, so no length a container reports is trusted and
+    nothing endless is read to its end. They come back in order, exactly as
+    read and otherwise unchecked; a model plan's stricter shape is
+    ``is_model_plan``'s. None means they number more than
+    ``PLAN_MAX_STEPS`` or cannot be read: a value without ``steps``,
+    anything that cannot be iterated or fails while it is read, and one-shot
+    steps, which are never read because reading them would consume the very
+    steps they hold. ``plan_snapshot`` reads a plan's steps by this rule.
+    The bound counts the steps requested, not time: a container's own code
+    can still take as long as it likes to hand out any one of them.
+    """
+    try:
+        steps = plan.steps
+    except Exception:  # noqa: BLE001 - no readable steps, never in bounds.
+        return None
+    return _bounded_read(steps)
+
+
+def is_within_step_bound(plan: object) -> bool:
+    """Return whether a plan's steps can be read and are within the limit.
+
+    This is ``bounded_steps`` answered as yes or no, so the steps are read
+    rather than counted by the length they report, and read again every
+    time rather than trusted from construction, because a frozen dataclass
+    can still be altered through ``object.__setattr__``. It asks about the
+    steps alone; whether a plan may be confirmed or run is
+    ``plan_snapshot``'s question, and a model plan's stricter shape is
+    ``is_model_plan``'s.
+    """
+    return bounded_steps(plan) is not None
+
+
+def _bounded_read(steps: object) -> tuple[Any, ...] | None:
+    """Return steps read within ``PLAN_MAX_STEPS``, or None past it or unread.
+
+    This is the one rule both ``bounded_steps`` and ``plan_snapshot`` apply.
+    """
+    read = _read_steps(steps)
+    if read is None or len(read) > PLAN_MAX_STEPS:
+        return None
+    return read
+
+
+def _read_steps(steps: object) -> tuple[Any, ...] | None:
+    """Read at most one step past the bound, or return None if unreadable.
+
+    A fresh iterator is taken and at most ``PLAN_MAX_STEPS + 1`` steps are
+    read from it, so a misreported length is never consulted and an endless
+    iterable is never exhausted. One-shot steps are not read at all, since
+    reading them would consume them: an iterator, which is its own iterator,
+    and anything that hands out the same iterator every time it is asked.
+    """
+    try:
+        iterator = iter(steps)
+        if iterator is steps or iterator is iter(steps):
+            return None
+        return tuple(islice(iterator, PLAN_MAX_STEPS + 1))
+    except Exception:  # noqa: BLE001 - unreadable steps are never in bounds.
+        return None
 
 
 class Planner:

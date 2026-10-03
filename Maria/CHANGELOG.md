@@ -2,6 +2,45 @@
 
 ## Unreleased
 
+- Model-proposed work can now be a foreground plan of two to five steps,
+  shown in full, approved once as an immutable unit, and run in order with
+  explicit partial-failure reporting. A proposal may be one action, exactly as
+  before, or one JSON object holding exactly `steps`, a list of two to five
+  such actions in the order they are to run; the 4,096-byte cap covers the
+  whole reply, and a reply opening with `[` is still conversation. Every
+  action passes the same allowlist, eligibility, contract, text, and path
+  gates, a refusal of any one refuses the whole proposal, and a malformed list
+  has its own fixed refusal. A compiled plan is therefore no longer always
+  single-step, as the entry below says: it holds one to five steps, and every
+  plan of any origin now holds at most five, counted from the steps it
+  actually holds, never from the length its container reports, and checked
+  when it is built and again wherever it is confirmed or run. Approval binds
+  one snapshot of the plan, read once from its own fields: the sequence of
+  steps fingerprinted when it was offered is the one compared and run once
+  it is confirmed, and a plan missing any of its own fields, its origin
+  included, is refused before it is routed. A plan is flat, and every
+  argument is literal, so no step can use another's result. The approval
+  shows every step, numbered, with its exact arguments, and one approval
+  covers the whole plan; every step is checked again and its permission
+  resolved before anything runs, and a plan with any denied step is refused
+  whole before approval. Each step then runs under its own audit summary,
+  committed just before it. Maria goes on only after a step succeeded and its
+  outcome was recorded, and stops at a step whose summary cannot be recorded,
+  which then does not run, at a failed step, or after a step whose outcome
+  cannot be recorded, with no rollback, retry, or resumption. The report
+  names every step by number and declared tool action, says which completed,
+  failed, did not run, or were interrupted and why the plan stopped, repeats
+  no argument value in its labels or closing sentence, and never claims a
+  failed step had no effect. Ctrl+C during such a plan stops it and is
+  reported truthfully, including an audit write Maria could not confirm,
+  while a plan of one step behaves exactly as before. A step never reached
+  gets no audit summary, nothing links one plan's summaries, and the database
+  schema stays at version 5. Maria's proposal instructions now describe plans
+  and grow from 1,015 to 1,327 bytes within the unchanged budget, so a
+  proposal-mode request with no context or earlier conversation may carry at
+  most 6,865 bytes under the 8 KiB ceiling. Deterministic commands, their
+  approvals, reports, and history are unchanged, and there is no syntax for
+  chaining commands.
 - Natural-language requests can now be compiled into a validated, allowlisted
   plan that the owner approves before execution, with content-free structured
   audit summaries for every model-backed tool execution. This is the first

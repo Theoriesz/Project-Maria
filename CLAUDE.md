@@ -74,11 +74,14 @@ suite deliberately locks that behavior in. Two consequences follow:
 
 A local model's proposal has exactly one route to a tool, through Brain: the planner's
 generic fallback -> the local model -> `Maria/core/plan_compiler.py` (its closed
-allowlist must agree with the contract's explicit model eligibility, and every argument is
-checked) -> PermissionManager -> exactly one owner approval -> a committed audit summary
--> ToolManager -> tool. Every model-originated (`PlanOrigin.MODEL`) plan needs that one
-approval even when PermissionManager answers `ALLOWED`, and a `DENIED` action is refused
-before any approval is offered. That approval requirement lives in Brain and is separate
+allowlist must agree with the contract's explicit model eligibility, and every argument of
+every action is checked) -> PermissionManager for every step -> exactly one owner approval
+for the whole plan -> for each step in order, a committed audit summary -> ToolManager ->
+tool. A proposal is one action, or a `steps` envelope of two to five, compiled all or
+nothing; every plan of any origin holds at most five steps (`PLAN_MAX_STEPS`). Every
+model-originated (`PlanOrigin.MODEL`) plan needs that one approval even when
+PermissionManager answers `ALLOWED` for every step, and a plan with any `DENIED` action is
+refused before any approval is offered. That approval requirement lives in Brain and is separate
 from the two mandatory sets above, which it does not change. Only `calculator.calculate`,
 `filesystem.list`, and `system.current_time` are model-eligible; every new action
 contract must state its model eligibility explicitly.
@@ -103,7 +106,9 @@ authorised it for dispatch; it is committed before the tool runs, and the outcom
 appended afterwards. Every stored value is Maria's own, from the closed vocabulary in
 `Maria/core/audit.py`: never the request, the proposal, an argument, private context, a
 root name, a host path, a tool result, or exception text. A summary without an outcome
-means the execution is unknown, and a summary alone never proves the tool ran.
+means the execution is unknown, and a summary alone never proves the tool ran. A plan of
+several steps gets one summary per step reached for dispatch and none for later steps;
+no stored value groups a plan's summaries.
 
 Eleven lifecycle actions can update or remove an existing stored record:
 `history.delete`, `notes.retitle`, `notes.edit`, `notes.delete`, `notes.enable_context`,
@@ -172,8 +177,9 @@ boundary.
   and owns the no-action response copy and the help text. `PlanOrigin.MODEL` is set only by
   the compiler.
 - `Maria/core/plan_compiler.py` — the deny-by-default gate that compiles one model
-  proposal into a single-step, transient, model-originated plan or a fixed refusal, and
-  re-checks a compiled plan without reparsing it. It executes nothing.
+  proposal into a transient, model-originated plan of one to five steps or a fixed
+  refusal, and re-checks every step of a compiled plan without reparsing it. It executes
+  nothing.
 - `Maria/core/session.py` — owns the confirmation lifecycle, renders a model-originated
   plan for approval from the very plan the approval binds, and keeps the conversation.
 - `Maria/core/audit.py` — the closed audit-summary vocabulary and its validation; no SQL.

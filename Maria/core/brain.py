@@ -14,19 +14,23 @@ reasoning.
 
 A model reply the conversation module recognises as a proposal attempt is
 compiled here, through ``core/plan_compiler.py`` and against Tool Manager's
-active contract registry, into a model-originated plan or a fixed refusal.
-Such a plan never runs without exactly one approval from the owner, whatever
-PermissionManager decides for its action, and a denied action is refused
-before any approval is offered. The approved plan is the same immutable
-plan: it is checked again, never rebuilt or reparsed, no provider is asked
-anything, and it runs at most once, only after its content-free audit
-summary is committed.
+active contract registry, into a model-originated plan of one to five steps
+or a fixed refusal. Such a plan never runs without exactly one approval from
+the owner for the whole plan, whatever PermissionManager decides for its
+actions, and a plan with any denied action is refused whole before any
+approval is offered. The approved plan is the same immutable plan: every
+step is checked again, nothing is rebuilt or reparsed, no provider is asked
+anything, and each step runs at most once, in order, only after its own
+content-free audit summary is committed. A plan of several steps stops at
+the first failure, audit write that cannot be confirmed, or interruption,
+and its report says which steps ran and which did not.
 """
 
 from __future__ import annotations
 
 from collections.abc import Callable, Sequence
 from dataclasses import dataclass, replace
+from enum import Enum
 from logging import Logger
 
 from core.action_contracts import ActionContract, ContractViolation
@@ -66,12 +70,15 @@ from core.plan_compiler import (
     recheck_model_plan,
 )
 from core.planner import (
+    PLAN_MAX_STEPS,
     Plan,
     PlanOrigin,
     Planner,
     PlanStep,
     RecordingPolicy,
     is_model_plan,
+    own_origin,
+    plan_snapshot,
 )
 from core.reasoning import (
     ReasoningExchange,
@@ -99,6 +106,23 @@ AUDIT_SUMMARY_UNRECORDED_MESSAGE = (
     "Maria did not run the approved action because its audit summary could "
     "not be recorded."
 )
+PLAN_STEP_LIMIT_REFUSED_MESSAGE = (
+    "Maria refused that plan because a plan may hold at most "
+    f"{PLAN_MAX_STEPS} steps."
+)
+
+# What a step of a model-proposed plan of several steps is reported as, after
+# its number and its declared tool action. None names an argument value.
+_STEP_COMPLETED = "completed."
+_STEP_FAILED = "failed."
+_STEP_NOT_RUN = "not run."
+_STEP_NOT_AUTHORISED = (
+    "not run, because its audit summary could not be recorded."
+)
+_STEP_INTERRUPTED = "interrupted, so its outcome is unknown."
+AUDIT_SUMMARY_UNCONFIRMED_NOTICE = (
+    "Maria could not confirm whether its audit summary was recorded."
+)
 
 
 def audit_recorded_notice(summary_id: int) -> str:
@@ -111,6 +135,30 @@ def audit_outcome_unrecorded_notice(summary_id: int) -> str:
     return (
         f"Recorded as audit summary {summary_id}, but its outcome could not be "
         "recorded, so that summary shows the outcome as unknown."
+    )
+
+
+def audit_outcome_missing_notice(summary_id: int) -> str:
+    """Return the notice for a recorded summary never given an outcome.
+
+    That is a step interrupted after its summary was recorded, before its
+    tool returned a result, so no outcome was ever written for it.
+    """
+    return (
+        f"Recorded as audit summary {summary_id}, but no outcome was "
+        "recorded, so that summary shows the outcome as unknown."
+    )
+
+
+def audit_outcome_unconfirmed_notice(summary_id: int) -> str:
+    """Return the notice for a summary whose outcome write was interrupted.
+
+    The write may have committed before the interruption arrived, so Maria
+    claims neither that the outcome is stored nor that it is missing.
+    """
+    return (
+        f"Recorded as audit summary {summary_id}, but Maria could not confirm "
+        "whether its outcome was recorded."
     )
 
 
@@ -199,6 +247,88 @@ class _ResolvedPlan:
             for resolved_step in self.steps
             if resolved_step.permission.decision == required
         )
+
+    @property
+    def first_unpermitted_step(self) -> _ResolvedStep | None:
+        """Return the earliest step neither allowed nor awaiting approval.
+
+        A model-originated plan may proceed only when every decision is
+        exactly ALLOWED or exactly REQUIRES_CONFIRMATION, so anything else,
+        DENIED included, refuses the whole plan at this step.
+        """
+        for resolved_step in self.steps:
+            decision = resolved_step.permission.decision
+            if decision is not PermissionDecision.ALLOWED and (
+                decision is not PermissionDecision.REQUIRES_CONFIRMATION
+            ):
+                return resolved_step
+        return None
+
+
+class _StepStage(str, Enum):
+    """How far one step of a model-proposed plan of several steps has got."""
+
+    WAITING = "waiting"
+    AUTHORISING = "authorising"
+    AUTHORISED = "authorised"
+    DISPATCHING = "dispatching"
+    RECORDING = "recording"
+
+
+class _StopReason(str, Enum):
+    """Why a model-proposed plan of several steps stopped before its end."""
+
+    STEP_FAILED = "step_failed"
+    SUMMARY_UNRECORDED = "summary_unrecorded"
+    OUTCOME_UNRECORDED = "outcome_unrecorded"
+    INTERRUPTED = "interrupted"
+
+
+# What the closing sentence of a stopped plan's report says about why it
+# stopped. A failed step is shown failed in its own block.
+_STOP_CLAUSES = {
+    _StopReason.STEP_FAILED: "",
+    _StopReason.SUMMARY_UNRECORDED: (
+        " because its audit summary could not be recorded"
+    ),
+    _StopReason.OUTCOME_UNRECORDED: (
+        " because its audit outcome could not be recorded"
+    ),
+    _StopReason.INTERRUPTED: " because the run was interrupted",
+}
+
+
+class _StepAttempt:
+    """What is known about the step of a model-proposed plan now running.
+
+    Transient progress state for one step, replaced whole when the next step
+    begins, so an interruption is always reported against the step it
+    actually reached. It is never persisted, logged, or handed elsewhere.
+    """
+
+    __slots__ = ("index", "stage", "summary_id", "result")
+
+    def __init__(self, index: int) -> None:
+        self.index = index
+        self.stage = _StepStage.WAITING
+        self.summary_id: int | None = None
+        self.result: ToolExecutionResult | None = None
+
+
+@dataclass(frozen=True)
+class _StepReport:
+    """What the owner is told about one step a plan of several steps reached.
+
+    ``status`` follows the step's number and declared tool action, and
+    ``lines`` hold the tool's own message and the step's audit notice when
+    there are any. ``completed`` says whether the tool reported success, and
+    ``entered`` whether its dispatch was entered at all.
+    """
+
+    status: str
+    lines: tuple[str, ...] = ()
+    completed: bool = False
+    entered: bool = False
 
 
 class MariaBrain:
@@ -301,12 +431,13 @@ class MariaBrain:
         The deterministic planner always answers first, from the request text
         alone. Only when a reasoning provider was supplied, the configured
         reasoning settings are enabled, and the planner returned its exact
-        generic no-action fallback, is the request answered by the local
+        generic no-action fallback, holding exactly DETERMINISTIC as its own
+        origin, is the request answered by the local
         model instead, in the context of ``conversation``: the caller's
         earlier exchanges, oldest first, with ``supplied_context``, the
         fingerprints of the memories and notes supplied since they began.
-        The model may answer conversationally or propose one action; see
-        ``_converse``. With reasoning disabled the fallback is answered and
+        The model may answer conversationally or propose one action or a
+        plan of two to five; see ``_converse``. With reasoning disabled the fallback is answered and
         recorded exactly as it always was, whether or not a provider is
         present. Every other plan runs exactly as it always has and never
         sees the conversation or any stored context.
@@ -322,6 +453,7 @@ class MariaBrain:
         if (
             self.reasoning is not None
             and self.config.reasoning.enabled
+            and own_origin(plan) is PlanOrigin.DETERMINISTIC
             and is_generic_fallback(plan)
         ):
             return self._converse(cleaned_input, conversation, supplied_context)
@@ -345,7 +477,8 @@ class MariaBrain:
         the request carries Maria's fixed proposal instructions and the
         provider is asked exactly once. A conversational outcome is a
         zero-step plan that it, as the plan's producer, made transient, and
-        Brain accepts nothing else as one. That plan takes the ordinary
+        Brain accepts nothing else as one, nor one that does not hold exactly
+        DETERMINISTIC as its own origin. That plan takes the ordinary
         zero-step path, which returns before any contract, permission, or
         tool is consulted and records nothing. A proposal attempt goes to
         ``_consider_proposal`` instead, with the turn's notices. The
@@ -380,7 +513,9 @@ class MariaBrain:
                 turn.proposal,
                 turn.notices,
             )
-        elif is_conversational_plan(turn.plan):
+        elif own_origin(turn.plan) is PlanOrigin.DETERMINISTIC and (
+            is_conversational_plan(turn.plan)
+        ):
             response = self._run_plan(turn.plan, confirmed=False)
         else:
             self.logger.error(
@@ -511,7 +646,10 @@ class MariaBrain:
         contracts again and resolves its permissions again before dispatching
         anything, because an approval authorises a plan rather than freezing
         the contract and the decisions that were current when that plan was
-        shown, then resumes the ordinary dispatch and recording flow. A
+        shown, then resumes the ordinary dispatch and recording flow. The
+        session hands it the very snapshot whose fingerprint it compared, and
+        a plan handed here directly is snapshotted once in the same way, so
+        what is validated, resolved, and dispatched is one bounded read. A
         model-originated plan is also checked again against the compiler's
         gates and runs only behind its audit summary; see
         ``_run_model_plan``.
@@ -521,10 +659,24 @@ class MariaBrain:
     def _run_plan(self, plan: Plan, *, confirmed: bool) -> BrainResponse:
         """Validate, resolve, then dispatch a whole plan generically.
 
-        A plan whose origin is anything but exactly DETERMINISTIC takes
-        ``_run_model_plan`` instead, where only a well-formed model-originated
-        plan can proceed, and every other plan the path below. Three phases
-        run in a fixed order. Every
+        A plan that does not hold every one of its own fields, with a policy
+        and an origin that are exactly members, has no origin of its own,
+        as ``own_origin`` reads it, and is refused before either path is
+        chosen, with the fixed model-plan refusal and its fixed log line,
+        before any contract, permission, audit write, or tool. A plan whose
+        own origin is exactly DETERMINISTIC takes the path below; every other
+        takes ``_run_model_plan``, where only a well-formed model-originated
+        plan can proceed. A deterministic plan is then read once, by
+        ``plan_snapshot``, and every phase below, recording included, works
+        on that snapshot, so the steps validated, resolved, prepared, and
+        dispatched are one sequence of at most ``PLAN_MAX_STEPS``, whatever
+        their container reports or would hand out on a later read. A plan
+        whose steps cannot be read, which construction allows, or hold more
+        than ``PLAN_MAX_STEPS`` is refused before any contract, permission,
+        or tool, and nothing is recorded. A plan held for confirmation is
+        prepared from the snapshot, so the plan that becomes pending holds
+        exactly the steps checked here. Three phases then run in a fixed
+        order. Every
         step is first validated against the declared action contracts, then
         every step's permission is decided, and only then is anything
         dispatched. A contract failure anywhere refuses the plan before
@@ -534,15 +686,29 @@ class MariaBrain:
         Every outcome that records goes through _record_interaction, which
         honours the plan's recording policy.
         """
-        if plan.origin is not PlanOrigin.DETERMINISTIC:
+        origin = own_origin(plan)
+        if origin is None:
+            self.logger.error(
+                "Refused a model-originated plan that is not well formed."
+            )
+            return BrainResponse(MODEL_PLAN_REFUSED_MESSAGE, plan=plan)
+        if origin is not PlanOrigin.DETERMINISTIC:
             return self._run_model_plan(plan, confirmed=confirmed)
 
-        if not plan.steps:
+        snapshot = plan_snapshot(plan)
+        if snapshot is None:
+            self.logger.error("Refused a plan holding too many steps.")
+            return BrainResponse(PLAN_STEP_LIMIT_REFUSED_MESSAGE, plan=plan)
+        # Everything below, recording included, works on the snapshot alone.
+        plan = snapshot
+        steps = plan.steps
+
+        if not steps:
             response = plan.response_if_no_action or "I do not know how to handle that yet."
             self._record_interaction(plan, response)
             return BrainResponse(response, plan=plan)
 
-        violation = self._validate_plan(plan)
+        violation = self._validate_plan(steps)
         if violation is not None:
             self.logger.warning(
                 "Rejected plan step by contract: %s %s.%s field=%s",
@@ -555,7 +721,7 @@ class MariaBrain:
             self._record_interaction(plan, response)
             return BrainResponse(response, plan=plan)
 
-        resolved = self._resolve_plan(plan)
+        resolved = self._resolve_plan(plan, steps)
 
         denied_step = resolved.first_denied_step
         if denied_step is not None:
@@ -579,7 +745,9 @@ class MariaBrain:
             # The plan offered for approval is pinned to the exact state its
             # steps act on now, so the approval, bound to this plan's
             # fingerprint, cannot later be spent on different state. Any
-            # preview of that state is shown here and goes nowhere else.
+            # preview of that state is shown here and goes nowhere else. It
+            # is prepared from the snapshot, so what becomes pending holds
+            # exactly the steps checked above, in a tuple that cannot change.
             prepared = self.tool_manager.prepare_confirmation(plan)
             return BrainResponse(
                 text=self._format_confirmation_request(
@@ -592,9 +760,13 @@ class MariaBrain:
 
         return self._execute_resolved_plan(resolved)
 
-    def _validate_plan(self, plan: Plan) -> ContractViolation | None:
+    def _validate_plan(
+        self,
+        steps: tuple[PlanStep, ...],
+    ) -> ContractViolation | None:
         """Check every step against its action contract, in plan order.
 
+        ``steps`` are the plan's steps exactly as ``_run_plan`` read them.
         This is the phase that must complete before any permission decision,
         so a plan naming an unsupported action or carrying a malformed
         argument never reaches PermissionManager or a tool at all. Steps are
@@ -608,7 +780,7 @@ class MariaBrain:
         defensive pass inside dispatch can only ever consult one active
         registry.
         """
-        for step in plan.steps:
+        for step in steps:
             violation = self.tool_manager.validate_action(
                 step.tool_name,
                 step.action,
@@ -618,13 +790,20 @@ class MariaBrain:
                 return violation
         return None
 
-    def _resolve_plan(self, plan: Plan) -> _ResolvedPlan:
+    def _resolve_plan(
+        self,
+        plan: Plan,
+        steps: tuple[PlanStep, ...],
+    ) -> _ResolvedPlan:
         """Decide permission for every step before any step is dispatched.
 
-        Steps are inspected in plan order and each is paired with the result
-        PermissionManager returned for it. No tool runs during this pass, the
-        plan is neither rebuilt nor mutated, and the resolution is returned
-        rather than stored, so it cannot outlive the request producing it.
+        ``steps`` are the plan's steps as the caller read them: a
+        deterministic plan's one bounded read, or a model plan's own exact
+        tuple. Steps are inspected in plan order and each is paired with the
+        result PermissionManager returned for it. No tool runs during this
+        pass, the plan is neither rebuilt nor mutated, and the resolution is
+        returned rather than stored, so it cannot outlive the request
+        producing it.
         """
         return _ResolvedPlan(
             plan=plan,
@@ -633,7 +812,7 @@ class MariaBrain:
                     step,
                     self.permissions.check(step.tool_name, step.action),
                 )
-                for step in plan.steps
+                for step in steps
             ),
         )
 
@@ -684,15 +863,18 @@ class MariaBrain:
         confirmed: bool,
         notices: tuple[str, ...] = (),
     ) -> BrainResponse:
-        """Offer, refuse, or run one model-originated plan.
+        """Offer, refuse, or run one model-originated plan, as a whole.
 
         The same gates run whether the plan is being offered or has been
-        approved: its shape and origin, then ``recheck_model_plan`` against
-        Tool Manager's current registry, then PermissionManager. A plan that
-        fails any of them is refused, and a denied action is refused before
-        any approval is offered, so neither can ever reach an audit summary
-        or a tool. Every other plan needs exactly one approval from the
-        owner, including when its action is allowed outright: an unapproved
+        approved: its shape, origin, and step count, then
+        ``recheck_model_plan`` for every step against Tool Manager's current
+        registry, then PermissionManager for every step, all before any audit
+        write or tool. A plan that fails any of them is refused whole, and a
+        plan with any step that is not allowed or awaiting approval is
+        refused before any approval is offered, with the first such step's
+        reason, so neither can ever reach an audit summary or a tool. Every
+        other plan needs exactly one approval from the owner for the whole
+        plan, including when every action is allowed outright: an unapproved
         plan comes back for approval, as the very same immutable plan and
         never prepared or rebound, with ``notices`` as its whole text, and
         an approved one goes to ``_dispatch_model_plan``. ``notices`` are
@@ -702,28 +884,29 @@ class MariaBrain:
         if refusal is not None:
             return BrainResponse(with_notices(refusal, notices), plan=plan)
 
-        step = plan.steps[0]
-        permission = self.permissions.check(step.tool_name, step.action)
-        decision = permission.decision
-        if decision is not PermissionDecision.ALLOWED and (
-            decision is not PermissionDecision.REQUIRES_CONFIRMATION
-        ):
+        resolved = self._resolve_plan(plan, plan.steps)
+        unpermitted = resolved.first_unpermitted_step
+        if unpermitted is not None:
             self.logger.warning(
                 "Denied model-proposed action: %s.%s",
-                step.tool_name,
-                step.action,
+                unpermitted.step.tool_name,
+                unpermitted.step.action,
             )
             return BrainResponse(
-                with_notices(f"Permission denied: {permission.reason}", notices),
+                with_notices(
+                    f"Permission denied: {unpermitted.permission.reason}",
+                    notices,
+                ),
                 plan=plan,
             )
 
         if not confirmed:
-            self.logger.info(
-                "Owner approval required for model-proposed action: %s.%s",
-                step.tool_name,
-                step.action,
-            )
+            for resolved_step in resolved.steps:
+                self.logger.info(
+                    "Owner approval required for model-proposed action: %s.%s",
+                    resolved_step.step.tool_name,
+                    resolved_step.step.action,
+                )
             return BrainResponse(
                 "\n".join(notices),
                 needs_confirmation=True,
@@ -735,9 +918,10 @@ class MariaBrain:
         """Return why a model-originated plan cannot proceed, or None.
 
         The plan must still be exactly a well-formed model-originated plan,
-        and its one step must still pass every compiler gate against the
-        registry Tool Manager holds now. Nothing is parsed or rebuilt, and
-        the reason is fixed text that repeats nothing the model supplied.
+        of 1 to ``PLAN_MAX_STEPS`` steps, and every one of its steps must
+        still pass every compiler gate against the registry Tool Manager
+        holds now. Nothing is parsed or rebuilt, and the reason is fixed text
+        that repeats nothing the model supplied.
         """
         if not is_model_plan(plan):
             self.logger.error(
@@ -761,8 +945,9 @@ class MariaBrain:
     ) -> BrainResponse:
         """Run one approved model-originated plan, at most once, under audit.
 
-        An unapproved plan is refused here whatever called this. Otherwise
-        the plan's audit summary is inserted and committed first; when it
+        An unapproved plan is refused here whatever called this. A plan of
+        several steps runs through ``_dispatch_model_steps``. Otherwise the
+        plan's audit summary is inserted and committed first; when it
         cannot be, nothing is dispatched and the attempt is refused, and the
         approval is not given back. The step then runs exactly once, with
         exactly the immutable arguments the owner approved, and its outcome,
@@ -777,6 +962,9 @@ class MariaBrain:
                 "Refused to dispatch a model-proposed action without approval."
             )
             return BrainResponse(MODEL_PLAN_UNAPPROVED_MESSAGE, plan=plan)
+
+        if len(plan.steps) > 1:
+            return self._dispatch_model_steps(plan)
 
         step = plan.steps[0]
         contract = self.tool_manager.contracts.contract_for(
@@ -793,18 +981,13 @@ class MariaBrain:
             contract.identifier,
             summary_id,
         )
-        result = self.tool_manager.execute_tool(
-            step.tool_name,
-            step.action,
-            step.arguments,
-        )
-        if type(result) is not ToolExecutionResult:
-            # Anything but a real result is neither shown nor trusted: it
-            # counts as the shared fixed tool failure.
-            result = ToolExecutionResult(
-                False,
-                Failure(FailureKind.TOOL_EXECUTION_FAILED).message,
+        result = _tool_result(
+            self.tool_manager.execute_tool(
+                step.tool_name,
+                step.action,
+                step.arguments,
             )
+        )
         succeeded = result.success is True
         outcome = AuditOutcome.SUCCEEDED if succeeded else AuditOutcome.FAILED
         if self._record_audit_outcome(summary_id, outcome):
@@ -812,6 +995,112 @@ class MariaBrain:
         else:
             notice = audit_outcome_unrecorded_notice(summary_id)
         return BrainResponse(f"{result.message}\n\n{notice}", plan=plan)
+
+    def _dispatch_model_steps(self, plan: Plan) -> BrainResponse:
+        """Run an approved model-originated plan of several steps, in order.
+
+        Each step reached gets its own audit summary, committed before that
+        step is dispatched, and is dispatched at most once, with exactly the
+        immutable arguments the owner approved. Its outcome, succeeded or
+        failed by the tool's own success flag, is then appended to its
+        summary. The next step is reached only when this one succeeded and
+        its outcome was recorded, so the plan stops at the first step whose
+        summary cannot be recorded, whose tool fails, or whose outcome
+        cannot be recorded. A step never reached gets no summary at all.
+
+        ``KeyboardInterrupt`` alone is also handled here, and only so the
+        owner is told truthfully what is known: it stops the plan, nothing is
+        retried or resumed, and no outcome is written merely because the run
+        was interrupted. Every other exception propagates as it always has.
+        An abrupt end of the process can leave no report at all, and an
+        interruption that lands while the report is being built cannot be
+        reported either.
+
+        The report names every step by number and declared tool action,
+        never by an argument value, and says which completed, which failed,
+        which were interrupted, and which did not run. It never claims a
+        failed or interrupted step had no effect, and it is shown once and
+        kept nowhere: a model-originated plan is transient.
+        """
+        steps = plan.steps
+        reports: list[_StepReport] = []
+        stop: _StopReason | None = None
+        attempt: _StepAttempt | None = None
+        try:
+            for index, step in enumerate(steps):
+                attempt = _StepAttempt(index)
+                contract = self.tool_manager.contracts.contract_for(
+                    step.tool_name,
+                    step.action,
+                )
+                attempt.stage = _StepStage.AUTHORISING
+                summary_id = self._authorize_dispatch(contract)
+                if summary_id is None:
+                    reports.append(_StepReport(_STEP_NOT_AUTHORISED))
+                    stop = _StopReason.SUMMARY_UNRECORDED
+                    break
+                attempt.summary_id = summary_id
+                attempt.stage = _StepStage.AUTHORISED
+
+                self.logger.info(
+                    "Dispatching approved model-proposed action %s under "
+                    "audit summary %s.",
+                    contract.identifier,
+                    summary_id,
+                )
+                attempt.stage = _StepStage.DISPATCHING
+                attempt.result = _tool_result(
+                    self.tool_manager.execute_tool(
+                        step.tool_name,
+                        step.action,
+                        step.arguments,
+                    )
+                )
+                attempt.stage = _StepStage.RECORDING
+                succeeded = attempt.result.success is True
+                outcome = (
+                    AuditOutcome.SUCCEEDED
+                    if succeeded
+                    else AuditOutcome.FAILED
+                )
+                recorded = self._record_audit_outcome(summary_id, outcome)
+                notice = (
+                    audit_recorded_notice(summary_id)
+                    if recorded
+                    else audit_outcome_unrecorded_notice(summary_id)
+                )
+                reports.append(
+                    _StepReport(
+                        _STEP_COMPLETED if succeeded else _STEP_FAILED,
+                        (attempt.result.message, notice),
+                        completed=succeeded,
+                        entered=True,
+                    )
+                )
+                if not succeeded:
+                    stop = _StopReason.STEP_FAILED
+                    break
+                if not recorded:
+                    stop = _StopReason.OUTCOME_UNRECORDED
+                    break
+        except KeyboardInterrupt:
+            stop = _StopReason.INTERRUPTED
+            if len(reports) < len(steps):
+                current = (
+                    attempt
+                    if attempt is not None and attempt.index == len(reports)
+                    else None
+                )
+                reports.append(_interrupted_step_report(current))
+
+        if stop is not None:
+            self.logger.warning(
+                "Stopped a model-proposed plan at step %s of %s: %s.",
+                len(reports),
+                len(steps),
+                stop.value,
+            )
+        return BrainResponse(_plan_report(steps, reports, stop), plan=plan)
 
     def _authorize_dispatch(self, contract: ActionContract | None) -> int | None:
         """Commit the audit summary that authorises one dispatch, or refuse.
@@ -940,3 +1229,107 @@ class MariaBrain:
             for result in results
         ]
         return "\n".join(recorded_texts)
+
+
+def _tool_result(result: object) -> ToolExecutionResult:
+    """Return a dispatch's own result, or the shared fixed failure for it.
+
+    Anything but a real result is neither shown nor trusted: it counts as
+    the shared fixed tool failure.
+    """
+    if type(result) is ToolExecutionResult:
+        return result
+    return ToolExecutionResult(
+        False,
+        Failure(FailureKind.TOOL_EXECUTION_FAILED).message,
+    )
+
+
+def _interrupted_step_report(attempt: _StepAttempt | None) -> _StepReport:
+    """Report the step an interruption reached, saying only what is known.
+
+    A step not yet begun did not run. While its summary write may still
+    have been under way, that write may or may not have committed, so it is
+    reported as unconfirmed rather than absent. A step whose summary was
+    recorded but whose dispatch was never entered did not run, and that
+    summary has no outcome. A step whose tool was entered without returning
+    has an unknown outcome, and nothing is recorded as failed merely because
+    of the interruption. A step whose tool did return keeps that known
+    result, and its outcome is unconfirmed once its write had begun, or
+    missing when it had not.
+    """
+    if attempt is None or attempt.stage is _StepStage.WAITING:
+        return _StepReport(_STEP_NOT_RUN)
+    summary_id = attempt.summary_id
+    if summary_id is None:
+        return _StepReport(_STEP_NOT_RUN, (AUDIT_SUMMARY_UNCONFIRMED_NOTICE,))
+    result = attempt.result
+    if result is not None:
+        completed = result.success is True
+        notice = (
+            audit_outcome_unconfirmed_notice(summary_id)
+            if attempt.stage is _StepStage.RECORDING
+            else audit_outcome_missing_notice(summary_id)
+        )
+        return _StepReport(
+            _STEP_COMPLETED if completed else _STEP_FAILED,
+            (result.message, notice),
+            completed=completed,
+            entered=True,
+        )
+    missing = audit_outcome_missing_notice(summary_id)
+    if attempt.stage is _StepStage.DISPATCHING:
+        return _StepReport(_STEP_INTERRUPTED, (missing,), entered=True)
+    return _StepReport(_STEP_NOT_RUN, (missing,))
+
+
+def _plan_report(
+    steps: tuple[PlanStep, ...],
+    reports: Sequence[_StepReport],
+    stop: _StopReason | None,
+) -> str:
+    """Return the owner's report of a model-proposed plan of several steps.
+
+    One block per step, in plan order, separated by blank lines: the step's
+    number, its declared tool action, and how it ended, followed by the
+    tool's message and the step's audit notice when it reached either.
+    Every step after those reported did not run. A plan that stopped, for
+    whatever reason, ends with one sentence saying where and why it stopped
+    and which steps it did not run, and, when any dispatch was entered, that
+    nothing that ran was undone; only a plan whose every step completed with
+    its outcome recorded has no such sentence.
+    """
+    total = len(steps)
+    blocks: list[str] = []
+    for position, step in enumerate(steps, start=1):
+        label = f"Step {position} of {total}, {step.tool_name}.{step.action}: "
+        if position <= len(reports):
+            report = reports[position - 1]
+            blocks.append("\n".join((label + report.status, *report.lines)))
+        else:
+            blocks.append(label + _STEP_NOT_RUN)
+
+    stopped = len(reports)
+    if stop is not None and stopped:
+        clause = _STOP_CLAUSES[stop]
+        where = "after" if reports[-1].completed else "at"
+        sentence = f"Maria stopped {where} step {stopped}{clause}"
+        later = _later_steps(stopped + 1, total)
+        if later:
+            sentence += f"{',' if clause else ''} and did not run {later}"
+        sentence += "."
+        if any(report.entered for report in reports):
+            sentence += " Nothing that ran was undone."
+        blocks.append(sentence)
+    return "\n\n".join(blocks)
+
+
+def _later_steps(first: int, total: int) -> str:
+    """Name the steps from ``first`` to ``total``, or nothing if none."""
+    if first > total:
+        return ""
+    if first == total:
+        return f"step {first}"
+    if first + 1 == total:
+        return f"steps {first} and {total}"
+    return f"steps {first} to {total}"

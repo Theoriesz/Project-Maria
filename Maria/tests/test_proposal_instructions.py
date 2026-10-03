@@ -104,19 +104,25 @@ from tests.test_ollama_adapter import (
 
 # --- The owner's text, written out independently -----------------------------
 
-# The owner's approved proposal instructions, spelled out here rather than
-# imported, so the module's constant cannot pass by agreeing with itself.
-# Paragraphs are separated by one blank line, and there is no trailing
-# newline.
+# The owner's approved proposal instructions, as revised for V1-19, spelled
+# out here rather than imported, so the module's constant cannot pass by
+# agreeing with itself. Paragraphs are separated by one blank line, and there
+# is no trailing newline.
 OWNER_PROPOSAL_INSTRUCTIONS = (
     "You are Maria. Reply normally to conversation.\n"
     "\n"
-    "When the user's current request asks for an allowed action, you may "
-    "propose exactly one action instead of replying conversationally.\n"
+    "When the user's current request asks for allowed actions, you may "
+    "propose them instead of replying conversationally.\n"
     "\n"
-    'A proposal must be one JSON object with exactly "tool", "action", and '
-    '"arguments". Do not include surrounding prose, a code fence, approval '
-    "fields, or additional fields.\n"
+    'A proposal for one action must be one JSON object with exactly "tool", '
+    '"action", and "arguments". Do not include surrounding prose, a code '
+    "fence, approval fields, or additional fields.\n"
+    "\n"
+    "A proposal for 2 to 5 actions must be one JSON object with exactly one "
+    'field, "steps": an array of 2 to 5 such action objects, run in order. '
+    "Maria stops if a step fails, an audit write fails, or the run is "
+    "interrupted. Every argument must be a complete literal value; a step "
+    "cannot use an earlier step's result.\n"
     "\n"
     "Allowed proposals:\n"
     '{"tool":"calculator","action":"calculate",'
@@ -137,9 +143,11 @@ OWNER_PROPOSAL_INSTRUCTIONS = (
     'reply with "{".'
 )
 
-# Counted by hand: 999 bytes of text on 17 lines joined by 16 line feeds.
-# Every character is ASCII, so this is also its length in characters.
-OWNER_INSTRUCTION_BYTES = 1015
+# Counted by hand: 1,309 bytes of text on 19 lines joined by 18 line feeds.
+# Every character is ASCII, so this is also its length in characters. V1-19's
+# revision added 312 bytes to V1-18's 1,015.
+OWNER_INSTRUCTION_BYTES = 1327
+V1_18_INSTRUCTION_BYTES = 1015
 
 # What joins the instructions to the context framing, and its size.
 OWNER_SEPARATOR = "\n\n"
@@ -507,14 +515,17 @@ class ProposalInstructionTextTests(unittest.TestCase):
         self.assertIs(type(PROPOSAL_INSTRUCTIONS), str)
         self.assertEqual(PROPOSAL_INSTRUCTIONS, OWNER_PROPOSAL_INSTRUCTIONS)
 
-    def test_the_instructions_are_ascii_and_exactly_1015_bytes(self) -> None:
+    def test_the_instructions_are_ascii_and_exactly_1327_bytes(self) -> None:
         self.assertTrue(PROPOSAL_INSTRUCTIONS.isascii())
         self.assertEqual(
             len(PROPOSAL_INSTRUCTIONS.encode("ascii")),
             OWNER_INSTRUCTION_BYTES,
         )
-        self.assertEqual(len(PROPOSAL_INSTRUCTIONS.encode("utf-8")), 1015)
-        self.assertEqual(len(PROPOSAL_INSTRUCTIONS), 1015)
+        self.assertEqual(len(PROPOSAL_INSTRUCTIONS.encode("utf-8")), 1327)
+        self.assertEqual(len(PROPOSAL_INSTRUCTIONS), 1327)
+        # The V1-19 revision grew the instructions by exactly this much, and
+        # no budget grew with them.
+        self.assertEqual(OWNER_INSTRUCTION_BYTES - V1_18_INSTRUCTION_BYTES, 312)
         # Printable ASCII and line feeds only: no tab, carriage return, or
         # any other control character.
         self.assertEqual(
@@ -529,10 +540,10 @@ class ProposalInstructionTextTests(unittest.TestCase):
     def test_the_paragraphs_are_joined_by_single_blank_lines(self) -> None:
         lines = PROPOSAL_INSTRUCTIONS.split("\n")
 
-        self.assertEqual(len(lines), 17)
+        self.assertEqual(len(lines), 19)
         self.assertEqual(
             [index for index, line in enumerate(lines) if not line],
-            [1, 3, 5, 11, 13, 15],
+            [1, 3, 5, 7, 13, 15, 17],
         )
         self.assertNotIn("\n\n\n", PROPOSAL_INSTRUCTIONS)
         self.assertFalse(PROPOSAL_INSTRUCTIONS.endswith("\n"))
@@ -761,8 +772,8 @@ class RequestMeasureTests(unittest.TestCase):
     def test_the_instruction_bytes_add_the_separator_only_with_context(
         self,
     ) -> None:
-        self.assertEqual(proposal_instruction_bytes(False), 1015)
-        self.assertEqual(proposal_instruction_bytes(True), 1015 + 2)
+        self.assertEqual(proposal_instruction_bytes(False), 1327)
+        self.assertEqual(proposal_instruction_bytes(True), 1327 + 2)
 
     def test_the_flag_without_context_adds_exactly_the_instructions(
         self,
@@ -784,7 +795,7 @@ class RequestMeasureTests(unittest.TestCase):
     def test_with_context_the_separator_is_added_as_well(self) -> None:
         self.assertEqual(
             request_content_bytes(PROMPT, (), 4096, self.context, True),
-            PROMPT_BYTES + 1015 + 2 + self.context_bytes,
+            PROMPT_BYTES + 1327 + 2 + self.context_bytes,
         )
         self.assertEqual(
             request_content_bytes(PROMPT, (), 4096, self.context, False),
@@ -800,7 +811,7 @@ class RequestMeasureTests(unittest.TestCase):
         history_bytes = EARLIER_BYTES + 2 + 3
         cases = (
             ((), False, PROMPT_BYTES + history_bytes),
-            ((), True, PROMPT_BYTES + 1015 + history_bytes),
+            ((), True, PROMPT_BYTES + 1327 + history_bytes),
             (
                 self.context,
                 False,
@@ -809,7 +820,7 @@ class RequestMeasureTests(unittest.TestCase):
             (
                 self.context,
                 True,
-                PROMPT_BYTES + 1015 + 2 + self.context_bytes + history_bytes,
+                PROMPT_BYTES + 1327 + 2 + self.context_bytes + history_bytes,
             ),
         )
         for context, flag, expected in cases:
@@ -822,7 +833,7 @@ class RequestMeasureTests(unittest.TestCase):
     def test_the_measure_meets_the_bound_exactly_and_stops_past_it(
         self,
     ) -> None:
-        alone = PROMPT_BYTES + 1015
+        alone = PROMPT_BYTES + 1327
         self.assertEqual(
             request_content_bytes(PROMPT, (), alone, (), True),
             alone,
@@ -832,7 +843,7 @@ class RequestMeasureTests(unittest.TestCase):
             alone - 1,
         )
 
-        with_context = PROMPT_BYTES + 1015 + 2 + self.context_bytes
+        with_context = PROMPT_BYTES + 1327 + 2 + self.context_bytes
         self.assertEqual(
             request_content_bytes(PROMPT, (), with_context, self.context, True),
             with_context,
@@ -978,7 +989,7 @@ class ReasoningBoundaryBudgetTests(unittest.TestCase):
         provider = _answering(REPLY)
         logger = _quiet_logger("tests.proposal_instructions.boundary")
         request = ReasoningRequest(PROMPT, (), (_memory_item(),), True)
-        exact = PROMPT_BYTES + 1015 + 2 + _tier_a_bytes(1, FACT)
+        exact = PROMPT_BYTES + 1327 + 2 + _tier_a_bytes(1, FACT)
 
         self.assertEqual(
             request_reasoning(
@@ -1247,7 +1258,7 @@ class AdapterBudgetTests(StubbedAdapterTestCase):
 
     def test_with_context_and_history_the_separator_counts_too(self) -> None:
         request = ReasoningRequest(PROMPT, (EARLIER,), (_memory_item(3),), True)
-        exact = PROMPT_BYTES + 1015 + 2 + _tier_a_bytes(3, FACT) + EARLIER_BYTES
+        exact = PROMPT_BYTES + 1327 + 2 + _tier_a_bytes(3, FACT) + EARLIER_BYTES
 
         self.assertRefusedAs(
             FailureKind.REASONING_INPUT_OVER_BUDGET,
@@ -1367,7 +1378,7 @@ class ProposalModeBudgetTests(unittest.TestCase):
     def test_tier_a_context_fits_only_beside_instructions_and_separator(
         self,
     ) -> None:
-        exact = PROMPT_BYTES + 1015 + 2 + _tier_a_bytes(1, FACT)
+        exact = PROMPT_BYTES + 1327 + 2 + _tier_a_bytes(1, FACT)
 
         turn, provider = self.turn(exact, memory=True)
 
@@ -1399,7 +1410,7 @@ class ProposalModeBudgetTests(unittest.TestCase):
     def test_tier_b_matches_fit_only_beside_instructions_and_separator(
         self,
     ) -> None:
-        exact = PROMPT_BYTES + 1015 + 2 + rendered_context_bytes((_note_item(),))
+        exact = PROMPT_BYTES + 1327 + 2 + rendered_context_bytes((_note_item(),))
 
         turn, provider = self.turn(exact, note=True)
 
@@ -1423,7 +1434,7 @@ class ProposalModeBudgetTests(unittest.TestCase):
     def test_history_is_fitted_last_at_its_exact_boundary(self) -> None:
         conversation = (EARLIER,)
 
-        exact = PROMPT_BYTES + 1015 + EARLIER_BYTES
+        exact = PROMPT_BYTES + 1327 + EARLIER_BYTES
         _, provider = self.turn(exact, conversation=conversation)
         self.assertEqual(
             provider.requests,
@@ -1434,7 +1445,7 @@ class ProposalModeBudgetTests(unittest.TestCase):
 
         # The context is fitted before the history: one byte short, the much
         # smaller exchange is dropped while the memory is still sent.
-        exact = PROMPT_BYTES + 1015 + 2 + _tier_a_bytes(1, FACT) + EARLIER_BYTES
+        exact = PROMPT_BYTES + 1327 + 2 + _tier_a_bytes(1, FACT) + EARLIER_BYTES
         _, provider = self.turn(exact, conversation=conversation, memory=True)
         self.assertEqual(
             provider.requests,
@@ -1450,7 +1461,7 @@ class ProposalModeBudgetTests(unittest.TestCase):
         self,
     ) -> None:
         # The prompt alone fits every one of these budgets.
-        for budget in (PROMPT_BYTES, PROMPT_BYTES + 1, PROMPT_BYTES + 1014):
+        for budget in (PROMPT_BYTES, PROMPT_BYTES + 1, PROMPT_BYTES + 1326):
             with self.subTest(budget=budget):
                 turn, provider = self.turn(
                     budget,
@@ -1468,7 +1479,7 @@ class ProposalModeBudgetTests(unittest.TestCase):
         # At exactly the reservation the instructions are sent, and the
         # optional context and history are what wait.
         turn, provider = self.turn(
-            PROMPT_BYTES + 1015,
+            PROMPT_BYTES + 1327,
             conversation=(EARLIER,),
             memory=True,
         )
@@ -1483,14 +1494,14 @@ class ProposalModeBudgetTests(unittest.TestCase):
         conversation = (EARLIER,)
         context = (_memory_item(),)
 
-        exact = PROMPT_BYTES + 1015 + EARLIER_BYTES
+        exact = PROMPT_BYTES + 1327 + EARLIER_BYTES
         self.assertEqual(
             fitted_history(PROMPT, conversation, exact, (), True),
             conversation,
         )
         self.assertEqual(fitted_history(PROMPT, conversation, exact - 1, (), True), ())
 
-        exact = PROMPT_BYTES + 1015 + 2 + _tier_a_bytes(1, FACT) + EARLIER_BYTES
+        exact = PROMPT_BYTES + 1327 + 2 + _tier_a_bytes(1, FACT) + EARLIER_BYTES
         self.assertEqual(
             fitted_history(PROMPT, conversation, exact, context, True),
             conversation,

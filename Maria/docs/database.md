@@ -358,7 +358,8 @@ system-information output, and unsupported, malformed, denied, or failed
 request responses. Blank input, CLI-only exit and cancellation paths, startup
 failures, and the initial confirmation-required response are not recorded.
 With reasoning enabled, unsupported input goes to the local reasoning model
-instead, which may reply conversationally or propose one action, and no
+instead, which may reply conversationally or propose one action or a plan of
+two to five, and no
 conversational request, reply, or controlled failure is recorded; the
 conversation lives only in the session's memory. A proposal, its refusal, its
 approval prompt, and the result of an approved model-proposed action are not
@@ -787,13 +788,19 @@ An audit summary is one logical record kept in two tables: its
 `audit_summaries` row and, once known, its `audit_outcomes` row. It records
 that the owner approved one action the local reasoning model proposed, and
 that Maria authorised that attempt for dispatch; by itself it does not prove
-that the tool ran. Every model-proposed action needs exactly one approval from
-the owner, even when its permission decision is `ALLOWED`, which is why
-`decision` has the single value `owner_approved`. Brain adds summaries and
-outcomes only when it dispatches an approved model-proposed action. A
-deterministic command, a refused proposal, a denied action (refused before any
-approval is offered), and a plan that is cancelled, never approved, or refused
-when it is checked again at confirmation add nothing to either table.
+that the tool ran. Every model-proposed plan needs exactly one approval from
+the owner, for the whole plan, even when every permission decision is
+`ALLOWED`, which is why `decision` has the single value `owner_approved`.
+Brain adds summaries and outcomes only when it dispatches an approved
+model-proposed action. A deterministic command, a refused proposal, a plan
+with a denied action (refused before any approval is offered), and a plan that
+is cancelled, never approved, or refused when it is checked again at
+confirmation add nothing to either table. A plan of two to five steps adds one
+summary, and then its outcome, for each step Maria reached for dispatch, and
+none for any step after it stopped. No column links the summaries of one plan,
+so the tables alone cannot say which summaries belonged to one plan or how
+many steps it held; V1-19 added no table, column, or vocabulary value, and the
+schema version is still 5.
 
 Every stored value is Maria's own, from the closed vocabulary in
 `core/audit.py`, and there is deliberately no column for anything else. A
@@ -808,11 +815,14 @@ The write order is fixed. Once the owner approves and the plan passes its
 checks again, Brain calls `record_audit_summary(action, decision, target)`,
 which inserts the summary with Maria's own timestamp, validated like every
 other field, and commits it before returning the new id. Only then is the tool
-dispatched, exactly once. If the
+dispatched, exactly once. For a plan of one step, if the
 summary cannot be committed, or the returned id is not an exact positive int,
 nothing is dispatched, the approval stays spent, and the owner sees `Maria did
 not run the approved action because its audit summary could not be
-recorded.` After the tool returns, `record_audit_outcome(summary_id,
+recorded.` In a plan of several steps each step follows this order in turn,
+and a summary that cannot be committed for one step leaves that step not run,
+the steps before it standing, and the plan stopped; its report says so in that
+step's block and in its closing sentence. After the tool returns, `record_audit_outcome(summary_id,
 outcome)` appends `succeeded` or `failed`, from the tool's own success flag,
 with one statement:
 
@@ -831,8 +841,12 @@ outcome could not be recorded, so that summary shows the outcome as
 unknown.` Nothing is retried. A summary without an outcome, because that write
 failed or because Maria stopped before or during the tool's run, reads as
 `Outcome not recorded; execution is unknown.`, and Maria never reruns the
-tool to find out. No statement updates a summary or an outcome once it is
-written; the only later change is deletion.
+tool to find out. In a plan of several steps, a step reached for dispatch may
+keep its summary without an outcome even when its tool never ran, if the run
+stopped before dispatch. A write interrupted while a plan of several steps
+runs may already have committed, so Maria then tells the owner only that she
+could not confirm whether it was recorded. No statement updates a summary or
+an outcome once it is written; the only later change is deletion.
 
 `list_audit_summaries(limit)` returns summaries newest id first, each with its
 outcome or None, through a `LEFT JOIN` of `audit_outcomes` onto
