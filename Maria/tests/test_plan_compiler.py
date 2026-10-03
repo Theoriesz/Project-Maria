@@ -93,6 +93,8 @@ from tests.test_reasoning import (
 )
 from tools.audit import AuditTool
 from tools.calculator import CalculatorTool
+from tools.conversation_summaries import ConversationSummariesTool
+from tools.conversations import ConversationsTool
 from tools.filesystem import FilesystemTool
 from tools.history import HistoryTool
 from tools.memory import MemoryTool
@@ -114,11 +116,17 @@ EXPECTED_ALLOWLIST = frozenset(
 
 # The actions PermissionManager allows with an empty configuration that the
 # model may nevertheless never propose. Deleting an audit summary is absent
-# only because it always requires confirmation.
+# only because it always requires confirmation, and so is every conversation
+# summary action but listing and reading, and deleting a saved conversation.
 PERMITTED_BUT_CLOSED = frozenset(
     {
         "audit.list",
         "audit.read",
+        "conversation_summaries.list",
+        "conversation_summaries.read",
+        "conversations.save",
+        "conversations.list",
+        "conversations.read",
         "filesystem.read",
         "history.list",
         "history.search",
@@ -159,6 +167,20 @@ VALID_ARGUMENTS: dict[str, dict[str, Any]] = {
     "audit.read": {"id": 1},
     "audit.delete": {"id": 1},
     "calculator.calculate": {"expression": "2 + 2"},
+    "conversation_summaries.create": {
+        "text": "We agreed on the plan.",
+        "text_digest": DIGEST,
+    },
+    "conversation_summaries.list": {},
+    "conversation_summaries.read": {"id": 1},
+    "conversation_summaries.edit": {"id": 1, "text": "We changed the plan."},
+    "conversation_summaries.delete": {"id": 1},
+    "conversation_summaries.enable_context": {"id": 1, "text_digest": DIGEST},
+    "conversation_summaries.disable_context": {"id": 1},
+    "conversations.save": {"transcript": '[["Hello","Hi."]]'},
+    "conversations.list": {},
+    "conversations.read": {"id": 1},
+    "conversations.delete": {"id": 1},
     "filesystem.read": {"path": "notes.txt"},
     "filesystem.list": {"path": "docs"},
     "filesystem.rename": {"source": "old.txt", "destination": "new.txt"},
@@ -380,6 +402,28 @@ def _registry_with(
     )
 
 
+def _registry_widened_past_session_input(identifier: str) -> ActionContractRegistry:
+    """Return the shipped registry with one session-input action made eligible.
+
+    A contract declaring a session input refuses to be model-eligible, so its
+    declaration is dropped first: this is that action widened as far as any
+    registry edit could take it.
+    """
+    return ActionContractRegistry(
+        replace(
+            contract,
+            arguments=tuple(
+                replace(argument, session_input=None)
+                for argument in contract.arguments
+            ),
+            model_eligibility=ModelEligibility.MODEL_ELIGIBLE,
+        )
+        if contract.identifier == identifier
+        else contract
+        for contract in BUILT_IN_ACTION_CONTRACTS.contracts
+    )
+
+
 def _registry_without(*identifiers: str) -> ActionContractRegistry:
     """Return the shipped registry with some actions left undeclared."""
     return ActionContractRegistry(
@@ -428,6 +472,8 @@ _TRIPWIRE_TARGETS = (
     (ToolManager, "load_tools"),
     (AuditTool, "execute"),
     (CalculatorTool, "execute"),
+    (ConversationSummariesTool, "execute"),
+    (ConversationsTool, "execute"),
     (FilesystemTool, "execute"),
     (HistoryTool, "execute"),
     (MemoryTool, "execute"),
@@ -1710,10 +1756,32 @@ class ModelPlanRecheckTests(unittest.TestCase):
             if identifier not in MODEL_ACTION_ALLOWLIST
         ]
         self.assertIn("audit.delete", closed)
+        # An action taking session text cannot even be declared eligible, so
+        # it is widened past its session input instead, and still refused.
+        session_bound = {
+            contract.identifier
+            for contract in BUILT_IN_ACTION_CONTRACTS.contracts
+            if contract.session_input_argument is not None
+        }
+        self.assertEqual(
+            session_bound,
+            {"conversation_summaries.create", "conversations.save"},
+        )
         for identifier in closed:
             plan = _hand_built(*_split(identifier), VALID_ARGUMENTS[identifier])
-            widened = _registry_with(identifier, ModelEligibility.MODEL_ELIGIBLE)
             with self.subTest(action=identifier):
+                if identifier in session_bound:
+                    with self.assertRaisesRegex(
+                        ValueError,
+                        r"declares a session input and so cannot be model-eligible\.$",
+                    ):
+                        _registry_with(identifier, ModelEligibility.MODEL_ELIGIBLE)
+                    widened = _registry_widened_past_session_input(identifier)
+                else:
+                    widened = _registry_with(
+                        identifier,
+                        ModelEligibility.MODEL_ELIGIBLE,
+                    )
                 self.assertIs(_recheck(plan), ProposalRejection.NOT_MODEL_ELIGIBLE)
                 self.assertIs(
                     _recheck(plan, widened),

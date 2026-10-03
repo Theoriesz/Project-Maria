@@ -5,7 +5,7 @@ Tools are small modules that expose controlled capabilities to Maria.
 ## Declared Argument Contracts
 
 Every built-in tool action is declared once in `core/action_contracts.py`,
-which is the positive allowlist of the 29 supported tool actions and of the
+which is the positive allowlist of the 40 supported tool actions and of the
 arguments each one accepts. A tool's `actions` set answers only whether an
 action is registered; the contract answers which arguments it takes, whether
 each is required, its exact type, any numeric bound, and, for a path field, the
@@ -42,10 +42,18 @@ canonical resolution, safe-root containment, symlink handling, and collisions.
 longer the acceptance policy: it sits below the Brain, Tool Manager, and tool
 gates as defence in depth and is unchanged.
 
+Two text fields are session inputs, declared as such on their contracts:
+`conversations.save.transcript` and `conversation_summaries.create.text`.
+Maria supplies their text herself, from the owner's session, before the
+contracts are checked; no request, planner, or model ever provides it, a plan
+that already carries it is refused, and a contract that declares one can
+never be model-eligible.
+
 Every contract also states, with no default, whether a reasoning model may
-ever propose its action. Only three of the 29 actions are model-eligible:
+ever propose its action. Only three of the 40 actions are model-eligible:
 `calculator.calculate`, `filesystem.list`, and `system.current_time`. The
-other 26, including all three audit actions, are closed to the model. The
+other 37, including all three audit actions and all eleven saved-conversation
+and conversation-summary actions, are closed to the model. The
 classification is independent of permission and approves nothing by itself:
 `core/plan_compiler.py` keeps its own closed allowlist and compiles a proposal
 only when the two agree and every argument satisfies the action's contract.
@@ -61,6 +69,11 @@ allows its action outright; see "Model-to-Plan Compilation Gate" and
 - `audit`: list, read, and delete content-free audit summaries of approved
   model-proposed actions
 - `calculator`: basic arithmetic
+- `conversation_summaries`: store an approved conversation summary, list,
+  read, edit, and delete summaries, and turn one summary's context consent on
+  or off
+- `conversations`: save the current session's conversation, and list, read,
+  and delete saved conversations
 - `filesystem`: read, list, rename, and move inside Maria's named filesystem roots
 - `history`: list, search, read, and delete SQLite-backed interaction-history
   rows
@@ -721,6 +734,121 @@ None of the three actions is model-eligible, so only the owner's own commands
 reach them, and audit summaries are never sent to the model as context. The
 tool contains no SQL; `core/memory.py` owns all database operations.
 
+## Conversations Tool
+
+The conversations tool supports exactly four actions:
+
+- `save`: store the transcript Maria supplied as one saved conversation
+- `list`: list the newest saved conversations
+- `read`: display one saved conversation by numeric ID
+- `delete`: remove one saved conversation by numeric ID
+
+`save` takes one argument, `transcript`, which is the session input its
+contract declares: the canonical compact JSON transcript of exactly the
+exchanges the session retains, supplied by Maria from the session, never by a
+request or a model. The tool checks that it is exactly that canonical form
+before storing it, and stores nothing otherwise. A save replies with only the
+new ID and the exchange count:
+
+```text
+Saved this session's 2 exchanges as saved conversation 3. It is an exact copy: later changes to memories or notes do not change it.
+```
+
+`list` shows at most the newest 20 saved conversations, newest ID first, one
+content-free line each, and appends
+`Showing the newest 20 saved conversations. More saved conversations exist.`
+when more exist; an empty result is `No saved conversations found.`:
+
+```text
+3: saved at 2026-10-03T08:09:10Z, exchanges: 2
+```
+
+`read` shows one saved conversation with every turn quoted on its own line,
+each text escaped exactly as a note's preview is, so no stored character can
+start a new line, hide, or pose as another turn:
+
+```text
+Saved conversation 3
+Saved at: 2026-10-03T08:09:10Z
+Exchanges: 2
+1. You: "hello there"
+   Maria: "Hello."
+2. You: "tell me more"
+   Maria: "There is more."
+```
+
+`read` and `delete` refuse an invalid direct ID with `Saved conversation id
+must be a positive whole number.` without calling `Memory`, and a missing ID
+returns `Saved conversation not found: <id>.`. A successful deletion returns
+`Deleted saved conversation <id>.`, removes one row, never cascades, and never
+lets the ID be reused. A memory-layer failure is one fixed message:
+`Unable to save the conversation.`, `Unable to list saved conversations.`,
+`Unable to read the saved conversation.`, or
+`Unable to delete the saved conversation.`.
+
+`list` records `Listed saved conversations.` and `read` records
+`Displayed saved conversation <id>.` through `recorded_message`; `save` and
+`delete` record their own content-free replies. `conversations.save`,
+`conversations.list`, and `conversations.read` are allowed by default, and
+`conversations.delete` always requires confirmation. No action is
+model-eligible, and a saved conversation is never sent to the model.
+
+## Conversation Summaries Tool
+
+The conversation summaries tool supports exactly seven actions:
+
+- `create`: store an approved summary draft
+- `list`: list the newest conversation summaries
+- `read`: display one summary by numeric ID
+- `edit`: replace one summary's text by numeric ID
+- `delete`: remove one summary by numeric ID
+- `enable_context`: turn one summary's context consent on
+- `disable_context`: turn one summary's context consent off
+
+`create` takes `text`, the session input its contract declares: a draft the
+owner's local model wrote from exactly the session's retained exchanges,
+supplied by Maria, never by a request or a model's proposal. `create` always
+requires confirmation, and the tool's `confirmation_binding` makes that
+confirmation the owner's review of exactly that text: it pins the draft's
+SHA-256 as `text_digest` and shows the whole draft, escaped, on one line:
+
+```text
+This approval stores exactly this draft as a new conversation summary, shown quoted:
+"We planned the trip: book the train on Friday."
+```
+
+The draft is stored only when `text_digest` matches it, so a draft never shown
+in full can never be stored, and the reply is
+`Saved as conversation summary <id>. Its context consent is off.`.
+`enable_context` is bound the same way to the stored text, which it reads
+once to show and pin; the memory layer enables consent only while the summary
+still holds exactly that text, and otherwise the owner is asked to request
+confirmation again. `edit` replaces the text and turns consent off, saying so
+when it was on.
+
+`list` shows the newest 20 summaries, one content-free line each, such as
+`1: created at 2026-10-03T08:09:10Z, context off`, and `read` shows one:
+
+```text
+Conversation summary 1
+Created at: 2026-10-03T08:09:10Z
+Updated at: 2026-10-03T08:09:10Z
+Context: off
+Text: "We planned the trip: book the train on Friday."
+```
+
+Invalid IDs return `Conversation summary id must be a positive whole
+number.`, missing ones `Conversation summary not found: <id>.`, and text that
+is not a valid summary is refused with the vocabulary's fixed message. Every
+memory-layer failure is one fixed message. `list` and `read` record
+`Listed conversation summaries.` and `Displayed conversation summary <id>.`
+through `recorded_message`, and every other reply names at most an ID.
+`conversation_summaries.list` and `conversation_summaries.read` are allowed
+by default; `create`, `edit`, `delete`, `enable_context`, and
+`disable_context` always require confirmation. No action is model-eligible.
+These are conversation summaries, never the content-free audit summaries of
+the audit tool.
+
 ## System Tool
 
 The system tool supports exactly two actions:
@@ -784,7 +912,10 @@ always require explicit confirmation before a memory row is changed or removed;
 the memory tool provides no bulk or clear-all action, and no way to select a
 memory by its fact text. Audit-summary deletion (`audit.delete`) is checked the
 same way and always requires explicit confirmation before a summary and its
-outcome are removed. An action a reasoning model proposes needs exactly one
+outcome are removed. Saved-conversation deletion (`conversations.delete`) and
+every conversation-summary change (`conversation_summaries.create`, `edit`,
+`delete`, `enable_context`, and `disable_context`) are checked the same way
+and always require explicit confirmation. An action a reasoning model proposes needs exactly one
 approval from the owner before it runs, even when `permissions.py` allows it
 outright; a denied one is refused before any approval is offered, and an
 approved one does not run at all unless its audit summary is committed first.

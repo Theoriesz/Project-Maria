@@ -36,6 +36,24 @@ from core.context import (
     SUPPLIED_CONTEXT_MAX_RECORDS,
     ContextConsentOutcome,
     note_digest,
+    summary_digest,
+)
+from core.conversation_records import (
+    CONVERSATION_SUMMARY_ID_MESSAGE,
+    RECORD_LIST_LIMIT_MESSAGE,
+    RECORD_MAXIMUM_ID,
+    RECORD_MESSAGE,
+    RECORD_QUERY_LIMIT,
+    SAVED_CONVERSATION_ID_MESSAGE,
+    SUMMARY_TEXT_MESSAGE,
+    TRANSCRIPT_MESSAGE,
+    ConversationSummary,
+    SavedConversation,
+    decode_transcript,
+    is_record_id,
+    is_record_timestamp,
+    is_summary_text,
+    record_timestamp,
 )
 from core.failures import Failure, FailureKind, TypedFailureError
 from core.logger import get_logger
@@ -78,13 +96,15 @@ _UNVERSIONED_SCHEMA = 0
 # ``memories`` table and is the published v0.2.0 baseline. Version 3 adds the
 # per-memory context-consent column. Version 4 adds the per-note context
 # consent column, which holds the approved text's identity. Version 5 adds the
-# two audit-summary tables. The current version lives in ``core.constants`` as
-# ``DATABASE_SCHEMA_VERSION``.
+# two audit-summary tables. Version 6 adds the saved-conversation and
+# conversation-summary tables. The current version lives in ``core.constants``
+# as ``DATABASE_SCHEMA_VERSION``.
 _SCHEMA_BEFORE_EXPLICIT_MEMORIES = 1
 _SCHEMA_V0_2_BASELINE = 2
 _SCHEMA_MEMORY_CONTEXT_CONSENT = 3
 _SCHEMA_NOTE_CONTEXT_CONSENT = 4
 _SCHEMA_AUDIT_SUMMARIES = 5
+_SCHEMA_CONVERSATION_RECORDS = 6
 
 # The live schema. These statements describe the database this build expects
 # and are what a brand-new database is created from, so they move whenever the
@@ -155,6 +175,35 @@ _CREATE_AUDIT_OUTCOMES_TABLE = """
     )
 """
 
+# ``saved_conversations`` holds one row for each explicit save: the session's
+# retained exchanges as one canonical transcript, never updated afterwards.
+# ``conversation_summaries`` holds summaries the owner approved, and
+# ``context_digest`` is the owner's per-summary consent to supply one to the
+# local reasoning model: the SHA-256 of exactly the approved body, or NULL
+# while consent is off. AUTOINCREMENT keeps a deleted record's id from ever
+# being reused. Neither table refers to the other or to any other table. A
+# summary's non-empty check counts the body's bytes, because SQLite's
+# length() of TEXT stops at the first NUL and Maria's summary text rule lets a
+# body begin with one; a transcript is canonical JSON, which never holds one.
+_CREATE_SAVED_CONVERSATIONS_TABLE = """
+    CREATE TABLE IF NOT EXISTS saved_conversations (
+        id INTEGER PRIMARY KEY AUTOINCREMENT,
+        created_at TEXT NOT NULL,
+        transcript TEXT NOT NULL CHECK (length(transcript) > 0)
+    )
+"""
+
+_CREATE_CONVERSATION_SUMMARIES_TABLE = """
+    CREATE TABLE IF NOT EXISTS conversation_summaries (
+        id INTEGER PRIMARY KEY AUTOINCREMENT,
+        body TEXT NOT NULL CHECK (length(CAST(body AS BLOB)) > 0),
+        created_at TEXT NOT NULL,
+        updated_at TEXT NOT NULL,
+        context_digest TEXT
+            CHECK (context_digest IS NULL OR length(context_digest) = 64)
+    )
+"""
+
 _CREATE_INTERACTIONS_INDEX = """
     CREATE INDEX IF NOT EXISTS idx_interactions_created_at
         ON interactions (created_at)
@@ -171,6 +220,8 @@ _CURRENT_SCHEMA_STATEMENTS: tuple[str, ...] = (
     _CREATE_MEMORIES_TABLE,
     _CREATE_AUDIT_SUMMARIES_TABLE,
     _CREATE_AUDIT_OUTCOMES_TABLE,
+    _CREATE_SAVED_CONVERSATIONS_TABLE,
+    _CREATE_CONVERSATION_SUMMARIES_TABLE,
     _CREATE_INTERACTIONS_INDEX,
     _CREATE_NOTES_INDEX,
 )
@@ -288,6 +339,28 @@ _HISTORICAL_AUDIT_OUTCOMES_TABLE = """
     )
 """
 
+# The two tables the version 6 step creates, frozen with the version 6
+# schema. Both start empty, and the step touches no existing table or row.
+# The summary body's non-empty check counts bytes, as the live one does.
+_HISTORICAL_SAVED_CONVERSATIONS_TABLE = """
+    CREATE TABLE saved_conversations (
+        id INTEGER PRIMARY KEY AUTOINCREMENT,
+        created_at TEXT NOT NULL,
+        transcript TEXT NOT NULL CHECK (length(transcript) > 0)
+    )
+"""
+
+_HISTORICAL_CONVERSATION_SUMMARIES_TABLE = """
+    CREATE TABLE conversation_summaries (
+        id INTEGER PRIMARY KEY AUTOINCREMENT,
+        body TEXT NOT NULL CHECK (length(CAST(body AS BLOB)) > 0),
+        created_at TEXT NOT NULL,
+        updated_at TEXT NOT NULL,
+        context_digest TEXT
+            CHECK (context_digest IS NULL OR length(context_digest) = 64)
+    )
+"""
+
 # Every version's complete schema, newest first. A marker is never taken at
 # its word: whatever version a database claims, its structure is checked
 # against the entry for that version before anything is migrated, so a file
@@ -296,6 +369,20 @@ _HISTORICAL_AUDIT_OUTCOMES_TABLE = """
 # one up to DATABASE_SCHEMA_VERSION therefore needs an entry here, and the
 # migration ladder refuses to run if one is missing.
 _FROZEN_SCHEMAS: tuple[tuple[int, tuple[str, ...]], ...] = (
+    (
+        _SCHEMA_CONVERSATION_RECORDS,
+        (
+            _HISTORICAL_INTERACTIONS_TABLE,
+            _HISTORICAL_NOTES_TABLE_WITH_CONTEXT_CONSENT,
+            _HISTORICAL_MEMORIES_TABLE_WITH_CONTEXT_CONSENT,
+            _HISTORICAL_AUDIT_SUMMARIES_TABLE,
+            _HISTORICAL_AUDIT_OUTCOMES_TABLE,
+            _HISTORICAL_SAVED_CONVERSATIONS_TABLE,
+            _HISTORICAL_CONVERSATION_SUMMARIES_TABLE,
+            _HISTORICAL_INTERACTIONS_INDEX,
+            _HISTORICAL_NOTES_INDEX,
+        ),
+    ),
     (
         _SCHEMA_AUDIT_SUMMARIES,
         (
@@ -413,6 +500,14 @@ _MIGRATIONS: tuple[_Migration, ...] = (
             _HISTORICAL_AUDIT_OUTCOMES_TABLE,
         ),
     ),
+    _Migration(
+        version=_SCHEMA_CONVERSATION_RECORDS,
+        name="create_conversation_records",
+        statements=(
+            _HISTORICAL_SAVED_CONVERSATIONS_TABLE,
+            _HISTORICAL_CONVERSATION_SUMMARIES_TABLE,
+        ),
+    ),
 )
 
 
@@ -423,10 +518,21 @@ _MIGRATIONS: tuple[_Migration, ...] = (
 _FACT_DIGEST_PATTERN = re.compile(r"[0-9a-f]{64}")
 
 # The SQL functions a context search registers, on its own connection only:
-# one tests a bounded text against the request's casefolded terms, and the
-# other tests whether a note's title and body are still its approved text.
+# one tests a bounded text against the request's casefolded terms, one tests
+# whether a note's title and body are still its approved text, and one
+# whether a conversation summary's body is still its approved text.
 _CONTEXT_MATCH_FUNCTION = "maria_context_match"
 _NOTE_APPROVED_FUNCTION = "maria_note_approved"
+_SUMMARY_APPROVED_FUNCTION = "maria_summary_approved"
+
+# The reasons a saved-conversation or conversation-summary call's log line
+# may give. Each is this module's own fixed phrase: nothing SQLite reports
+# and nothing a stored row holds ever joins one.
+_RECORD_DATABASE_BUSY = "database busy"
+_RECORD_DATABASE_ERROR = "database error"
+_RECORD_NO_ROW_INSERTED = "no row was inserted"
+_RECORD_INVALID_ID = "no valid id was returned"
+_RECORD_UNEXPECTED_VALUE = "a stored value is not one Maria can show"
 
 # The reasons an audit call's log line may give. Each is this module's own
 # fixed phrase: nothing SQLite reports and nothing a stored row holds ever
@@ -469,6 +575,19 @@ class NoteUpdate:
     ``updated`` is whether a row matched and received the new text, and
     ``context_consent_cleared`` says the note's context consent had been on
     and was turned off.
+    """
+
+    updated: bool
+    context_consent_cleared: bool = False
+
+
+@dataclass(frozen=True)
+class SummaryUpdate:
+    """What one conversation-summary edit did.
+
+    ``updated`` is whether a row matched and received the new text, and
+    ``context_consent_cleared`` says the summary's context consent had been
+    on and was turned off.
     """
 
     updated: bool
@@ -2385,6 +2504,674 @@ class Memory:
             self.logger.info("Deleted audit summary %s.", summary_id)
         return deleted
 
+    def save_conversation(self, transcript: str) -> int:
+        """Store one explicit save of a session's exchanges and return its id.
+
+        ``transcript`` must be exactly the canonical text
+        ``core.conversation_records.encode_transcript`` writes; it is checked
+        again here, before the database is opened, and anything else raises
+        ``ValueError`` with a fixed message. The row is committed before this
+        returns and is never updated afterwards, and saving the same
+        exchanges twice stores two rows. The save reads no other record: its
+        only statement is one INSERT.
+
+        Every failure raises ``RuntimeError`` with a fixed message and with
+        no cause or context: SQLite refusing or failing the insert or its
+        commit, a database still busy or locked once the busy timeout has
+        passed, an insert that added no row, and an id that is not an exact
+        positive int. The log records one fixed line and nothing stored.
+        """
+        if decode_transcript(transcript) is None:
+            raise ValueError(TRANSCRIPT_MESSAGE)
+        created_at = record_timestamp()
+        if not is_record_timestamp(created_at):
+            raise ValueError(RECORD_MESSAGE)
+
+        conversation_id: object = None
+        inserted = False
+        failure: str | None = None
+        try:
+            with self._connection(classify_contention=False) as connection:
+                cursor = connection.execute(
+                    """
+                    INSERT INTO saved_conversations (created_at, transcript)
+                    VALUES (?, ?)
+                    """,
+                    (created_at, transcript),
+                )
+                inserted = cursor.rowcount == 1
+                conversation_id = cursor.lastrowid
+        except sqlite3.Error as exc:
+            failure = _record_failure_reason(exc)
+        if failure is None and not inserted:
+            failure = _RECORD_NO_ROW_INSERTED
+        if failure is None and not is_record_id(conversation_id):
+            failure = _RECORD_INVALID_ID
+        if failure is not None:
+            raise self._record_failure("save conversation", failure)
+        self.logger.info("Saved conversation %s.", conversation_id)
+        return conversation_id
+
+    def list_saved_conversations(
+        self,
+        limit: int = RECORD_QUERY_LIMIT,
+    ) -> list[SavedConversation]:
+        """Return at most ``limit`` saved conversations, newest id first.
+
+        Every stored value is validated after it is read, the transcript
+        against its canonical form; one Maria could not have written fails
+        the whole read with a fixed message, and no value is repeated or
+        logged. A limit that is not an exact int from 1 to
+        ``RECORD_QUERY_LIMIT`` raises ``ValueError``; a failed read raises
+        ``RuntimeError`` with a fixed message and with no cause or context.
+        """
+        if type(limit) is not int or not 1 <= limit <= RECORD_QUERY_LIMIT:
+            raise ValueError(RECORD_LIST_LIMIT_MESSAGE)
+
+        rows: list[sqlite3.Row] = []
+        failure: str | None = None
+        try:
+            with self._connection(classify_contention=False) as connection:
+                rows = connection.execute(
+                    """
+                    SELECT id, created_at, transcript
+                    FROM saved_conversations
+                    ORDER BY id DESC
+                    LIMIT ?
+                    """,
+                    (limit,),
+                ).fetchall()
+        except sqlite3.Error as exc:
+            failure = _record_failure_reason(exc)
+        if failure is not None:
+            raise self._record_failure("list saved conversations", failure)
+
+        conversations = _settled_saved_conversations(rows)
+        if conversations is None:
+            raise self._record_failure(
+                "list saved conversations",
+                _RECORD_UNEXPECTED_VALUE,
+            )
+        return conversations
+
+    def get_saved_conversation(
+        self,
+        conversation_id: int,
+    ) -> SavedConversation | None:
+        """Return one saved conversation, or None if absent.
+
+        Validation and failures are exactly those of
+        ``list_saved_conversations``, and an id that is not an exact positive
+        int raises ``ValueError``. An id larger than any row can have is
+        absent and is answered without opening the database.
+        """
+        if not is_record_id(conversation_id):
+            raise ValueError(SAVED_CONVERSATION_ID_MESSAGE)
+        if conversation_id > RECORD_MAXIMUM_ID:
+            return None
+
+        row: sqlite3.Row | None = None
+        failure: str | None = None
+        try:
+            with self._connection(classify_contention=False) as connection:
+                row = connection.execute(
+                    """
+                    SELECT id, created_at, transcript
+                    FROM saved_conversations
+                    WHERE id = ?
+                    """,
+                    (conversation_id,),
+                ).fetchone()
+        except sqlite3.Error as exc:
+            failure = _record_failure_reason(exc)
+        if failure is not None:
+            raise self._record_failure("read saved conversation", failure)
+        if row is None:
+            return None
+
+        conversations = _settled_saved_conversations([row])
+        if conversations is None:
+            raise self._record_failure(
+                "read saved conversation",
+                _RECORD_UNEXPECTED_VALUE,
+            )
+        return conversations[0]
+
+    def delete_saved_conversation(self, conversation_id: int) -> bool:
+        """Delete one saved conversation by id.
+
+        Returns True when it existed and was deleted, and False when no saved
+        conversation has that id, in which case nothing changes. Exactly one
+        row can change, no other record is touched, and the id is never
+        reused. An id larger than any row can have deletes nothing and is
+        answered without opening the database. An id that is not an exact
+        positive int raises ``ValueError``; a failed delete raises
+        ``RuntimeError`` with a fixed message and with no cause or context.
+        The deleted transcript is never read, logged, or returned.
+        """
+        if not is_record_id(conversation_id):
+            raise ValueError(SAVED_CONVERSATION_ID_MESSAGE)
+        if conversation_id > RECORD_MAXIMUM_ID:
+            return False
+
+        deleted = False
+        failure: str | None = None
+        try:
+            with self._connection(classify_contention=False) as connection:
+                cursor = connection.execute(
+                    """
+                    DELETE FROM saved_conversations
+                    WHERE id = ?
+                    """,
+                    (conversation_id,),
+                )
+                deleted = cursor.rowcount == 1
+        except sqlite3.Error as exc:
+            failure = _record_failure_reason(exc)
+        if failure is not None:
+            raise self._record_failure("delete saved conversation", failure)
+        if deleted:
+            self.logger.info("Deleted saved conversation %s.", conversation_id)
+        return deleted
+
+    def create_conversation_summary(self, body: str) -> int:
+        """Store one approved conversation summary and return its id.
+
+        ``body`` must be exact, non-empty text of at most
+        ``CONVERSATION_SUMMARY_MAX_BYTES`` UTF-8 bytes that equals its own
+        stripped form, which is checked before the database is opened; it is
+        stored exactly as given. Context consent starts off: the new row's
+        ``context_digest`` is NULL. Failures are those of
+        ``save_conversation``, each with a fixed message and no cause or
+        context.
+        """
+        if not is_summary_text(body):
+            raise ValueError(SUMMARY_TEXT_MESSAGE)
+        timestamp = record_timestamp()
+        if not is_record_timestamp(timestamp):
+            raise ValueError(RECORD_MESSAGE)
+
+        summary_id: object = None
+        inserted = False
+        failure: str | None = None
+        try:
+            with self._connection(classify_contention=False) as connection:
+                cursor = connection.execute(
+                    """
+                    INSERT INTO conversation_summaries (body, created_at, updated_at)
+                    VALUES (?, ?, ?)
+                    """,
+                    (body, timestamp, timestamp),
+                )
+                inserted = cursor.rowcount == 1
+                summary_id = cursor.lastrowid
+        except sqlite3.Error as exc:
+            failure = _record_failure_reason(exc)
+        if failure is None and not inserted:
+            failure = _RECORD_NO_ROW_INSERTED
+        if failure is None and not is_record_id(summary_id):
+            failure = _RECORD_INVALID_ID
+        if failure is not None:
+            raise self._record_failure("store conversation summary", failure)
+        self.logger.info("Stored conversation summary %s.", summary_id)
+        return summary_id
+
+    def list_conversation_summaries(
+        self,
+        limit: int = RECORD_QUERY_LIMIT,
+    ) -> list[ConversationSummary]:
+        """Return at most ``limit`` conversation summaries, newest id first.
+
+        A summary reads as context-enabled only while its stored consent is
+        the identity of exactly its current body. Validation and failures
+        are those of ``list_saved_conversations``.
+        """
+        if type(limit) is not int or not 1 <= limit <= RECORD_QUERY_LIMIT:
+            raise ValueError(RECORD_LIST_LIMIT_MESSAGE)
+
+        rows: list[sqlite3.Row] = []
+        failure: str | None = None
+        try:
+            with self._connection(classify_contention=False) as connection:
+                rows = connection.execute(
+                    """
+                    SELECT id, body, created_at, updated_at, context_digest
+                    FROM conversation_summaries
+                    ORDER BY id DESC
+                    LIMIT ?
+                    """,
+                    (limit,),
+                ).fetchall()
+        except sqlite3.Error as exc:
+            failure = _record_failure_reason(exc)
+        if failure is not None:
+            raise self._record_failure("list conversation summaries", failure)
+
+        summaries = _settled_conversation_summaries(rows)
+        if summaries is None:
+            raise self._record_failure(
+                "list conversation summaries",
+                _RECORD_UNEXPECTED_VALUE,
+            )
+        return summaries
+
+    def get_conversation_summary(
+        self,
+        summary_id: int,
+    ) -> ConversationSummary | None:
+        """Return one conversation summary, or None if absent.
+
+        Validation and failures are those of ``list_conversation_summaries``,
+        an id that is not an exact positive int raises ``ValueError``, and an
+        id larger than any row can have is answered without opening the
+        database.
+        """
+        if not is_record_id(summary_id):
+            raise ValueError(CONVERSATION_SUMMARY_ID_MESSAGE)
+        if summary_id > RECORD_MAXIMUM_ID:
+            return None
+
+        row: sqlite3.Row | None = None
+        failure: str | None = None
+        try:
+            with self._connection(classify_contention=False) as connection:
+                row = connection.execute(
+                    """
+                    SELECT id, body, created_at, updated_at, context_digest
+                    FROM conversation_summaries
+                    WHERE id = ?
+                    """,
+                    (summary_id,),
+                ).fetchone()
+        except sqlite3.Error as exc:
+            failure = _record_failure_reason(exc)
+        if failure is not None:
+            raise self._record_failure("read conversation summary", failure)
+        if row is None:
+            return None
+
+        summaries = _settled_conversation_summaries([row])
+        if summaries is None:
+            raise self._record_failure(
+                "read conversation summary",
+                _RECORD_UNEXPECTED_VALUE,
+            )
+        return summaries[0]
+
+    def edit_conversation_summary(
+        self,
+        summary_id: int,
+        new_body: str,
+    ) -> SummaryUpdate:
+        """Replace one summary's body and report whether consent was cleared.
+
+        ``new_body`` must be valid summary text, checked as
+        ``create_conversation_summary`` checks it. Context consent belongs to
+        the exact text the owner approved, so an edit always leaves the
+        summary's consent off: it is turned off first, in the same
+        transaction as the new body and ``updated_at`` are written, so no
+        other connection can enable consent in between and a failure rolls
+        both back. A summary that does not exist changes in neither
+        statement. An id larger than any row can have changes nothing and is
+        answered without opening the database. Failures carry a fixed
+        message and no cause or context.
+        """
+        if not is_record_id(summary_id):
+            raise ValueError(CONVERSATION_SUMMARY_ID_MESSAGE)
+        if not is_summary_text(new_body):
+            raise ValueError(SUMMARY_TEXT_MESSAGE)
+        if summary_id > RECORD_MAXIMUM_ID:
+            return SummaryUpdate(False)
+        updated_at = record_timestamp()
+        if not is_record_timestamp(updated_at):
+            raise ValueError(RECORD_MESSAGE)
+
+        result = SummaryUpdate(False)
+        failure: str | None = None
+        try:
+            with self._connection(classify_contention=False) as connection:
+                consent_cursor = connection.execute(
+                    """
+                    UPDATE conversation_summaries
+                    SET context_digest = NULL
+                    WHERE id = ? AND context_digest IS NOT NULL
+                    """,
+                    (summary_id,),
+                )
+                cursor = connection.execute(
+                    """
+                    UPDATE conversation_summaries
+                    SET body = ?, updated_at = ?
+                    WHERE id = ?
+                    """,
+                    (new_body, updated_at, summary_id),
+                )
+                result = SummaryUpdate(
+                    cursor.rowcount == 1,
+                    consent_cursor.rowcount == 1,
+                )
+        except sqlite3.Error as exc:
+            failure = _record_failure_reason(exc)
+        if failure is not None:
+            raise self._record_failure("edit conversation summary", failure)
+        if result.updated:
+            self.logger.info("Edited conversation summary %s.", summary_id)
+        if result.context_consent_cleared:
+            self.logger.info(
+                "Turned off context consent for edited conversation summary %s.",
+                summary_id,
+            )
+        return result
+
+    def delete_conversation_summary(self, summary_id: int) -> bool:
+        """Delete one conversation summary by id.
+
+        The contract is ``delete_saved_conversation``'s: one row at most, no
+        other record touched, the id never reused, the deleted text never
+        read, logged, or returned.
+        """
+        if not is_record_id(summary_id):
+            raise ValueError(CONVERSATION_SUMMARY_ID_MESSAGE)
+        if summary_id > RECORD_MAXIMUM_ID:
+            return False
+
+        deleted = False
+        failure: str | None = None
+        try:
+            with self._connection(classify_contention=False) as connection:
+                cursor = connection.execute(
+                    """
+                    DELETE FROM conversation_summaries
+                    WHERE id = ?
+                    """,
+                    (summary_id,),
+                )
+                deleted = cursor.rowcount == 1
+        except sqlite3.Error as exc:
+            failure = _record_failure_reason(exc)
+        if failure is not None:
+            raise self._record_failure("delete conversation summary", failure)
+        if deleted:
+            self.logger.info("Deleted conversation summary %s.", summary_id)
+        return deleted
+
+    def enable_conversation_summary_context(
+        self,
+        summary_id: int,
+        expected_text_digest: str | None,
+    ) -> ContextConsentOutcome:
+        """Turn one summary's context consent on, only for the approved text.
+
+        ``expected_text_digest`` is the identity pinned when confirmation was
+        offered, or None when none was. The check and the change are one
+        write transaction: ``BEGIN IMMEDIATE`` takes the write lock before
+        the body is read, and the UPDATE applies only while the body is still
+        exactly the text checked. It stores that identity as the summary's
+        consent, so a later change made anywhere makes the summary
+        ineligible. A matching summary is enabled; a missing one is
+        ``NOT_FOUND``; and one whose text is not the approved text is
+        ``TARGET_CHANGED`` and is left unchanged.
+
+        Raises ValueError for an id that is not an exact positive int or an
+        identity that is neither None nor a lowercase hexadecimal SHA-256,
+        and ``RuntimeError`` with a fixed message, no cause, and no context
+        when SQLite fails. The body is never returned or logged.
+        """
+        if not is_record_id(summary_id):
+            raise ValueError(CONVERSATION_SUMMARY_ID_MESSAGE)
+        if expected_text_digest is not None and not (
+            type(expected_text_digest) is str
+            and _FACT_DIGEST_PATTERN.fullmatch(expected_text_digest)
+        ):
+            raise ValueError(
+                "A conversation summary text identity must be a SHA-256 digest."
+            )
+        if summary_id > RECORD_MAXIMUM_ID:
+            return ContextConsentOutcome.NOT_FOUND
+
+        outcome = ContextConsentOutcome.NOT_FOUND
+        failure: str | None = None
+        try:
+            with self._connection(classify_contention=False) as connection:
+                connection.execute("BEGIN IMMEDIATE")
+                row = connection.execute(
+                    """
+                    SELECT body
+                    FROM conversation_summaries
+                    WHERE id = ?
+                    """,
+                    (summary_id,),
+                ).fetchone()
+                if row is None:
+                    outcome = ContextConsentOutcome.NOT_FOUND
+                elif (
+                    expected_text_digest is None
+                    or not is_summary_text(row["body"])
+                    or summary_digest(row["body"]) != expected_text_digest
+                ):
+                    outcome = ContextConsentOutcome.TARGET_CHANGED
+                else:
+                    cursor = connection.execute(
+                        """
+                        UPDATE conversation_summaries
+                        SET context_digest = ?
+                        WHERE id = ? AND body = ?
+                        """,
+                        (expected_text_digest, summary_id, row["body"]),
+                    )
+                    outcome = (
+                        ContextConsentOutcome.ENABLED
+                        if cursor.rowcount == 1
+                        else ContextConsentOutcome.TARGET_CHANGED
+                    )
+        except sqlite3.Error as exc:
+            failure = _record_failure_reason(exc)
+        if failure is not None:
+            raise self._record_failure(
+                "change conversation summary context consent",
+                failure,
+            )
+        if outcome is ContextConsentOutcome.ENABLED:
+            self.logger.info(
+                "Enabled context consent for conversation summary %s.",
+                summary_id,
+            )
+        elif outcome is ContextConsentOutcome.TARGET_CHANGED:
+            self.logger.info(
+                "Refused context consent for conversation summary %s: "
+                "approved text changed.",
+                summary_id,
+            )
+        return outcome
+
+    def disable_conversation_summary_context(self, summary_id: int) -> bool:
+        """Turn one summary's context consent off by id.
+
+        Returns True when a row matched, including when consent was already
+        off, and False when none did. Turning consent off only narrows what
+        can be sent, so it needs no text check, and the body is never read,
+        logged, or returned. Failures are those of
+        ``enable_conversation_summary_context``.
+        """
+        if not is_record_id(summary_id):
+            raise ValueError(CONVERSATION_SUMMARY_ID_MESSAGE)
+        if summary_id > RECORD_MAXIMUM_ID:
+            return False
+
+        matched = False
+        failure: str | None = None
+        try:
+            with self._connection(classify_contention=False) as connection:
+                cursor = connection.execute(
+                    """
+                    UPDATE conversation_summaries
+                    SET context_digest = NULL
+                    WHERE id = ?
+                    """,
+                    (summary_id,),
+                )
+                matched = cursor.rowcount == 1
+        except sqlite3.Error as exc:
+            failure = _record_failure_reason(exc)
+        if failure is not None:
+            raise self._record_failure(
+                "change conversation summary context consent",
+                failure,
+            )
+        if matched:
+            self.logger.info(
+                "Disabled context consent for conversation summary %s.",
+                summary_id,
+            )
+        return matched
+
+    def context_summaries_by_id(
+        self,
+        summary_ids: Sequence[int],
+        max_text_bytes: int,
+    ) -> list[dict[str, Any]]:
+        """Return which of ``summary_ids`` are context-enabled now, with text.
+
+        This is the recheck of summaries already supplied to a conversation:
+        only the named ids are read, at most ``SUPPLIED_CONTEXT_MAX_RECORDS``
+        of them, each row holding ``id``, ``body``, and ``oversized``. A
+        named summary comes back whole only while its body is within
+        ``max_text_bytes`` UTF-8 bytes and still exactly its approved text,
+        and by id only, with ``oversized`` True, when its body is too large,
+        which can never be the approved text. One that is disabled, deleted,
+        or no longer its approved text is simply absent. Raises ValueError
+        for ids that are not distinct positive ints, and the same
+        RuntimeError as ``search_context_summaries`` for a read that cannot
+        be trusted.
+        """
+        identifiers = _require_record_ids(summary_ids)
+        return self._context_summary_rows(
+            max_text_bytes,
+            len(identifiers),
+            identifiers=identifiers,
+        )
+
+    def search_context_summaries(
+        self,
+        terms: Sequence[str],
+        limit: int,
+        max_text_bytes: int,
+    ) -> list[dict[str, Any]]:
+        """Return context-enabled summaries whose body holds a term.
+
+        This is Tier B's summary search, the note search's rule applied to
+        one text. Only summaries whose consent is on, whose body is text
+        within ``max_text_bytes`` UTF-8 bytes, and whose body is still
+        exactly the text the owner approved are searched, in ascending id
+        order, and a summary matches when one of the casefolded ``terms``
+        occurs literally in its casefolded body. Every check runs inside
+        SQLite, row by row, before the matcher sees anything: consent, type,
+        and stored size first, then the approved identity, recomputed from
+        the current body. A summary changed outside Maria, or too large to
+        verify, is never matched, named, or counted toward ``limit``. At
+        most ``limit`` rows come back, clamped to 1 through 100, each with
+        ``id``, ``body``, and ``oversized``, which is always False here.
+
+        Raises ValueError for terms that are not 1 to ``SEARCH_MAX_TERMS``
+        non-empty texts or a bound that is not a positive int, and
+        ``RuntimeError`` with a fixed message, no cause, and no context when
+        SQLite fails, because SQLite's message for a stored text it cannot
+        decode quotes the text.
+        """
+        return self._context_summary_rows(
+            max_text_bytes,
+            limit,
+            terms=_require_search_terms(terms),
+        )
+
+    def _context_summary_rows(
+        self,
+        max_text_bytes: int,
+        limit: int,
+        *,
+        identifiers: tuple[int, ...] = (),
+        terms: tuple[str, ...] = (),
+    ) -> list[dict[str, Any]]:
+        """Run one bounded read of context-enabled summaries, by id or terms.
+
+        Exactly one of ``identifiers`` and ``terms`` is given. Every value
+        travels as a bound parameter; the statement text around them is this
+        module's own.
+        """
+        if type(max_text_bytes) is not int or max_text_bytes < 1:
+            raise ValueError("A text size bound must be a positive whole number.")
+        safe_limit = max(1, min(limit, 100))
+        rows: list[sqlite3.Row] = []
+        failure: str | None = None
+        try:
+            with self._connection(classify_contention=False) as connection:
+                stored_bound = _stored_bound(connection, max_text_bytes)
+                if terms:
+                    connection.create_function(
+                        _SUMMARY_APPROVED_FUNCTION,
+                        2,
+                        _approved_summary_check(max_text_bytes),
+                        deterministic=True,
+                    )
+                    connection.create_function(
+                        _CONTEXT_MATCH_FUNCTION,
+                        1,
+                        _term_matcher(terms, max_text_bytes),
+                        deterministic=True,
+                    )
+                    # CASE settles its conditions in order, so the approval
+                    # check sees only a consented summary whose body fits the
+                    # stored bound, and the matcher sees only a body the
+                    # approval check confirmed. A row that fails either is
+                    # never returned and so never counts toward the limit.
+                    condition = f"""
+                        AND CASE
+                            WHEN context_digest IS NOT NULL
+                                AND typeof(body) = 'text'
+                                AND length(CAST(body AS BLOB)) <= ?
+                            THEN CASE
+                                WHEN {_SUMMARY_APPROVED_FUNCTION}(
+                                    body,
+                                    context_digest
+                                )
+                                THEN {_CONTEXT_MATCH_FUNCTION}(body)
+                                ELSE 0
+                            END
+                            ELSE 0
+                        END
+                    """
+                    parameters: tuple[Any, ...] = (stored_bound,)
+                else:
+                    placeholders = ", ".join("?" for _ in identifiers)
+                    condition = f"AND id IN ({placeholders})"
+                    parameters = identifiers
+                rows = connection.execute(
+                    f"""
+                    SELECT
+                        id,
+                        CASE
+                            WHEN length(CAST(body AS BLOB)) <= ? THEN body
+                        END AS body,
+                        context_digest
+                    FROM conversation_summaries
+                    WHERE context_digest IS NOT NULL
+                        AND typeof(body) = 'text'
+                        {condition}
+                    ORDER BY id ASC
+                    LIMIT ?
+                    """,
+                    (stored_bound, *parameters, safe_limit),
+                ).fetchall()
+        except sqlite3.Error as exc:
+            failure = _record_failure_reason(exc)
+        if failure is not None:
+            raise self._record_failure(
+                "read conversation summary context",
+                failure,
+            )
+        settled = (_bounded_summary_row(row, max_text_bytes) for row in rows)
+        return [row for row in settled if row is not None]
+
     @contextmanager
     def _connection(
         self,
@@ -2395,11 +3182,12 @@ class Memory:
 
         Contention is normally recognised and converted here, so every method
         answers a busy database with the same message. ``classify_contention``
-        turns that off for the initialization boundary and for every audit
-        method, which classify the error themselves: the conversion carries
-        an exception log with it, and those callers record a fixed event code
-        or reason instead. Rollback and close are unaffected either way, and
-        every other error still propagates unchanged.
+        turns that off for the initialization boundary and for every audit,
+        saved-conversation, and conversation-summary method, which classify
+        the error themselves: the conversion carries an exception log with
+        it, and those callers record a fixed event code or reason instead.
+        Rollback and close are unaffected either way, and every other error
+        still propagates unchanged.
         """
         connection = self._connect()
         try:
@@ -2441,6 +3229,22 @@ class Memory:
         """
         self.logger.error("Failed to %s: %s.", operation, reason)
         if reason == _AUDIT_DATABASE_BUSY:
+            return RuntimeError(_DATABASE_BUSY_MESSAGE)
+        return RuntimeError(f"Unable to {operation}.")
+
+    def _record_failure(self, operation: str, reason: str) -> RuntimeError:
+        """Log one fixed line and return a conversation-record call's failure.
+
+        ``operation`` and ``reason`` are always this module's own fixed
+        phrases, never anything SQLite or a stored row supplied. Contention
+        keeps the shared busy message, which says that retrying may help;
+        every other failure names the operation that could not complete. A
+        caller raises the result only after its ``except`` block has ended,
+        so the failure has neither a cause nor a context, and no SQLite text
+        or traceback reaches the log.
+        """
+        self.logger.error("Failed to %s: %s.", operation, reason)
+        if reason == _RECORD_DATABASE_BUSY:
             return RuntimeError(_DATABASE_BUSY_MESSAGE)
         return RuntimeError(f"Unable to {operation}.")
 
@@ -2678,6 +3482,123 @@ def _audit_failure_reason(exc: sqlite3.Error) -> str:
     if _is_busy_or_locked(exc):
         return _AUDIT_DATABASE_BUSY
     return _AUDIT_DATABASE_ERROR
+
+
+def _record_failure_reason(exc: sqlite3.Error) -> str:
+    """Return the fixed reason a conversation-record call gives for a failure."""
+    if _is_busy_or_locked(exc):
+        return _RECORD_DATABASE_BUSY
+    return _RECORD_DATABASE_ERROR
+
+
+def _approved_summary_check(max_bytes: int) -> Callable[[object, object], int]:
+    """Return the summary search's check that a summary is its approved text.
+
+    The check answers 1 only when the body is non-empty text within
+    ``max_bytes`` UTF-8 bytes whose identity, ``summary_digest`` of exactly
+    it, is the one the summary's consent holds, and 0 otherwise. It runs
+    before the matcher sees the body, so text changed outside Maria is never
+    searched, and a body too large to hash within the bound can never be
+    taken as approved.
+    """
+
+    def approved(body: object, approved_digest: object) -> int:
+        return int(
+            type(body) is str
+            and bool(body)
+            and _is_within_bound(body, max_bytes)
+            and type(approved_digest) is str
+            and summary_digest(body) == approved_digest
+        )
+
+    return approved
+
+
+def _bounded_summary_row(
+    row: sqlite3.Row,
+    max_text_bytes: int,
+) -> dict[str, Any] | None:
+    """Return one summary context row, or None when it is not approved text.
+
+    SQLite admitted the body against its stored size; this settles the exact
+    UTF-8 size. A summary whose body is over the bound comes back by id
+    only, as oversized. One within the bound comes back whole only while its
+    body is still exactly the text whose identity the owner's consent holds,
+    so text changed by any other means is never eligible.
+    """
+    body = row["body"]
+    if body is not None and (
+        type(body) is not str or _utf8_size(body) > max_text_bytes
+    ):
+        body = None
+    record_id = int(row["id"])
+    if body is None:
+        return {"id": record_id, "body": None, "oversized": True}
+    approved = row["context_digest"]
+    if not body or type(approved) is not str or summary_digest(body) != approved:
+        return None
+    return {"id": record_id, "body": body, "oversized": False}
+
+
+def _settled_saved_conversations(
+    rows: Sequence[sqlite3.Row],
+) -> list[SavedConversation] | None:
+    """Return stored rows as validated saved conversations, or None.
+
+    A row holding any value Maria could not have written makes the whole
+    result None rather than raising, so the caller's fixed failure is raised
+    outside every handler and the refused value travels nowhere.
+    """
+    conversations: list[SavedConversation] = []
+    for row in rows:
+        exchanges = decode_transcript(row["transcript"])
+        if exchanges is None:
+            return None
+        try:
+            conversations.append(
+                SavedConversation(row["id"], row["created_at"], exchanges)
+            )
+        except ValueError:
+            return None
+    return conversations
+
+
+def _settled_conversation_summaries(
+    rows: Sequence[sqlite3.Row],
+) -> list[ConversationSummary] | None:
+    """Return stored rows as validated conversation summaries, or None.
+
+    A stored consent must be NULL or a lowercase hexadecimal SHA-256, and a
+    summary reads as context-enabled only while that identity is exactly
+    its current body's. Any other value makes the whole result None, as for
+    saved conversations.
+    """
+    summaries: list[ConversationSummary] = []
+    for row in rows:
+        body = row["body"]
+        approved = row["context_digest"]
+        if approved is not None and not (
+            type(approved) is str and _FACT_DIGEST_PATTERN.fullmatch(approved)
+        ):
+            return None
+        enabled = (
+            approved is not None
+            and is_summary_text(body)
+            and summary_digest(body) == approved
+        )
+        try:
+            summaries.append(
+                ConversationSummary(
+                    row["id"],
+                    body,
+                    row["created_at"],
+                    row["updated_at"],
+                    enabled,
+                )
+            )
+        except ValueError:
+            return None
+    return summaries
 
 
 def _settled_audit_summaries(

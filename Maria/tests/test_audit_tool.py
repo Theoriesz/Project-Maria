@@ -207,6 +207,8 @@ RECORD_TABLES = (
     "memories",
     "audit_summaries",
     "audit_outcomes",
+    "saved_conversations",
+    "conversation_summaries",
 )
 ZERO_COUNTS = {table: 0 for table in RECORD_TABLES}
 SEEDED_COUNTS = {**ZERO_COUNTS, "audit_summaries": 3, "audit_outcomes": 2}
@@ -1945,7 +1947,13 @@ class AuditWithReasoningTests(unittest.TestCase):
         (request,) = self.provider.requests
         self.assertEqual(request.context, ())
         self.assertEqual(request.history, ())
-        self.assertEqual({source.value for source in ContextSource}, {"memory", "note"})
+        # V1-20's "summary" source is the owner's conversation summaries,
+        # read only from their own table; no audit summary is ever a source,
+        # which the two audit reads below never being called still proves.
+        self.assertEqual(
+            {source.value for source in ContextSource},
+            {"memory", "note", "summary"},
+        )
         self.harness.list_audit_summaries.assert_not_called()
         self.harness.get_audit_summary.assert_not_called()
         self.assertEqual(self.harness.row_counts(), SEEDED_COUNTS)

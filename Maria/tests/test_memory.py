@@ -2093,7 +2093,9 @@ class MemoryContextConsentTests(unittest.TestCase):
                 memory.initialize()
                 memory.initialize()
 
-                self.assertEqual(memory.schema_version(), 5)
+                # The current schema: 6 since V1-20, so a UTF-16 baseline
+                # climbs every step, the conversation-record tables included.
+                self.assertEqual(memory.schema_version(), 6)
                 with closing(sqlite3.connect(path)) as connection:
                     self.assertEqual(
                         connection.execute("PRAGMA encoding").fetchone()[0],

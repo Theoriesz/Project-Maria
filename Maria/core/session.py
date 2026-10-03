@@ -8,12 +8,20 @@ command line and any future interface share one contract.
 A session also owns its conversation: the completed conversational exchanges
 of this session alone, bounded in count and size, held in process memory, and
 discarded when the session ends. Beside it the session keeps the fingerprints
-of every memory and note supplied to the model since that conversation was
-last cleared, at most ``SUPPLIED_CONTEXT_MAX_RECORDS`` of them and never the
-records' text, so a later turn can discard the whole conversation before an
-earlier reply carries a revoked record back. Brain keeps nothing between
-requests, so a new session always starts with no conversation and can never
-observe another's.
+of every memory, note, and conversation summary supplied to the model since
+that conversation was last cleared, at most ``SUPPLIED_CONTEXT_MAX_RECORDS``
+of them and never the records' text, so a later turn can discard the whole
+conversation before an earlier reply carries a revoked record back. Brain
+keeps nothing between requests, so a new session always starts with no
+conversation and can never observe another's.
+
+The conversation is handed to Brain with every request, exactly as held.
+Only an explicit save or summary request makes anything of it durable, and
+only through Brain and the ordinary tool path: an explicit save stores
+exactly the exchanges held at that moment, and a summary is stored only once
+the owner confirms the exact draft shown. Either request is still an
+ordinary submit, so it discards any approval still pending. Once the session
+ends there is nothing left to save.
 
 A plan the local model proposed is rendered here, by the session that binds
 its approval: for every step, in order, the declared tool and action and
@@ -86,9 +94,10 @@ class PendingApproval:
     else is kept: not the text the owner was shown, and not the notices
     shown with it. The object stays in process memory: it is never written
     to SQLite, a file, or configuration, never serialized, and never logged,
-    because the plan it wraps can contain note bodies, memory facts, and file
-    paths. Its ``repr`` therefore shows none of the request, the arguments,
-    what was shown, or the fingerprint.
+    because the plan it wraps can contain note bodies, memory facts, file
+    paths, a saved conversation's transcript, or a summary draft. Its
+    ``repr`` therefore shows none of the request, the arguments, what was
+    shown, or the fingerprint.
     """
 
     plan: Plan
@@ -138,7 +147,9 @@ class MariaSession:
         and it replaces both together: a completed reply with the
         conversation after it, and a turn that had to clear the conversation
         with nothing. A turn that ended in a proposal changes them only when
-        it cleared them. Whatever comes back is held to the retention limits
+        it cleared them, and so does a summary request, whose recheck of the
+        supplied records may clear them but whose draft never joins the
+        conversation. Whatever comes back is held to the retention limits
         again here, so the session never keeps more than they allow, whoever
         computed it: fingerprints beyond what Maria rechecks clear both.
 

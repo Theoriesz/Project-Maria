@@ -17,6 +17,8 @@ from core.action_contracts import (
     FACT_DIGEST_LENGTH,
     MAXIMUM_EXPRESSION_LENGTH,
     MAXIMUM_LIST_LIMIT,
+    MAXIMUM_SUMMARY_LENGTH,
+    MAXIMUM_TRANSCRIPT_LENGTH,
     MINIMUM_LIST_LIMIT,
     ActionContract,
     ActionContractRegistry,
@@ -44,6 +46,17 @@ EXPECTED_ACTION_IDENTIFIERS = frozenset(
         "audit.read",
         "audit.delete",
         "calculator.calculate",
+        "conversation_summaries.create",
+        "conversation_summaries.list",
+        "conversation_summaries.read",
+        "conversation_summaries.edit",
+        "conversation_summaries.delete",
+        "conversation_summaries.enable_context",
+        "conversation_summaries.disable_context",
+        "conversations.save",
+        "conversations.list",
+        "conversations.read",
+        "conversations.delete",
         "filesystem.read",
         "filesystem.list",
         "filesystem.rename",
@@ -407,7 +420,9 @@ class RegistryCompletenessTests(unittest.TestCase):
             BUILT_IN_ACTION_CONTRACTS.action_identifiers,
             EXPECTED_ACTION_IDENTIFIERS,
         )
-        self.assertEqual(len(EXPECTED_ACTION_IDENTIFIERS), 29)
+        # V1-20 adds four saved-conversation and seven conversation-summary
+        # actions to V1-18's twenty-nine.
+        self.assertEqual(len(EXPECTED_ACTION_IDENTIFIERS), 40)
 
     def test_registry_and_loaded_tool_inventory_agree_in_both_directions(self) -> None:
         with TemporaryDirectory() as name:
@@ -445,7 +460,7 @@ class RegistryCompletenessTests(unittest.TestCase):
         ]
 
         self.assertEqual(len(identifiers), len(set(identifiers)))
-        self.assertEqual(len(identifiers), 29)
+        self.assertEqual(len(identifiers), 40)
 
     def test_no_contract_exists_for_a_mandatorily_denied_filesystem_action(
         self,
@@ -483,7 +498,10 @@ class RegistryCompletenessTests(unittest.TestCase):
             if argument.value_type is str
         ]
 
-        self.assertEqual(len(text_fields), 18)
+        # V1-20 adds five: a summary's text and pinned identity on create,
+        # the new text on edit, the pinned identity on enable_context, and a
+        # save's transcript.
+        self.assertEqual(len(text_fields), 23)
         for contract, argument in text_fields:
             with self.subTest(field=f"{contract.identifier}.{argument.name}"):
                 self.assertIsInstance(argument.allow_blank, bool)
@@ -524,15 +542,29 @@ class RegistryCompletenessTests(unittest.TestCase):
                 "calculator.calculate.expression": MAXIMUM_EXPRESSION_LENGTH,
                 "memory.enable_context.fact_digest": FACT_DIGEST_LENGTH,
                 "notes.enable_context.text_digest": FACT_DIGEST_LENGTH,
+                # V1-20: session text Maria supplies is always bounded, the
+                # owner's new summary text has the same ceiling, and each
+                # pinned summary identity is exactly a SHA-256.
+                "conversation_summaries.create.text": MAXIMUM_SUMMARY_LENGTH,
+                "conversation_summaries.create.text_digest": FACT_DIGEST_LENGTH,
+                "conversation_summaries.edit.text": MAXIMUM_SUMMARY_LENGTH,
+                "conversation_summaries.enable_context.text_digest": (
+                    FACT_DIGEST_LENGTH
+                ),
+                "conversations.save.transcript": MAXIMUM_TRANSCRIPT_LENGTH,
             },
         )
         self.assertEqual(MAXIMUM_EXPRESSION_LENGTH, 200)
         self.assertEqual(FACT_DIGEST_LENGTH, 64)
+        self.assertEqual(MAXIMUM_SUMMARY_LENGTH, 2048)
+        self.assertEqual(MAXIMUM_TRANSCRIPT_LENGTH, 65536)
         self.assertEqual(
             minimums,
             {
                 "memory.enable_context.fact_digest",
                 "notes.enable_context.text_digest",
+                "conversation_summaries.create.text_digest",
+                "conversation_summaries.enable_context.text_digest",
             },
         )
         digest = BUILT_IN_ACTION_CONTRACTS.contract_for(
@@ -586,6 +618,13 @@ class RegistryCompletenessTests(unittest.TestCase):
             ("notes", "delete"),
             ("notes", "enable_context"),
             ("notes", "disable_context"),
+            ("conversations", "read"),
+            ("conversations", "delete"),
+            ("conversation_summaries", "read"),
+            ("conversation_summaries", "edit"),
+            ("conversation_summaries", "delete"),
+            ("conversation_summaries", "enable_context"),
+            ("conversation_summaries", "disable_context"),
         )
         for tool_name, action in identifier_actions:
             with self.subTest(action=f"{tool_name}.{action}"):
@@ -635,6 +674,10 @@ class RegistryCompletenessTests(unittest.TestCase):
                 # V1-16: likewise pinned for a note, naming its exact title
                 # and body together.
                 ("notes", "enable_context", "text_digest"),
+                # V1-20: likewise pinned for a summary, beside the full
+                # preview of a draft or of the stored text.
+                ("conversation_summaries", "create", "text_digest"),
+                ("conversation_summaries", "enable_context", "text_digest"),
             },
         )
 
@@ -674,7 +717,7 @@ class ModelEligibilityClassificationTests(unittest.TestCase):
         )
         self.assertEqual(eligible, EXPECTED_MODEL_ELIGIBLE)
         self.assertEqual(closed, EXPECTED_NOT_MODEL_ELIGIBLE)
-        self.assertEqual((len(eligible), len(closed)), (3, 26))
+        self.assertEqual((len(eligible), len(closed)), (3, 37))
         for identifier, decision in classified.items():
             with self.subTest(action=identifier):
                 self.assertIs(type(decision), ModelEligibility)
@@ -860,7 +903,7 @@ class RegistryConstructionTests(unittest.TestCase):
                 "sample", "run", model_eligibility=NOT_ELIGIBLE
             )
 
-        self.assertEqual(len(BUILT_IN_ACTION_CONTRACTS.action_identifiers), 29)
+        self.assertEqual(len(BUILT_IN_ACTION_CONTRACTS.action_identifiers), 40)
 
     def test_unsupported_declared_type_is_rejected(self) -> None:
         with self.assertRaises(ValueError):

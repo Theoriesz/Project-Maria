@@ -243,6 +243,8 @@ RECORD_TABLES = (
     "memories",
     "audit_summaries",
     "audit_outcomes",
+    "saved_conversations",
+    "conversation_summaries",
 )
 ZERO_ROWS = dict.fromkeys(RECORD_TABLES, 0)
 

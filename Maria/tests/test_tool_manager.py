@@ -40,6 +40,8 @@ from tests.log_assertions import assert_log_omits
 EXPECTED_MODULES = (
     "tools.audit",
     "tools.calculator",
+    "tools.conversation_summaries",
+    "tools.conversations",
     "tools.filesystem",
     "tools.history",
     "tools.memory",
@@ -47,7 +49,17 @@ EXPECTED_MODULES = (
     "tools.system",
 )
 EXPECTED_TOOL_NAMES = frozenset(
-    {"audit", "calculator", "filesystem", "history", "memory", "notes", "system"}
+    {
+        "audit",
+        "calculator",
+        "conversation_summaries",
+        "conversations",
+        "filesystem",
+        "history",
+        "memory",
+        "notes",
+        "system",
+    }
 )
 
 # The one owner-visible sentence an unexpected tool exception produces,

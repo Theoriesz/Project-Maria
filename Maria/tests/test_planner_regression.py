@@ -17,6 +17,10 @@ MEMORY_ID_RESPONSE = "Memory id must be a positive whole number."
 NOTE_ID_RESPONSE = "Note id must be a positive whole number."
 INTERACTION_ID_RESPONSE = "Interaction id must be a positive whole number."
 AUDIT_ID_RESPONSE = "Audit summary id must be a positive whole number."
+SAVED_CONVERSATION_ID_RESPONSE = (
+    "Saved conversation id must be a positive whole number."
+)
+SUMMARY_ID_RESPONSE = "Conversation summary id must be a positive whole number."
 
 # The largest id any record can have, because every id is a SQLite integer.
 LARGEST_ID = 2**63 - 1
@@ -24,7 +28,7 @@ LARGEST_ID = 2**63 - 1
 # an operand padded with them raises ValueError if int() is handed it whole.
 LONG_ZEROES = "0" * 5000
 
-# The thirteen ID-only planner commands, which share one id parser: each
+# The twenty ID-only planner commands, which share one id parser: each
 # one's request template, the tool, action, and other arguments of the step
 # it plans, and the response it gives an id it cannot use. The command
 # "read note <id or exact title>" is not among them; it uses its separate,
@@ -55,6 +59,43 @@ ID_COMMANDS: tuple[tuple[str, str, str, dict[str, str], str], ...] = (
     ("delete interaction {}", "history", "delete", {}, INTERACTION_ID_RESPONSE),
     ("read audit {}", "audit", "read", {}, AUDIT_ID_RESPONSE),
     ("delete audit {}", "audit", "delete", {}, AUDIT_ID_RESPONSE),
+    (
+        "read conversation {}",
+        "conversations",
+        "read",
+        {},
+        SAVED_CONVERSATION_ID_RESPONSE,
+    ),
+    (
+        "delete conversation {}",
+        "conversations",
+        "delete",
+        {},
+        SAVED_CONVERSATION_ID_RESPONSE,
+    ),
+    ("read summary {}", "conversation_summaries", "read", {}, SUMMARY_ID_RESPONSE),
+    (
+        "edit summary {}: New text",
+        "conversation_summaries",
+        "edit",
+        {"text": "New text"},
+        SUMMARY_ID_RESPONSE,
+    ),
+    ("delete summary {}", "conversation_summaries", "delete", {}, SUMMARY_ID_RESPONSE),
+    (
+        "enable summary context {}",
+        "conversation_summaries",
+        "enable_context",
+        {},
+        SUMMARY_ID_RESPONSE,
+    ),
+    (
+        "disable summary context {}",
+        "conversation_summaries",
+        "disable_context",
+        {},
+        SUMMARY_ID_RESPONSE,
+    ),
 )
 
 

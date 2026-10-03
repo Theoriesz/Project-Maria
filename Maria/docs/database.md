@@ -26,7 +26,8 @@ counter over Maria's schema history rather than a release number:
 | 2 | The published v0.2.0 baseline, which adds `memories`. |
 | 3 | Adds the per-memory `context_enabled` consent column to `memories`, off for every row. |
 | 4 | Adds the per-note `context_digest` consent column to `notes`, off (NULL) for every row. |
-| 5 | Adds the `audit_summaries` and `audit_outcomes` tables, both empty, which hold the audit summaries of approved model-proposed actions. This is the current schema. |
+| 5 | Adds the `audit_summaries` and `audit_outcomes` tables, both empty, which hold the audit summaries of approved model-proposed actions. |
+| 6 | Adds the `saved_conversations` and `conversation_summaries` tables, both empty, which hold explicitly saved conversations and owner-approved conversation summaries. This is the current schema. |
 
 Versions 1 and 2 are the only shapes that can exist without a marker, because
 every database Maria creates or migrates from this build onwards is stamped.
@@ -210,7 +211,7 @@ database. Both boundaries classify contention themselves rather than
 inheriting the shared conversion, because that conversion logs the exception
 on its way past and these record a fixed event code instead.
 
-There are four migrations. `create_memories` brings a version 1 database to
+There are five migrations. `create_memories` brings a version 1 database to
 version 2 by adding the `memories` table; Maria does not copy or infer explicit
 memories from existing interaction rows. `add_memory_context_consent` brings a
 version 2 database to version 3 with one statement:
@@ -252,10 +253,34 @@ CREATE TABLE audit_outcomes (
 
 Both tables start empty, and the step touches no existing table or row. The
 frozen version 5 schema is the frozen version 4 schema plus these same two
-statements, and a database created new at version 5 fingerprints exactly as a
-migrated one does. Adding them changed neither the frozen schemas of versions
-1 through 4 nor the statements of the earlier steps. No step rewrites a row or
-deletes anything.
+statements. Adding them changed neither the frozen schemas of versions 1
+through 4 nor the statements of the earlier steps. `create_conversation_records`
+brings a version 5 database to version 6 the same way, with two statements:
+
+```sql
+CREATE TABLE saved_conversations (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    created_at TEXT NOT NULL,
+    transcript TEXT NOT NULL CHECK (length(transcript) > 0)
+);
+CREATE TABLE conversation_summaries (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    body TEXT NOT NULL CHECK (length(CAST(body AS BLOB)) > 0),
+    created_at TEXT NOT NULL,
+    updated_at TEXT NOT NULL,
+    context_digest TEXT
+        CHECK (context_digest IS NULL OR length(context_digest) = 64)
+);
+```
+
+Both start empty, the step touches no existing table, row, or AUTOINCREMENT
+high-water mark, and the frozen version 6 schema is the frozen version 5
+schema plus these two statements; a database created new at version 6
+fingerprints exactly as a migrated one does. Neither table refers to the
+other or to any other table: there is no foreign key, trigger, extra index, or
+cascade. Adding them changed neither the frozen schemas of versions 1 through
+5 nor the statements of the earlier steps. No step rewrites a row or deletes
+anything.
 
 Every step runs its own frozen historical statements, never the live schema
 statements a new database is created from. The version 2 step therefore creates
@@ -269,7 +294,7 @@ and requires the frozen successor, so no step can drift that way again.
 ### No pre-migration backup
 
 V1-09 writes no backup copy before migrating, and that is a decision rather
-than an omission; V1-15's, V1-16's, and V1-18's steps keep it true. Every
+than an omission; V1-15's, V1-16's, V1-18's, and V1-20's steps keep it true. Every
 step is additive schema change plus the version stamp, committed in a single
 transaction that SQLite rolls back in full on any failure, so the failure a
 backup would protect
@@ -361,7 +386,9 @@ With reasoning enabled, unsupported input goes to the local reasoning model
 instead, which may reply conversationally or propose one action or a plan of
 two to five, and no
 conversational request, reply, or controlled failure is recorded; the
-conversation lives only in the session's memory. A proposal, its refusal, its
+conversation lives only in the session's memory unless the owner keeps a copy
+with `save conversation` (see "Saved Conversations and Conversation
+Summaries" below). A proposal, its refusal, its
 approval prompt, and the result of an approved model-proposed action are not
 recorded either. A compiled model-originated plan is transient, so neither its
 request nor its result becomes an interaction row, and running an approved one
@@ -553,6 +580,43 @@ secondary index. The vocabulary is enforced by the memory layer instead, when
 a value is written and again when it is read, and the link between the two
 tables is kept by the statements that write and delete them, as described
 under "Audit Summaries".
+
+### saved_conversations
+
+Stores one explicit save of a session's retained exchanges; see "Saved
+Conversations and Conversation Summaries" below.
+
+| Column | Type and constraints | Purpose |
+| --- | --- | --- |
+| id | INTEGER PRIMARY KEY AUTOINCREMENT | Stable saved-conversation identifier, never reused |
+| created_at | TEXT NOT NULL | Maria's own UTC timestamp to the second, in the form `YYYY-MM-DDTHH:MM:SSZ` |
+| transcript | TEXT NOT NULL, non-empty | The canonical compact JSON transcript of 1 to 8 `[user, assistant]` pairs, oldest first, at most 8,192 UTF-8 bytes of their text |
+
+### conversation_summaries
+
+Stores one owner-approved conversation summary and its context consent.
+
+| Column | Type and constraints | Purpose |
+| --- | --- | --- |
+| id | INTEGER PRIMARY KEY AUTOINCREMENT | Stable summary identifier, never reused |
+| body | TEXT NOT NULL, at least one byte | The approved or edited text, at most 2,048 UTF-8 bytes and equal to its own stripped form |
+| created_at | TEXT NOT NULL | Maria's own UTC timestamp to the second, in the form `YYYY-MM-DDTHH:MM:SSZ` |
+| updated_at | TEXT NOT NULL | The same form; equal to `created_at` until the summary is edited |
+| context_digest | TEXT, NULL or exactly 64 characters | The owner's context consent: NULL while off, otherwise the lowercase hexadecimal SHA-256 of exactly the approved `body` |
+
+Neither table refers to the other or to any other table. The canonical form,
+the limits, and the timestamp form are enforced by the memory layer from
+`core/conversation_records.py`, when a value is written and again when it is
+read.
+
+The summary body's non-empty check, `length(CAST(body AS BLOB)) > 0`, counts
+the bytes the body is stored in. SQLite's `length()` of text counts only the
+characters before the first NUL, so a check on it would refuse a body that
+begins with NUL, which the summary text rule allows. With the byte count, such
+a body is stored and read back exactly, and is shown escaped like any other
+control character. Empty text and an empty blob are still refused, in UTF-8
+and UTF-16 databases alike. A transcript is canonical JSON, which writes every
+NUL as an escape, so its plain `length()` check needs no such care.
 
 ## Interaction Retrieval
 
@@ -799,8 +863,8 @@ confirmation add nothing to either table. A plan of two to five steps adds one
 summary, and then its outcome, for each step Maria reached for dispatch, and
 none for any step after it stopped. No column links the summaries of one plan,
 so the tables alone cannot say which summaries belonged to one plan or how
-many steps it held; V1-19 added no table, column, or vocabulary value, and the
-schema version is still 5.
+many steps it held; V1-19 added no table, column, or vocabulary value, and
+V1-20's step to version 6 changed neither audit table.
 
 Every stored value is Maria's own, from the closed vocabulary in
 `core/audit.py`, and there is deliberately no column for anything else. A
@@ -921,29 +985,106 @@ traceback and no SQLite text. A successful write logs only its id: `Recorded
 audit summary <id>.`, `Recorded the outcome of audit summary <id>.`, or
 `Deleted audit summary <id>.`
 
+## Saved Conversations and Conversation Summaries
+
+A saved conversation is one `saved_conversations` row written by an explicit
+`save conversation`: the canonical compact JSON transcript of exactly the
+exchanges the session retained, oldest first, as `[[user, assistant], ...]`
+with no spaces between tokens and non-ASCII text kept as itself.
+`save_conversation(transcript)` checks, before the database is opened, that
+the text is exactly that canonical form for 1 to 8 pairs of non-empty text and
+at most 8,192 UTF-8 bytes of it, and then runs one statement and reads
+nothing:
+
+```sql
+INSERT INTO saved_conversations (created_at, transcript) VALUES (?, ?);
+```
+
+A row is never updated, and saving the same exchanges twice stores two rows.
+`list_saved_conversations(limit)` and `get_saved_conversation(id)` read rows
+newest id first, or by id, and decode every transcript again: a stored text in
+any other form, or a timestamp or id Maria could not have written, fails the
+whole read with a fixed message. `delete_saved_conversation(id)` removes one
+row with `DELETE FROM saved_conversations WHERE id = ?`. A saved conversation
+has no consent column and no context method ever reads one.
+
+A conversation summary is one `conversation_summaries` row.
+`create_conversation_summary(body)` stores text the owner approved, after
+checking that it is non-empty, at most 2,048 UTF-8 bytes, and equal to its own
+stripped form; both timestamps are Maria's own and `context_digest` starts
+NULL. `edit_conversation_summary(id, new_body)` runs two statements in one
+transaction, first clearing consent with
+`UPDATE conversation_summaries SET context_digest = NULL WHERE id = ? AND
+context_digest IS NOT NULL`, then writing the new body and `updated_at`, and
+reports whether consent was cleared, so no other connection can enable consent
+between the two and a failure rolls both back.
+`delete_conversation_summary(id)` removes one row.
+`enable_conversation_summary_context(id, digest)` takes the write lock with
+`BEGIN IMMEDIATE`, reads the body, and stores the digest only when it is
+exactly the SHA-256 of that body, through
+`UPDATE ... SET context_digest = ? WHERE id = ? AND body = ?`; otherwise
+nothing changes and the outcome says the text changed.
+`disable_conversation_summary_context(id)` sets the digest to NULL. A summary
+reads as context-enabled only while its stored digest is the identity of
+exactly its current body.
+
+`search_context_summaries(terms, limit, max_text_bytes)` and
+`context_summaries_by_id(ids, max_text_bytes)` are the note context reads
+applied to one text. Consent, type, and stored size are checked inside SQLite
+first; then a function registered on that connection recomputes the approved
+identity from the current body; only then does the literal matcher see it. In
+a UTF-16 database the stored bound is twice the UTF-8 bound and each admitted
+body's exact UTF-8 size is settled afterwards, so the bound is the same in
+either encoding. A summary changed outside Maria never matches and never
+counts toward a read's limit.
+
+Listings read 21 rows, so the tools can show the newest 20 and say that more
+exist. An id that is not an exact positive int raises `ValueError` with a
+fixed message before the database is opened, and an id larger than SQLite's
+largest integer is answered as absent without opening it. Every database
+failure raises a fixed `RuntimeError` with no cause and no context:
+`Database is busy. Try again shortly.` for contention, which these methods
+classify themselves, as the audit methods do, and otherwise
+`Unable to <operation>.` The log receives one fixed line,
+`Failed to <operation>: <reason>.`, whose reason is `database busy`,
+`database error`, `no row was inserted`, `no valid id was returned`, or
+`a stored value is not one Maria can show`, and a successful write logs only
+its id. No transcript, body, digest, or SQLite text is ever logged.
+
+The two tools, `tools/conversations.py` and `tools/conversation_summaries.py`,
+reach these tables only through those `Memory` methods. Listings and readings
+are recorded in interaction history as fixed labels, and every other reply
+names at most an id and a count; an `edit summary` request keeps its new text
+in the request half, as a note edit does. Deleting either record never
+cascades, and AUTOINCREMENT keeps a deleted id from being reused.
+
 ## Data Considerations
 
-Interaction history, notes, explicit memories, and audit summaries are
-distinct persistent concepts and use separate tables in the same configured
-database; an audit summary spans two of them, `audit_summaries` and
-`audit_outcomes`. The same
+Interaction history, notes, explicit memories, audit summaries, saved
+conversations, and conversation summaries are distinct persistent concepts and
+use separate tables in the same configured database; an audit summary spans
+two of them, `audit_summaries` and `audit_outcomes`. The same
 text may nevertheless appear more than once: an explicit fact can occur in its
 `remember` request, the `memories` table, and later recall or list responses;
 a note body can remain in an interaction response as well as the `notes` table.
 Likewise, file or note content returned in a response remains independent of
 its original source. Removing or changing source data outside Maria does not
 automatically remove matching text from existing interaction rows. An audit
-summary holds none of that text. All of these tables share one database file;
-external removal or replacement affects all four datasets.
+summary holds none of that text, while a saved conversation or a summary can
+repeat any of it. All of these tables share one database file; external
+removal or replacement affects all six datasets.
 
 In the current implementation, `delete interaction <id>`,
 `delete note <id>`, and `forget memory <id>` each target at most one row by ID
 and remove it when found, `delete audit <id>` removes at most one audit
-summary, its summary row together with any outcome row, and `retitle note
-<id>`, `edit note <id>`, and `update memory <id>` each change one stored
-field; Maria still exposes no API or CLI operation to prune or bulk-delete
-interaction history, bulk-delete or clear notes, bulk-delete or clear explicit
-memories, or bulk-delete or clear audit summaries. Removing one record never
+summary, its summary row together with any outcome row,
+`delete conversation <id>` and `delete summary <id>` each remove at most one
+row, and `retitle note <id>`, `edit note <id>`, `update memory <id>`, and
+`edit summary <id>` each change one stored row; Maria still exposes no API or
+CLI operation to prune or bulk-delete interaction history, bulk-delete or
+clear notes, bulk-delete or clear explicit memories, bulk-delete or clear
+audit summaries, or bulk-delete or clear saved conversations or summaries.
+Removing one record never
 cascades into another record type, so forgetting a memory leaves any copy of
 its text that already exists in `interactions` untouched, and deleting an
 audit summary leaves the rows the audit commands recorded in `interactions`
@@ -966,9 +1107,10 @@ action ran, naming its action and the summary's id.
 Do not submit or request display of passwords, API keys, access tokens, private
 keys, recovery codes, confidential credentials, or other highly sensitive
 secrets. In particular, reading a sensitive file or note can copy its returned
-content into interaction history, and enabling a note or memory for context
-lets its entire text reach the local reasoning model: Maria does not check
-consented text for secrets and cannot tell sensitive text from any other.
+content into interaction history, saving a conversation copies whatever its
+exchanges said, and enabling a note, memory, or summary for context lets its
+entire text reach the local reasoning model: Maria does not check consented
+or saved text for secrets and cannot tell sensitive text from any other.
 
 ## Connection Timeouts and Contention
 
@@ -1022,14 +1164,15 @@ method), with their `_reporting_consent` forms. Their SQL, transactions,
 rollback and closing, success logging, recognised uniqueness conflicts, and
 owner-visible messages are unchanged. The audit methods
 (`record_audit_summary`, `record_audit_outcome`, `list_audit_summaries`,
-`get_audit_summary`, and `delete_audit_summary`) follow the same rule, as
-described under "Audit Summaries" above.
+`get_audit_summary`, and `delete_audit_summary`) and every saved-conversation
+and conversation-summary method follow the same rule, as described under
+"Audit Summaries" and "Saved Conversations and Conversation Summaries" above.
 
 Busy/locked contention is still converted as described above, and outside the
-audit methods that conversion still logs SQLite's busy exception and attaches
-it, because its message is SQLite's own fixed text. The audit methods
-classify contention themselves: they raise the same busy message, but log
-only their fixed line and attach nothing. Initialization and `schema_version()`
+audit and conversation-record methods that conversion still logs SQLite's busy
+exception and attaches it, because its message is SQLite's own fixed text.
+Those methods classify contention themselves: they raise the same busy
+message, but log only their fixed line and attach nothing. Initialization and `schema_version()`
 never read a stored record's text; they record only their fixed event codes,
 as described under "What initialization logs", and keep SQLite's exception as
 the cause for a caller that needs it.
@@ -1040,4 +1183,8 @@ Only `core/memory.py` should open SQLite connections or execute SQL. Brain
 writes audit summaries, and `tools/audit.py` lists, reads, and deletes them,
 only through `Memory`'s audit methods; `core/audit.py` holds the audit
 vocabulary that the memory layer, Brain, and the audit tool share, and
+executes no SQL. `tools/conversations.py` and
+`tools/conversation_summaries.py` reach their tables only through `Memory`'s
+conversation-record methods, and `core/conversation_records.py` holds the
+vocabulary they, the memory layer, and the conversation module share, and
 executes no SQL.

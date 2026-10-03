@@ -113,6 +113,8 @@ RECORD_TABLES = (
     "memories",
     "audit_summaries",
     "audit_outcomes",
+    "saved_conversations",
+    "conversation_summaries",
 )
 ZERO_ROWS = {table: 0 for table in RECORD_TABLES}
 
@@ -867,7 +869,7 @@ class AuditTargetTests(unittest.TestCase):
 
     def test_every_registered_contract_has_its_target(self) -> None:
         contracts = BUILT_IN_ACTION_CONTRACTS.contracts
-        self.assertEqual(len(contracts), 29)
+        self.assertEqual(len(contracts), 40)
         for contract in contracts:
             with self.subTest(action=contract.identifier):
                 expected = (

@@ -55,7 +55,7 @@ TESTS_DIR = PROJECT_ROOT / "tests"
 # the test instead of agreed with: the stamp the v0.2.0 baseline receives when
 # it is classified, and the current schema every database ends at.
 BASELINE_SCHEMA_VERSION = 2
-EXPECTED_SCHEMA_VERSION = 5
+EXPECTED_SCHEMA_VERSION = 6
 # V1-15's memory consent step, pinned by its own number now that V1-16's
 # note consent step follows it and the current version has moved on.
 MEMORY_CONTEXT_CONSENT_VERSION = 3
@@ -63,11 +63,17 @@ UNVERSIONED = 0
 PRE_MEMORIES_VERSION = 1
 
 # The frozen v0.2.0 fixture's tables. Version 5 adds V1-18's two audit tables
-# beside them, so every database Maria creates or migrates now ends with
-# exactly the current set, while the fixture itself still holds only these.
+# beside them, and version 6 V1-20's two conversation-record tables, so every
+# database Maria creates or migrates now ends with exactly the current set,
+# while the fixture itself still holds only these.
 BASELINE_TABLES = frozenset({"interactions", "notes", "memories"})
 CURRENT_TABLES = BASELINE_TABLES | frozenset(
-    {"audit_summaries", "audit_outcomes"}
+    {
+        "audit_summaries",
+        "audit_outcomes",
+        "saved_conversations",
+        "conversation_summaries",
+    }
 )
 
 # The two constraints the v0.2.0 ``memories`` table is required to carry,
@@ -340,6 +346,7 @@ class BaselineClassificationTests(_TemporaryDatabaseTestCase):
                 "add_memory_context_consent",
                 "add_note_context_consent",
                 "create_audit_summaries",
+                "create_conversation_records",
             ],
         )
 
@@ -918,6 +925,7 @@ class MigrationRunnerTests(_TemporaryDatabaseTestCase):
                 "add_memory_context_consent",
                 "add_note_context_consent",
                 "create_audit_summaries",
+                "create_conversation_records",
             ],
         )
         for identifier, request, response, created_at in BASELINE_INTERACTIONS:
@@ -2252,6 +2260,28 @@ V5_AUDIT_OUTCOMES_TABLE = """
     """
 V5_SCHEMA = V4_SCHEMA + (V5_AUDIT_SUMMARIES_TABLE, V5_AUDIT_OUTCOMES_TABLE)
 
+# The version 6 conversation-record tables, pinned the same way: version 5
+# with V1-20's saved conversations and conversation summaries. Both are new
+# tables, so version 6 is version 5 with these two added and nothing changed.
+V6_SAVED_CONVERSATIONS_TABLE = """
+    CREATE TABLE saved_conversations (
+        id INTEGER PRIMARY KEY AUTOINCREMENT,
+        created_at TEXT NOT NULL,
+        transcript TEXT NOT NULL CHECK (length(transcript) > 0)
+    )
+    """
+V6_CONVERSATION_SUMMARIES_TABLE = """
+    CREATE TABLE conversation_summaries (
+        id INTEGER PRIMARY KEY AUTOINCREMENT,
+        body TEXT NOT NULL CHECK (length(CAST(body AS BLOB)) > 0),
+        created_at TEXT NOT NULL,
+        updated_at TEXT NOT NULL,
+        context_digest TEXT
+            CHECK (context_digest IS NULL OR length(context_digest) = 64)
+    )
+    """
+V6_SCHEMA = V5_SCHEMA + (V6_SAVED_CONVERSATIONS_TABLE, V6_CONVERSATION_SUMMARIES_TABLE)
+
 
 class MemoryContextConsentMigrationTests(_TemporaryDatabaseTestCase):
     """Verify V1-15's consent column arrives through the V1-09 runner.
@@ -2313,7 +2343,7 @@ class MemoryContextConsentMigrationTests(_TemporaryDatabaseTestCase):
         self.memory.initialize()
 
         self.assertEqual(read_schema_version(self.database_path), EXPECTED_SCHEMA_VERSION)
-        self.assertEqual(self.describe(), memory_module._reference_schema(V5_SCHEMA))
+        self.assertEqual(self.describe(), memory_module._reference_schema(V6_SCHEMA))
         self.assertEqual(
             self._raw_memories(),
             [(*row, 0) for row in BASELINE_MEMORIES],
@@ -2363,6 +2393,7 @@ class MemoryContextConsentMigrationTests(_TemporaryDatabaseTestCase):
                 "add_memory_context_consent",
                 "add_note_context_consent",
                 "create_audit_summaries",
+                "create_conversation_records",
             ],
         )
         self.assertEqual(read_schema_version(self.database_path), EXPECTED_SCHEMA_VERSION)
@@ -2438,6 +2469,7 @@ class MemoryContextConsentMigrationTests(_TemporaryDatabaseTestCase):
                 "add_memory_context_consent",
                 "add_note_context_consent",
                 "create_audit_summaries",
+                "create_conversation_records",
             ],
         )
         self.assertEqual(
@@ -2550,7 +2582,7 @@ class NoteContextConsentMigrationTests(_TemporaryDatabaseTestCase):
             memory.initialize()
         return committed
 
-    def test_the_pinned_version_four_schema_is_frozen_and_version_five_is_current(
+    def test_the_pinned_version_four_schema_is_frozen_and_version_six_is_current(
         self,
     ) -> None:
         pinned = memory_module._reference_schema(V4_SCHEMA)
@@ -2561,9 +2593,10 @@ class NoteContextConsentMigrationTests(_TemporaryDatabaseTestCase):
                 memory_module._frozen_schema(self.NOTE_CONTEXT_CONSENT_VERSION)
             ),
         )
-        # V1-18's audit step now follows this one, so the current schema is
-        # the pinned version 5 shape: this one with the two audit tables.
-        current = memory_module._reference_schema(V5_SCHEMA)
+        # V1-18's audit step and V1-20's conversation-record step now follow
+        # this one, so the current schema is the pinned version 6 shape: this
+        # one with the two audit tables and the two conversation-record tables.
+        current = memory_module._reference_schema(V6_SCHEMA)
         self.assertEqual(
             current,
             memory_module._reference_schema(
@@ -2592,7 +2625,7 @@ class NoteContextConsentMigrationTests(_TemporaryDatabaseTestCase):
         note_id = self.memory.create_note("Fresh", "body")
 
         self.assertEqual(read_schema_version(self.database_path), EXPECTED_SCHEMA_VERSION)
-        self.assertEqual(self.describe(), memory_module._reference_schema(V5_SCHEMA))
+        self.assertEqual(self.describe(), memory_module._reference_schema(V6_SCHEMA))
         self.assertIsNone(self._raw_notes()[0][-1])
         self.assertEqual(self._raw_notes()[0][0], note_id)
 
@@ -2607,19 +2640,21 @@ class NoteContextConsentMigrationTests(_TemporaryDatabaseTestCase):
         )
 
         self.assertEqual(read_schema_version(self.database_path), EXPECTED_SCHEMA_VERSION)
-        # The note step still leaves exactly version 4, and the audit step
-        # then carries the database on to the current shape.
+        # The note step still leaves exactly version 4, and the audit and
+        # conversation-record steps then carry the database on to the current
+        # shape.
         self.assertEqual(
             committed[self.NOTE_CONTEXT_CONSENT_VERSION],
             memory_module._reference_schema(V4_SCHEMA),
         )
-        self.assertEqual(self.describe(), memory_module._reference_schema(V5_SCHEMA))
+        self.assertEqual(self.describe(), memory_module._reference_schema(V6_SCHEMA))
         self.assertEqual(
             self._applied(recording_logger),
             [
                 "add_memory_context_consent",
                 "add_note_context_consent",
                 "create_audit_summaries",
+                "create_conversation_records",
             ],
         )
         self.assertEqual(
@@ -2650,6 +2685,7 @@ class NoteContextConsentMigrationTests(_TemporaryDatabaseTestCase):
                     "add_memory_context_consent",
                     "add_note_context_consent",
                     "create_audit_summaries",
+                    "create_conversation_records",
                 ],
             ),
             BASELINE_SCHEMA_VERSION: (
@@ -2658,6 +2694,7 @@ class NoteContextConsentMigrationTests(_TemporaryDatabaseTestCase):
                     "add_memory_context_consent",
                     "add_note_context_consent",
                     "create_audit_summaries",
+                    "create_conversation_records",
                 ],
             ),
             MEMORY_CONTEXT_CONSENT_VERSION: (
@@ -2667,7 +2704,11 @@ class NoteContextConsentMigrationTests(_TemporaryDatabaseTestCase):
                     with_rows=True,
                     with_memories=True,
                 ),
-                ["add_note_context_consent", "create_audit_summaries"],
+                [
+                    "add_note_context_consent",
+                    "create_audit_summaries",
+                    "create_conversation_records",
+                ],
             ),
         }
         for version, (create, expected_steps) in starts.items():
@@ -2683,7 +2724,8 @@ class NoteContextConsentMigrationTests(_TemporaryDatabaseTestCase):
 
                 self.assertEqual(self._applied(recording_logger), expected_steps)
                 # Each start still reaches exactly version 4 before the audit
-                # step carries it on to the current version.
+                # and conversation-record steps carry it on to the current
+                # version.
                 self.assertEqual(
                     committed[self.NOTE_CONTEXT_CONSENT_VERSION],
                     memory_module._reference_schema(V4_SCHEMA),
@@ -2738,7 +2780,11 @@ class NoteContextConsentMigrationTests(_TemporaryDatabaseTestCase):
         self.assertEqual(read_schema_version(self.database_path), EXPECTED_SCHEMA_VERSION)
         self.assertEqual(
             self._applied(recording_logger),
-            ["add_note_context_consent", "create_audit_summaries"],
+            [
+                "add_note_context_consent",
+                "create_audit_summaries",
+                "create_conversation_records",
+            ],
         )
         self.assertEqual(
             self._raw_notes(),

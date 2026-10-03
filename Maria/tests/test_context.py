@@ -92,10 +92,11 @@ UNREADABLE_NOTICE = (
     "Memory context could not be read, so none was supplied and this "
     "session's earlier conversation was cleared."
 )
+# V1-20 names conversation summaries too, since they can be supplied as well.
 CLEARED_NOTICE = (
-    "This session's earlier conversation was cleared because a memory or note "
-    "supplied to it is no longer enabled with the same text, so the copy "
-    "supplied earlier was invalidated."
+    "This session's earlier conversation was cleared because a memory, note, "
+    "or summary supplied to it is no longer enabled with the same text, so the "
+    "copy supplied earlier was invalidated."
 )
 ENABLE_CONFIRMATION = (
     "Confirmation required: memory.enable_context requires explicit "

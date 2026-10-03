@@ -183,18 +183,19 @@ bounded.
 - **Tier A — automatically usable when relevant:** explicit memories marked
   context-enabled, owner preferences, active tasks and reminders, active-project facts.
 - **Tier B — automatically searchable, bounded, with visible provenance:** notes the
-  owner has enabled for context, saved conversation summaries, context-enabled explicit
-  memories beyond Tier A's bounded window, project records. Under Tier A's ascending-id
-  order those additional memories are the newer ones by id, not older ones.
+  owner has enabled for context, conversation summaries the owner has enabled for
+  context, context-enabled explicit memories beyond Tier A's bounded window, project
+  records. Under Tier A's ascending-id order those additional memories are the newer
+  ones by id, not older ones.
 - **Tier C — requires explicit selection or approved workflow scope:** raw interaction
-  history, arbitrary files, logs, credentials, sensitive records, unrelated project
-  data. Every memory or note without context consent is treated as a sensitive record:
-  Maria cannot tell sensitive free text from any other, so consent, not inspection, is
-  the boundary.
+  history, saved conversations, arbitrary files, logs, credentials, sensitive records,
+  unrelated project data. Every memory, note, or conversation summary without context
+  consent is treated as a sensitive record: Maria cannot tell sensitive free text from
+  any other, so consent, not inspection, is the boundary.
 
 Every context item included in reasoning carries deterministic provenance produced by
-Maria — a memory, note, task, reminder, or project id, or a file identity — never
-supplied by the model. Maria discloses uncertainty, and discloses a possible conflict or
+Maria — a memory, note, conversation summary, task, reminder, or project id, or a file
+identity — never supplied by the model. Maria discloses uncertainty, and discloses a possible conflict or
 an out-of-date copy only on deterministic evidence: notes that share a title but have
 different bodies are named together as possible divergent versions, never as a proven
 contradiction; a last-saved date is a fact, not proof that a record is stale; and a
@@ -1433,6 +1434,117 @@ they find gets its own focused `fix/<topic>` branch, never a release branch.
 
 - Branch: `feature/conversation-summary-persistence`
 - Prerequisites: V1-10, V1-14, V1-16
+- Owner-approved amendment (V1-20-R1). The V1-20 read-only entry audit found
+  that this entry left undecided the route from the session's retained
+  exchanges to storage, the raw save's lifecycle and tier, how a summary is
+  drafted and accepted, summary consent, recording, and limits, and the
+  module footprint; that its capture criterion cannot hold for text already
+  present in an exchange; and that Tier B listed summaries without consent.
+  The owner approved the resolution below in writing, with decisions D1 to D4
+  as recommended, before the branch opened, and this entry is amended in the
+  V1-20 pull request itself. The text after this amendment stays recorded
+  exactly as it was written.
+  - Records (schema 6): one appended step, `create_conversation_records`,
+    creates `saved_conversations` and `conversation_summaries`, both empty,
+    and changes nothing earlier. A saved conversation is an immutable Tier C
+    record: one canonical compact JSON transcript of 1 to 8 `[user,
+    assistant]` pairs of non-empty text, at most 8,192 UTF-8 bytes, validated
+    on write and again on read, with no consent, no edit, and no context
+    source. A conversation summary is one text of 1 to 2,048 UTF-8 bytes
+    equal to its own stripped form, with `created_at`, `updated_at`, and a
+    nullable `context_digest`. No foreign key, trigger, index, cascade, or
+    audit vocabulary is added, and ids are positive and never reused. The
+    shared limits, transcript codec, value objects, and fixed messages live
+    in a leaf module, `core/conversation_records.py`, with no SQL, I/O, or
+    logging.
+  - Capture (D4): `save conversation` stores exactly the exchanges the
+    session retains, as they stand, reads no other record, and leaves the
+    conversation unchanged; like any request it discards a pending approval,
+    a pending summary draft included. Its reply is fixed text in which only
+    the new id and the exchange count vary, saying the copy is exact and
+    that later changes to memories or notes do not change it. With nothing
+    retained it answers that there is nothing to save and stores nothing,
+    and its ordinary interaction row is still recorded. Saving twice stores
+    two rows. The capture criterion below is reworded: the save persists the
+    retained exchanges byte for byte and reads no other record, and text
+    already in an exchange is kept verbatim even when it quotes a memory,
+    note, file, or earlier session.
+  - Drafting (D1): `summarize conversation` asks the local model once, and
+    only on that request, for a draft of every retained exchange, with
+    Maria's fixed 336-byte prompt, no stored context, and no proposal
+    instructions, within the configured input budget or refused whole. A
+    denied permission, unavailable reasoning, an empty conversation, and a
+    recheck of every record supplied to the conversation each refuse before
+    any request is made; a revoked, changed, or unreadable record also
+    clears the conversation. The reply's outer whitespace is stripped once,
+    and an empty draft or one over 2,048 UTF-8 bytes is discarded whole.
+    Every outcome is transient, and a draft is never kept as an exchange.
+    This is the one route for model-drafted text into storage, and the model
+    selects no tool, action, or argument name on it.
+  - Acceptance (D2): the draft is shown whole, escaped, in the ordinary
+    confirmation of `conversation_summaries.create`, which becomes
+    mandatory; its binding pins the draft's digest, and the tool stores only
+    text matching it. Confirming makes no provider call, and any other
+    request, a cancel, or the end of the session discards the draft. No
+    audit summary is written: the owner chose and approved the action, and
+    the stored row is its own trace.
+  - Consent (D3): a summary's context consent starts off and changes only
+    through `enable summary context <id>` and `disable summary context <id>`,
+    both confirmation-required. Enabling shows the stored text and is bound
+    to it; editing turns consent off in the same transaction; and text
+    changed outside Maria is never eligible.
+  - Tier B: an enabled summary is a third Tier B source, untitled, matched
+    by the V1-16 literal term rule over its one text and named `summary N`,
+    taken after memories and notes and supplied whole or not at all within
+    the unchanged bounds: 8 Tier B items, 24 combined items, 4,096 bytes, 9
+    rows per source, 2,048 bytes per item, and 64 rechecked records. The
+    2,048-byte cap never guarantees that a summary is selected. A request
+    that selects no summary is byte for byte the V1-19 request for the same
+    inputs, configuration, and flags; one that selects a summary carries a
+    third fixed framing naming conversation summaries. A supplied summary
+    joins the recheck that clears the conversation.
+  - Mechanism: the two texts Maria supplies, the transcript and the draft,
+    are contract-declared session inputs. Brain supplies one only in
+    `process`, generically, for a planner's plan holding exactly
+    DETERMINISTIC as its own origin: never at confirmation, for a
+    model-originated plan, or on the conversational path. A plan that
+    already carries the text, or holds any other step, is refused, and a
+    contract declaring a session input cannot be model-eligible.
+  - Commands and permissions: eleven commands, all `NOT_MODEL_ELIGIBLE`:
+    `save conversation`, `conversations`, `read conversation <id>`,
+    `delete conversation <id>`, `summarize conversation`, `summaries`,
+    `read summary <id>`, `edit summary <id>: <new text>`,
+    `delete summary <id>`, `enable summary context <id>`, and
+    `disable summary context <id>`. The action inventory grows from 29 to
+    40 and the mandatory confirmation set from 13 to 19, with fixed notices
+    for storing a summary and enabling its context; model-eligible actions
+    stay at three, and the denied floor is unchanged. `list summaries` stays
+    a directory listing.
+  - Recording and privacy: save, list, read, edit, delete, and both consent
+    commands are recorded with content-free replies, list and read through
+    a fixed `recorded_message`; an edit keeps its new text in the request
+    half, as a note edit does; summarize is transient throughout. Logs
+    carry ids, counts, and fixed codes only, never a transcript, draft,
+    body, digest, or plan, and every new storage failure is a fixed message
+    with no SQLite detail, contention included.
+  - Footprint: new `core/conversation_records.py`, `tools/conversations.py`,
+    and `tools/conversation_summaries.py`; changed `core/constants.py`,
+    `core/memory.py`, `core/context.py`, `core/conversation.py`,
+    `core/brain.py`, `core/action_contracts.py`, `core/permissions.py`,
+    `core/planner.py` (routing and help only), and `core/tool_manager.py`;
+    and `core/session.py` in its docstring only. `core/reasoning.py`,
+    `core/ollama_adapter.py`, `core/plan_compiler.py`, `core/audit.py`,
+    `main.py`, configuration, dependencies, and the version literals are
+    unchanged.
+  - Compatibility: the deliberate changes are the eleven commands and help
+    lines, schema 6, the two conversation-clearing notices that now name
+    summaries, and Brain's two session inputs. Every existing command's text
+    and recording, the proposal allowlist and instructions, the compiler,
+    and the audit vocabulary are unchanged.
+  - Non-goals added: no automatic or end-of-session summary and no
+    compaction of evicted turns; a saved conversation never re-enters a
+    session; no transcript edits; no model-eligible conversation action; no
+    relevance ranking.
 - Purpose: Give the owner a deliberate way to keep the bounded session conversation
   introduced in V1-14, or an approved summary of it, with the same single-row,
   positive-integer-id lifecycle discipline as every other record type. V1-16 is a

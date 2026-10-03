@@ -1689,10 +1689,13 @@ class TierCExclusionTests(unittest.TestCase):
 
         Rejecting a list of forbidden names would let any unlisted source in,
         so the registered sources are compared with the approved set itself.
+        V1-20 changed it on purpose: conversation summaries the owner enabled
+        for context are a third source, Tier B only and untitled, while a
+        saved conversation is not a source at all.
         """
         self.assertEqual(
             [(source.name, source.value) for source in ContextSource],
-            [("MEMORY", "memory"), ("NOTE", "note")],
+            [("MEMORY", "memory"), ("NOTE", "note"), ("SUMMARY", "summary")],
         )
         self.assertEqual(
             {
@@ -1701,22 +1704,32 @@ class TierCExclusionTests(unittest.TestCase):
                     _memory(1, "a"),
                     _memory(2, "b", ContextTier.B),
                     _note_item(3, "t", "b"),
+                    ContextItem(ContextSource.SUMMARY, 4, "s", None, ContextTier.B),
                 )
             },
             {
                 (ContextSource.MEMORY, ContextTier.A),
                 (ContextSource.MEMORY, ContextTier.B),
                 (ContextSource.NOTE, ContextTier.B),
+                (ContextSource.SUMMARY, ContextTier.B),
             },
         )
         for label, value in (
             ("a text source", "interaction"),
+            ("a saved-conversation stand-in", "saved_conversation"),
             ("an enum-like stand-in", ContextTier.A),
             ("None", None),
         ):
             with self.subTest(case=label):
                 with self.assertRaises(ValueError):
                     ContextItem(value, 1, "text", None, ContextTier.B)
+        for label, item in (
+            ("a Tier A summary", (ContextSource.SUMMARY, 5, "s", None, ContextTier.A)),
+            ("a titled summary", (ContextSource.SUMMARY, 6, "s", "t", ContextTier.B)),
+        ):
+            with self.subTest(case=label):
+                with self.assertRaises(ValueError):
+                    ContextItem(*item)
 
     def test_no_tier_c_sentinel_reaches_any_request(self) -> None:
         provider, harness = _harness(self, _echoing_model)

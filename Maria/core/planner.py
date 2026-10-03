@@ -795,6 +795,157 @@ class Planner:
                 )
             return self._single_step(text, "audit", "delete", {"id": summary_id})
 
+        if lowered == "save conversation":
+            return self._single_step(text, "conversations", "save", {})
+
+        if lowered == "conversations":
+            return self._single_step(text, "conversations", "list", {})
+
+        if lowered == "read conversation":
+            return self._no_action(text, "Use: read conversation <id>")
+
+        if lowered.startswith("read conversation "):
+            operand = text[len("read conversation ") :].strip()
+            conversation_id = _parse_positive_ascii_id(operand)
+            if conversation_id is None:
+                return self._no_action(
+                    text,
+                    "Saved conversation id must be a positive whole number.",
+                )
+            return self._single_step(
+                text,
+                "conversations",
+                "read",
+                {"id": conversation_id},
+            )
+
+        if lowered == "delete conversation":
+            return self._no_action(text, "Use: delete conversation <id>")
+
+        if lowered.startswith("delete conversation "):
+            operand = text[len("delete conversation ") :].strip()
+            conversation_id = _parse_positive_ascii_id(operand)
+            if conversation_id is None:
+                return self._no_action(
+                    text,
+                    "Saved conversation id must be a positive whole number.",
+                )
+            return self._single_step(
+                text,
+                "conversations",
+                "delete",
+                {"id": conversation_id},
+            )
+
+        if lowered == "summarize conversation":
+            return self._single_step(
+                text,
+                "conversation_summaries",
+                "create",
+                {},
+            )
+
+        if lowered == "summaries":
+            return self._single_step(text, "conversation_summaries", "list", {})
+
+        if lowered == "read summary":
+            return self._no_action(text, "Use: read summary <id>")
+
+        if lowered.startswith("read summary "):
+            operand = text[len("read summary ") :].strip()
+            summary_id = _parse_positive_ascii_id(operand)
+            if summary_id is None:
+                return self._no_action(
+                    text,
+                    "Conversation summary id must be a positive whole number.",
+                )
+            return self._single_step(
+                text,
+                "conversation_summaries",
+                "read",
+                {"id": summary_id},
+            )
+
+        if lowered == "edit summary":
+            return self._no_action(text, "Use: edit summary <id>: <new text>")
+
+        if lowered.startswith("edit summary "):
+            parsed_mutation = _parse_id_and_colon_operand(
+                text[len("edit summary ") :].strip()
+            )
+            if parsed_mutation is None or not parsed_mutation[1]:
+                return self._no_action(
+                    text,
+                    "Use: edit summary <id>: <new text>",
+                )
+            id_text, new_text = parsed_mutation
+            summary_id = _parse_positive_ascii_id(id_text)
+            if summary_id is None:
+                return self._no_action(
+                    text,
+                    "Conversation summary id must be a positive whole number.",
+                )
+            return self._single_step(
+                text,
+                "conversation_summaries",
+                "edit",
+                {"id": summary_id, "text": new_text},
+            )
+
+        if lowered == "delete summary":
+            return self._no_action(text, "Use: delete summary <id>")
+
+        if lowered.startswith("delete summary "):
+            operand = text[len("delete summary ") :].strip()
+            summary_id = _parse_positive_ascii_id(operand)
+            if summary_id is None:
+                return self._no_action(
+                    text,
+                    "Conversation summary id must be a positive whole number.",
+                )
+            return self._single_step(
+                text,
+                "conversation_summaries",
+                "delete",
+                {"id": summary_id},
+            )
+
+        if lowered == "enable summary context":
+            return self._no_action(text, "Use: enable summary context <id>")
+
+        if lowered.startswith("enable summary context "):
+            operand = text[len("enable summary context ") :].strip()
+            summary_id = _parse_positive_ascii_id(operand)
+            if summary_id is None:
+                return self._no_action(
+                    text,
+                    "Conversation summary id must be a positive whole number.",
+                )
+            return self._single_step(
+                text,
+                "conversation_summaries",
+                "enable_context",
+                {"id": summary_id},
+            )
+
+        if lowered == "disable summary context":
+            return self._no_action(text, "Use: disable summary context <id>")
+
+        if lowered.startswith("disable summary context "):
+            operand = text[len("disable summary context ") :].strip()
+            summary_id = _parse_positive_ascii_id(operand)
+            if summary_id is None:
+                return self._no_action(
+                    text,
+                    "Conversation summary id must be a positive whole number.",
+                )
+            return self._single_step(
+                text,
+                "conversation_summaries",
+                "disable_context",
+                {"id": summary_id},
+            )
+
         if lowered in {"system", "system info", "status", "sys", "sys info"}:
             return self._single_step(text, "system", "overview", {})
 
@@ -929,6 +1080,17 @@ def _help_text() -> str:
         "- forget memory <id>\n"
         "- enable memory context <id>\n"
         "- disable memory context <id>\n"
+        "- save conversation\n"
+        "- conversations\n"
+        "- read conversation <id>\n"
+        "- delete conversation <id>\n"
+        "- summarize conversation\n"
+        "- summaries\n"
+        "- read summary <id>\n"
+        "- edit summary <id>: <new text>\n"
+        "- delete summary <id>\n"
+        "- enable summary context <id>\n"
+        "- disable summary context <id>\n"
         "- system\n"
         "- time\n"
         "- history\n"
