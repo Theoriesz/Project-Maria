@@ -28,13 +28,14 @@ The planner knows nothing about conversation or memory context. When
 reasoning is enabled, Brain answers exactly that generic fallback with the
 local model's reply instead of showing it. A reply whose first character after
 any spaces, tabs, carriage returns, or line feeds is `{` is treated as a
-proposal of one action, which Brain, never the planner, hands to
-`core/plan_compiler.py`: it either becomes a one-step model-originated plan
-that runs only after the owner approves it, or is refused with a fixed
-message. Any other reply stays a conversational text reply. Nothing from such
-a turn, its request included, is recorded as interaction history, and an
-approved proposal runs only after Maria has committed a content-free audit
-summary for it, the only trace it leaves in Maria's database. Help, every
+proposal, of one action or of two to five actions in a `steps` envelope, which
+Brain, never the planner, hands to `core/plan_compiler.py`: it either becomes
+a model-originated plan of one to five steps that runs only after the owner
+approves it, as a whole, or is refused with a fixed message. Any other reply
+stays a conversational text reply. Nothing from such a turn, its request
+included, is recorded as interaction history, and each approved step runs
+only after Maria has committed a content-free audit summary for it, the only
+trace it leaves in Maria's database. Help, every
 usage response, and every command never reach the model. See
 "Deterministic-First Conversation", "Model-to-Plan Compilation Gate", and
 "Model-Originated Execution and Audit" in `docs/architecture.md`, and "Plan
@@ -556,7 +557,8 @@ summaries are never sent to the model as context.
 A plan contains:
 
 - The original request
-- Zero or more steps
+- Zero to five steps, in order, `PLAN_MAX_STEPS`; a plan is flat, so no step
+  holds another step or a plan
 - An optional response when no action should run
 - A recording policy, `RECORD` by default; the planner never sets any other
 - An origin, `DETERMINISTIC` by default; the planner never sets any other
@@ -566,14 +568,27 @@ Each step names a tool, an action, and its arguments.
 The origin is a `PlanOrigin`. The only other one is `MODEL`, and only
 `core/plan_compiler.py` sets it, on the plan it compiles from one local-model
 proposal after the planner has returned its generic fallback. A `MODEL` plan
-always has exactly one step and the `TRANSIENT` recording policy, and never a
-response for when no action should run; `Plan` refuses to construct one of any
-other shape, and `is_model_plan()` reports whether a value is exactly such a
-plan. The planner never sees a model's reply or a compiled plan, and an
-approved compiled plan runs as compiled, never planned again. Brain requires
-exactly one approval from the owner for every `MODEL` plan, even when its
-action is allowed outright, and refuses one whose action is denied before
-offering it; see "Model-Originated Execution and Audit" in
+always has exact text as its request, one to five steps in an exact tuple, and
+the `TRANSIENT` recording policy, and never a response for when no action
+should run; `Plan` refuses to construct one of any other shape, and
+`is_model_plan()` reports whether a value is exactly such a plan, answering no
+rather than raising for one missing any of its own fields. Every plan,
+whatever its origin, holds at most five steps, counted by reading them rather
+than by the length their container reports: `Plan` refuses more, and wherever
+a deterministic plan is confirmed or run it is read again, as one snapshot,
+by `plan_snapshot()`, while a model-originated one is checked again by
+`is_model_plan()`. Both read every field from the plan itself, as
+`own_origin()` does, so a deleted field is never read as its class default.
+In V1-19, only the model proposal path gains multi-step production. The
+deterministic command planner keeps its existing zero-or-one-step grammar;
+internally constructed deterministic plans retain multi-step support within
+the five-step bound. The planner has no grammar for chaining commands, and
+text such as `calculate 2 + 2 and then show time` stays one command. The
+planner never sees a model's reply or a compiled plan, and an approved
+compiled plan runs as compiled, never planned again. Brain requires exactly
+one approval from the owner for every `MODEL` plan, for the whole plan, even
+when every action is allowed outright, and refuses one with any denied action
+before offering it; see "Model-Originated Execution and Audit" in
 `docs/architecture.md`.
 
 `Plan` and `PlanStep` are immutable, hashable value objects. `PlanStep`

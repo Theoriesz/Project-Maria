@@ -32,10 +32,11 @@ search matches, each bearing the source and record id Maria read, empty by
 default and validated again here rather than trusted. Nothing else personal
 can be carried, and raw interaction history has no field at all.
 
-The instructions invite the model to answer an allowed request with one
-action proposal instead of conversation. They grant nothing: a proposal is
-still only text here, and what Maria does with one is decided elsewhere,
-under her own gates and the owner's approval.
+The instructions invite the model to answer an allowed request with a
+proposal, of one action or of a short ordered plan of actions, instead of
+conversation. They grant nothing: a proposal is still only text here, and
+what Maria does with one is decided elsewhere, under her own gates and the
+owner's approval.
 """
 
 from __future__ import annotations
@@ -183,20 +184,28 @@ REASONING_PROPOSAL_INSTRUCTIONS_MESSAGE = (
 )
 
 
-# Maria's fixed instructions for a request that may be answered with one
-# action proposal. They are her own text and never contain stored text,
-# request text, or anything a model wrote. The proposals they show are exactly
-# the compiler's allowlist, which a test holds them to.
+# Maria's fixed instructions for a request that may be answered with a
+# proposal: one action, or a steps envelope of two to five actions. They are
+# her own text and never contain stored text, request text, or anything a
+# model wrote. The proposals they show are exactly the compiler's allowlist,
+# and the step counts they name exactly the compiler's, which tests hold them
+# to.
 PROPOSAL_INSTRUCTIONS = "\n".join(
     (
         "You are Maria. Reply normally to conversation.",
         "",
-        "When the user's current request asks for an allowed action, you may "
-        "propose exactly one action instead of replying conversationally.",
+        "When the user's current request asks for allowed actions, you may "
+        "propose them instead of replying conversationally.",
         "",
-        'A proposal must be one JSON object with exactly "tool", "action", and '
-        '"arguments". Do not include surrounding prose, a code fence, approval '
-        "fields, or additional fields.",
+        "A proposal for one action must be one JSON object with exactly "
+        '"tool", "action", and "arguments". Do not include surrounding '
+        "prose, a code fence, approval fields, or additional fields.",
+        "",
+        "A proposal for 2 to 5 actions must be one JSON object with exactly "
+        'one field, "steps": an array of 2 to 5 such action objects, run in '
+        "order. Maria stops if a step fails, an audit write fails, or the "
+        "run is interrupted. Every argument must be a complete literal "
+        "value; a step cannot use an earlier step's result.",
         "",
         "Allowed proposals:",
         '{"tool":"calculator","action":"calculate",'

@@ -145,9 +145,10 @@ every one that predates the policy records exactly what it recorded before the
 policy existed. Transient plans have two producers. `conversation.py` makes
 every conversational turn, a reply or a controlled failure, a zero-step
 transient plan, so conversation writes no interaction row. `plan_compiler.py`
-makes every plan it compiles from a model proposal a one-step transient plan,
-which Brain runs on a path of its own that never reaches the four recording
-branches, so neither a proposal's approval prompt nor its result is recorded;
+makes every plan it compiles from a model proposal a transient plan of one to
+five steps, which Brain runs on a path of its own that never reaches the four
+recording branches, so neither a proposal's approval prompt nor its result,
+nor a plan's report, is recorded;
 a refused proposal is answered without any plan and is not recorded either.
 Brain itself never chooses a policy; it only runs the plan it was given.
 
@@ -328,15 +329,22 @@ first discards any approval still pending, then plans exactly once. A
 confirmation-required response becomes the pending approval: the immutable
 `Plan` and the fingerprint captured at that moment, and nothing else. A
 model-originated plan that Brain does not refuse comes back as such a
-response even when `PermissionManager` allows its action outright, because
-every one needs the owner's approval.
+response even when `PermissionManager` allows every one of its actions
+outright, because every one needs the owner's approval, given once for the
+whole plan.
 
 The session renders a model-originated plan for approval itself, from the
 very plan it is about to bind and before binding it, so what the owner sees is
-exactly what they approve. The first line is fixed, `Maria's local reasoning
-model proposed this action. It runs only if you approve it.`, and the next
-three name the declared tool, the action, and every argument as one JSON
-object with its names in sorted order, `{}` when there are none. A whole
+exactly what they approve. A plan of one step is four lines. The first is
+fixed, `Maria's local reasoning model proposed this action. It runs only if
+you approve it.`, and the next three name the declared tool, the action, and
+every argument as one JSON object with its names in sorted order, `{}` when
+there are none. A plan of two to five steps begins instead with `Maria's local
+reasoning model proposed this plan of N actions. They run in order, and only
+if you approve the whole plan. Maria stops if a step fails, an audit write
+fails, or the run is interrupted.`, with N its step count, and then shows
+every step in plan order as a `Step i of N` line followed by the same three
+lines; every step is checked for plain names before any of it is rendered. A whole
 number is written in full, and `approval_quoted` writes each name and text
 value between quotation marks. A visible ASCII character stays as itself,
 except that a quotation mark or a backslash is preceded by a backslash, and a
@@ -353,14 +361,29 @@ once; they
 are not kept with the approval or shown again on confirmation. A plan that
 cannot be rendered raises `ValueError` and never becomes pending.
 
-Confirming first checks that the pending plan is still an exact `Plan` whose
-origin is exactly `DETERMINISTIC`, or still exactly a well-formed
-model-originated plan, and only then compares its current fingerprint with the
-captured one, because the fingerprint reads the origin and every step. A plan
-that fails that check, cannot be fingerprinted at all, or no longer matches
-gets the same fixed refusal, never an error. The approval is consumed before
-any of this, so a failing tool or a raised exception cannot make it
-replayable.
+What becomes pending is one snapshot of the plan, taken by `plan_snapshot`: a
+well-formed model plan is its own, and a deterministic plan that is not an
+exact `Plan` holding its steps in an exact tuple is replaced by a copy
+holding one bounded read of them and every other field exactly as the plan
+holds it. Confirming consumes the approval first, then reads the pending plan
+once more, the same way: it must still be an exact `Plan` holding every one
+of its own fields, with exactly its own origin, whose steps can be read
+within the bound, and exactly a well-formed model-originated plan if it is
+not exactly deterministic. Only that snapshot is fingerprinted and compared
+with the captured fingerprint, and that very snapshot is what Brain runs,
+handed on only if it still holds exactly the field objects that were
+fingerprinted, so code that runs while it is fingerprinted cannot swap what
+runs. No steps container is read again after the comparison: Brain re-checks
+that very snapshot, whose steps are a tuple, so a container that hands out
+different steps on a later read cannot change what runs. The snapshot fixes
+the plan's own fields and its sequence of steps; the step objects are the
+plan's own, and a deterministic plan's are not type-checked, so what code
+inside them hands out is outside that guarantee. A plan that cannot be
+snapshotted, cannot be fingerprinted at all, or no longer matches gets the
+same fixed refusal, never an error, a field deleted from it or one of its
+steps included, and so does an approval missing its plan or its fingerprint.
+The approval is consumed before any of this, so a failing tool or a raised
+exception cannot make it replayable.
 Cancelling discards the pending approval and executes and plans nothing. A
 second confirmation, a confirmation after cancellation, and a confirmation
 after any intervening request all execute nothing and return one fixed,
@@ -428,8 +451,9 @@ can never remove them.
 
 A model-originated plan meets one further requirement, which belongs to Brain
 rather than to `PermissionManager`: it always needs exactly one approval from
-the owner, even when its action is allowed outright, and a denied action is
-refused before any approval is offered. That requirement adds no entry to
+the owner, for the whole plan, even when every one of its actions is allowed
+outright, and a plan with any denied action is refused before any approval is
+offered. That requirement adds no entry to
 either mandatory set and changes no decision `PermissionManager` makes, so the
 three model-eligible actions keep their permission policies; see
 "Model-Originated Execution and Audit".
@@ -565,16 +589,33 @@ The tools also keep their own argument checks as defence in depth, so a
 malformed value is refused rather than converted even on a path that did not
 come through Brain.
 
-Production plans still contain at most one step, because the planner emits at
-most one and the compiler exactly one. These guarantees therefore protect plans
-a later stage may produce; they change no command available today. A
-single-step confirmation keeps its existing wording, while a longer plan is
-rendered as a deterministic, plan-ordered list of each step's tool action and
-resolved permission outcome. That rendering repeats no argument value, so it
-exposes no absolute host path, no fingerprint, and no canonical plan content;
-it is not logged, and a pending confirmation is not written to interaction
+No plan holds more than five steps, `PLAN_MAX_STEPS`, whatever produced it.
+Steps are counted by reading them, at most one past the bound, never by the
+length their container reports. `Plan` refuses more when it is built, and the
+session and Brain read a plan's steps again before they confirm or run it, so
+a plan altered after it was built is refused there, runs nothing, and records
+nothing. Brain takes one snapshot of a deterministic plan, every field read
+from the plan itself and its steps read once, then validates, resolves,
+prepares for approval, dispatches, and records exactly that snapshot. The
+bound limits how many steps are requested, not time: a container's own code
+can still take as long as it likes to hand out any one of them. A plan
+is flat: a step holds only a tool name, an action name, and text or
+whole-number arguments, so no step can hold another step or a plan, and
+nothing a step returns can add one. In V1-19, only the model proposal path
+gains multi-step production. The deterministic command planner keeps its
+existing zero-or-one-step grammar; internally constructed deterministic plans
+retain multi-step support within the five-step bound. For deterministic plans
+the guarantees in this section therefore protect what a later stage may
+produce and change no command available today; "Model-Originated Execution
+and Audit" describes the model path. A single-step confirmation keeps its
+existing wording, while a longer deterministic plan is rendered as a
+deterministic, plan-ordered list of each step's tool action and resolved
+permission outcome. That rendering repeats no argument value, so it exposes
+no absolute host path, no fingerprint, and no canonical plan content; it is
+not logged, and a pending confirmation is not written to interaction
 history. A model-originated plan is never rendered that way: the session shows
-every one of its argument values exactly, as "Session Boundary" describes. A
+every one of its argument values exactly, every step numbered when there are
+several, as "Session Boundary" describes. A
 model-supplied path is always plain text relative to the default named root,
 never a resolved host path, and that approval text is likewise never logged,
 recorded, kept in the conversation, or sent to the model.
@@ -945,8 +986,8 @@ With a reasoning provider present and reasoning enabled, Maria answers the one
 kind of request its planner has no command for, its exact generic fallback,
 with the owner's local model, in the context of the current session's earlier
 conversational turns: with a text reply or, when the model proposes one of the
-three actions it may propose and the proposal passes every check, with a plan
-offered for the owner's approval. Any other proposal is refused. Everything
+three actions it may propose, or a plan of two to five of them, and the
+proposal passes every check, with a plan offered for the owner's approval. Any other proposal is refused. Everything
 else is exactly as it was.
 
 ```text
@@ -1240,15 +1281,27 @@ the reply exactly as it arrived, and Tool Manager's active contract registry.
 A refusal is answered with its fixed message, followed by the turn's context
 notices, and nothing is repaired, retried, or asked of the model again.
 
-`compile_proposal` accepts exactly one JSON object holding `tool`, `action`,
-and an `arguments` object, which is required even when empty, at most 4,096
-UTF-8 bytes measured before parsing. Parsing is strict: a repeated key, `NaN`
-or `Infinity`, nesting deeper than eight containers, surrounding prose, a code
-fence, a second document, and truncated text are all refused, and nothing is
-repaired. The gates run in a fixed order and the first failure decides the
-refusal: the byte cap, strict parsing, the proposal's shape, the allowlist and
+`compile_proposal` accepts exactly one JSON object, at most 4,096 UTF-8 bytes
+however many actions it proposes, measured before parsing. A proposal for one
+action holds exactly `tool`, `action`, and an `arguments` object, which is
+required even when empty. A proposal for two to five actions, run in order,
+holds exactly one field, `steps`, a list of two to five objects each shaped
+exactly as a proposal for one action; one action is never proposed inside an
+envelope, so no plan has two spellings. An object holding exactly `steps`
+whose list is anything else, including fewer than two or more than five
+actions, a nested list or envelope, or an action with a missing or extra
+field, is refused with one fixed message, `The proposed plan did not have
+exactly a steps list of 2 to 5 actions, each with exactly a tool, an action,
+and an arguments object.` Any other object keeps the single-action refusal. A
+reply opening with `[` is never a proposal attempt at all. Parsing is strict:
+a repeated key at any level, `NaN` or `Infinity`, nesting deeper than eight
+containers, surrounding prose, a code fence, a second document, and truncated
+text are all refused, and nothing is repaired. The gates run in a fixed order
+and the first failure decides the refusal: the byte cap, strict parsing, the
+proposal's shape, and then, for each action in order, the allowlist and
 eligibility, the action contract, then a text check and a path check on each
-present argument.
+present argument. Compilation is all or nothing: a refusal of any action
+refuses the whole proposal, and no part of it becomes a plan.
 
 An action is open to the model only when two independent declarations agree:
 the compiler's own closed `MODEL_ACTION_ALLOWLIST` and the contract's
@@ -1271,19 +1324,23 @@ still decide resolved containment and the permanent exclusions when a plan
 runs. It is also a temporary restriction: a model cannot yet name a
 non-default root or an absolute path.
 
-A passing proposal becomes the existing single-step `Plan`. Its step names
-Maria's own declared tool and action and holds the arguments exactly as
-supplied; its `original_request` is the owner's cleaned request, never model
-text; it is recorded as `TRANSIENT`; its origin is `PlanOrigin.MODEL`; and it
-is immutable and fingerprinted like every other plan. A refusal is one
+A passing proposal becomes one `Plan` with one step per proposed action, in
+the proposed order. Each step names Maria's own declared tool and action and
+holds the arguments exactly as supplied, never repaired, reordered, defaulted,
+or substituted: a value such as `$1` or `{{step1}}` is only literal text, and
+no step can use another's result. The plan's `original_request` is the owner's
+cleaned request, never model text; it is recorded as `TRANSIENT`; its origin
+is `PlanOrigin.MODEL`; and it is immutable and fingerprinted like every other
+plan, the fingerprint covering every step and their order. A refusal is one
 `ProposalRejection` member with a fixed message that names no tool, action,
 argument, or value the model supplied, and no parser or contract error
 escapes. The gate logs only whether a proposal compiled and, when it did not,
 the refusal code, never the proposal, a plan, or a fingerprint.
 
-`recheck_model_plan` applies the same gates again to an already compiled plan,
-exactly as it stands: the allowlist with the eligibility the current registry
-declares, the argument contract, then the text and path checks. Nothing is
+`recheck_model_plan` applies the same gates again to every step of an already
+compiled plan, in order, exactly as it stands: the allowlist with the
+eligibility the current registry declares, the argument contract, then the
+text and path checks. Nothing is
 parsed, rebuilt, repaired, or substituted, and no provider is asked anything.
 Brain asks it when it offers a compiled plan for approval and again just
 before the approved plan runs, because an approval authorises a plan rather
@@ -1300,18 +1357,21 @@ MariaBrain.process()                     provider, enabled, exact fallback
 -> conversation.converse(proposals=True) one provider call
 -> reply opens with "{"                  after JSON whitespace only
 -> plan_compiler.compile_proposal()      Tool Manager's active registry
--> one-step TRANSIENT MODEL plan         or a fixed refusal, never retried
--> recheck_model_plan()                  the compiler's gates, unchanged plan
--> PermissionManager                     denied: refused before approval
--> MariaSession                          renders the plan, binds the approval
+-> TRANSIENT MODEL plan of 1 to 5 steps  or a fixed refusal, never retried
+-> recheck_model_plan()                  every step, unchanged plan
+-> PermissionManager                     every step; any denied: refused whole
+-> MariaSession                          renders every step, binds the approval
 -> owner approves: MariaSession.confirm()
 -> MariaBrain.execute_confirmed_plan()   no planner, context, or provider
--> recheck_model_plan()                  again, against the current registry
--> PermissionManager                     again; denied: nothing runs
--> Memory.record_audit_summary()         committed, or nothing is dispatched
--> ToolManager.execute_tool()            exactly once, approved arguments
--> Memory.record_audit_outcome()         succeeded or failed
--> the result, then "Recorded as audit summary N."
+-> recheck_model_plan()                  again, every step, current registry
+-> PermissionManager                     again, every step; denied: none runs
+-> for each step, in order:
+   -> Memory.record_audit_summary()      committed, or this step does not run
+   -> ToolManager.execute_tool()         at most once, approved arguments
+   -> Memory.record_audit_outcome()      succeeded or failed
+   -> the next step only after success with its outcome recorded
+-> one step: the result, then "Recorded as audit summary N."
+-> several steps: a numbered report of every step
 ```
 
 **Origin.** `Plan` carries its origin as a `PlanOrigin`: `DETERMINISTIC`, the
@@ -1321,17 +1381,29 @@ part of plan equality, hashing, and the fingerprint, which it joins only when
 it is not the default: every deterministic plan keeps exactly the fingerprint
 it had before, while a model-originated plan never fingerprints like an
 otherwise identical deterministic one. A `MODEL` plan can only be transient,
-with exactly one step and no canned response; any other shape is refused when
-the plan is constructed, and every boundary that acts on one asks again
-whether it is still exactly that shape.
+with exact text as its request, one to five steps in an exact tuple, each an
+exact `PlanStep` named by exact text with its immutable arguments, and no
+canned response; any other shape is refused when the plan is constructed, and
+every boundary that acts on one asks again whether it is still exactly that
+shape. A plan missing any of its own fields, or holding a step missing one,
+is not, and the question is answered no rather than raising; the boundaries
+read a plan's fields from the plan itself, so a deleted field is never read
+as its class default. V1-19 widened V1-18's one step to one to five.
 
 **Approval.** Brain offers every model-originated plan that passes its checks
-for exactly one approval from the owner, even when `PermissionManager` allows
-its action outright, and refuses a denied action before any approval is
-offered or any audit summary exists. That requirement is Brain's, keyed to the
-plan's origin, and adds nothing to `PermissionManager`. Brain and the session
-treat every origin but exactly `DETERMINISTIC` this way, so a plan whose
-origin was altered can only be refused, never run as a deterministic plan.
+for exactly one approval from the owner, for the whole plan, even when
+`PermissionManager` allows every one of its actions outright, and refuses a
+plan with any denied action, giving the first such step's reason with the
+turn's notices once, before any approval is offered or any audit summary
+exists. That requirement is Brain's, keyed to the
+plan's origin, and adds nothing to `PermissionManager`. A plan with no
+origin of its own, one whose origin was deleted included, is refused by Brain
+before either path is chosen and by the session at confirmation, and every
+other plan whose own origin is not exactly `DETERMINISTIC` is treated this
+way, so neither can ever run as a deterministic plan. An origin reassigned to
+`DETERMINISTIC` is an exact member, so the final object alone cannot show
+the change; the fingerprint captured when approval was offered detects a
+change made after that, and the session refuses the confirmation.
 The plan offered is
 the very plan the compiler built: Brain never passes it through
 `ToolManager.prepare_confirmation()`, which refuses a model-originated plan, so
@@ -1341,15 +1413,17 @@ request, ending the session, or a changed plan keeps it from running.
 
 **Confirmation.** On approval the session hands that same plan to
 `MariaBrain.execute_confirmed_plan()`, after refusing one that is no longer
-exactly a well-formed model-originated plan. Brain checks it again, its shape
-and origin, `recheck_model_plan` against the registry Tool Manager holds now,
-and its current permission, without asking any provider, running the
-planner, retrieving context, reparsing the proposal, or rebuilding the plan. A
-plan that fails any check is refused and nothing runs, and dispatch itself
+exactly a well-formed model-originated plan. Brain checks it again, its shape,
+origin, and step count, `recheck_model_plan` for every step against the
+registry Tool Manager holds now, and every step's current permission, all
+before any audit write, without asking any provider, running the planner,
+retrieving context, reparsing the proposal, or rebuilding the plan. A plan
+that fails any check is refused whole and nothing runs, and dispatch itself
 refuses a plan that was not approved.
 
-**The audit gate.** Before the tool runs, Brain has the memory layer insert
-and commit exactly one audit summary: the contract's canonical identifier, the
+**The audit gate.** Before a step's tool runs, Brain has the memory layer
+insert and commit exactly one audit summary for that step: the contract's
+canonical identifier, the
 decision `owner_approved`, and the target class the contract implies,
 `named_filesystem_root` for an action that declares a path argument, whether
 or not a path was supplied, and `none` otherwise. The memory layer adds
@@ -1367,13 +1441,52 @@ outcome could not be recorded, by a notice that the summary exists but shows
 its outcome as unknown. Nothing is retried, the tool is never rerun
 automatically, and nothing about the plan is recorded as interaction history.
 
+**Plans of several steps.** A plan of two to five steps runs each step in
+order through that same gate: its own summary is committed immediately before
+that step is dispatched, the step is dispatched at most once, and its outcome
+is appended immediately after. The next step is reached only when this one
+succeeded by its tool's own success flag and its outcome was recorded, so the
+plan stops at the first step whose summary cannot be recorded or whose id is
+not valid, which then does not run, at the first step whose tool fails, and
+after the first step whose outcome cannot be recorded. There is no rollback,
+compensation, retry, or resumption. The approval is spent whatever happens.
+The owner is shown one report, a block per step in plan order, each opening
+`Step i of N, tool.action:` and saying `completed.`, `failed.`, `not run.`,
+`not run, because its audit summary could not be recorded.`, or
+`interrupted, so its outcome is unknown.`, followed, for a step that reached
+them, by its tool's own message and its audit notice. A plan that stopped,
+for any reason, ends with one sentence such as `Maria stopped at step 2 and
+did not run step 3. Nothing that ran was undone.`, naming why when an audit
+write or an interruption stopped it, even when no step was left unrun; it says
+`after` for a step that completed and `at` otherwise, and the last clause
+appears only when some dispatch was entered. No label or closing sentence
+repeats an argument value, and nothing in the report claims a failed or
+interrupted step had no effect. Only a plan in which every step completed with
+its outcome recorded has no closing sentence.
+
+`KeyboardInterrupt`, and nothing broader, is handled during such a run, only so
+the report can say what is known. It stops the plan and is reported against
+the step it reached: a step not yet dispatched is `not run.`; one whose tool
+was entered without returning is `interrupted, so its outcome is unknown.`;
+one whose tool had returned keeps its known result. An interrupted audit write
+may already have committed, so the report says that Maria could not confirm
+whether the summary or the outcome was recorded, never that it is absent or
+unknown. No outcome is ever written merely because a run was interrupted, and
+nothing is retried or resumed. Every other exception propagates exactly as
+before, a plan of one step lets an interruption propagate exactly as V1-18
+did, and an abrupt end of the process can leave no report at all.
+
 **What a summary means.** A summary records that an approved execution attempt
 was authorised for dispatch; by itself it does not prove the tool ran. A
 summary without an outcome shows `Outcome not recorded; execution is unknown.`,
-because Maria may have stopped after committing it, during the tool's run, or
-before the outcome could be written. An outcome is inserted only while its
-summary still exists, and at most once, and because ids are never reused, no
-outcome can attach to a deleted summary or to a later one.
+because Maria may have stopped after committing it, before or during the
+tool's run, or before the outcome could be written. An outcome is inserted
+only while its summary still exists, and at most once, and because ids are
+never reused, no outcome can attach to a deleted summary or to a later one. A
+plan of several steps has one summary for each step Maria reached for
+dispatch, and none for a step after it stopped. No stored value links the
+summaries of one plan, so the audit rows alone cannot say which summaries
+belonged to one plan or how many steps it held.
 
 **Audit commands.** `audit` lists the newest 20 summaries by id, reading one
 more to say when more exist; `read audit <id>` shows one summary as a labelled
@@ -1401,9 +1514,11 @@ outside the vocabulary fails the whole read with a fixed message that repeats
 nothing. When the memory layer fails to write or read a summary, it raises a
 fixed error with no cause or context and logs at most one fixed line, never
 SQLite's text, a stored value, or a traceback. On this path Brain logs only
-fixed lines, the declared tool and action, and summary ids, so the operational
-log may still show that a model-proposed action ran after its summary is
-deleted, which the deletion's confirmation notice says.
+fixed lines, the declared tool and action, and summary ids, and, when a plan of
+several steps stops, the step number, the step count, and a fixed stop code,
+never a report, so the operational log may still show that a model-proposed
+action ran after its summary is deleted, which the deletion's confirmation
+notice says.
 
 ## Boundaries
 

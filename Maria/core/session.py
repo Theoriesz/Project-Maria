@@ -16,11 +16,19 @@ requests, so a new session always starts with no conversation and can never
 observe another's.
 
 A plan the local model proposed is rendered here, by the session that binds
-its approval: the declared tool and action and every argument exactly, quoted
-by ``approval_quoted``, from the very plan whose fingerprint the approval is
-then bound to, and before that binding exists. Brain supplies only the
-turn's context notices, which are shown once below the rendering and are
-never kept with the approval or shown again when it is confirmed.
+its approval: for every step, in order, the declared tool and action and
+every argument exactly, quoted by ``approval_quoted``, from the very plan
+whose fingerprint the approval is then bound to, and before that binding
+exists. A plan of several steps is approved once, as a whole. Brain supplies
+only the turn's context notices, which are shown once below the rendering
+and are never kept with the approval or shown again when it is confirmed.
+
+What becomes pending is one bounded snapshot of the plan, and confirming
+reads the pending plan once more, as a snapshot, compares that snapshot's
+fingerprint with the approval, and hands that very snapshot to Brain only if
+it still holds exactly the field objects that were fingerprinted. No steps
+container is read again after the comparison: Brain re-checks the very
+snapshot, whose steps are a tuple.
 """
 
 from __future__ import annotations
@@ -33,7 +41,15 @@ from core.brain import BrainResponse, MariaBrain
 from core.context import SUPPLIED_CONTEXT_MAX_RECORDS, ContextFingerprint
 from core.conversation import bounded_conversation
 from core.logger import get_logger
-from core.planner import Plan, PlanOrigin, is_model_plan
+from core.planner import (
+    PLAN_STEP_LIMIT_MESSAGE,
+    Plan,
+    PlanOrigin,
+    PlanStep,
+    is_model_plan,
+    own_origin,
+    plan_snapshot,
+)
 from core.reasoning import ReasoningExchange
 
 
@@ -41,7 +57,8 @@ CONFIRMATION_REFUSED_MESSAGE = (
     "No pending action matches that confirmation. Please make the request again."
 )
 
-# The first line of every model-originated plan shown for approval.
+# The first line of every model-originated plan of one step shown for
+# approval.
 MODEL_APPROVAL_HEADER = (
     "Maria's local reasoning model proposed this action. It runs only if you "
     "approve it."
@@ -129,6 +146,12 @@ class MariaSession:
         ``render_model_approval``, from the very plan about to be bound and
         before it is bound, with Brain's notices below the rendering. A plan
         that cannot be rendered raises ``ValueError`` and is never pending.
+        What becomes pending is one bounded snapshot of the prepared plan, as
+        ``plan_snapshot`` takes it: a well-formed model plan is its own, and
+        a deterministic plan is snapshotted here unless it already is one, so
+        what is rendered and fingerprinted is exactly what confirmation will
+        compare and run. A deterministic plan that cannot be snapshotted
+        raises ``ValueError`` and is never pending either.
         """
         self._pending = None
         if self._supplied_context:
@@ -161,37 +184,51 @@ class MariaSession:
                 "A confirmation-required response must carry the plan it describes."
             )
 
-        if response.plan.origin is not PlanOrigin.DETERMINISTIC:
+        plan = response.plan
+        if own_origin(plan) is not PlanOrigin.DETERMINISTIC:
             # Rendered from the very plan the approval is about to bind, and
             # before it binds, so what the owner is shown is exactly what
             # they approve. A plan that cannot be rendered is never pending,
-            # and any origin but exactly DETERMINISTIC must render as a
-            # well-formed model plan or fail here.
+            # and any plan but a whole one holding exactly DETERMINISTIC must
+            # render as a well-formed model plan, its own snapshot, or fail
+            # here.
             response = replace(
                 response,
-                text=_with_model_approval(response.plan, response.text),
+                text=_with_model_approval(plan, response.text),
             )
+        else:
+            snapshot = plan_snapshot(plan)
+            if snapshot is None:
+                raise ValueError(PLAN_STEP_LIMIT_MESSAGE)
+            if snapshot is not plan:
+                plan = snapshot
+                response = replace(response, plan=snapshot)
 
-        self._pending = PendingApproval(response.plan, response.plan.fingerprint)
+        self._pending = PendingApproval(plan, plan.fingerprint)
         return response
 
     def confirm(self) -> BrainResponse:
         """Execute the pending plan exactly as it was presented for approval.
 
         The approval is consumed before anything else, so neither a failing
-        tool nor a raised exception can leave it replayable. When nothing is
-        pending, or ``_binds_its_plan`` finds the pending plan is no longer
-        exactly the one approved, the confirmation is refused with a fixed
+        tool nor a raised exception can leave it replayable. The pending plan
+        is then read once, as one bounded snapshot, by ``_approved_snapshot``,
+        which compares that snapshot's fingerprint with the one captured when
+        the plan was offered; that very snapshot is what Brain receives and
+        re-checks, so no steps container is read again after the comparison.
+        When nothing is pending, or no snapshot of the pending plan still
+        matches the approval, the confirmation is refused with a fixed
         content-free message and runs nothing.
         """
         pending = self._pending
         self._pending = None
 
-        if pending is None or not _binds_its_plan(pending):
+        approved = None if pending is None else _approved_snapshot(pending)
+        if approved is None:
             self.logger.warning("Refused a confirmation that binds no pending plan.")
             return BrainResponse(CONFIRMATION_REFUSED_MESSAGE)
 
-        return self.brain.execute_confirmed_plan(pending.plan)
+        return self.brain.execute_confirmed_plan(approved)
 
     def cancel(self) -> bool:
         """Discard the pending plan, planning and executing nothing.
@@ -220,54 +257,104 @@ class MariaSession:
         self.logger.info("Session ended.")
 
 
-def _binds_its_plan(pending: PendingApproval) -> bool:
-    """Return whether a pending approval still binds exactly its plan.
+def _approved_snapshot(pending: PendingApproval) -> Plan | None:
+    """Return the snapshot of a pending plan its approval still binds, or None.
 
-    The plan must still be an exact ``Plan`` whose origin is exactly
-    DETERMINISTIC, or still exactly a well-formed model-originated plan, and
-    only then is it fingerprinted. The fingerprint reads the origin and every
-    step, so checking them first means a plan altered after it became
-    pending is refused rather than failing inside the fingerprint. A plan
-    that still cannot be fingerprinted is refused as well, with its failure
-    neither raised, logged, nor shown, and so is one whose fingerprint
-    differs from the value captured when it became pending.
+    The pending plan must still be an exact ``Plan``, and ``plan_snapshot``
+    must take it: whole, holding exactly its own origin, within the step
+    bound, and exactly a well-formed model plan if it is not exactly
+    deterministic. Only that snapshot is then fingerprinted, so the
+    fingerprint compared and the steps Brain runs come from the same single
+    read. A deterministic plan's request and steps are not type-checked, so
+    fingerprinting can run code they carry; the snapshot is handed on only
+    if it still holds exactly the field objects that were fingerprinted, so
+    nothing that code does can swap what Brain receives. Checking first
+    means a plan altered after it became pending is refused rather than
+    failing inside the fingerprint, and an approval missing its plan or its
+    fingerprint is refused too. A snapshot that still cannot be
+    fingerprinted is refused as well, with its failure neither raised,
+    logged, nor shown, and so is one whose fingerprint differs from the
+    value captured when the plan became pending.
     """
-    plan = pending.plan
-    if not (
-        (type(plan) is Plan and plan.origin is PlanOrigin.DETERMINISTIC)
-        or is_model_plan(plan)
-    ):
-        return False
     try:
-        fingerprint = plan.fingerprint
+        plan = pending.plan
+        approved = pending.fingerprint
+    except AttributeError:
+        return None
+    if type(plan) is not Plan:
+        return None
+    snapshot = plan_snapshot(plan)
+    if snapshot is None:
+        return None
+    fingerprinted = dict(vars(snapshot))
+    try:
+        fingerprint = snapshot.fingerprint
     except Exception:  # noqa: BLE001 - an altered plan is refused, not raised.
-        return False
-    return fingerprint == pending.fingerprint
+        return None
+    if fingerprint != approved or not _still_holds(snapshot, fingerprinted):
+        return None
+    return snapshot
+
+
+def _still_holds(plan: Plan, fields: dict[str, object]) -> bool:
+    """Return whether a plan still holds exactly these field objects."""
+    held = vars(plan)
+    return (
+        type(held) is dict
+        and held.keys() == fields.keys()
+        and all(held[name] is value for name, value in fields.items())
+    )
+
+
+def model_plan_approval_header(count: int) -> str:
+    """Return the first line of a model-originated plan of several steps."""
+    return (
+        f"Maria's local reasoning model proposed this plan of {count} "
+        "actions. They run in order, and only if you approve the whole plan. "
+        "Maria stops if a step fails, an audit write fails, or the run is "
+        "interrupted."
+    )
 
 
 def render_model_approval(plan: Plan) -> str:
     """Render a model-originated plan exactly, for the owner's approval.
 
-    The text names the step's declared tool and action, then every argument
-    as one JSON object with its names in sorted order: ``{}`` when there are
-    none, and otherwise each name and each text value quoted by
-    ``approval_quoted`` and each whole number written out in full. Nothing
-    is truncated, omitted, or normalised, and the plan itself is not
-    changed. Anything but a well-formed model-originated plan named by plain
-    identifiers raises ``ValueError`` with a fixed message.
+    The text names each step's declared tool and action, then every
+    argument as one JSON object with its names in sorted order: ``{}`` when
+    there are none, and otherwise each name and each text value quoted by
+    ``approval_quoted`` and each whole number written out in full. A plan of
+    one step is those three lines below ``MODEL_APPROVAL_HEADER``; a plan of
+    several has its own header and numbers every step, in plan order.
+    Nothing is truncated, omitted, or normalised, and the plan itself is not
+    changed. Anything but a well-formed model-originated plan whose every
+    step is named by plain identifiers raises ``ValueError`` with a fixed
+    message, before any of it is rendered.
     """
     if not is_model_plan(plan):
         raise ValueError(MODEL_APPROVAL_MESSAGE)
-    step = plan.steps[0]
-    if not (_is_plain_name(step.tool_name) and _is_plain_name(step.action)):
+    steps = plan.steps
+    if not all(
+        _is_plain_name(step.tool_name) and _is_plain_name(step.action)
+        for step in steps
+    ):
         raise ValueError(MODEL_APPROVAL_MESSAGE)
-    return "\n".join(
-        (
-            MODEL_APPROVAL_HEADER,
-            f"Tool: {step.tool_name}",
-            f"Action: {step.action}",
-            f"Arguments: {approval_arguments(step.arguments)}",
+    if len(steps) == 1:
+        return "\n".join(
+            (MODEL_APPROVAL_HEADER, *_approval_step_lines(steps[0]))
         )
+    lines = [model_plan_approval_header(len(steps))]
+    for position, step in enumerate(steps, start=1):
+        lines.append(f"Step {position} of {len(steps)}")
+        lines.extend(_approval_step_lines(step))
+    return "\n".join(lines)
+
+
+def _approval_step_lines(step: PlanStep) -> tuple[str, str, str]:
+    """Return one step's tool, action, and exact arguments, one per line."""
+    return (
+        f"Tool: {step.tool_name}",
+        f"Action: {step.action}",
+        f"Arguments: {approval_arguments(step.arguments)}",
     )
 
 

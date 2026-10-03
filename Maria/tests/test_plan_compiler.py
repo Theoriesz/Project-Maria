@@ -138,6 +138,7 @@ EXPECTED_REJECTION_CODES = frozenset(
         "oversized",
         "malformed_output",
         "malformed_proposal",
+        "malformed_plan",
         "unknown_tool",
         "unknown_action",
         "not_model_eligible",
@@ -2043,7 +2044,13 @@ class CallerContractTests(unittest.TestCase):
             "recorded": altered("recording", RecordingPolicy.RECORD),
             "canned response": altered("response_if_no_action", "Done."),
             "step list": altered("steps", list(compiled.steps)),
-            "two steps": altered("steps", compiled.steps * 2),
+            # Two to five steps are a model plan since V1-19; six are not,
+            # and neither is a second step that is not a step at all.
+            "six steps": altered("steps", compiled.steps * 6),
+            "a second step that is not one": altered(
+                "steps",
+                (compiled.steps[0], "system.current_time"),
+            ),
             "no steps": altered("steps", ()),
             "origin text": altered("origin", "model"),
             "recording text": altered("recording", "transient"),

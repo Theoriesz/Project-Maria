@@ -11,6 +11,7 @@ from typing import Any
 
 from core.planner import (
     MODEL_PLAN_SHAPE_MESSAGE,
+    PLAN_STEP_LIMIT_MESSAGE,
     Plan,
     PlanArguments,
     Planner,
@@ -612,7 +613,13 @@ class PlanOriginTests(unittest.TestCase):
         shapes: dict[str, dict[str, Any]] = {
             "recorded": {"steps": (self.step,), "recording": RecordingPolicy.RECORD},
             "no step": {"steps": ()},
-            "two steps": {"steps": (self.step, other)},
+            # V1-19 admits two steps; every step is still held to the shape.
+            "two steps, the second a step subclass": {
+                "steps": (
+                    other,
+                    _PlanStepSubclass("calculator", "calculate", {"expression": "1"}),
+                ),
+            },
             "a canned response": {
                 "steps": (self.step,),
                 "response_if_no_action": "Supported commands",
@@ -653,8 +660,8 @@ class PlanOriginTests(unittest.TestCase):
 
         self.assertEqual(
             MODEL_PLAN_SHAPE_MESSAGE,
-            "A model-originated plan must be transient, with exactly one step "
-            "and no canned response.",
+            "A model-originated plan must be transient, with 1 to 5 steps and "
+            "no canned response.",
         )
         for shape, fields in shapes.items():
             arguments = {"recording": RecordingPolicy.TRANSIENT, **fields}
@@ -669,6 +676,16 @@ class PlanOriginTests(unittest.TestCase):
                     Plan("calculate 2 + 2", **arguments).origin,
                     PlanOrigin.DETERMINISTIC,
                 )
+
+        # Six steps are refused with either origin, each with its own message.
+        six = {"steps": (self.step,) * 6, "recording": RecordingPolicy.TRANSIENT}
+        with self.assertRaises(ValueError) as raised:
+            Plan("calculate 2 + 2", origin=PlanOrigin.MODEL, **six)
+        self.assertEqual(str(raised.exception), MODEL_PLAN_SHAPE_MESSAGE)
+        with self.assertRaises(ValueError) as raised:
+            Plan("calculate 2 + 2", **six)
+        self.assertEqual(str(raised.exception), PLAN_STEP_LIMIT_MESSAGE)
+        self.assertEqual(PLAN_STEP_LIMIT_MESSAGE, "A plan may hold at most 5 steps.")
 
     def test_a_plan_subclass_can_never_carry_the_model_origin(self) -> None:
         with self.assertRaises(ValueError) as raised:
@@ -691,7 +708,7 @@ class PlanOriginTests(unittest.TestCase):
             (plan, {"origin": PlanOrigin.MODEL}),
             (model, {"recording": RecordingPolicy.RECORD}),
             (model, {"steps": ()}),
-            (model, {"steps": (self.step, self.step)}),
+            (model, {"steps": (self.step,) * 6}),
             (model, {"response_if_no_action": "reply"}),
         )
         for source, changes in refused:
@@ -700,6 +717,11 @@ class PlanOriginTests(unittest.TestCase):
                     dataclasses.replace(source, **changes)
 
                 self.assertEqual(str(raised.exception), MODEL_PLAN_SHAPE_MESSAGE)
+
+        # Since V1-19 two steps rebuild into a model plan bound to both.
+        widened = dataclasses.replace(model, steps=(self.step, self.step))
+        self.assertTrue(is_model_plan(widened))
+        self.assertNotEqual(widened.fingerprint, model.fingerprint)
 
         rebuilt = dataclasses.replace(
             plan,
@@ -747,7 +769,8 @@ class PlanOriginTests(unittest.TestCase):
             ("recording", "transient"),
             ("response_if_no_action", ""),
             ("steps", ()),
-            ("steps", (self.step, self.step)),
+            ("steps", (self.step,) * 6),
+            ("steps", (self.step, "calculator.calculate")),
             ("steps", [self.step]),
         )
 

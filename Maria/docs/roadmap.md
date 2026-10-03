@@ -1318,6 +1318,90 @@ they find gets its own focused `fix/<topic>` branch, never a release branch.
 
 - Branch: `feature/foreground-multi-step-plans`
 - Prerequisites: V1-18
+- Owner-approved amendment (V1-19-R1). The V1-19 read-only entry audit found
+  that every model boundary, the owner-approved proposal instructions, and the
+  audit gate assumed one step, that this entry left the step bound, plan
+  depth, proposal format, and audit design undecided, and that "approved once"
+  could be read against the permission-driven approval of deterministic plans.
+  The owner approved the resolution below in writing before the branch opened,
+  and this entry is amended in the V1-19 pull request itself. It supersedes,
+  from this stage on, V1-18-R1's rule that a `MODEL` plan has exactly one
+  step; V1-18-R1 stays recorded above exactly as it was approved.
+  - Scope: In V1-19, only the model proposal path gains multi-step production.
+    The deterministic command planner keeps its existing zero-or-one-step
+    grammar; internally constructed deterministic plans retain multi-step
+    support within the five-step bound. No command-chaining syntax is added,
+    and a conjunction stays ordinary text inside one command.
+  - Bound and depth: every plan of any origin holds at most five steps,
+    `PLAN_MAX_STEPS`, refused when it is built and counted again wherever a
+    plan is confirmed or run, so a plan altered after it was built cannot run.
+    A deterministic plan keeps zero to five steps and every freedom its steps
+    had; a `MODEL` plan holds one to five in an exact tuple, is transient, and
+    has no canned response. A plan is flat: no step holds a step or a plan,
+    nothing a step returns adds one, and there are no loops, branches,
+    conditionals, or references to another step's output.
+  - Proposal format: the single-action object is unchanged, and two to five
+    actions are one object of exactly `steps`, a list of single-action objects
+    run in order. The 4,096-byte cap covers the whole reply, the nesting cap
+    stays eight, strict parsing is unchanged, and so is classification: only a
+    reply opening with `{` is a proposal attempt, and one opening with `[`
+    stays conversation. Compilation is all or nothing, every action passing
+    every existing gate in order before permission is consulted, the first
+    failure deciding one fixed refusal, and a malformed envelope has its own
+    fixed refusal. Arguments are literal: `$1` or `{{step1}}` is text.
+  - Deterministic path: deterministic approval, rendering, execution
+    reporting, and recording are unchanged, except for the five-step bound.
+  - Approval: a `MODEL` plan of any length needs exactly one owner approval,
+    for the whole plan, rendered in full from the very plan the approval
+    binds, every step numbered with its exact arguments. At the offer and
+    again at confirmation every step is rechecked and its permission resolved
+    before any audit write or tool, and any denied step refuses the whole
+    plan with the first such step's reason. After approval there is no
+    provider call, planning, context retrieval, parsing, confirmation
+    preparation, substitution, retry, rollback, or background work.
+  - Audit: each step reached for dispatch gets one summary, committed
+    immediately before that step, then its outcome. The plan continues only
+    after a successful result whose outcome was recorded, and stops when a
+    summary cannot be recorded or its id is not valid, when the tool fails,
+    when the outcome cannot be recorded, or on a handled `KeyboardInterrupt`;
+    the approval stays spent. No schema, grouping field, `not_run` outcome,
+    migration, or audit vocabulary is added: a step never reached gets no
+    summary, a reached attempt may keep a summary without an outcome, and the
+    audit rows cannot reconstruct which summaries belonged to one plan.
+  - Report: a plan of several steps answers with one block per step, opening
+    `Step i of N, tool.action:` and its status, then the tool's own message
+    and the step's audit notice, and, when it stopped for any reason, one
+    closing sentence naming where and why it stopped and which steps did not
+    run. No
+    label or closing sentence repeats an argument value, and nothing claims a
+    failed or interrupted step had no effect. A handled interruption reports
+    a step not yet dispatched as not run, a step interrupted inside its tool
+    as unknown, a step whose tool returned with that known result, and an
+    interrupted audit write as unconfirmed; nothing is retried, resumed, or
+    recorded as failed because of it. Only `KeyboardInterrupt` is handled, a
+    plan of one step lets it propagate as before, and an abrupt end of the
+    process can leave no report.
+  - Privacy and transience: proposals, refusals, approval displays, step
+    results, and partial reports of a `MODEL` plan stay transient: no
+    interaction row and no retained exchange, and nothing they contain is
+    logged; Brain's new stop line holds only step numbers and a fixed code.
+    V1-18's retention and clearing of supplied-context fingerprints is
+    unchanged.
+  - Instructions: the proposal instructions are the owner-approved revised
+    text, 1,327 UTF-8 bytes, 312 more than V1-18's, and no budget grew: under
+    the 8,192-byte ceiling a request with no context or earlier conversation
+    may carry at most 6,865 prompt bytes in proposal mode.
+  - Compatibility: valid single-step proposals, plans, fingerprints, approval
+    renderings, results, and audit rows are unchanged, and so is deterministic
+    behavior apart from the bound. The deliberate changes are the instruction
+    text, the widened `MODEL` shape and its message, the malformed-envelope
+    refusal, and the universal step bound.
+  - Footprint: the approved scope is wider than "Architecture affected"
+    names. It is `core/planner.py`, `core/plan_compiler.py`, `core/brain.py`,
+    `core/session.py`, and `core/reasoning.py`, with their tests and the
+    documentation. The memory layer, schema, migrations, audit vocabulary,
+    tools, Tool Manager, permissions, action contracts, conversation,
+    adapters, `main.py`, configuration, and dependencies are unchanged.
 - Purpose: Let a plan contain more than one step, now that whole-plan permission
   resolution, immutable fingerprinting, and binding approval are all in place and
   proven. Today the planner only ever emits zero or one step.

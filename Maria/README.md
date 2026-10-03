@@ -195,8 +195,8 @@ With the shipped configuration Maria uses no language model, and every command
 works exactly as it always has. Reasoning is off until the owner enables it in
 a private local override. Maria then answers input that matches no command
 with the owner's local Ollama model, which may reply conversationally or
-propose one of three allowed actions; a proposed action runs only if the owner
-approves it. See "Local Ollama Adapter", "Conversation", and "Model-Proposed
+propose one of three allowed actions, or a plan of two to five of them; a
+proposed action or plan runs only if the owner approves it. See "Local Ollama Adapter", "Conversation", and "Model-Proposed
 Actions" below.
 
 The tracked `config/config.toml` keeps reasoning disabled:
@@ -289,7 +289,8 @@ conversationally: `remember when we ...` stores a memory, and
 
 A reply is conversational text unless its first character, after only spaces,
 tabs, carriage returns, and line feeds, is `{`: such a reply is a proposed
-action, handled as described under "Model-Proposed Actions", and is never
+action or plan of actions, handled as described under "Model-Proposed
+Actions", and is never
 shown or kept as conversation. Maria never treats a reply as a command or an
 approval, and no reply can change a record or a file or confirm anything,
 whatever it says; a proposed action runs only if you approve it. That includes
@@ -307,7 +308,7 @@ or anything from an earlier session. Maria keeps at most the last eight
 exchanges, and at most 8 KiB of their text together with the current request,
 Maria's fixed proposal instructions, and any context, or `max_input_bytes` if
 that is smaller. The request and the instructions are fitted first, then any
-context, then the newest exchanges; the instructions take 1,015 bytes and are
+context, then the newest exchanges; the instructions take 1,327 bytes and are
 never left out, and the oldest exchanges are dropped first, whole. A request
 too large to send beside the instructions, or a reply too large to keep beside
 its request, is refused with a fixed message rather than cut short, and an
@@ -435,9 +436,10 @@ changed and changed back in between looks unchanged.
 Every request Maria sends to the local model carries her fixed instructions
 saying which actions she accepts. When the model's reply opens with `{`, after
 only spaces, tabs, carriage returns, and line feeds, Maria reads it as a
-proposal of exactly one action. A reply that does not open that way, such as
-one that puts a proposal after other words or inside a code fence, is ordinary
-conversational text, and nothing in it runs. The model is asked once per
+proposal: of one action, or of a short plan of two to five actions run in
+order. A reply that does not open that way, such as one that puts a proposal
+after other words or inside a code fence, or one that opens with `[`, is
+ordinary conversational text, and nothing in it runs. The model is asked once per
 request, and only while reasoning is enabled; with the shipped configuration
 no model proposes anything.
 
@@ -448,9 +450,13 @@ Only three actions can be proposed:
   `path` relative to it
 - `system.current_time`
 
-A proposal must be exactly one JSON object holding only `tool`, `action`, and
-`arguments`, at most 4,096 bytes, with nothing but whitespace around it, and
-its arguments must meet the same rules as the matching command's. No text
+A proposal must be exactly one JSON object, at most 4,096 bytes however many
+actions it holds, with nothing but whitespace around it. For one action it
+holds only `tool`, `action`, and `arguments`; for two to five it holds only
+`steps`, a list of such objects in the order they are to run. Every action
+must be one of the three, and its arguments must meet the same rules as the
+matching command's. Every argument is taken literally: a step cannot use an
+earlier step's result, and text such as `$1` is just text. No text
 argument may contain a control, formatting, surrogate, or line or paragraph
 separator character, and a path must be plain relative text below the default
 root: never absolute or just `.`, and with no drive, colon, leading `~`, part
@@ -458,15 +464,16 @@ made only of dots and spaces such as `..`, or Windows device name such as
 `NUL`. When a listing runs, the usual root and exclusion rules apply to it as
 to any `list` command. Anything else is refused with one fixed message, such
 as `Maria does not accept that action from the reasoning model.`, followed by
-Maria's notes about context. Nothing is repaired, and the model is not asked
-again.
+Maria's notes about context. A plan is refused whole if any of its actions is,
+and nothing in it runs. Nothing is repaired, and the model is not asked again.
 
 A proposal that passes is shown to you, and it runs only if you approve it
 with `y` or `yes` at the usual confirmation prompt. That holds for all three
 actions, even though the shipped `calculate`, `list`, and `time` commands run
-without asking. Each proposal needs exactly one approval, whatever your
-configuration says about confirming that action, and an action your
-configuration denies is refused before any approval is asked for. For
+without asking. Each proposal needs exactly one approval, for the whole plan
+when it holds several steps, whatever your configuration says about
+confirming those actions, and a plan with any action your configuration
+denies is refused before any approval is asked for. For
 example, if the model answers the request below by proposing a calculation,
 Maria shows:
 
@@ -517,6 +524,63 @@ approval prompt, and the result never become conversation or interaction
 history, so on a later turn the model sees neither the proposal nor its
 result.
 
+A plan of several steps is shown whole, every step numbered with its tool,
+action, and exact arguments:
+
+```text
+Maria's local reasoning model proposed this plan of 3 actions. They run in order, and only if you approve the whole plan. Maria stops if a step fails, an audit write fails, or the run is interrupted.
+Step 1 of 3
+Tool: system
+Action: current_time
+Arguments: {}
+Step 2 of 3
+Tool: filesystem
+Action: list
+Arguments: {"path": "missing"}
+Step 3 of 3
+Tool: calculator
+Action: calculate
+Arguments: {"expression": "2 + 2"}
+
+No memory context supplied.
+```
+
+Once you approve it, the steps run in order, each behind its own audit
+summary, committed just before that step runs. Maria goes on to the next step
+only when the step before it succeeded and its outcome was recorded; she stops
+at the first step that fails, at a step whose audit summary cannot be
+recorded, which then does not run, and after a step whose outcome cannot be
+recorded. The report says exactly what happened to every step:
+
+```text
+Step 1 of 3, system.current_time: completed.
+Date: 2031-02-03
+Time: 04:05:06
+UTC offset: +00:00
+ISO-8601: 2031-02-03T04:05:06+00:00
+Recorded as audit summary 1.
+
+Step 2 of 3, filesystem.list: failed.
+Not a directory: missing
+Recorded as audit summary 2.
+
+Step 3 of 3, calculator.calculate: not run.
+
+Maria stopped at step 2 and did not run step 3. Nothing that ran was undone.
+```
+
+Nothing is rolled back, retried, or resumed, and a step that failed or was
+interrupted may still have done part of its work. Pressing Ctrl+C while a plan
+of several steps runs stops it: Maria reports a step that had not started as
+not run, a step interrupted inside its tool as having an unknown outcome, and
+a step whose tool had already answered with that answer. If the interruption
+came while an audit summary or outcome was being written, she says she could
+not confirm whether it was recorded, because it may already have been. A plan
+of one step stops at Ctrl+C exactly as before, and if Maria's process ends
+abruptly no report can be shown at all. A step that was never reached has no
+audit summary, and the audit listing does not group one plan's summaries
+together.
+
 ## Audit Summaries
 
 An audit summary is Maria's record of one approved model-proposed action. It
@@ -526,7 +590,9 @@ target of `named filesystem root` for a directory listing or `none`
 otherwise, never which root or path; and, once the action has run, whether it
 succeeded or failed by the tool's own report. It never holds your request,
 the model's reply, an argument such as an expression or a path, a root's
-name, a host path, the result, or any memory or note.
+name, a host path, the result, or any memory or note. A plan of several steps
+leaves one summary for each step Maria reached, and none for a step after it
+stopped; nothing in the summaries says which of them belonged to one plan.
 
 - `audit` lists the newest 20 summaries, newest first, and says when more
   exist.
@@ -781,7 +847,8 @@ production runtime files are not required and no test creates or reads a real
 calculator, memory, Logger, Tool Manager, notes, interaction history,
 filesystem, filesystem roots and permanent exclusions, system information,
 Brain, Planner, the reasoning interface, the local Ollama adapter,
-model-proposed actions with their approval and audit summaries, the audit
+model-proposed actions and plans with their approval, audit summaries, and
+reports, the audit
 commands, database schema upgrades, and clean startup wiring. The adapter's
 tests run only against a local stub on a socket pair inside the test process,
 and every other model reply is scripted, so the suite needs no Ollama, no
