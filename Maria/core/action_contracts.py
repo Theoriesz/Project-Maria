@@ -17,6 +17,12 @@ Every contract also states, with no default, whether a reasoning model may
 ever propose its action. That classification is independent of permission and
 approves nothing by itself: ``core/plan_compiler.py`` keeps its own closed
 allowlist and compiles a proposal only when the two agree.
+
+A text argument may also declare a session input: text that Maria herself
+supplies from the owner's current session when Brain receives a planner's
+plan, and that no request, planner, or model ever supplies. The declaration
+is the whole of the mechanism's knowledge of which actions take one, so Brain
+needs no tool-specific branch to fill it.
 """
 
 from __future__ import annotations
@@ -44,8 +50,17 @@ MAXIMUM_LIST_LIMIT = 100
 MAXIMUM_EXPRESSION_LENGTH = 200
 
 # The length of a hexadecimal SHA-256, the text identity an enable approval
-# carries: a memory's fact, or a note's title and body together.
+# carries: a memory's fact, a note's title and body together, or a
+# conversation summary's text.
 FACT_DIGEST_LENGTH = 64
+
+# The longest conversation summary and the longest saved-conversation
+# transcript, in characters, measured as every text argument is. Each is a
+# coarse ceiling the contract can check without encoding anything; the
+# exact UTF-8 and structural checks belong to ``core.conversation_records``,
+# which a test holds these to.
+MAXIMUM_SUMMARY_LENGTH = 2 * 1024
+MAXIMUM_TRANSCRIPT_LENGTH = 64 * 1024
 
 
 # The longest metadata name Maria will repeat back. Every declared tool,
@@ -127,6 +142,20 @@ class ModelEligibility(str, Enum):
 
     MODEL_ELIGIBLE = "model_eligible"
     NOT_MODEL_ELIGIBLE = "not_model_eligible"
+
+
+class SessionInput(str, Enum):
+    """Text Maria supplies to one declared argument from the owner's session.
+
+    ``CONVERSATION`` is the canonical transcript of exactly the exchanges the
+    session retains. ``CONVERSATION_SUMMARY_DRAFT`` is a summary the owner's
+    local reasoning model drafts from exactly those exchanges, on request.
+    Neither ever comes from the request text, the planner, or a model's
+    proposal, and an argument declaring one is never model-eligible.
+    """
+
+    CONVERSATION = "conversation"
+    CONVERSATION_SUMMARY_DRAFT = "conversation_summary_draft"
 
 
 class ContractFailure(str, Enum):
@@ -261,6 +290,10 @@ class ArgumentContract:
     can never be omitted by accident. Metadata that cannot apply to the
     declared type is rejected at construction rather than ignored or
     normalized away.
+
+    ``session_input`` names the session text Maria supplies to this
+    argument, or None for an argument the request supplies. Only a required,
+    non-blank, bounded text argument with no root class may declare one.
     """
 
     name: str
@@ -272,6 +305,7 @@ class ArgumentContract:
     maximum_length: int | None = None
     allow_blank: bool | None = None
     root_class: RootClass | None = None
+    session_input: SessionInput | None = None
 
     def __post_init__(self) -> None:
         """Reject a declaration the validator could not honour."""
@@ -281,6 +315,27 @@ class ArgumentContract:
             self._validate_text_declaration()
         else:
             self._validate_numeric_declaration()
+        self._validate_session_input()
+
+    def _validate_session_input(self) -> None:
+        """Reject a session input on anything but bounded, required text."""
+        if self.session_input is None:
+            return
+        if type(self.session_input) is not SessionInput:
+            raise ValueError(
+                f"session_input must be a SessionInput member: {self.name!r}."
+            )
+        if not (
+            self.value_type is str
+            and self.required is True
+            and self.allow_blank is False
+            and self.maximum_length is not None
+            and self.root_class is None
+        ):
+            raise ValueError(
+                "A session input must be a required, non-blank, bounded text "
+                f"argument with no root class: {self.name!r}."
+            )
 
     def _validate_identity(self) -> None:
         """Reject an unusable name, requiredness, type, or root class."""
@@ -481,12 +536,38 @@ class ActionContract:
                     f"{argument.name}."
                 )
             seen.add(argument.name)
+
+        # Session text never comes from a model, so an action a model may
+        # propose cannot take any, and one action takes at most one.
+        session_inputs = [
+            argument for argument in snapshot if argument.session_input is not None
+        ]
+        if len(session_inputs) > 1:
+            raise ValueError(
+                f"{self.identifier} may declare at most one session input."
+            )
+        if (
+            session_inputs
+            and self.model_eligibility is not ModelEligibility.NOT_MODEL_ELIGIBLE
+        ):
+            raise ValueError(
+                f"{self.identifier} declares a session input and so cannot be "
+                "model-eligible."
+            )
         object.__setattr__(self, "arguments", snapshot)
 
     @property
     def identifier(self) -> str:
         """Return the canonical tool.action identifier."""
         return f"{self.tool_name}.{self.action}"
+
+    @property
+    def session_input_argument(self) -> ArgumentContract | None:
+        """Return the one argument Maria supplies from the session, or None."""
+        for argument in self.arguments:
+            if argument.session_input is not None:
+                return argument
+        return None
 
     @property
     def field_names(self) -> frozenset[str]:
@@ -690,7 +771,7 @@ class ActionContractRegistry:
 
 
 def _identifier(required: bool = True) -> ArgumentContract:
-    """Declare the positive row identifier shared by thirteen actions.
+    """Declare the positive row identifier shared by twenty actions.
 
     Every tool that takes an ``id`` rejects a bool, a non-int, and anything
     below 1, and none imposes a ceiling.
@@ -739,6 +820,44 @@ def _text(
         allow_blank=allow_blank,
         minimum_length=minimum_length,
         maximum_length=maximum_length,
+    )
+
+
+def _session_text(
+    name: str,
+    session_input: SessionInput,
+    *,
+    maximum_length: int,
+) -> ArgumentContract:
+    """Declare one text field Maria supplies from the owner's session.
+
+    It is required and non-blank, because Maria always supplies it before
+    the contract is checked, and bounded, because session text is too.
+    Every parameter but the name and the input is keyword-only.
+    """
+    return ArgumentContract(
+        name,
+        str,
+        required=True,
+        allow_blank=False,
+        minimum_length=None,
+        maximum_length=maximum_length,
+        session_input=session_input,
+    )
+
+
+def _text_digest() -> ArgumentContract:
+    """Declare the optional exact-text identity a confirmation pins.
+
+    It is absent from the planner's plan and is pinned when confirmation is
+    offered, so the approved plan names the exact text it covers.
+    """
+    return _text(
+        "text_digest",
+        required=False,
+        allow_blank=False,
+        minimum_length=FACT_DIGEST_LENGTH,
+        maximum_length=FACT_DIGEST_LENGTH,
     )
 
 
@@ -802,6 +921,105 @@ BUILT_IN_ACTION_CONTRACTS = ActionContractRegistry(
                 ),
             ),
             model_eligibility=ModelEligibility.MODEL_ELIGIBLE,
+        ),
+        ActionContract(
+            "conversation_summaries",
+            "create",
+            (
+                # Drafted by the owner's local model from exactly the
+                # session's retained exchanges when Brain receives the plan;
+                # never supplied by the request.
+                _session_text(
+                    "text",
+                    SessionInput.CONVERSATION_SUMMARY_DRAFT,
+                    maximum_length=MAXIMUM_SUMMARY_LENGTH,
+                ),
+                # Absent from the planner's plan; pinned when confirmation is
+                # offered, beside the full preview of exactly this text.
+                _text_digest(),
+            ),
+            model_eligibility=ModelEligibility.NOT_MODEL_ELIGIBLE,
+        ),
+        ActionContract(
+            "conversation_summaries",
+            "list",
+            model_eligibility=ModelEligibility.NOT_MODEL_ELIGIBLE,
+        ),
+        ActionContract(
+            "conversation_summaries",
+            "read",
+            (_identifier(),),
+            model_eligibility=ModelEligibility.NOT_MODEL_ELIGIBLE,
+        ),
+        ActionContract(
+            "conversation_summaries",
+            "edit",
+            (
+                _identifier(),
+                _text(
+                    "text",
+                    required=True,
+                    allow_blank=False,
+                    minimum_length=None,
+                    maximum_length=MAXIMUM_SUMMARY_LENGTH,
+                ),
+            ),
+            model_eligibility=ModelEligibility.NOT_MODEL_ELIGIBLE,
+        ),
+        ActionContract(
+            "conversation_summaries",
+            "delete",
+            (_identifier(),),
+            model_eligibility=ModelEligibility.NOT_MODEL_ELIGIBLE,
+        ),
+        ActionContract(
+            "conversation_summaries",
+            "enable_context",
+            (
+                _identifier(),
+                # Absent from the planner's plan; pinned when confirmation is
+                # offered, so the approved plan names the exact summary text.
+                _text_digest(),
+            ),
+            model_eligibility=ModelEligibility.NOT_MODEL_ELIGIBLE,
+        ),
+        ActionContract(
+            "conversation_summaries",
+            "disable_context",
+            (_identifier(),),
+            model_eligibility=ModelEligibility.NOT_MODEL_ELIGIBLE,
+        ),
+        ActionContract(
+            "conversations",
+            "save",
+            (
+                # The canonical transcript of exactly the exchanges the
+                # session retains, supplied by Maria when Brain receives the
+                # plan; never supplied by the request.
+                _session_text(
+                    "transcript",
+                    SessionInput.CONVERSATION,
+                    maximum_length=MAXIMUM_TRANSCRIPT_LENGTH,
+                ),
+            ),
+            model_eligibility=ModelEligibility.NOT_MODEL_ELIGIBLE,
+        ),
+        ActionContract(
+            "conversations",
+            "list",
+            model_eligibility=ModelEligibility.NOT_MODEL_ELIGIBLE,
+        ),
+        ActionContract(
+            "conversations",
+            "read",
+            (_identifier(),),
+            model_eligibility=ModelEligibility.NOT_MODEL_ELIGIBLE,
+        ),
+        ActionContract(
+            "conversations",
+            "delete",
+            (_identifier(),),
+            model_eligibility=ModelEligibility.NOT_MODEL_ELIGIBLE,
         ),
         ActionContract(
             "filesystem",

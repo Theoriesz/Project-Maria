@@ -61,6 +61,20 @@ DELETE_AUDIT_NOTICE = (
     "undo the action, and Maria's operational log may still show that a "
     "model-proposed action ran."
 )
+# V1-20's conversation summary notices, pinned the same way.
+STORE_SUMMARY_NOTICE = (
+    "Storing this summary keeps text your local reasoning model wrote, which "
+    "can repeat anything said in this session, including text from memories "
+    "or notes it was given. Its context consent starts off, and Maria does "
+    "not check it for passwords or other secrets."
+)
+ENABLE_SUMMARY_CONTEXT_NOTICE = (
+    "Once enabled, this summary's entire text may be sent to your local "
+    "reasoning model on a later conversational turn when a word of four or "
+    "more characters from your request appears literally in it, within "
+    "Maria's context limits. Maria does not check the summary for passwords "
+    "or other secrets, and enabling it does not mean it contains none."
+)
 
 
 class PermissionManagerTests(unittest.TestCase):
@@ -368,10 +382,19 @@ class PermissionManagerTests(unittest.TestCase):
                     "memory.forget",
                     "memory.enable_context",
                     "memory.disable_context",
+                    # V1-20: storing a drafted summary is the owner's
+                    # full-text review, and every summary lifecycle action
+                    # and the raw-save deletion are confirmed.
+                    "conversation_summaries.create",
+                    "conversation_summaries.edit",
+                    "conversation_summaries.delete",
+                    "conversation_summaries.enable_context",
+                    "conversation_summaries.disable_context",
+                    "conversations.delete",
                 }
             ),
         )
-        self.assertEqual(len(MANDATORY_CONFIRMATION_ACTIONS), 13)
+        self.assertEqual(len(MANDATORY_CONFIRMATION_ACTIONS), 19)
         self.assertEqual(
             MANDATORY_DENIED_ACTIONS,
             frozenset({"filesystem.delete", "filesystem.write"}),
@@ -555,6 +578,10 @@ class PermissionManagerTests(unittest.TestCase):
                         reason = f"{reason} {ENABLE_CONTEXT_NOTICE}"
                     if action_id == "notes.enable_context":
                         reason = f"{reason} {ENABLE_NOTE_CONTEXT_NOTICE}"
+                    if action_id == "conversation_summaries.create":
+                        reason = f"{reason} {STORE_SUMMARY_NOTICE}"
+                    if action_id == "conversation_summaries.enable_context":
+                        reason = f"{reason} {ENABLE_SUMMARY_CONTEXT_NOTICE}"
                     with self.subTest(action_id=action_id):
                         self.assertEqual(
                             manager.check(tool_name, action),

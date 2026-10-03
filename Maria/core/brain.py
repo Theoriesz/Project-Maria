@@ -7,10 +7,20 @@ or any provider-specific work, and it never imports a reasoning adapter.
 
 The planner receives the request text and nothing else. The only stored
 inputs to reasoning are records the owner enabled for context - Tier A
-memories and what Tier B's bounded search finds among enabled memories and
-notes - read through the memory layer's bounded context queries only on the
-conversational path; interaction history is never read for planning or
-reasoning.
+memories and what Tier B's bounded search finds among enabled memories,
+notes, and conversation summaries - read through the memory layer's bounded
+context queries on the conversational path, and on a summary request only by
+id, to recheck the records supplied to the conversation; interaction history
+and saved conversations are never read for planning or reasoning.
+
+A planner's plan whose one step's contract declares a session input, from
+V1-20, is given that text here, generically, before anything else checks it:
+the canonical transcript of exactly the session's retained exchanges for an
+explicit save, or, for a summary request, a draft the local model writes from
+exactly those exchanges, after every record supplied to them is rechecked and
+with no other context. The conversation module builds every resulting plan,
+so the choice of recording policy stays with that producer, and nothing here
+names a tool or an action.
 
 A model reply the conversation module recognises as a proposal attempt is
 compiled here, through ``core/plan_compiler.py`` and against Tool Manager's
@@ -33,7 +43,7 @@ from dataclasses import dataclass, replace
 from enum import Enum
 from logging import Logger
 
-from core.action_contracts import ActionContract, ContractViolation
+from core.action_contracts import ActionContract, ContractViolation, SessionInput
 from core.audit import AuditDecision, AuditOutcome, audit_target
 from core.config import MariaConfig, load_config
 from core.constants import LOCAL_CONFIG_PATH
@@ -51,8 +61,14 @@ from core.context import (
 )
 from core.conversation import (
     converse,
+    declared_session_input,
+    draft_summary,
     is_conversational_plan,
     is_generic_fallback,
+    saved_conversation_plan,
+    summary_draft_plan,
+    summary_refused_plan,
+    unsupported_session_input_plan,
     with_notices,
 )
 from core.failures import Failure, FailureKind
@@ -168,12 +184,13 @@ class BrainResponse:
 
     ``conversation`` is set by a completed conversational reply, to the
     session's conversation as it stands after that reply, and to an empty
-    conversation by a conversational turn that had to clear it, whatever
-    else that turn produced. Every other response leaves it None, so no
-    command, its result, a proposal, or a failed conversational turn ever
-    becomes conversation. ``supplied_context`` travels with it: the
-    fingerprints of every memory and note supplied since that conversation
-    was last cleared, which the session keeps beside it.
+    conversation by a conversational turn, or a summary request, that had to
+    clear it, whatever else that request produced. Every other response
+    leaves it None, so no command, its result, a proposal, a summary draft,
+    or a failed conversational turn ever becomes conversation.
+    ``supplied_context`` travels with it: the fingerprints of every memory,
+    note, and conversation summary supplied since that conversation was last
+    cleared, which the session keeps beside it.
 
     A model-originated plan awaiting approval comes back with
     ``needs_confirmation`` set, the plan itself, and as ``text`` only
@@ -202,6 +219,22 @@ class _ContextReads:
     supplied_notes: Sequence[object] = ()
     searched_memories: Sequence[object] = ()
     searched_notes: Sequence[object] = ()
+    supplied_summaries: Sequence[object] = ()
+    searched_summaries: Sequence[object] = ()
+
+
+@dataclass(frozen=True)
+class _SessionInputBinding:
+    """What supplying one planner plan's session input produced.
+
+    Transient: ``plan`` is what then runs, through the ordinary path, and
+    ``cleared`` says the session's conversation and supplied-record
+    fingerprints must be cleared because a supplied record could not be
+    confirmed current. It is never persisted, logged, or handed elsewhere.
+    """
+
+    plan: Plan
+    cleared: bool = False
 
 
 @dataclass(frozen=True)
@@ -435,12 +468,19 @@ class MariaBrain:
         origin, is the request answered by the local
         model instead, in the context of ``conversation``: the caller's
         earlier exchanges, oldest first, with ``supplied_context``, the
-        fingerprints of the memories and notes supplied since they began.
+        fingerprints of the memories, notes, and conversation summaries
+        supplied since they began.
         The model may answer conversationally or propose one action or a
         plan of two to five; see ``_converse``. With reasoning disabled the fallback is answered and
         recorded exactly as it always was, whether or not a provider is
-        present. Every other plan runs exactly as it always has and never
-        sees the conversation or any stored context.
+        present.
+
+        Every other plan runs exactly as it always has and never sees any
+        stored context. The one exception to its never seeing the
+        conversation is a plan whose one step's contract declares a session
+        input: that plan is given exactly the text it declares, here and
+        nowhere else, before contracts, permissions, or any tool see it; see
+        ``_with_session_input``. A plan that declares none is untouched.
         """
         cleaned_input = user_input.strip()
         if not cleaned_input:
@@ -458,7 +498,23 @@ class MariaBrain:
         ):
             return self._converse(cleaned_input, conversation, supplied_context)
 
-        return self._run_plan(plan, confirmed=False)
+        # A deterministic plan is read once, here, so asking whether it
+        # declares a session input never reads its steps a second time: what
+        # follows, and ``_run_plan`` itself, work on this one snapshot. A
+        # plan whose steps cannot be read within the bound is refused now,
+        # exactly as ``_run_plan`` refuses it, and never read again.
+        if own_origin(plan) is PlanOrigin.DETERMINISTIC:
+            snapshot = plan_snapshot(plan)
+            if snapshot is None:
+                return self._refused_step_limit(plan)
+            plan = snapshot
+        binding = self._with_session_input(plan, conversation, supplied_context)
+        response = self._run_plan(binding.plan, confirmed=False)
+        if not binding.cleared:
+            return response
+        # Nothing from the refused request is kept, but whatever its recheck
+        # cleared stays cleared.
+        return replace(response, conversation=(), supplied_context=frozenset())
 
     def _converse(
         self,
@@ -468,10 +524,12 @@ class MariaBrain:
     ) -> BrainResponse:
         """Answer one unrecognised request with the local model.
 
-        This is the only place context is read, and only after every gate
-        above has passed; ``_read_context`` says which bounded reads run.
-        When any of them fails, the conversation module sends no context and
-        no earlier exchange.
+        This is the only place context is read to be sent, and only after
+        every gate above has passed; ``_read_context`` says which bounded
+        reads run. A summary request only rechecks, by id, records already
+        supplied, and sends none of them; see ``_read_supplied_context``.
+        When any read here fails, the conversation module sends no context
+        and no earlier exchange.
 
         The conversation module settles the whole turn in proposal mode, so
         the request carries Maria's fixed proposal instructions and the
@@ -506,6 +564,8 @@ class MariaBrain:
             searched_memories_read=reads.searched_memories,
             searched_notes_read=reads.searched_notes,
             proposals=True,
+            supplied_summaries_read=reads.supplied_summaries,
+            searched_summaries_read=reads.searched_summaries,
         )
         if turn.proposal is not None:
             response = self._consider_proposal(
@@ -578,8 +638,9 @@ class MariaBrain:
         run only when the request yields search terms: its memory search
         only when Tier A's read found more enabled memories than it
         considers, starting after the last one it considered, and its note
-        search over notes the owner enabled. Every read goes through the
-        memory layer's own bounded query; nothing is kept once the turn ends.
+        and summary searches over notes and summaries the owner enabled.
+        Every read goes through the memory layer's own bounded query; nothing
+        is kept once the turn ends.
 
         Any read that fails, or a Tier A read too malformed to start the
         search from, ends them all: the turn is handed None and fails closed.
@@ -593,6 +654,7 @@ class MariaBrain:
             terms = search_terms(request)
             memory_ids = supplied_record_ids(supplied, ContextSource.MEMORY)
             note_ids = supplied_record_ids(supplied, ContextSource.NOTE)
+            summary_ids = supplied_record_ids(supplied, ContextSource.SUMMARY)
             return _ContextReads(
                 enabled=enabled,
                 supplied_memories=(
@@ -630,12 +692,164 @@ class MariaBrain:
                     if terms
                     else ()
                 ),
+                supplied_summaries=(
+                    self.memory.context_summaries_by_id(
+                        summary_ids,
+                        max_text_bytes=CONTEXT_MAX_BYTES,
+                    )
+                    if summary_ids
+                    else ()
+                ),
+                searched_summaries=(
+                    self.memory.search_context_summaries(
+                        terms,
+                        limit=SEARCH_QUERY_LIMIT,
+                        max_text_bytes=CONTEXT_MAX_BYTES,
+                    )
+                    if terms
+                    else ()
+                ),
             )
         except (RuntimeError, ValueError):
             # The memory layer's messages are fixed, but nothing about the
             # failure is needed here: the turn fails closed either way.
             self.logger.warning("Unable to read memory context.")
             return _ContextReads(enabled=None)
+
+    def _read_supplied_context(
+        self,
+        supplied: frozenset[ContextFingerprint],
+    ) -> _ContextReads:
+        """Recheck, by id, every record supplied to the session's conversation.
+
+        These are the only reads a summary draft makes before its exchanges
+        are sent again: no Tier A read and no search runs, so nothing beyond
+        the retained exchanges can reach the draft request. A record is read
+        only when one of its source was supplied. Any read that fails ends
+        them all, and the result's ``enabled`` is then None.
+        """
+        try:
+            memory_ids = supplied_record_ids(supplied, ContextSource.MEMORY)
+            note_ids = supplied_record_ids(supplied, ContextSource.NOTE)
+            summary_ids = supplied_record_ids(supplied, ContextSource.SUMMARY)
+            return _ContextReads(
+                enabled=(),
+                supplied_memories=(
+                    self.memory.context_memories_by_id(
+                        memory_ids,
+                        max_fact_bytes=CONTEXT_MAX_BYTES,
+                    )
+                    if memory_ids
+                    else ()
+                ),
+                supplied_notes=(
+                    self.memory.context_notes_by_id(
+                        note_ids,
+                        max_text_bytes=CONTEXT_MAX_BYTES,
+                    )
+                    if note_ids
+                    else ()
+                ),
+                supplied_summaries=(
+                    self.memory.context_summaries_by_id(
+                        summary_ids,
+                        max_text_bytes=CONTEXT_MAX_BYTES,
+                    )
+                    if summary_ids
+                    else ()
+                ),
+            )
+        except (RuntimeError, ValueError):
+            self.logger.warning("Unable to recheck supplied context.")
+            return _ContextReads(enabled=None)
+
+    def _with_session_input(
+        self,
+        plan: Plan,
+        conversation: tuple[ReasoningExchange, ...],
+        supplied_context: frozenset[ContextFingerprint],
+    ) -> _SessionInputBinding:
+        """Supply the one session text a planner's plan declares, if any.
+
+        The contract registry Tool Manager holds says which argument, if
+        any, Maria supplies; a plan declaring none comes back untouched. The
+        conversation module settles whether the declaration is acceptable,
+        and builds every plan returned here, so this method chooses no
+        recording policy and names no tool or action.
+
+        A save is given the canonical transcript of exactly the retained
+        exchanges, reading no other record. A summary request is first
+        checked against PermissionManager, so a denied one never sends the
+        exchanges anywhere, then refused when reasoning is unavailable;
+        otherwise every supplied record is rechecked by id and the local
+        model is asked once for a draft. A declared input of any other kind
+        is refused with the fixed session-input refusal, so nothing is
+        supplied that this method does not name. This runs only from
+        ``process``, for a new request: never at confirmation, for a
+        model-originated plan, or on the conversational path.
+        """
+        request = declared_session_input(
+            plan,
+            self.tool_manager.session_input_argument,
+        )
+        if request is None:
+            return _SessionInputBinding(plan)
+        if request.refusal is not None:
+            self.logger.warning("Refused a plan carrying its own session input.")
+            return _SessionInputBinding(request.refusal)
+        if request.kind is SessionInput.CONVERSATION:
+            self.logger.info("Supplying the session's retained exchanges to a save.")
+            return _SessionInputBinding(
+                saved_conversation_plan(request, conversation)
+            )
+        if request.kind is not SessionInput.CONVERSATION_SUMMARY_DRAFT:
+            self.logger.warning("Refused a plan declaring an unknown session input.")
+            return _SessionInputBinding(unsupported_session_input_plan(request))
+
+        permission = self.permissions.check(
+            request.step.tool_name,
+            request.step.action,
+        )
+        if permission.decision is PermissionDecision.DENIED:
+            self.logger.warning("Refused a summary request before drafting.")
+            return _SessionInputBinding(
+                summary_refused_plan(
+                    request,
+                    f"Permission denied: {permission.reason}",
+                )
+            )
+        if self.reasoning is None or not self.config.reasoning.enabled:
+            self.logger.warning("Refused a summary request: reasoning unavailable.")
+            return _SessionInputBinding(
+                summary_refused_plan(
+                    request,
+                    Failure(FailureKind.REASONING_UNAVAILABLE).message,
+                )
+            )
+
+        reads = (
+            self._read_supplied_context(
+                validated_supplied_context(supplied_context)
+            )
+            if conversation
+            else _ContextReads(enabled=())
+        )
+        draft = draft_summary(
+            self.reasoning,
+            self.config.reasoning,
+            conversation,
+            self.logger,
+            supplied_context=supplied_context,
+            supplied_memories_read=(
+                None if reads.enabled is None else reads.supplied_memories
+            ),
+            supplied_notes_read=reads.supplied_notes,
+            supplied_summaries_read=reads.supplied_summaries,
+        )
+        return _SessionInputBinding(
+            summary_draft_plan(request, draft),
+            draft.cleared,
+        )
 
     def execute_confirmed_plan(self, plan: Plan) -> BrainResponse:
         """Run an already-approved plan without planning the request again.
@@ -697,8 +911,7 @@ class MariaBrain:
 
         snapshot = plan_snapshot(plan)
         if snapshot is None:
-            self.logger.error("Refused a plan holding too many steps.")
-            return BrainResponse(PLAN_STEP_LIMIT_REFUSED_MESSAGE, plan=plan)
+            return self._refused_step_limit(plan)
         # Everything below, recording included, works on the snapshot alone.
         plan = snapshot
         steps = plan.steps
@@ -759,6 +972,15 @@ class MariaBrain:
             )
 
         return self._execute_resolved_plan(resolved)
+
+    def _refused_step_limit(self, plan: Plan) -> BrainResponse:
+        """Refuse a plan whose steps cannot be read within the step bound.
+
+        Nothing is checked, dispatched, or recorded: the reply and the log
+        line are fixed, and the plan handed back is the one refused.
+        """
+        self.logger.error("Refused a plan holding too many steps.")
+        return BrainResponse(PLAN_STEP_LIMIT_REFUSED_MESSAGE, plan=plan)
 
     def _validate_plan(
         self,

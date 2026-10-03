@@ -12,9 +12,13 @@ Maria is organized around a small set of modules with clear ownership.
    proposed for the owner's approval.
 3. `brain.py` coordinates the request. On the model-backed conversational path
    only, it reads the owner's enabled memory context, and what a bounded
-   literal search finds among enabled memories and notes, through the memory
-   layer and `context.py`; it reads no interaction history for planning or
-   reasoning.
+   literal search finds among enabled memories, notes, and conversation
+   summaries, through the memory layer and `context.py`; it reads no
+   interaction history or saved conversation for planning or reasoning. For a
+   planner's plan whose one step's contract declares a session input, it
+   supplies that text itself, generically: the canonical transcript of the
+   session's retained exchanges for a save, or a summary draft from the local
+   model; see "Saved Conversations and Summaries".
 4. `planner.py` converts explicit commands into structured plan steps.
 5. `action_contracts.py` declares which tool actions exist and which arguments
    each one accepts. Brain validates every step of a plan against it before any
@@ -23,8 +27,8 @@ Maria is organized around a small set of modules with clear ownership.
    resolves every step of a plan before any step is dispatched.
 7. `tool_manager.py` dispatches allowed actions to registered tools.
 8. Tools perform their focused work and return a `ToolExecutionResult`.
-9. `memory.py` owns persistent interactions, notes, explicit memories, and
-   audit summaries in SQLite.
+9. `memory.py` owns persistent interactions, notes, explicit memories, audit
+   summaries, saved conversations, and conversation summaries in SQLite.
 10. `brain.py` forms the final response and, on recordable completion paths,
     attempts to record the cleaned request and response as an interaction. An
     approved model-proposed action records no interaction: Brain commits its
@@ -52,6 +56,11 @@ Maria is organized around a small set of modules with clear ownership.
     Brain writes, through the memory layer, before an approved model-proposed
     action runs, and `tools/audit.py` lists, reads, and deletes them on the
     owner's commands. See "Model-Originated Execution and Audit".
+16. `conversation_records.py` is the vocabulary of saved conversations and
+    conversation summaries: their limits, the canonical transcript, value
+    objects, and fixed messages. `tools/conversations.py` and
+    `tools/conversation_summaries.py` store, list, read, edit, and delete them
+    on the owner's commands. See "Saved Conversations and Summaries".
 
 An explicit memory request uses the same execution path as every other tool
 request:
@@ -139,12 +148,14 @@ static source-scan guard test checks the gate's opening transient return and
 its single interaction write, and rejects direct tool-, action-, or
 request-specific recording decisions in the Brain methods that lead to the gate
 and in the helpers that produce recorded text; it does not analyze aliasing or
-data flow in general. No command Maria currently understands
-produces a transient plan: every deterministic command keeps the default, and
+data flow in general. Every deterministic command keeps the default, and
 every one that predates the policy records exactly what it recorded before the
-policy existed. Transient plans have two producers. `conversation.py` makes
-every conversational turn, a reply or a controlled failure, a zero-step
-transient plan, so conversation writes no interaction row. `plan_compiler.py`
+policy existed; the one command whose plan becomes transient is V1-20's
+`summarize conversation`. Transient plans have two producers. `conversation.py`
+makes every conversational turn, a reply or a controlled failure, a zero-step
+transient plan, so conversation writes no interaction row, and it makes every
+outcome of a summary request transient as well, the draft bound for approval
+and each fixed refusal alike. `plan_compiler.py`
 makes every plan it compiles from a model proposal a transient plan of one to
 five steps, which Brain runs on a path of its own that never reaches the four
 recording branches, so neither a proposal's approval prompt nor its result,
@@ -163,18 +174,25 @@ response half. Brain applies this generically, reading only `.message` and
 therefore change what a recorded row's response half says, but never whether a
 row is written; only the plan's recording policy decides that.
 
-In the current implementation, successful `history.read`, `audit.list`, and
-`audit.read` results are the only ones that supply a non-`None`
-`recorded_message`. For `history.read` that keeps redisplayed interaction
-content from being duplicated into a new interaction row, and the two audit
-actions record only `Listed audit summaries.` and `Displayed audit summary
-<id>.`, so neither a summary's fields nor a listing reaches interaction
-history. Every other current tool result, including `history.delete`,
-`notes.retitle`, `notes.edit`, `notes.delete`, and `audit.delete`, leaves the
+In the current implementation, successful `history.read`, `audit.list`,
+`audit.read`, `conversations.list`, `conversations.read`,
+`conversation_summaries.list`, and `conversation_summaries.read` results are
+the only ones that supply a non-`None` `recorded_message`. For
+`history.read` that keeps redisplayed interaction content from being
+duplicated into a new interaction row, the two audit actions record only
+`Listed audit summaries.` and `Displayed audit summary <id>.`, and the four
+conversation-record actions record only `Listed saved conversations.`,
+`Displayed saved conversation <id>.`, `Listed conversation summaries.`, and
+`Displayed conversation summary <id>.`, so no listing, summary field,
+transcript, or summary text reaches interaction history that way. Every other
+current tool result, including `history.delete`, `notes.retitle`,
+`notes.edit`, `notes.delete`, `audit.delete`, `conversations.save`,
+`conversations.delete`, and every conversation-summary mutation, leaves the
 field as `None` and therefore retains the existing message-as-recorded
-behavior; those displayed messages are already short,
-content-free summaries, so no override is needed. `read file`, `read note`,
-and `recall` are unmodified and still record their full displayed content.
+behavior; those displayed messages are already short, content-free
+summaries naming at most an id and a count, so no override is needed.
+`read file`, `read note`, and `recall` are unmodified and still record their
+full displayed content.
 
 `history.delete`'s row deletion and the subsequent interaction-recording
 `INSERT` are separate transactions, following the same boundary as every other
@@ -185,21 +203,24 @@ already-computed successful deletion response is still returned unchanged;
 the deletion is not rolled back and no compensating write is attempted, so an
 interaction row recording the deletion is not guaranteed in that case.
 
-`notes.retitle`, `notes.edit`, `notes.delete`, and `audit.delete` follow that
-identical boundary: `Memory.retitle_note()`, `Memory.edit_note()`,
-`Memory.delete_note()`, and `Memory.delete_audit_summary()` each commit in
-their own transaction, independently of the later
+`notes.retitle`, `notes.edit`, `notes.delete`, `audit.delete`, and the
+conversation-record mutations follow that identical boundary:
+`Memory.retitle_note()`, `Memory.edit_note()`, `Memory.delete_note()`,
+`Memory.delete_audit_summary()`, `Memory.save_conversation()`,
+`Memory.delete_saved_conversation()`, `Memory.edit_conversation_summary()`,
+`Memory.delete_conversation_summary()`, and the two summary consent methods
+each commit in their own transaction, independently of the later
 `Memory.record_interaction()` call. A recording failure after a committed
 mutation is logged, does not roll the mutation back, does not
 replace the successful response, and triggers no compensating write or retry.
 
 Because Brain records the original cleaned request as the `user_input` half of
-an interaction, a `retitle note` command retains its new title and an `edit
-note` command retains its new body in interaction history even though the
-recorded response is content-free. `recorded_message` can only change the
-response half of a recorded interaction, never the request half, so later
-editing or deleting the note does not rewrite or remove those independent
-interaction rows.
+an interaction, a `retitle note` command retains its new title, an `edit
+note` command its new body, and an `edit summary` command its new text in
+interaction history even though the recorded response is content-free.
+`recorded_message` can only change the response half of a recorded
+interaction, never the request half, so later editing or deleting the note or
+summary does not rewrite or remove those independent interaction rows.
 
 Some paths return before this boundary. Blank CLI input is not processed, and
 blank input passed directly to `process()` returns before logging, planning,
@@ -230,8 +251,8 @@ retrieved up to three recent interaction rows on every request and handed them
 to the planner, which discarded them unused; that feed is gone, and
 `Planner.create_plan()` now accepts the cleaned request text and nothing else.
 The `history` command still reads recent rows through its own tool, and
-interaction rows remain Tier C: no automatic path hands one to the planner or
-to the reasoning model.
+interaction rows remain Tier C, as saved conversations are: no automatic path
+hands one to the planner or to the reasoning model.
 
 Operational logging and interaction persistence are separate boundaries.
 `logger.py` configures Maria's namespaced file logger; default startup targets
@@ -415,6 +436,16 @@ any pending approval, writes nothing, and is idempotent. Brain keeps no state
 between requests, so a new session always starts with an empty conversation
 and can never observe another session's turns.
 
+Only an explicit `save conversation` or `summarize conversation` makes
+anything of that conversation durable, and only through Brain and the
+ordinary tool path; each is an ordinary submit, so it discards any approval
+still pending, a pending summary draft included, and the session is not
+changed to keep one. A save leaves the conversation exactly as it was. A
+summary draft is never kept as an exchange, and a summary request whose
+recheck finds a supplied record changed clears the conversation and its
+fingerprints, as a conversational turn would. Once a session has ended there
+is nothing left to save.
+
 ## Permission Policy
 
 All planned actions pass through `PermissionManager`.
@@ -426,9 +457,12 @@ malformed present arrays stop configuration loading instead of weakening it.
 When an action is both denied and confirmation-required, denial wins.
 
 In the current implementation, the mandatory confirmation baseline is
-thirteen actions: `audit.delete`, `filesystem.rename`, `filesystem.move`,
-`history.delete`, `notes.retitle`, `notes.edit`, `notes.delete`,
-`notes.enable_context`, `notes.disable_context`,
+nineteen actions: `audit.delete`, `conversations.delete`,
+`conversation_summaries.create`, `conversation_summaries.edit`,
+`conversation_summaries.delete`, `conversation_summaries.enable_context`,
+`conversation_summaries.disable_context`, `filesystem.rename`,
+`filesystem.move`, `history.delete`, `notes.retitle`, `notes.edit`,
+`notes.delete`, `notes.enable_context`, `notes.disable_context`,
 `memory.update`, `memory.forget`, `memory.enable_context`, and
 `memory.disable_context`. The confirmation for `memory.enable_context` also
 carries a fixed notice, from `CONFIRMATION_NOTICES` in `core/permissions.py`,
@@ -441,10 +475,18 @@ appears literally in its title or body, and that Maria does not check the note
 for passwords or other secrets. The confirmation for `audit.delete` carries one
 that deleting an audit summary removes it from Maria's database but does not
 undo the action, and that Maria's operational log may still show that a
-model-proposed action ran.
-`audit.list`, `audit.read`, `history.list`, `history.search`, `history.read`,
-`notes.create`, `notes.list`, `notes.read`, `memory.store`, `memory.search`,
-and `memory.list` are allowed by default. These entries live
+model-proposed action ran. The confirmation for
+`conversation_summaries.create` carries one that storing the summary keeps
+text the local model wrote, which can repeat anything said in the session,
+including text from memories or notes it was given, that its context consent
+starts off, and that Maria does not check it for passwords or other secrets;
+the confirmation for `conversation_summaries.enable_context` carries the
+note notice's counterpart for one summary's entire text.
+`audit.list`, `audit.read`, `conversations.save`, `conversations.list`,
+`conversations.read`, `conversation_summaries.list`,
+`conversation_summaries.read`, `history.list`, `history.search`,
+`history.read`, `notes.create`, `notes.list`, `notes.read`, `memory.store`,
+`memory.search`, and `memory.list` are allowed by default. These entries live
 in `MANDATORY_CONFIRMATION_ACTIONS` in `core/permissions.py` rather than in
 `config/config.toml`, so configuration can add restrictions on top of them but
 can never remove them.
@@ -493,17 +535,33 @@ Every contract also declares its model eligibility, `MODEL_ELIGIBLE` or
 `NOT_MODEL_ELIGIBLE`, as a required keyword with no default, so no action can
 be declared without that decision. Only `calculator.calculate`,
 `filesystem.list`, and `system.current_time` are model-eligible; every other
-action, the three audit actions included, is not. The
+action, the three audit actions and the eleven conversation-record actions
+included, is not. The
 classification is independent of permission and approves nothing by itself;
 see "Model-to-Plan Compilation Gate".
+
+A text field may also declare a `SessionInput`: text that only Maria supplies,
+from the owner's session, and that no request, planner, or model provides.
+Only a required, non-blank, bounded text field without a root class may
+declare one, a contract may hold at most one, and a contract that holds one
+cannot be model-eligible. The shipped registry declares two:
+`conversations.save.transcript`, the canonical transcript of the retained
+exchanges (`CONVERSATION`, at most 65,536 characters), and
+`conversation_summaries.create.text`, a summary draft (`CONVERSATION_SUMMARY_DRAFT`,
+at most 2,048 characters). Tool Manager's `session_input_argument` answers
+which argument of an action takes one, and Brain supplies the text; see
+"Saved Conversations and Summaries".
 
 Every str field in the shipped registry rejects blank text, because every tool
 that takes text already refuses it: `FilesystemTool` raises `Path is required.`,
 `CalculatorTool` returns `No expression provided.`, and the notes, history, and
-memory paths each return their own required-value message. Only
+memory paths each return their own required-value message.
 `calculator.calculate.expression` declares a maximum length, 200 characters,
 measured on the stripped text exactly as `CalculatorTool` measures it before
-handing the expression to `evaluate_expression`. No field declares a minimum
+handing the expression to `evaluate_expression`. The text identities a
+confirmation pins declare exactly 64 characters, and the conversation-record
+texts declare their character ceilings above, their exact UTF-8 limits being
+settled by `core/conversation_records.py`. No other field declares a minimum
 length beyond being non-blank.
 
 Validation rejects; it never repairs. It performs no coercion, parsing,
@@ -747,12 +805,14 @@ the schema advances. Startup settles that version once, classifies an
 unversioned database structurally against the shapes Maria actually shipped,
 runs any missing forward migrations in order, and refuses a database stamped
 newer than the running build before writing anything.
-`docs/database.md` describes the rules; the four record types below are
-unchanged by them. The current schema is version 5, whose one appended
-migration, `create_audit_summaries`, creates the two empty audit tables,
-`audit_summaries` and `audit_outcomes`, and changes no existing table or row.
+`docs/database.md` describes the rules; the six record types below are
+unchanged by them. The current schema is version 6, whose one appended
+migration, `create_conversation_records`, creates the two empty
+conversation-record tables, `saved_conversations` and
+`conversation_summaries`, and changes no existing table or row; version 5's
+`create_audit_summaries` created the two audit tables the same way.
 
-Maria keeps four kinds of persistent data separate:
+Maria keeps six kinds of persistent data separate:
 
 - **Interaction history** records cleaned requests and the responses chosen
   for recording on the four recording branches described above, for every
@@ -804,6 +864,24 @@ Maria keeps four kinds of persistent data separate:
   reused. Nothing cascades between summaries and the other record types.
   Neither Brain nor the planner reads them, and no automatic path supplies one
   to the reasoning model; see "Model-Originated Execution and Audit" below.
+- **Saved conversations** are exact, immutable copies of the exchanges one
+  session retained, each stored by an explicit `save conversation` as one
+  canonical compact JSON transcript of 1 to 8 `[user, assistant]` pairs, at
+  most 8,192 UTF-8 bytes of text, validated when written and again when read.
+  They are never edited; `delete conversation <id>` removes one by id after
+  confirmation, and ids are never reused. They carry no consent and are Tier
+  C: no automatic path reads one, for planning or for the reasoning model.
+- **Conversation summaries** are texts of at most 2,048 UTF-8 bytes, each
+  equal to its own stripped form, that the owner approved word for word after
+  the local model drafted them on request, or later replaced with
+  `edit summary`; each keeps `created_at` and `updated_at`. Each carries the
+  owner's context consent, off until the owner enables that one summary
+  through a confirmation-gated command; the consent is the identity of exactly
+  the approved text, and an edit turns it off in the same transaction. Only
+  such summaries can reach the reasoning model, through a literal search; see
+  "Saved Conversations and Summaries" and "Tier B Search Context" below.
+  Nothing cascades between the conversation records and any other record
+  type, and these are never the content-free audit summaries above.
 
 On the completed paths described above, memory commands and their responses
 also appear in interaction history when recording succeeds. A stored fact can
@@ -940,7 +1018,10 @@ after a blank line, or form the only `system` message when the flag is off;
 neither ever contains stored text. The delimited data block then follows as a
 `user` message of its own. The context instructions are the V1-15 text unless
 a Tier B item is present, when a fixed variant also says some records were
-found because they contain a word from the current request. There is no
+found because they contain a word from the current request; a third fixed
+variant, which also names conversation summaries, is used only when a
+conversation summary is among the items, so a request without one is byte for
+byte what it was before summaries existed. There is no
 option, tool, or thinking request. Before anything is serialized, the adapter
 validates the context again and measures the prompt, history, rendered
 context, and any selected instructions together against its own
@@ -1030,17 +1111,17 @@ original response and its interaction row.
   context, and the UTF-8 text of the retained exchanges' user and assistant
   halves.
 - Every context read is settled first. A failed or untrustworthy read, or a
-  supplied memory or note that has since been disabled, changed, deleted, or
-  forgotten, clears the earlier conversation before anything is sent; see
-  "Tier A Memory Context" and "Tier B Search Context" below.
+  supplied memory, note, or summary that has since been disabled, changed,
+  deleted, or forgotten, clears the earlier conversation before anything is
+  sent; see "Tier A Memory Context" and "Tier B Search Context" below.
 - A request that is over the budget together with the proposal instructions
   is refused with the fixed input-over-budget message before the provider is
   asked; the instructions are never dropped to make it fit. Text the interface
   cannot carry, such as a lone surrogate, is refused with its own fixed
   message.
 - The request and the proposal instructions come first, then as much Tier A
-  context as its rule fits, then as many Tier B matches as fit, memories
-  before notes, then the newest earlier exchanges that fit beside all of them,
+  context as its rule fits, then as many Tier B matches as fit, memories, then
+  notes, then summaries, then the newest earlier exchanges that fit beside all of them,
   at most eight (`CONVERSATION_MAX_EXCHANGES`); the oldest are dropped first,
   whole. Nothing is truncated. A conversation that would then carry more than
   64 supplied records is cleared before sending instead.
@@ -1082,13 +1163,16 @@ alone, and even a compiled one runs only after the owner approves it.
 
 What the model sees is Maria's fixed proposal instructions, the current
 request, the session's own completed conversational exchanges, the explicit
-memories the owner has enabled for context, and notes the owner has enabled
-for context that literally contain a word of the request. It never sees a
-command or its result, its own earlier proposals, an approval prompt, what an
-approved action returned, a memory or note the owner has not enabled, a file,
-a stored interaction, an audit summary, or anything from an earlier session. A
-new session starts empty, and ending one discards its conversation and its
-supplied-record fingerprints.
+memories the owner has enabled for context, and notes and conversation
+summaries the owner has enabled for context that literally contain a word of
+the request. It never sees a command or its result, its own earlier proposals,
+an approval prompt, what an approved action returned, a memory, note, or
+summary the owner has not enabled, a saved conversation, a file, a stored
+interaction, an audit summary, or anything from an earlier session. A
+`summarize conversation` request is the one other request Maria sends, and it
+carries less: her fixed summary prompt and the retained exchanges only; see
+"Saved Conversations and Summaries". A new session starts empty, and ending
+one discards its conversation and its supplied-record fingerprints.
 
 ## Tier A Memory Context
 
@@ -1152,8 +1236,8 @@ memory is stale, fresh, consistent, or conflicting: `created_at` dates the row,
 not its current text, and there is no `updated_at`.
 
 **Revocation.** The session keeps, beside its conversation, the fingerprint —
-source, id, and SHA-256 of the exact text — of every memory and note supplied
-with a request whose reply it kept since the conversation was last cleared, at
+source, id, and SHA-256 of the exact text — of every memory, note, and summary
+supplied with a request whose reply it kept since the conversation was last cleared, at
 most 64 of them, never the text itself; a proposal attempt is never kept, so
 the records supplied with it are not tracked. Before each model-backed
 conversational request — never on a
@@ -1177,9 +1261,11 @@ send; and it cannot erase text a model has already received.
 ## Tier B Search Context
 
 Tier B is what a bounded literal search of the current request finds among
-records the owner has enabled for context. In V1-16 it has two sources:
-enabled memories beyond Tier A's window, and notes the owner has enabled with
-`enable note context <id>`. Nothing without that consent is ever searched.
+records the owner has enabled for context. V1-16 gave it two sources, enabled
+memories beyond Tier A's window and notes the owner has enabled with
+`enable note context <id>`, and V1-20 adds a third, conversation summaries the
+owner has enabled with `enable summary context <id>`. Nothing without that
+consent is ever searched, and a saved conversation never is.
 
 **Note consent.** Every note's consent is off by default: the V1-16
 migration leaves every existing note off, and a new note is stored off.
@@ -1227,8 +1313,12 @@ matcher see either text, and the note matches when a term occurs wholly within
 its casefolded title or wholly within its casefolded body; the two are never
 joined. A note changed outside Maria is therefore never matched and never uses
 up a read's rows, and a note with a text too large to verify is never
-searched. There are no model-generated queries, `LIKE` wildcards, rankings,
-embeddings, or fuzzy or semantic matching.
+searched. A conversation summary follows the note rule for its one text: it is
+searched only while its consent is on, its text is within 2 KiB, and the
+approval check finds it is still exactly the approved text, and it matches
+when a term occurs wholly within its casefolded text. There are no
+model-generated queries, `LIKE` wildcards, rankings, embeddings, or fuzzy or
+semantic matching.
 
 **Bounded reads.** The memory search covers only enabled memories after the
 16th one Tier A considered, and runs only when Tier A's read found more than
@@ -1241,24 +1331,29 @@ oversized flag, so it is named and never supplied, and it counts toward its
 read's rows. A note search never returns a note by id only: a note whose title
 or body is beyond 2 KiB cannot have its approved identity verified, so it is
 neither matched nor named, and a note search result that named one would be
-treated as an unreadable read.
+treated as an unreadable read. A summary search behaves the same way.
 
 **Selection and bounds.** The first 8 rows of each source are candidates,
-memories before notes, each in ascending id order, and are taken whole while
-fewer than 8 have been taken and everything rendered still fits. Tier A keeps
+memories, then notes, then summaries, each in ascending id order, and are
+taken whole while fewer than 8 have been taken and everything rendered still
+fits. Tier A keeps
 its 16 items and 2 KiB; both tiers together are at most 24 items and 4,096
 fully rendered UTF-8 bytes — context instructions, headers, source ids, JSON
 quoting, and escaped line separators included — and everything fits beside
 the request and Maria's proposal instructions within the conversational
 budget. The request and those instructions come first, then Tier A, then
-Tier B memories, then Tier B notes, then earlier exchanges. The limits are
-validated again when a `ReasoningRequest` is constructed and in the adapter
-before any connection.
+Tier B memories, then Tier B notes, then Tier B summaries, then earlier
+exchanges. The limits are validated again when a `ReasoningRequest` is
+constructed and in the adapter before any connection. A summary's 2,048-byte
+cap never guarantees that it is selected: one that does not fit is left out
+whole and named by id.
 
 **Rendering and notices.** Tier B records follow their own header in the same
 data block, each on one line as its source and id and then JSON: a memory's
-fact as a string, a note's title and body as one object, with the same line
-separator escapes as Tier A. After a successful reply Maria names them —
+fact as a string, a note's title and body as one object, a summary's text as a
+string, with the same line separator escapes as Tier A. The header and the
+context instructions name conversation summaries only when a summary is among
+the items, so a request without one is exactly what it was before. After a successful reply Maria names them —
 `Found by search and supplied: memory 21, note 4.` — with the same caveat that
 she cannot verify whether they are current or conflict; after a failure she
 names them as selected; matches the limits left out are named by id when a
@@ -1267,6 +1362,77 @@ share exactly a title but have different bodies are named together as
 possible divergent versions; Maria never calls them contradictory, never calls
 a record stale, and treats a note's `updated_at` only as the fact of when it
 was last saved.
+
+## Saved Conversations and Summaries
+
+V1-20 lets the owner keep what a session holds, in two record types that are
+never written without an explicit command; see "Persistence Models".
+
+**Session inputs.** Two action contracts declare an argument whose text only
+Maria supplies, from the session: `conversations.save` takes the canonical
+transcript of the retained exchanges, and `conversation_summaries.create` a
+summary draft. The planner's `save conversation` and `summarize conversation`
+plans name the action and no text. In `process`, and only there, Brain reads a
+deterministic plan once, as a bounded snapshot, asks Tool Manager's
+`session_input_argument` whether its step declares a session input, and lets
+`conversation.py` settle the declaration and build the resulting plan, so
+Brain names no tool or action and chooses no recording policy. Only a
+planner's plan holding exactly DETERMINISTIC as its own origin is asked. A
+plan that already carries the declared argument, or holds any other step, is
+refused with a fixed message, and so is a declared input of any kind Brain
+does not name, so a new kind is refused until Brain is changed to supply it.
+Nothing is supplied at confirmation, for a model-originated plan, which the
+compiler refuses for these actions in any case, or on the conversational
+path, and a contract that declares a session input cannot be model-eligible.
+
+**Saving.** The transcript is one compact JSON array of `[user, assistant]`
+pairs, oldest first: exactly the exchanges the session retains and nothing
+else, since no notice, context item, command result, proposal, or approval
+text is ever an exchange. The save reads no other record and asks no model,
+and the memory layer's write is one INSERT. The plan keeps its default
+`RECORD` policy, so the interaction row holds the command and the fixed reply,
+which names only the new id and the exchange count; with no retained exchange
+the plan becomes a zero-step plan answering that there is nothing to save,
+recorded the same way. The conversation is left as it was. Because a save
+rechecks nothing, text quoted from a record revoked since is kept verbatim,
+which the reply's sentence about an exact copy states; a saved conversation
+never reaches the model, so that copy cannot travel back to it.
+
+**Drafting.** For `summarize conversation`, Brain first checks the step's
+permission, so a denied summary never sends the exchanges anywhere, and then
+requires an injected provider and enabled settings. With exchanges retained,
+it rechecks by id every record supplied to the conversation, with no Tier A
+read and no search, and `conversation.draft_summary()` refuses before any
+request when there is no exchange, when that recheck fails or finds a record
+changed, which also clears the conversation and its fingerprints, or when the
+fixed 336-byte prompt with every retained exchange is over `max_input_bytes`;
+the exchanges are never cut down to fit. Otherwise the provider is asked once,
+through `request_reasoning`, with that prompt, every retained exchange, no
+context, and the proposal instructions off, so a reply opening with `{` is
+only text. The reply's outer whitespace is stripped once, and an empty result
+or one over 2,048 UTF-8 bytes is discarded whole with a fixed message. Every
+outcome is a transient plan, and a draft is never kept as an exchange.
+
+**Approval.** A draft is bound, exactly, as the step's `text`, and
+`conversation_summaries.create` always requires confirmation. Through Tool
+Manager's generic `ConfirmationBinding`, the summaries tool pins the draft's
+SHA-256 as `text_digest` and shows the whole draft below the fixed notice, as
+one escaped line that decodes to exactly the bound text. Confirming makes no
+provider call: the session hands Brain exactly the snapshot it fingerprinted,
+and the tool stores the text only while the pinned digest still matches it.
+Any other submit, a cancel, or the end of the session discards the draft, and
+a store that fails still spends the approval. No audit summary is written: the
+owner chose the action and approved its exact text, and the stored row is its
+own trace.
+
+**Consent and context.** A stored summary's consent is off.
+`enable summary context <id>` reads the summary once, shows its whole text,
+and pins its identity; the memory layer enables consent only inside one write
+transaction that still finds exactly that text, and stores the identity as the
+summary's `context_digest`. `edit summary` turns consent off in the same
+transaction as the new text, and a summary changed any other way no longer
+matches its identity and is never eligible. An enabled summary is a Tier B
+source; see "Tier B Search Context".
 
 ## Model-to-Plan Compilation Gate
 
@@ -1493,9 +1659,10 @@ more to say when more exist; `read audit <id>` shows one summary as a labelled
 block; and `delete audit <id>` removes one summary together with its outcome
 in one transaction. The commands are case-insensitive. `read audit` and
 `delete audit` take the same positive whole-number ids as the eleven memory,
-note, and interaction commands addressed by id alone; these thirteen ID-only
-planner commands share one parser, while `read note <id or exact title>` uses
-its separate, unchanged lookup path.
+note, and interaction commands addressed by id alone and, since V1-20, the
+seven saved-conversation and summary commands; these twenty ID-only planner
+commands share one parser, while `read note <id or exact title>` uses its
+separate, unchanged lookup path.
 `list audits` is still a filesystem listing. `audit.list` and `audit.read` are
 allowed by default, `audit.delete` always requires confirmation, even for an id
 that does not exist, and none of the three is model-eligible. In interaction
@@ -1535,8 +1702,12 @@ permission. `core/context.py` imports no Maria module at all.
 `core/reasoning.py` reaches nothing but the context module, the shared
 failures, and the logger, and `core/ollama_adapter.py` nothing but those and
 the reasoning interface. `core/conversation.py` reaches only those, the
-logger, and the planner's plan types, never Tool Manager, permissions, the
-compiler, or the memory layer. A conversational reply reaches Brain only as
+logger, the planner's plan types, and two leaf declarations that import
+nothing from Maria, the action contracts and `core/conversation_records.py`,
+never Tool Manager, permissions, the compiler, or the memory layer. A
+summary draft reaches storage only as the declared argument of the planner's
+`summarize conversation` step, after the owner approved exactly its text. A
+conversational reply reaches Brain only as
 the text of a zero-step transient plan, and a proposal attempt only as the
 untouched `ReasoningResponse`, which Brain passes to the compiler and nowhere
 else; no module passes a reply to the planner or a tool, and a compiled plan's
@@ -1563,7 +1734,9 @@ unchanged by explicit memory support. Brain's model-plan path likewise
 branches on a plan's origin, never on a tool or action name, and writes audit
 summaries only through the memory layer's public methods. `AuditTool`
 contains no SQL either: it reaches summaries only through the shared `Memory`
-object.
+object, and so do `ConversationsTool` and `ConversationSummariesTool`. Brain
+supplies session inputs generically, from contract declarations, never by a
+tool or action name.
 
 ## Scope
 

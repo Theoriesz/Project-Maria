@@ -11,6 +11,7 @@ from typing import Any, Protocol
 from core.action_contracts import (
     BUILT_IN_ACTION_CONTRACTS,
     ActionContractRegistry,
+    ArgumentContract,
     ContractViolation,
 )
 from core.config import MariaConfig
@@ -23,6 +24,8 @@ from core.planner import Plan, PlanOrigin, PlanStep
 BUILT_IN_TOOL_MODULES = (
     "tools.audit",
     "tools.calculator",
+    "tools.conversation_summaries",
+    "tools.conversations",
     "tools.filesystem",
     "tools.history",
     "tools.memory",
@@ -170,6 +173,22 @@ class ToolManager:
         anything else in the pipeline runs.
         """
         return self.contracts.validate(tool_name, action, arguments)
+
+    def session_input_argument(
+        self,
+        tool_name: str,
+        action: str,
+    ) -> ArgumentContract | None:
+        """Return the argument Maria supplies from the session, or None.
+
+        This is the active registry's declaration for one action: the one
+        argument whose text Maria herself supplies from the owner's session,
+        or None when the action declares none or is not declared at all. It
+        executes nothing and reads no session; Brain uses it to learn whether
+        a planner's plan asks for session text without naming any tool.
+        """
+        contract = self.contracts.contract_for(tool_name, action)
+        return None if contract is None else contract.session_input_argument
 
     def prepare_confirmation(self, plan: Plan) -> PreparedConfirmation:
         """Return the plan to present for approval, pinned to its exact targets.

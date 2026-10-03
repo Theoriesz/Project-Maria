@@ -4,12 +4,18 @@ V1-18 appends one forward step to Maria's migration ladder. It creates the two
 tables Maria's content-free audit summaries live in, empty, and touches no
 existing table or row. Every database here is built under a
 ``TemporaryDirectory``: the two unstamped historical shapes come from
-``tests.schema_fixtures``, reused unchanged, and the tables versions 3, 4, and
-5 introduced are written out by hand below, so each migration starts from the
-database an owner actually has and ends at a schema this file states rather
-than one it reads back from the memory layer. The frozen statements are also
-pinned word for word, so an edit to history fails here even where it would
-not change the schema it creates.
+``tests.schema_fixtures``, reused unchanged, and the tables versions 3, 4, 5,
+and 6 introduced are written out by hand below, so each migration starts from
+the database an owner actually has and ends at a schema this file states
+rather than one it reads back from the memory layer. The frozen statements are
+also pinned word for word, so an edit to history fails here even where it
+would not change the schema it creates.
+
+V1-20 appends the create_conversation_records step after this one, so version
+5 is now a frozen version every climb passes through on its way to the
+current version 6. That step has its own focused tests in
+``tests.test_conversation_records_migration``; here it only completes each
+climb, and the audit step itself is pinned exactly as before.
 
 Every helper that opens or builds a database refuses Maria's live database
 directory before anything is opened, and Maria's live log and private
@@ -93,7 +99,8 @@ BASELINE_SCHEMA_VERSION = 2
 MEMORY_CONTEXT_CONSENT_VERSION = 3
 NOTE_CONTEXT_CONSENT_VERSION = 4
 AUDIT_SUMMARIES_VERSION = 5
-NEWER_SCHEMA_VERSION = 6
+CONVERSATION_RECORDS_VERSION = 6
+NEWER_SCHEMA_VERSION = 7
 
 # The whole forward ladder, in the order it runs.
 LADDER_NAMES = (
@@ -101,11 +108,13 @@ LADDER_NAMES = (
     "add_memory_context_consent",
     "add_note_context_consent",
     "create_audit_summaries",
+    "create_conversation_records",
 )
 
 RECORD_TABLES = ("interactions", "notes", "memories")
 AUDIT_TABLES = ("audit_summaries", "audit_outcomes")
-ALL_TABLES = (*RECORD_TABLES, *AUDIT_TABLES)
+CONVERSATION_TABLES = ("saved_conversations", "conversation_summaries")
+ALL_TABLES = (*RECORD_TABLES, *AUDIT_TABLES, *CONVERSATION_TABLES)
 CURRENT_TABLES = frozenset(ALL_TABLES)
 
 # A busy timeout short enough that real contention fails at once.
@@ -142,9 +151,12 @@ APPLIED_STEP_LINES = {
         "Applied migration add_note_context_consent; schema version is now 4."
     ),
     "create_audit_summaries": APPLIED_AUDIT_STEP_LINE,
+    "create_conversation_records": (
+        "Applied migration create_conversation_records; schema version is now 6."
+    ),
 }
-READY_LINE = "Database ready at schema version 5."
-CREATED_LINE = "Created a new database at schema version 5."
+READY_LINE = "Database ready at schema version 6."
+CREATED_LINE = "Created a new database at schema version 6."
 FAILED_AUDIT_STEP_LINE = (
     "Migration create_audit_summaries to schema version 5 failed and was "
     "rolled back; the database remains at version 4."
@@ -158,7 +170,7 @@ DRIFTED_VERSION_FIVE_LINE = (
     "the frozen schema for that version."
 )
 TOO_NEW_LINE = (
-    "Refused a database stamped at schema version 6; this build expects 5."
+    "Refused a database stamped at schema version 7; this build expects 6."
 )
 UNRECOGNISED_UNVERSIONED_LINE = (
     "Refused an unversioned database whose structure matches no schema "
@@ -270,6 +282,25 @@ FROZEN_AUDIT_OUTCOMES_TABLE = """
     )
 """
 
+FROZEN_SAVED_CONVERSATIONS_TABLE = """
+    CREATE TABLE saved_conversations (
+        id INTEGER PRIMARY KEY AUTOINCREMENT,
+        created_at TEXT NOT NULL,
+        transcript TEXT NOT NULL CHECK (length(transcript) > 0)
+    )
+"""
+
+FROZEN_CONVERSATION_SUMMARIES_TABLE = """
+    CREATE TABLE conversation_summaries (
+        id INTEGER PRIMARY KEY AUTOINCREMENT,
+        body TEXT NOT NULL CHECK (length(CAST(body AS BLOB)) > 0),
+        created_at TEXT NOT NULL,
+        updated_at TEXT NOT NULL,
+        context_digest TEXT
+            CHECK (context_digest IS NULL OR length(context_digest) = 64)
+    )
+"""
+
 # Every version's complete frozen schema, statement for statement.
 EXPECTED_FROZEN_SCHEMAS: dict[int, tuple[str, ...]] = {
     PRE_MEMORIES_VERSION: (
@@ -308,6 +339,17 @@ EXPECTED_FROZEN_SCHEMAS: dict[int, tuple[str, ...]] = {
         FROZEN_INTERACTIONS_INDEX,
         FROZEN_NOTES_INDEX,
     ),
+    CONVERSATION_RECORDS_VERSION: (
+        FROZEN_INTERACTIONS_TABLE,
+        FROZEN_NOTES_TABLE_WITH_CONTEXT_CONSENT,
+        FROZEN_MEMORIES_TABLE_WITH_CONTEXT_CONSENT,
+        FROZEN_AUDIT_SUMMARIES_TABLE,
+        FROZEN_AUDIT_OUTCOMES_TABLE,
+        FROZEN_SAVED_CONVERSATIONS_TABLE,
+        FROZEN_CONVERSATION_SUMMARIES_TABLE,
+        FROZEN_INTERACTIONS_INDEX,
+        FROZEN_NOTES_INDEX,
+    ),
 }
 
 # Every forward step: its version, its name, and exactly what it runs.
@@ -328,7 +370,16 @@ EXPECTED_LADDER: tuple[tuple[int, str, tuple[str, ...]], ...] = (
         "create_audit_summaries",
         (FROZEN_AUDIT_SUMMARIES_TABLE, FROZEN_AUDIT_OUTCOMES_TABLE),
     ),
+    (
+        CONVERSATION_RECORDS_VERSION,
+        "create_conversation_records",
+        (FROZEN_SAVED_CONVERSATIONS_TABLE, FROZEN_CONVERSATION_SUMMARIES_TABLE),
+    ),
 )
+# The audit step's own entry, found by name rather than by position.
+(AUDIT_STEP,) = [
+    step for step in EXPECTED_LADDER if step[1] == "create_audit_summaries"
+]
 
 # The stamped shapes, built the way test_schema_versioning builds them: the
 # frozen v0.2.0 fixture with each later table substituted by its pinned text.
@@ -345,9 +396,14 @@ V4_SCHEMA = tuple(
     for statement in V3_SCHEMA
 )
 V5_SCHEMA = V4_SCHEMA + (FROZEN_AUDIT_SUMMARIES_TABLE, FROZEN_AUDIT_OUTCOMES_TABLE)
+V6_SCHEMA = V5_SCHEMA + (
+    FROZEN_SAVED_CONVERSATIONS_TABLE,
+    FROZEN_CONVERSATION_SUMMARIES_TABLE,
+)
 
-# The owner rows every migration must keep, as they read once at version 5:
-# each note's consent off (NULL) and each memory's consent off (0).
+# The owner rows every migration must keep, as they read once at version 5
+# and every version after it: each note's consent off (NULL) and each
+# memory's consent off (0).
 MIGRATED_INTERACTIONS = tuple(tuple(row) for row in BASELINE_INTERACTIONS)
 MIGRATED_NOTES = tuple((*row, None) for row in BASELINE_NOTES)
 MIGRATED_MEMORIES = tuple((*row, 0) for row in BASELINE_MEMORIES)
@@ -357,6 +413,8 @@ BASELINE_COUNTS = {
     "memories": len(BASELINE_MEMORIES),
     "audit_summaries": 0,
     "audit_outcomes": 0,
+    "saved_conversations": 0,
+    "conversation_summaries": 0,
 }
 
 # Owner-visible texts for the end-to-end audit flows, written out by hand.
@@ -501,7 +559,7 @@ def _object_names(database_path: Path) -> tuple[str, ...]:
 
 
 def _row_counts(database_path: Path) -> dict[str, int]:
-    """Count the rows of all five record and audit tables."""
+    """Count the rows of all seven record, audit, and conversation tables."""
     return {
         table: int(_query(database_path, f"SELECT COUNT(*) FROM {table}")[0][0])
         for table in ALL_TABLES
@@ -644,11 +702,12 @@ def _build_stamped_v4(database_path: Path) -> None:
 
 @dataclass(frozen=True)
 class _Start:
-    """One database a migration to version 5 can begin from.
+    """One database a climb through version 5 can begin from.
 
     ``classified_as`` is the version an unstamped file is recognised as, or
     None for a stamped one; ``steps`` are the migrations it must run, in
-    order; ``memories`` are its memory rows as they read at version 5.
+    order, up to the current version; ``memories`` are its memory rows as
+    they read once migrated.
     """
 
     label: str
@@ -671,6 +730,7 @@ START_BASELINE = _Start(
         "add_memory_context_consent",
         "add_note_context_consent",
         "create_audit_summaries",
+        "create_conversation_records",
     ),
     MIGRATED_MEMORIES,
 )
@@ -690,6 +750,7 @@ START_V2 = _Start(
         "add_memory_context_consent",
         "add_note_context_consent",
         "create_audit_summaries",
+        "create_conversation_records",
     ),
     MIGRATED_MEMORIES,
 )
@@ -697,14 +758,18 @@ START_V3 = _Start(
     "stamped version 3",
     _build_stamped_v3,
     None,
-    ("add_note_context_consent", "create_audit_summaries"),
+    (
+        "add_note_context_consent",
+        "create_audit_summaries",
+        "create_conversation_records",
+    ),
     MIGRATED_MEMORIES,
 )
 START_V4 = _Start(
     "stamped version 4",
     _build_stamped_v4,
     None,
-    ("create_audit_summaries",),
+    ("create_audit_summaries", "create_conversation_records"),
     MIGRATED_MEMORIES,
 )
 STAMPED_STARTS = (START_V1, START_V2, START_V3, START_V4)
@@ -729,15 +794,31 @@ def _applied(logger: Mock) -> list[str]:
     ]
 
 
+def _real_audit_step() -> object:
+    """Return the memory layer's own audit step, found by its name."""
+    (step,) = [
+        migration
+        for migration in memory_module._MIGRATIONS
+        if migration.name == "create_audit_summaries"
+    ]
+    return step
+
+
 def _broken_ladder(*statements: str) -> tuple[object, ...]:
-    """Return the real ladder with its audit step running ``statements`` instead."""
-    return (
-        *memory_module._MIGRATIONS[:3],
+    """Return the real ladder with its audit step running ``statements`` instead.
+
+    Every other step, the later conversation-record step included, is the
+    real one, in its real place.
+    """
+    return tuple(
         memory_module._Migration(
             version=AUDIT_SUMMARIES_VERSION,
             name="create_audit_summaries",
             statements=statements,
-        ),
+        )
+        if migration.name == "create_audit_summaries"
+        else migration
+        for migration in memory_module._MIGRATIONS
     )
 
 
@@ -931,7 +1012,7 @@ class _MigratedHarness:
         return MariaSession(self.brain, logger=self.logger)
 
     def row_counts(self) -> dict[str, int]:
-        """Count the rows of all five record and audit tables."""
+        """Count the rows of all seven record, audit, and conversation tables."""
         return _row_counts(self.database_path)
 
     def audit_rows(
@@ -1001,12 +1082,20 @@ class _TemporaryDatabaseTestCase(unittest.TestCase):
         # No journal or other file is left beside it.
         self.assertEqual(_siblings(database_path), before_siblings)
 
-    def assert_at_version_five(self, database_path: Path, start: _Start) -> None:
-        """Assert a migrated database is version 5 with every owner row kept."""
-        self.assertEqual(read_schema_version(database_path), AUDIT_SUMMARIES_VERSION)
+    def assert_at_current_version(self, database_path: Path, start: _Start) -> None:
+        """Assert a migrated database is current with every owner row kept.
+
+        The climb passed through version 5, so its audit tables exist and are
+        empty, and the conversation-record step that follows added its two
+        tables empty too.
+        """
+        self.assertEqual(
+            read_schema_version(database_path),
+            CONVERSATION_RECORDS_VERSION,
+        )
         self.assertEqual(
             _describe(database_path),
-            memory_module._reference_schema(V5_SCHEMA),
+            memory_module._reference_schema(V6_SCHEMA),
         )
         self.assertEqual(table_names(database_path), CURRENT_TABLES)
         self.assertEqual(
@@ -1018,6 +1107,11 @@ class _TemporaryDatabaseTestCase(unittest.TestCase):
             },
         )
         self.assertEqual(_audit_rows(database_path), ([], []))
+        counts = _row_counts(database_path)
+        self.assertEqual(
+            {table: counts[table] for table in CONVERSATION_TABLES},
+            dict.fromkeys(CONVERSATION_TABLES, 0),
+        )
 
     def assert_refused_untouched(self, database_path: Path, *, marker: int) -> Mock:
         """Assert initialization refuses and leaves the file exactly as found.
@@ -1056,15 +1150,24 @@ class _TemporaryDatabaseTestCase(unittest.TestCase):
 
 
 class AuditSchemaPinTests(unittest.TestCase):
-    """Pin schema 5, its one new step, and the history it must not disturb."""
+    """Pin schema 5, its one step, and the history it must not disturb.
 
-    def test_the_schema_version_is_five_and_the_app_version_is_unchanged(self) -> None:
-        self.assertEqual(DATABASE_SCHEMA_VERSION, AUDIT_SUMMARIES_VERSION)
+    Version 5 is now frozen history itself: V1-20's conversation-record step
+    follows it, and only that step's place in the ladder is pinned here.
+    """
+
+    def test_the_schema_version_is_current_and_the_app_version_is_unchanged(
+        self,
+    ) -> None:
+        self.assertEqual(DATABASE_SCHEMA_VERSION, CONVERSATION_RECORDS_VERSION)
         self.assertIs(type(DATABASE_SCHEMA_VERSION), int)
-        self.assertEqual(memory_module.DATABASE_SCHEMA_VERSION, AUDIT_SUMMARIES_VERSION)
+        self.assertEqual(
+            memory_module.DATABASE_SCHEMA_VERSION,
+            CONVERSATION_RECORDS_VERSION,
+        )
         self.assertEqual(APP_VERSION, "0.2.0")
 
-    def test_the_ladder_is_exactly_four_steps_ending_with_the_audit_step(self) -> None:
+    def test_the_ladder_is_exactly_five_steps_with_the_audit_step_fourth(self) -> None:
         ladder = memory_module._MIGRATIONS
 
         self.assertEqual(tuple(step.name for step in ladder), LADDER_NAMES)
@@ -1075,16 +1178,18 @@ class AuditSchemaPinTests(unittest.TestCase):
                 MEMORY_CONTEXT_CONSENT_VERSION,
                 NOTE_CONTEXT_CONSENT_VERSION,
                 AUDIT_SUMMARIES_VERSION,
+                CONVERSATION_RECORDS_VERSION,
             ),
         )
+        self.assertEqual(ladder[3].name, "create_audit_summaries")
         self.assertIsNone(memory_module._validate_migration_ladder())
 
     def test_the_audit_step_runs_exactly_its_two_frozen_create_statements(self) -> None:
-        step = memory_module._MIGRATIONS[-1]
+        step = _real_audit_step()
 
         self.assertEqual(
             (step.version, step.name, step.statements),
-            EXPECTED_LADDER[-1],
+            AUDIT_STEP,
         )
         self.assertIs(type(step.statements), tuple)
         frozen_five = dict(memory_module._FROZEN_SCHEMAS)[AUDIT_SUMMARIES_VERSION]
@@ -1118,17 +1223,18 @@ class AuditSchemaPinTests(unittest.TestCase):
     def test_the_frozen_version_five_entry_is_pinned_word_for_word(self) -> None:
         versions = [version for version, _ in memory_module._FROZEN_SCHEMAS]
 
-        self.assertEqual(sorted(versions), [1, 2, 3, 4, 5])
+        self.assertEqual(sorted(versions), [1, 2, 3, 4, 5, 6])
         self.assertEqual(len(versions), len(set(versions)))
         self.assertEqual(
             dict(memory_module._FROZEN_SCHEMAS)[AUDIT_SUMMARIES_VERSION],
             EXPECTED_FROZEN_SCHEMAS[AUDIT_SUMMARIES_VERSION],
         )
 
-    def test_the_hand_written_version_five_schema_is_the_frozen_and_current_one(
+    def test_the_hand_written_version_five_schema_is_the_frozen_one_and_six_is_current(
         self,
     ) -> None:
         pinned = memory_module._reference_schema(V5_SCHEMA)
+        current = memory_module._reference_schema(V6_SCHEMA)
 
         self.assertEqual(
             pinned,
@@ -1136,9 +1242,17 @@ class AuditSchemaPinTests(unittest.TestCase):
                 memory_module._frozen_schema(AUDIT_SUMMARIES_VERSION)
             ),
         )
+        # The live statements now describe version 6: version 5 with the two
+        # conversation-record tables.
         self.assertEqual(
-            pinned,
+            current,
             memory_module._reference_schema(memory_module._CURRENT_SCHEMA_STATEMENTS),
+        )
+        self.assertEqual(
+            current,
+            memory_module._reference_schema(
+                memory_module._frozen_schema(CONVERSATION_RECORDS_VERSION)
+            ),
         )
 
     def test_the_hand_written_earlier_schemas_match_their_frozen_entries(self) -> None:
@@ -1191,9 +1305,15 @@ class AuditSchemaPinTests(unittest.TestCase):
         # The same holds for the shapes pinned in this file.
         self.assertEqual(
             memory_module._reference_schema(
-                V4_SCHEMA + memory_module._MIGRATIONS[-1].statements
+                V4_SCHEMA + _real_audit_step().statements
             ),
             memory_module._reference_schema(V5_SCHEMA),
+        )
+        self.assertEqual(
+            memory_module._reference_schema(
+                V5_SCHEMA + memory_module._MIGRATIONS[-1].statements
+            ),
+            memory_module._reference_schema(V6_SCHEMA),
         )
 
     def test_only_versions_two_and_one_can_exist_unstamped(self) -> None:
@@ -1207,7 +1327,7 @@ class AuditSchemaPinTests(unittest.TestCase):
 
 
 class AuditMigrationUpgradeTests(_TemporaryDatabaseTestCase):
-    """Verify every earlier database reaches version 5 with every row kept."""
+    """Verify every earlier database climbs through version 5 keeping every row."""
 
     def _migrate(self, start: _Start) -> tuple[Path, Mock, dict[str, int]]:
         """Build a start, migrate it once, and return what the step saw."""
@@ -1226,8 +1346,8 @@ class AuditMigrationUpgradeTests(_TemporaryDatabaseTestCase):
         recording: Mock,
         sequences: dict[str, int],
     ) -> None:
-        """Assert one start's whole climb to version 5 and its log."""
-        self.assert_at_version_five(database_path, start)
+        """Assert one start's whole climb through version 5 and its log."""
+        self.assert_at_current_version(database_path, start)
         self.assertEqual(_applied(recording), list(start.steps))
         self.assertEqual(
             _row_counts(database_path),
@@ -1254,7 +1374,16 @@ class AuditMigrationUpgradeTests(_TemporaryDatabaseTestCase):
                 READY_LINE,
             ],
         )
-        self.assertEqual(messages[-2], APPLIED_AUDIT_STEP_LINE)
+        # The audit step is applied, followed only by the conversation-record
+        # step and the ready line.
+        self.assertEqual(
+            messages[-3:],
+            [
+                APPLIED_AUDIT_STEP_LINE,
+                APPLIED_STEP_LINES["create_conversation_records"],
+                READY_LINE,
+            ],
+        )
         self.assertEqual(_messages(recording, "warning"), [])
         self.assertEqual(_messages(recording, "error"), [])
         recording.exception.assert_not_called()
@@ -1267,17 +1396,19 @@ class AuditMigrationUpgradeTests(_TemporaryDatabaseTestCase):
         self._assert_upgraded(database_path, START_BASELINE, recording, sequences)
         # The new tables answer through the memory layer, and hold nothing.
         reopened = Memory(database_path, logger=TEST_LOGGER)
-        self.assertEqual(reopened.schema_version(), AUDIT_SUMMARIES_VERSION)
+        self.assertEqual(reopened.schema_version(), CONVERSATION_RECORDS_VERSION)
         self.assertEqual(reopened.list_audit_summaries(), [])
         self.assertIsNone(reopened.get_audit_summary(1))
 
-    def test_the_pre_memories_shape_climbs_every_step_to_version_five(self) -> None:
+    def test_the_pre_memories_shape_climbs_every_step_to_the_current_version(
+        self,
+    ) -> None:
         database_path, recording, sequences = self._migrate(START_PRE_MEMORIES)
 
         self._assert_upgraded(database_path, START_PRE_MEMORIES, recording, sequences)
         self.assertEqual(_applied(recording), list(LADDER_NAMES))
 
-    def test_stamped_versions_one_to_four_each_reach_version_five(self) -> None:
+    def test_stamped_versions_one_to_four_each_reach_the_current_version(self) -> None:
         for start in STAMPED_STARTS:
             with self.subTest(start=start.label):
                 database_path, recording, sequences = self._migrate(start)
@@ -1305,7 +1436,7 @@ class AuditMigrationUpgradeTests(_TemporaryDatabaseTestCase):
                 self.assertEqual(_messages(recording), [READY_LINE, READY_LINE])
                 self.assertEqual(_messages(recording, "error"), [])
                 self.assertEqual(_messages(recording, "warning"), [])
-                self.assert_at_version_five(database_path, start)
+                self.assert_at_current_version(database_path, start)
 
     def test_the_audit_step_rewrites_no_existing_row_and_keeps_consent_exactly(
         self,
@@ -1330,7 +1461,11 @@ class AuditMigrationUpgradeTests(_TemporaryDatabaseTestCase):
 
         Memory(database_path, logger=TEST_LOGGER).initialize()
 
-        self.assertEqual(read_schema_version(database_path), AUDIT_SUMMARIES_VERSION)
+        # The conversation-record step that follows rewrites no row either.
+        self.assertEqual(
+            read_schema_version(database_path),
+            CONVERSATION_RECORDS_VERSION,
+        )
         self.assertEqual(_record_rows(database_path), before)
         self.assertEqual(_sequences(database_path), sequences)
         self.assertEqual(_audit_rows(database_path), ([], []))
@@ -1409,21 +1544,24 @@ class AuditMigrationUpgradeTests(_TemporaryDatabaseTestCase):
 
 
 class FreshDatabaseTests(_TemporaryDatabaseTestCase):
-    """Verify a database Maria creates itself starts directly at version 5."""
+    """Verify a database Maria creates itself starts at the current version."""
 
     def _assert_created_directly(self, database_path: Path, recording: Mock) -> None:
-        """Assert one creation went straight to version 5 with no ladder."""
+        """Assert one creation went straight to version 6 with no ladder."""
         self.assertEqual(_messages(recording), [CREATED_LINE, READY_LINE])
         self.assertEqual(_applied(recording), [])
-        self.assertEqual(read_schema_version(database_path), AUDIT_SUMMARIES_VERSION)
+        self.assertEqual(
+            read_schema_version(database_path),
+            CONVERSATION_RECORDS_VERSION,
+        )
         self.assertEqual(table_names(database_path), CURRENT_TABLES)
         self.assertEqual(
             _describe(database_path),
-            memory_module._reference_schema(V5_SCHEMA),
+            memory_module._reference_schema(V6_SCHEMA),
         )
         self.assertEqual(_row_counts(database_path), dict.fromkeys(ALL_TABLES, 0))
 
-    def test_a_new_database_is_created_directly_at_version_five(self) -> None:
+    def test_a_new_database_is_created_directly_at_the_current_version(self) -> None:
         database_path = self.database("fresh")
         recording = Mock(spec=logging.Logger)
 
@@ -1431,7 +1569,7 @@ class FreshDatabaseTests(_TemporaryDatabaseTestCase):
 
         self._assert_created_directly(database_path, recording)
 
-    def test_an_empty_file_is_created_directly_at_version_five(self) -> None:
+    def test_an_empty_file_is_created_directly_at_the_current_version(self) -> None:
         database_path = self.database("empty")
         database_path.parent.mkdir(parents=True)
         database_path.touch()
@@ -1458,7 +1596,7 @@ class FreshDatabaseTests(_TemporaryDatabaseTestCase):
         )
         self.assertEqual(
             _describe(fresh_path),
-            memory_module._reference_schema(V5_SCHEMA),
+            memory_module._reference_schema(V6_SCHEMA),
         )
 
     def test_reopening_a_fresh_database_holding_audit_rows_changes_nothing(
@@ -1511,7 +1649,7 @@ class AuditStepAtomicityTests(_TemporaryDatabaseTestCase):
 
     def _injections(self) -> dict[str, Callable[[], object]]:
         """Return each way the audit step is made to fail part-way."""
-        real_statements = memory_module._MIGRATIONS[-1].statements
+        real_statements = _real_audit_step().statements
         real_write = memory_module._write_schema_version
 
         def refuse_the_audit_stamp(
@@ -1585,9 +1723,12 @@ class AuditStepAtomicityTests(_TemporaryDatabaseTestCase):
         retrying.initialize()
         retrying.initialize()
 
-        self.assertEqual(_applied(recording), ["create_audit_summaries"])
+        self.assertEqual(
+            _applied(recording),
+            ["create_audit_summaries", "create_conversation_records"],
+        )
         self.assertEqual(_messages(recording).count(APPLIED_AUDIT_STEP_LINE), 1)
-        self.assert_at_version_five(database_path, START_V4)
+        self.assert_at_current_version(database_path, START_V4)
 
     def test_a_climb_that_fails_at_the_audit_step_stops_whole_at_version_four(
         self,
@@ -1650,9 +1791,10 @@ class AuditStepAtomicityTests(_TemporaryDatabaseTestCase):
                         "add_memory_context_consent",
                         "add_note_context_consent",
                         "create_audit_summaries",
+                        "create_conversation_records",
                     ],
                 )
-                self.assert_at_version_five(database_path, START_BASELINE)
+                self.assert_at_current_version(database_path, START_BASELINE)
 
 
 class AuditStepContentionTests(_TemporaryDatabaseTestCase):
@@ -1710,8 +1852,11 @@ class AuditStepContentionTests(_TemporaryDatabaseTestCase):
         retrying.initialize()
         retrying.initialize()
 
-        self.assertEqual(_applied(recording), ["create_audit_summaries"])
-        self.assert_at_version_five(database_path, START_V4)
+        self.assertEqual(
+            _applied(recording),
+            ["create_audit_summaries", "create_conversation_records"],
+        )
+        self.assert_at_current_version(database_path, START_V4)
 
     def _locking_the_audit_step(
         self,
@@ -1768,7 +1913,7 @@ class AuditStepContentionTests(_TemporaryDatabaseTestCase):
             before_siblings=before_siblings,
         )
 
-    def test_contention_at_the_end_of_a_climb_keeps_the_steps_before_it(
+    def test_contention_at_the_audit_step_of_a_climb_keeps_the_steps_before_it(
         self,
     ) -> None:
         database_path = self.build(START_BASELINE)
@@ -1823,9 +1968,10 @@ class AuditStepContentionTests(_TemporaryDatabaseTestCase):
                 "add_memory_context_consent",
                 "add_note_context_consent",
                 "create_audit_summaries",
+                "create_conversation_records",
             ],
         )
-        self.assert_at_version_five(database_path, START_BASELINE)
+        self.assert_at_current_version(database_path, START_BASELINE)
 
 
 # --- Drift and newer schemas -------------------------------------------------
@@ -1853,22 +1999,52 @@ class VersionFiveDriftTests(_TemporaryDatabaseTestCase):
                     [DRIFTED_VERSION_FIVE_LINE],
                 )
 
-    def test_the_exact_version_five_schema_is_accepted_without_a_write(self) -> None:
+    def test_the_exact_version_five_schema_is_accepted_and_climbs_one_step(
+        self,
+    ) -> None:
+        """Version 5 is frozen now, so an exact one climbs one step and stops.
+
+        Only the conversation-record step runs, every owner row is kept, and
+        the database it leaves is current and then accepted without a write.
+        """
         database_path = self.database("exact")
         _build_schema(database_path, V5_SCHEMA, AUDIT_SUMMARIES_VERSION)
-        before = database_path.read_bytes()
+        before_rows = _record_rows(database_path)
+        before_sequences = _sequences(database_path)
         recording = Mock(spec=logging.Logger)
 
+        Memory(database_path, logger=recording).initialize()
+
+        self.assertEqual(_applied(recording), ["create_conversation_records"])
+        self.assertEqual(
+            _messages(recording),
+            [APPLIED_STEP_LINES["create_conversation_records"], READY_LINE],
+        )
+        self.assertEqual(_messages(recording, "error"), [])
+        self.assertEqual(
+            read_schema_version(database_path),
+            CONVERSATION_RECORDS_VERSION,
+        )
+        self.assertEqual(
+            _describe(database_path),
+            memory_module._reference_schema(V6_SCHEMA),
+        )
+        self.assertEqual(_record_rows(database_path), before_rows)
+        self.assertEqual(_sequences(database_path), before_sequences)
+        self.assertEqual(_audit_rows(database_path), ([], []))
+
+        migrated = database_path.read_bytes()
+        reopening = Mock(spec=logging.Logger)
         with patch.object(
             memory_module,
             "_run_in_one_transaction",
             side_effect=AssertionError("a current database may not be written"),
         ):
-            Memory(database_path, logger=recording).initialize()
+            Memory(database_path, logger=reopening).initialize()
 
-        self.assertEqual(database_path.read_bytes(), before)
-        self.assertEqual(_messages(recording), [READY_LINE])
-        self.assertEqual(_messages(recording, "error"), [])
+        self.assertEqual(database_path.read_bytes(), migrated)
+        self.assertEqual(_messages(reopening), [READY_LINE])
+        self.assertEqual(_messages(reopening, "error"), [])
 
     def test_a_version_five_database_missing_an_audit_table_is_refused_untouched(
         self,
@@ -1980,16 +2156,16 @@ class VersionFiveDriftTests(_TemporaryDatabaseTestCase):
 
 
 class NewerSchemaTests(_TemporaryDatabaseTestCase):
-    """Verify a database stamped 6 belongs to a newer build and is refused."""
+    """Verify a database stamped 7 belongs to a newer build and is refused."""
 
-    def _stamped_six(self, label: str, schema: tuple[str, ...]) -> Path:
-        """Build a schema with owner rows and stamp it 6."""
+    def _stamped_newer(self, label: str, schema: tuple[str, ...]) -> Path:
+        """Build a schema with owner rows and stamp it 7."""
         database_path = self.database(label)
         _build_schema(database_path, schema, NEWER_SCHEMA_VERSION)
         return database_path
 
-    def test_a_database_stamped_six_raises_the_typed_too_new_failure(self) -> None:
-        database_path = self._stamped_six("newer", V5_SCHEMA)
+    def test_a_newer_stamp_raises_the_typed_too_new_failure(self) -> None:
+        database_path = self._stamped_newer("newer", V6_SCHEMA)
 
         with self.assertRaises(TypedFailureError) as raised:
             Memory(database_path, logger=TEST_LOGGER).initialize()
@@ -2002,7 +2178,7 @@ class NewerSchemaTests(_TemporaryDatabaseTestCase):
         self.assertEqual(raised.exception.args, (raised.exception.failure,))
 
     def test_the_too_new_refusal_writes_nothing_and_logs_only_versions(self) -> None:
-        database_path = self._stamped_six("newer", V5_SCHEMA)
+        database_path = self._stamped_newer("newer", V6_SCHEMA)
         before_bytes = database_path.read_bytes()
         before_siblings = _siblings(database_path)
         recording = Mock(spec=logging.Logger)
@@ -2026,12 +2202,13 @@ class NewerSchemaTests(_TemporaryDatabaseTestCase):
             NEWER_SCHEMA_VERSION,
         )
 
-    def test_a_database_stamped_six_is_too_new_whatever_its_shape(self) -> None:
+    def test_a_newer_stamp_is_too_new_whatever_its_shape(self) -> None:
         for label, schema in (
+            ("version six shape", V6_SCHEMA),
             ("version five shape", V5_SCHEMA),
             (
                 "unknown later shape",
-                V5_SCHEMA
+                V6_SCHEMA
                 + (
                     "CREATE TABLE audit_annotations "
                     "(summary_id INTEGER PRIMARY KEY, note TEXT NOT NULL)",
@@ -2040,7 +2217,7 @@ class NewerSchemaTests(_TemporaryDatabaseTestCase):
             ("version four shape", V4_SCHEMA),
         ):
             with self.subTest(shape=label):
-                database_path = self._stamped_six(label.replace(" ", "-"), schema)
+                database_path = self._stamped_newer(label.replace(" ", "-"), schema)
                 before_bytes = database_path.read_bytes()
                 recording = Mock(spec=logging.Logger)
 
@@ -2139,6 +2316,8 @@ class AuditMigrationLoggingTests(unittest.TestCase):
                 "INSERT INTO",
                 "SELECT ",
                 "audit_outcomes",
+                "saved_conversations",
+                "conversation_summaries",
             )
         )
         return sentinels
@@ -2151,13 +2330,20 @@ class AuditMigrationLoggingTests(unittest.TestCase):
         logged = self._logged()
 
         self.assertIn(f"| INFO | maria.memory | {APPLIED_AUDIT_STEP_LINE}", logged)
-        self.assertEqual(logged.count("Applied migration"), 1)
+        self.assertEqual(logged.count(APPLIED_AUDIT_STEP_LINE), 1)
+        # The conversation-record step follows it with its own one line.
+        self.assertEqual(logged.count("Applied migration"), 2)
         self.assertIn(f"| INFO | maria.memory | {READY_LINE}", logged)
         self.assertEqual(
             self._entries(),
             [
                 LOGGING_CONFIGURED_ENTRY,
                 ("INFO", "maria.memory", APPLIED_AUDIT_STEP_LINE),
+                (
+                    "INFO",
+                    "maria.memory",
+                    APPLIED_STEP_LINES["create_conversation_records"],
+                ),
                 ("INFO", "maria.memory", READY_LINE),
             ],
         )
@@ -2193,6 +2379,12 @@ class AuditMigrationLoggingTests(unittest.TestCase):
                     "version is now 4.",
                 ),
                 ("INFO", "maria.memory", APPLIED_AUDIT_STEP_LINE),
+                (
+                    "INFO",
+                    "maria.memory",
+                    "Applied migration create_conversation_records; schema "
+                    "version is now 6.",
+                ),
                 ("INFO", "maria.memory", READY_LINE),
             ],
         )
@@ -2202,7 +2394,7 @@ class AuditMigrationLoggingTests(unittest.TestCase):
         _build_stamped_v4(self.database_path)
         configure_logging(self.log_dir, "DEBUG")
         broken = _broken_ladder(
-            *memory_module._MIGRATIONS[-1].statements,
+            *_real_audit_step().statements,
             NEVER_COMMITTED,
         )
 
@@ -2292,7 +2484,10 @@ class MigratedDatabaseAuditFlowTests(unittest.TestCase):
             provider=provider,
         )
         session = harness.session()
-        self.assertEqual(harness.memory.schema_version(), AUDIT_SUMMARIES_VERSION)
+        self.assertEqual(
+            harness.memory.schema_version(),
+            CONVERSATION_RECORDS_VERSION,
+        )
         self.assertEqual(harness.row_counts(), BASELINE_COUNTS)
         owner_rows = _record_rows(harness.database_path)
 
@@ -2565,10 +2760,10 @@ class LiveDatabaseRefusalTests(_TemporaryDatabaseTestCase):
         with TemporaryDirectory() as directory:
             database_path = Path(directory) / "database" / "maria-test.db"
             self.assertIsNone(_refuse_live_database(database_path))
-            _build_schema(database_path, V5_SCHEMA, AUDIT_SUMMARIES_VERSION)
+            _build_schema(database_path, V6_SCHEMA, CONVERSATION_RECORDS_VERSION)
             self.assertEqual(
                 read_schema_version(database_path),
-                AUDIT_SUMMARIES_VERSION,
+                CONVERSATION_RECORDS_VERSION,
             )
             self.assertEqual(_row_counts(database_path), BASELINE_COUNTS)
 

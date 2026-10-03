@@ -15,6 +15,7 @@ Supported command families:
 - Explicit persistent-memory commands
 - Interaction-history commands
 - Audit-summary commands
+- Saved-conversation and conversation-summary commands
 - Read-only system information commands
 
 Input that matches no command receives the planner's generic no-action
@@ -551,6 +552,81 @@ Only these owner commands reach the audit actions. None of the three is
 model-eligible, so a reasoning model's proposal naming one is refused with
 `Maria does not accept that action from the reasoning model.`, and audit
 summaries are never sent to the model as context.
+
+## Conversation Record Grammar
+
+Saved-conversation and conversation-summary commands use strict command
+syntax, and their keywords are case-insensitive; see "Conversations Tool" and
+"Conversation Summaries Tool" in `docs/tools.md` and "Saved Conversations and
+Summaries" in `docs/architecture.md`. Each creates one step:
+
+| Command | Tool and action | Arguments |
+| --- | --- | --- |
+| `save conversation` | `conversations.save` | `{}` |
+| `conversations` | `conversations.list` | `{}` |
+| `read conversation <id>` | `conversations.read` | `{"id": id}` |
+| `delete conversation <id>` | `conversations.delete` | `{"id": id}` |
+| `summarize conversation` | `conversation_summaries.create` | `{}` |
+| `summaries` | `conversation_summaries.list` | `{}` |
+| `read summary <id>` | `conversation_summaries.read` | `{"id": id}` |
+| `edit summary <id>: <new text>` | `conversation_summaries.edit` | `{"id": id, "text": new_text}` |
+| `delete summary <id>` | `conversation_summaries.delete` | `{"id": id}` |
+| `enable summary context <id>` | `conversation_summaries.enable_context` | `{"id": id}` |
+| `disable summary context <id>` | `conversation_summaries.disable_context` | `{"id": id}` |
+
+The four argumentless commands match only the whole request, so a
+conversational phrasing such as `save the conversation` or
+`summarize conversation please` still gets the generic fallback, and reaches
+the model when reasoning is enabled. The planner never supplies session text:
+the save step carries no `transcript` and the summary step no `text`. Brain
+supplies each from the session, as its contract-declared session input, only
+when the planner's plan reaches `process`, and refuses a plan that already
+carries one.
+
+The seven ID commands take a positive numeric ID through the same parser as
+`read interaction` and the audit commands, so there are now twenty ID-only
+planner commands. An invalid ID returns
+`Saved conversation id must be a positive whole number.` or
+`Conversation summary id must be a positive whole number.`, and a bare command
+returns its usage response:
+
+```text
+Use: read conversation <id>
+Use: delete conversation <id>
+Use: read summary <id>
+Use: edit summary <id>: <new text>
+Use: delete summary <id>
+Use: enable summary context <id>
+Use: disable summary context <id>
+```
+
+`edit summary` splits its operand on the first colon only, so the new text may
+itself contain colons; outer whitespace is removed from both parts, and an
+empty text or a missing colon gets the usage response. `delete conversation`,
+`summarize conversation`, `edit summary`, `delete summary`, and both summary
+consent commands always require confirmation. `list summaries` is not a
+summary command: it keeps its existing meaning, a `filesystem.list` step for
+the path `summaries`.
+
+`help` lists the eleven commands after `disable memory context <id>` and
+before `system`:
+
+```text
+- save conversation
+- conversations
+- read conversation <id>
+- delete conversation <id>
+- summarize conversation
+- summaries
+- read summary <id>
+- edit summary <id>: <new text>
+- delete summary <id>
+- enable summary context <id>
+- disable summary context <id>
+```
+
+None of the eleven actions is model-eligible, so a reasoning model's proposal
+naming one is refused, and a saved conversation is never sent to the model.
 
 ## Plan Shape
 

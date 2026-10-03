@@ -51,6 +51,7 @@ DEFAULT_DATABASE_BUSY_TIMEOUT_SECONDS = 5.0
 # the published v0.2.0 baseline, which adds the ``memories`` table; 3 adds the
 # per-memory ``context_enabled`` consent column; 4 adds the per-note
 # ``context_digest`` consent column; 5 adds the ``audit_summaries`` and
-# ``audit_outcomes`` tables and is the current schema. A new version is added
-# by appending one migration, never by editing this value's meaning.
-DATABASE_SCHEMA_VERSION = 5
+# ``audit_outcomes`` tables; 6 adds the ``saved_conversations`` and
+# ``conversation_summaries`` tables and is the current schema. A new version
+# is added by appending one migration, never by editing this value's meaning.
+DATABASE_SCHEMA_VERSION = 6

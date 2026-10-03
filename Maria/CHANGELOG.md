@@ -2,6 +2,47 @@
 
 ## Unreleased
 
+- The current session's bounded conversation can now be kept on request, and
+  the local model can draft a conversation summary that is stored only once
+  the owner confirms it. `save conversation` stores exactly the exchanges the
+  session holds, at most 8 exchanges and 8 KiB of their text, as one immutable
+  saved conversation, reading no other record and leaving the conversation as
+  it was. Its reply names only the new id and the exchange count and says the
+  copy is exact, so later changes to memories or notes do not change it.
+  Saving twice stores two copies, and a session with nothing retained,
+  including one that has ended, has nothing to save. `conversations`,
+  `read conversation <id>`, and `delete conversation <id>` list, show, and
+  delete saved conversations, and deletion needs confirmation. A saved
+  conversation is never edited and never becomes model context.
+  `summarize conversation` asks the local model once, and only then, to
+  summarize every retained exchange, sending Maria's fixed prompt and those
+  exchanges and nothing else: no memory, note, or summary context and no
+  action instructions, within the configured input budget or not at all. A
+  record supplied earlier in the conversation that has since been disabled,
+  changed, or deleted, or that cannot be rechecked, clears the conversation
+  instead, and nothing is sent. The draft, at most 2,048 bytes once its outer
+  whitespace is removed, is shown whole and escaped in a confirmation and is
+  stored exactly as shown only when the owner answers yes. Confirming asks
+  the model nothing, any other request discards the draft, and a reply that
+  looks like an action is only text. Drafting, its refusals, and the draft
+  itself are never recorded as history or kept in the conversation.
+  `summaries`, `read summary <id>`, `edit summary <id>: <new text>`, and
+  `delete summary <id>` list, show, replace, and delete summaries, and editing
+  and deletion need confirmation. A summary's context consent stays off until
+  the owner confirms `enable summary context <id>`, which shows its exact
+  stored text and covers only that text; `disable summary context <id>`, any
+  edit, or a change made outside Maria ends it. An enabled summary can then be
+  found by the same literal search as an enabled note, after memories and
+  notes and within the same limits, and is named as `summary N` when it is
+  supplied; a request that carries no summary is byte for byte what it was
+  before. Listings and readings are recorded only as fixed labels, and no
+  reply repeats saved or summary text, except that an edit's request keeps its
+  new text, as a note edit's does. The notices that say an earlier
+  conversation was cleared now name summaries too. The database moves to
+  schema version 6, adding two empty tables through one forward migration
+  that changes no existing row, and record ids are never reused. Nothing is
+  saved or summarized automatically, there is no bulk deletion, and an ended
+  session cannot be recovered.
 - Model-proposed work can now be a foreground plan of two to five steps,
   shown in full, approved once as an immutable unit, and run in order with
   explicit partial-failure reporting. A proposal may be one action, exactly as

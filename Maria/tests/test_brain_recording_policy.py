@@ -79,6 +79,17 @@ HELP_TEXT = (
     "- forget memory <id>\n"
     "- enable memory context <id>\n"
     "- disable memory context <id>\n"
+    "- save conversation\n"
+    "- conversations\n"
+    "- read conversation <id>\n"
+    "- delete conversation <id>\n"
+    "- summarize conversation\n"
+    "- summaries\n"
+    "- read summary <id>\n"
+    "- edit summary <id>: <new text>\n"
+    "- delete summary <id>\n"
+    "- enable summary context <id>\n"
+    "- disable summary context <id>\n"
     "- system\n"
     "- time\n"
     "- history\n"
@@ -348,6 +359,70 @@ COMMAND_CORPUS: tuple[CorpusEntry, ...] = (
     ),
     _records_nothing("delete audit 1", CANCEL),
     _records("delete audit 1", "Audit summary not found: 1.", CONFIRM),
+    # V1-20's commands run after V1-18's, so every id listed above is
+    # unchanged. No reasoning model runs here, so the session retains no
+    # exchange: a save records its fixed reply and stores nothing, and a
+    # summary request is answered as unavailable and, like every summary
+    # outcome, records nothing at all. Listings and readings record a fixed
+    # label, and every other row is fixed text naming at most an id, apart
+    # from an edit's request, which keeps its new text as a note edit does.
+    _records("save conversation", "There is no conversation in this session to save."),
+    _records("conversations", "Listed saved conversations."),
+    _records("read conversation", "Use: read conversation <id>"),
+    _records(
+        "read conversation x",
+        "Saved conversation id must be a positive whole number.",
+    ),
+    _records("read conversation 1", "Saved conversation not found: 1."),
+    _records("delete conversation", "Use: delete conversation <id>"),
+    _records(
+        "delete conversation 0",
+        "Saved conversation id must be a positive whole number.",
+    ),
+    _records_nothing("delete conversation 1", CANCEL),
+    _records("delete conversation 1", "Saved conversation not found: 1.", CONFIRM),
+    _records_nothing("summarize conversation", RUN),
+    _records("summaries", "Listed conversation summaries."),
+    _records("read summary", "Use: read summary <id>"),
+    _records(
+        "read summary x",
+        "Conversation summary id must be a positive whole number.",
+    ),
+    _records("read summary 1", "Conversation summary not found: 1."),
+    _records("edit summary", "Use: edit summary <id>: <new text>"),
+    _records("edit summary 1:", "Use: edit summary <id>: <new text>"),
+    _records(
+        "edit summary 1: Replaced summary text",
+        "Conversation summary not found: 1.",
+        CONFIRM,
+    ),
+    _records("delete summary", "Use: delete summary <id>"),
+    _records(
+        "delete summary 0",
+        "Conversation summary id must be a positive whole number.",
+    ),
+    _records_nothing("delete summary 1", CANCEL),
+    _records("delete summary 1", "Conversation summary not found: 1.", CONFIRM),
+    _records("enable summary context", "Use: enable summary context <id>"),
+    _records(
+        "enable summary context x",
+        "Conversation summary id must be a positive whole number.",
+    ),
+    _records(
+        "enable summary context 1",
+        "Conversation summary not found: 1.",
+        CONFIRM,
+    ),
+    _records("disable summary context", "Use: disable summary context <id>"),
+    _records(
+        "disable summary context 0",
+        "Conversation summary id must be a positive whole number.",
+    ),
+    _records(
+        "disable summary context 1",
+        "Conversation summary not found: 1.",
+        CONFIRM,
+    ),
     _records_nothing("   ", RUN),
     _records_nothing("", REFUSE),
 )

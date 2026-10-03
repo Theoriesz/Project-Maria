@@ -201,6 +201,17 @@ class PlannerMemoryTests(unittest.TestCase):
             "- forget memory <id>",
             "- enable memory context <id>",
             "- disable memory context <id>",
+            "- save conversation",
+            "- conversations",
+            "- read conversation <id>",
+            "- delete conversation <id>",
+            "- summarize conversation",
+            "- summaries",
+            "- read summary <id>",
+            "- edit summary <id>: <new text>",
+            "- delete summary <id>",
+            "- enable summary context <id>",
+            "- disable summary context <id>",
             "- system",
             "- time",
             "- history",
@@ -459,6 +470,108 @@ class PlannerMemoryTests(unittest.TestCase):
         plan = self.planner.create_plan(request)
         self.assertEqual(plan.steps, ())
         self.assertEqual(plan.response_if_no_action, UNSUPPORTED_RESPONSE)
+
+
+class ConversationRecordCommandTests(unittest.TestCase):
+    """Verify V1-20's eleven commands and the grammar they leave alone."""
+
+    def setUp(self) -> None:
+        self.planner = Planner(logger=_quiet_logger())
+
+    def test_each_command_maps_to_one_step_of_its_own_action(self) -> None:
+        for request, tool_name, action, arguments in (
+            ("save conversation", "conversations", "save", {}),
+            ("conversations", "conversations", "list", {}),
+            ("read conversation 3", "conversations", "read", {"id": 3}),
+            ("delete conversation 3", "conversations", "delete", {"id": 3}),
+            ("summarize conversation", "conversation_summaries", "create", {}),
+            ("summaries", "conversation_summaries", "list", {}),
+            ("read summary 4", "conversation_summaries", "read", {"id": 4}),
+            (
+                "edit summary 4: New text.",
+                "conversation_summaries",
+                "edit",
+                {"id": 4, "text": "New text."},
+            ),
+            ("delete summary 4", "conversation_summaries", "delete", {"id": 4}),
+            (
+                "enable summary context 4",
+                "conversation_summaries",
+                "enable_context",
+                {"id": 4},
+            ),
+            (
+                "disable summary context 4",
+                "conversation_summaries",
+                "disable_context",
+                {"id": 4},
+            ),
+        ):
+            with self.subTest(request=request):
+                self.assertEqual(
+                    self.planner.create_plan(request),
+                    Plan(
+                        original_request=request,
+                        steps=(PlanStep(tool_name, action, arguments),),
+                    ),
+                )
+
+    def test_the_argumentless_commands_match_whole_requests_in_any_case(
+        self,
+    ) -> None:
+        for request, action in (
+            ("SAVE CONVERSATION", "save"),
+            ("Save Conversation", "save"),
+            ("Summarize Conversation", "create"),
+        ):
+            with self.subTest(request=request):
+                self.assertEqual(
+                    [step.action for step in self.planner.create_plan(request).steps],
+                    [action],
+                )
+
+    def test_conversational_phrasings_still_reach_the_fallback(self) -> None:
+        for request in (
+            "save the conversation",
+            "please save conversation",
+            "save conversation now",
+            "save conversations",
+            "summarize the conversation",
+            "summarize conversation please",
+            "summarise conversation",
+            "conversation",
+            "summary",
+        ):
+            with self.subTest(request=request):
+                plan = self.planner.create_plan(request)
+                self.assertEqual(plan.steps, ())
+                self.assertEqual(plan.response_if_no_action, UNSUPPORTED_RESPONSE)
+
+    def test_list_summaries_stays_a_directory_listing(self) -> None:
+        self.assertEqual(
+            self.planner.create_plan("list summaries"),
+            Plan(
+                original_request="list summaries",
+                steps=(PlanStep("filesystem", "list", {"path": "summaries"}),),
+            ),
+        )
+
+    def test_bare_and_malformed_forms_answer_with_their_usage(self) -> None:
+        for request, usage in (
+            ("read conversation", "Use: read conversation <id>"),
+            ("delete conversation", "Use: delete conversation <id>"),
+            ("read summary", "Use: read summary <id>"),
+            ("edit summary", "Use: edit summary <id>: <new text>"),
+            ("edit summary 4", "Use: edit summary <id>: <new text>"),
+            ("edit summary 4:", "Use: edit summary <id>: <new text>"),
+            ("delete summary", "Use: delete summary <id>"),
+            ("enable summary context", "Use: enable summary context <id>"),
+            ("disable summary context", "Use: disable summary context <id>"),
+        ):
+            with self.subTest(request=request):
+                plan = self.planner.create_plan(request)
+                self.assertEqual(plan.steps, ())
+                self.assertEqual(plan.response_if_no_action, usage)
 
 
 def _quiet_logger() -> logging.Logger:

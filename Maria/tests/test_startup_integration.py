@@ -118,6 +118,8 @@ class StartupIntegrationTests(unittest.TestCase):
                 "memories",
                 "audit_summaries",
                 "audit_outcomes",
+                "saved_conversations",
+                "conversation_summaries",
             }.issubset(table_names)
         )
 

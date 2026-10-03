@@ -13,6 +13,12 @@ from core.logger import get_logger
 MANDATORY_CONFIRMATION_ACTIONS = frozenset(
     {
         "audit.delete",
+        "conversation_summaries.create",
+        "conversation_summaries.edit",
+        "conversation_summaries.delete",
+        "conversation_summaries.enable_context",
+        "conversation_summaries.disable_context",
+        "conversations.delete",
         "filesystem.rename",
         "filesystem.move",
         "history.delete",
@@ -37,6 +43,20 @@ CONFIRMATION_NOTICES = MappingProxyType(
             "Deleting an audit summary removes it from Maria's database. It "
             "does not undo the action, and Maria's operational log may still "
             "show that a model-proposed action ran."
+        ),
+        "conversation_summaries.create": (
+            "Storing this summary keeps text your local reasoning model wrote, "
+            "which can repeat anything said in this session, including text "
+            "from memories or notes it was given. Its context consent starts "
+            "off, and Maria does not check it for passwords or other secrets."
+        ),
+        "conversation_summaries.enable_context": (
+            "Once enabled, this summary's entire text may be sent to your "
+            "local reasoning model on a later conversational turn when a word "
+            "of four or more characters from your request appears literally "
+            "in it, within Maria's context limits. Maria does not check the "
+            "summary for passwords or other secrets, and enabling it does not "
+            "mean it contains none."
         ),
         "memory.enable_context": (
             "Once enabled, this memory may be sent to your local reasoning "

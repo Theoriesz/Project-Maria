@@ -20,6 +20,7 @@ from pathlib import Path
 from types import SimpleNamespace
 from unittest.mock import Mock, patch
 
+from core.action_contracts import BUILT_IN_ACTION_CONTRACTS
 from core.brain import BrainResponse, MariaBrain
 from core.config import MariaConfig
 from core.constants import APP_VERSION, PROJECT_ROOT
@@ -181,6 +182,9 @@ ZERO_ROWS = {
     "memories": 0,
     "audit_summaries": 0,
     "audit_outcomes": 0,
+    # V1-20: no conversational turn may save a conversation or a summary.
+    "saved_conversations": 0,
+    "conversation_summaries": 0,
 }
 
 # Since V1-15 every model-backed conversational response ends with Maria's own
@@ -418,6 +422,8 @@ class _Harness:
                     "memories",
                     "audit_summaries",
                     "audit_outcomes",
+                    "saved_conversations",
+                    "conversation_summaries",
                 )
             }
         finally:
@@ -1370,6 +1376,13 @@ class CommandCorpusWithReasoningTests(unittest.TestCase):
     enabled. Its three generic-fallback entries become conversational and
     record nothing; every other entry is compared, row for row, with the
     same entry run through a disabled controller that skips those three.
+
+    V1-20's two session-input commands read the exchanges a session
+    retains, and only a session with reasoning on can retain any. Each is
+    compared like for like: the enabled session is ended just before it, so
+    both controllers meet the empty conversation a disabled one always has.
+    What they do with retained exchanges is pinned in
+    ``tests.test_conversation_persistence``.
     """
 
     def setUp(self) -> None:
@@ -1389,6 +1402,21 @@ class CommandCorpusWithReasoningTests(unittest.TestCase):
             fallback,
             {"sing me an unsupported song", "list", "histories"},
         )
+        session_bound = {
+            command
+            for command, _outcome, _expected in COMMAND_CORPUS
+            if command.strip()
+            for step in planner.create_plan(command.strip()).steps
+            if BUILT_IN_ACTION_CONTRACTS.contract_for(
+                step.tool_name,
+                step.action,
+            ).session_input_argument
+            is not None
+        }
+        self.assertEqual(
+            session_bound,
+            {"save conversation", "summarize conversation"},
+        )
 
         provider = ScriptedProvider(lambda request: "A conversational reply.")
         enabled = _CorpusHarness(self)
@@ -1398,9 +1426,13 @@ class CommandCorpusWithReasoningTests(unittest.TestCase):
             reasoning=enabled_settings(),
         )
         disabled = _CorpusHarness(self)
+        discarded: list[int] = []
 
         for command, outcome, _expected in COMMAND_CORPUS:
             with self.subTest(command=command, outcome=outcome):
+                if command in session_bound:
+                    discarded.append(len(enabled.session.conversation))
+                    enabled.session.end()
                 recorded = enabled.drive(command, outcome)
                 if command in fallback:
                     self.assertEqual(recorded, ())
@@ -1411,6 +1443,12 @@ class CommandCorpusWithReasoningTests(unittest.TestCase):
                 )
 
         self.assertEqual(enabled.all_rows(), disabled.all_rows())
+        # Positive control: the three fallback replies were retained until
+        # the first session-input command, so ending the session there was
+        # what kept the comparison like for like.
+        self.assertEqual(discarded, [3, 0])
+        # Neither session-input command reached the provider: with nothing
+        # retained, a summary request is refused before any request is built.
         self.assertEqual(
             [request.prompt for request in provider.requests],
             [command for command, _, _ in COMMAND_CORPUS if command in fallback],
@@ -1605,7 +1643,12 @@ class ConversationImportBoundaryTests(unittest.TestCase):
             "collections.abc",
             "dataclasses",
             "logging",
+            # V1-20: two leaf declarations that themselves import nothing
+            # from Maria, which test_session_input_binding asserts, so the
+            # module still has no path to dispatch or persistence.
+            "core.action_contracts",
             "core.context",
+            "core.conversation_records",
             "core.failures",
             "core.logger",
             "core.planner",
