@@ -106,8 +106,31 @@ ReasoningProvider | None` and `main.build_runtime_brain() -> MariaBrain`
 The runtime composition point. `build_reasoning_provider` returns `None` for
 disabled settings and otherwise constructs `OllamaReasoningProvider(settings)`,
 whose own `ValueError` refuses settings it cannot honour.
-`build_runtime_brain()` is the CLI's default startup and calls
+`build_runtime_brain()` is the default startup of both interfaces and calls
 `MariaBrain.from_defaults(reasoning_factory=build_reasoning_provider)`.
+
+`main.main(arguments: Sequence[str] | None = None) -> int`,
+`main.run_cli(brain_factory=None) -> int`, and
+`main.run_gui(brain_factory=None) -> int`
+
+`main()` runs the desktop GUI when `--gui` (`main.GUI_OPTION`) is among the
+arguments, `sys.argv[1:]` by default, and the CLI otherwise; every other
+argument is ignored, as before. Both interfaces build Brain through the same
+startup handling, with the same sanitized messages and statuses. `run_gui()`
+first imports `gui.window` and calls `prepare_application()`, before Brain is
+built. When either fails it prints `Maria: The desktop GUI is unavailable.
+Install the optional GUI requirements, or start Maria without --gui to use the
+command line.` and returns 1, or prints `Maria: Startup interrupted.` and
+returns 130 for `KeyboardInterrupt`. It then hands `gui.window.run_window()` a
+factory of `MariaSession` objects over that Brain, never Brain itself. A window
+that raises `KeyboardInterrupt` reads like an interrupted startup. A window
+that raises any other `Exception`, logged only as `The desktop GUI failed:
+<exception type>.`, or returns a non-zero status because its session ended
+unexpectedly, could not end cleanly, or could not be closed in order, or
+because the window itself failed, prints
+`Maria: The desktop GUI stopped unexpectedly. Review the available logs, or
+start Maria without --gui to use the command line.` and returns 1;
+`MemoryError` propagates.
 
 `MariaBrain.execute_confirmed_plan(plan: Plan) -> BrainResponse`
 
@@ -325,7 +348,9 @@ The answer is the tool's message, a blank line, and `Recorded as audit summary
 <id>, but its outcome could not be recorded, so that summary shows the outcome
 as unknown.` Nothing is retried, and nothing is recorded as interaction
 history, because a `MODEL` plan is transient. A plan of one step lets a
-`KeyboardInterrupt` propagate exactly as before.
+`KeyboardInterrupt` propagate exactly as before. Only the CLI can deliver one:
+in the desktop GUI the plan runs on the worker thread, which Ctrl+C never
+reaches.
 
 A plan of two to five steps runs those same three steps for each of its steps
 in order, each step under its own summary, committed immediately before that
@@ -374,7 +399,8 @@ yet dispatched is `not run.`, one whose tool was entered without returning is
 its known result; an interrupted audit write is reported as unconfirmed,
 because it may already have committed. No outcome is written because of an
 interruption, nothing is retried or resumed, and every other exception
-propagates. An abrupt end of the process can leave no report.
+propagates. An abrupt end of the process can leave no report. In the desktop
+GUI no such interruption arrives, so a plan finishes or stops on its own terms.
 
 The dispatch step itself refuses any call not marked approved with `Maria runs
 a model-proposed action only after you approve it.` Brain's log lines on this path, the compiler's included,
@@ -392,9 +418,11 @@ argument, a report, or a result, and
 `MariaSession(brain: MariaBrain, logger: Logger | None = None)`
 
 The interface-agnostic confirmation boundary. It needs no standard input,
-standard output, or terminal, so the CLI and any later interface share one
+standard output, or terminal, so the CLI and the desktop GUI share one
 contract. It holds at most one pending approval and owns the whole policy for
-invalidation, replay prevention, and refusal.
+invalidation, replay prevention, and refusal. A session is used from one
+thread at a time: the CLI's own thread, or the GUI's one worker thread, which
+creates, uses, and ends that session; see "GUI".
 
 `MariaSession.submit(user_input: str) -> BrainResponse`
 
@@ -442,7 +470,8 @@ was, and a summary draft is never kept as an exchange.
 
 Ends the session: discards its conversation, its supplied-record fingerprints,
 and any pending approval, writes nothing, and logs only `Session ended.`. Ending again changes nothing. The CLI
-calls it on every way out of its main loop.
+calls it on every way out of its main loop, and the GUI's worker calls it once,
+when its window closes or its session stops unexpectedly.
 
 `MariaSession.confirm() -> BrainResponse`
 
@@ -562,6 +591,152 @@ Anything but exact text, and text holding a surrogate, raises
 `ValueError(MODEL_APPROVAL_MESSAGE)`, so a plan that cannot be shown exactly
 is never pending. It is the approval's own quoter, separate from
 `quoted_for_owner`.
+
+## GUI
+
+The optional desktop GUI (Stage V1-21, amendment V1-21-R1) lives in the `gui`
+package. Only `gui/window.py` imports PyQt6; the controller and the worker are
+Qt-free, so they import and run without it. The package imports nothing from
+Maria but `core.session`, `core.constants`, `core.logger`, and its own modules.
+
+`gui.session_worker.SessionWorker(session_factory, deliver, logger=None)`
+
+Runs every session operation of one window, in order, on one non-daemon thread
+named `maria-session`, the GUI's one concurrency exception and the only
+production use of `threading`. `start()` starts the thread, which first calls
+`session_factory()` and then owns that session until it ends. `submit(request:
+str)`, `confirm(serial: int)`, `cancel()`, and `close()` only queue work, and
+return at once; `join(timeout=None) -> bool` waits for the thread, never stops
+it, and returns whether it has ended, which is immediate for a worker never
+started. Each operation that finishes delivers exactly one event through
+`deliver`, called on the worker thread, which the window turns into a queued Qt
+signal; an operation that raises delivers none of its own and ends the session
+instead:
+
+- `Reply(text)`: what a finished operation said.
+- `ApprovalOffer(serial, text)`: a request left an approval pending, and `text`
+  is the core's complete approval text. The worker keeps the exact
+  `PendingApproval` the session holds, numbered by `serial`.
+- `SessionEnded(failed)`: the session has ended and the thread is stopping;
+  `failed` is set unless the end came from `close()` and the session's `end()`
+  then succeeded, so anything raised by creating the session, by an operation,
+  or by `end()`, whatever its kind, counts as failed.
+
+`confirm(serial)` calls the session's own `confirm()` only when `serial` names
+the last offer and the object that offer kept is still
+`session.pending_approval`; anything else confirms nothing, calls `cancel()` so
+no approval the owner was not shown stays pending, logs `Refused an approval
+that no longer matches its offer.`, and delivers the core's
+`CONFIRMATION_REFUSED_MESSAGE`. `cancel()` calls the session's `cancel()` and
+delivers `Action cancelled.`, the CLI's wording. `close()` ends the session
+after every earlier operation, through `end()`, which also discards an approval
+that arrived meanwhile; operations queued after it never run. Every failure, of
+any kind, is caught at the worker thread's boundary, so nothing reaches
+Python's thread exception hook or prints a traceback, and no global hook is
+changed. An operation that raises stops the queue, so no later operation runs
+and none runs twice, and logs only `The GUI session stopped after an
+unexpected <exception type>.` The worker then drops any offer it kept and,
+whenever a session exists, calls `end()` exactly once; an `end()` that raises
+is logged as `The GUI session did not end cleanly: unexpected <exception
+type>.` The text of an event never appears in its `repr`, and a delivery that
+raises, whatever its kind, is logged as `Could not deliver a GUI event.`
+without stopping the worker.
+
+`gui.controller.GuiController(view, worker)`
+
+The Qt-free controller. It decides what the window shows, through the view's
+`append`, `set_status`, `show_approval`, `hide_approval`, `set_controls`,
+`clear_input`, and `close_window`, and which owner actions it accepts. Every
+method is called on the GUI thread.
+
+- `start()` shows the CLI's banner and help line and starts the worker.
+- `send(text) -> bool` takes one request only while `state` is `READY`. The text
+  is stripped and a blank one ignored. `exit`, `quit`, and `q`, in any case,
+  close the window without reaching the session. Text still holding `\n` or
+  `\r` is refused with `Maria takes one line per request, as the command line
+  does. Remove the line breaks and send it again.` and left in the input.
+  Otherwise the request is shown as `You: <request>`, the input is cleared, and
+  the state becomes `BUSY`.
+- `approve(serial) -> bool` and `cancel(serial) -> bool` accept an answer only
+  while `state` is `AWAITING_APPROVAL` and `serial` names the offer showing; the
+  offer is retired at once, so a second click or a stale callback returns
+  `False`.
+- `receive(event)` shows a `Reply` as `Maria: <text>` and returns to `READY`,
+  and shows an `ApprovalOffer` as `Maria: <text>` and in the approval area,
+  except while closing, when an offer is never shown. `SessionEnded` settles
+  the outcome, then clears the window and asks it to close; the close is
+  attempted even when clearing fails, and that failure is raised afterwards.
+- `request_close() -> bool` starts closing once, asking the worker to end the
+  session after anything running and refusing every later action, and returns
+  `True` only once the session has ended.
+- `close_as_failed()` closes a window that has itself failed. It records the
+  failure and starts closing exactly as `request_close()` does, before the
+  window is touched: every later Send, Approve, and Cancel is refused, and the
+  worker is asked to end the session, which discards any pending approval. An
+  operation already running finishes first. Calling it again, or after the
+  session has ended, records the failure and nothing else.
+- `state` is one of `READY`, `BUSY`, `AWAITING_APPROVAL`, `CLOSING`, and
+  `CLOSED`. `exit_status` is 0 only once the controller has seen the session
+  end in order with no window failure, and 1 otherwise: when the session ended
+  unasked or failed, when the window failed, and also before any end has been
+  seen. The status line reads `Ready`, `Working...`, `Waiting for your
+  approval`, `Closing`, `Closing after the current request finishes`, or
+  `Closed`.
+
+`gui.window.prepare_application(fatal_message: str, fatal_status: int) ->
+QApplication`
+
+Creates Qt's application object, or returns the one that exists untouched.
+Creating it is where Qt checks that it can show windows at all, and a failure
+there is fatal inside Qt rather than an exception. While the object is created,
+every Qt message is withheld, and a fatal one writes `fatal_message` to
+standard error and ends the process at once with `fatal_status`, which is safe
+because `run_gui()` calls this before anything is configured or opened. The
+exit happens even when standard error is missing or fails to write or flush,
+and only the fixed message is ever printed. As soon as the object exists, or
+its creation raises, exactly the message handler installed before is put back,
+so Maria leaves no handler of its own for Qt to call while the interpreter
+shuts down. On Windows, a process without a console first sees Qt's own error
+dialog for a platform that cannot start, because Qt shows it before reporting
+the fatal error.
+
+`gui.window.run_window(session_factory) -> int` and `gui.window.MariaWindow`
+
+`run_window()` creates the Qt application if none exists, builds the window, the
+worker, and the controller, shows the window, and runs Qt's event loop. Ctrl+C
+is ignored while it runs and its previous handler restored afterwards. Whatever
+ends the loop, it asks the session to end and waits for the worker before it
+returns, letting Qt deliver events every 50 ms meanwhile, so the window keeps
+showing that it is closing and the session's last events, its end included,
+are seen. Closing waits for the current operation and has no general GUI-wide
+deadline. Provider deadlines apply where configured, but a stalled
+operation can delay closing indefinitely. If asking the controller to close,
+or letting Qt deliver events, raises an `Exception`, `run_window()` logs only
+its type, still asks the worker to end, waits for it, restores Ctrl+C, and
+returns 1. Anything else raised there propagates only after the same request,
+wait, and restore. It returns 0 only when the controller's `exit_status` is 0
+and nothing failed, and 1 otherwise. `MariaWindow` is the presentation: a
+read-only conversation display and approval display that cannot be selected,
+copied from, or focused and have no context menu, a one-line input with no
+length cap below Qt's maximum, Send, Approve and Cancel buttons that never take
+keyboard focus, and a plain-text status label. Its title is always `Maria`.
+Its close event is accepted only once the controller reports the session
+ended; a close that fails to start leaves the window open. Every callback it
+hands to Qt reaches the controller through a shield, because Qt ends the
+process when a callback raises: an `Exception` there is logged only as `A
+desktop window callback failed: <exception type>.`, sets the window's
+`failed`, and calls the controller's `close_as_failed()`, whose recorded
+failure makes `run_window()` return 1. Anything that call raises while the
+broken window is updated is logged only as `The failed desktop window could
+not show it is closing: <exception type>.` From then on no Send, Approve, or
+Cancel is accepted, including one Qt had already queued, the session ends
+through the worker, and the window is asked to close once that end is
+delivered. Until it closes, the window may show a stale state, such as a
+status line that no longer changes, but nothing it shows can still be
+approved. What the window shows is presentation state, never saved
+automatically or replayed into the session. Display history is never
+populated automatically from stored records. Explicit record-reading commands
+still display their results.
 
 ## Conversation
 
@@ -2336,7 +2511,7 @@ exact type, so anything else raises `ValueError`. It derives from `Exception`
 rather than a more specific built-in, so an existing `except RuntimeError` or
 `except sqlite3.Error` handler cannot silently absorb a refusal the owner is
 meant to see. `Memory.initialize()` raises it for a database written by a
-newer build, and `run_cli()` prints its message.
+newer build, and `run_cli()` or `run_gui()` prints its message.
 
 ## Reasoning Interface
 

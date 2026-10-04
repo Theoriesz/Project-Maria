@@ -11,6 +11,8 @@ without the owner's approval.
 
 - Python 3.11 or newer
 - SQLite, included with Python
+- Optional, for the desktop GUI only: PyQt6 and its runtime dependencies,
+  pinned in `requirements-gui.txt`. The command line never needs them.
 
 ## Setup
 
@@ -19,6 +21,15 @@ From the `Maria` directory:
 ```text
 python -m pip install -r requirements.txt
 python main.py
+```
+
+To use the optional desktop window as well, install its requirements, ideally
+into a virtual environment rather than a global interpreter, and start Maria
+with `--gui`:
+
+```text
+python -m pip install -r requirements-gui.txt
+python main.py --gui
 ```
 
 ## CLI Exit and Interruption Behavior
@@ -42,6 +53,64 @@ unrecognized input re-prompts instead of approving or cancelling. EOF or
 Ctrl+C cancels the pending action immediately, without executing it, even
 after earlier invalid input. Ctrl+C returns to the main prompt; if input
 remains closed after EOF, the next main prompt exits cleanly.
+
+## Desktop GUI
+
+`python main.py --gui` opens a small desktop window over the same Maria: the
+same commands, approvals, records, permissions, and audit summaries as the
+command line, through the same session. Without `--gui`, Maria starts the
+command line exactly as before. The window is deliberately simple:
+
+- a read-only conversation area showing `You:` and `Maria:` lines, starting
+  with the same banner the command line prints;
+- a one-line input with Send, or press Enter; every command, record commands
+  included, is typed exactly as on the command line;
+- a short status line: `Ready`, `Working...`, `Waiting for your approval`, or
+  a closing message;
+- while an action waits for approval, the complete approval text Maria
+  produced, with Approve and Cancel.
+
+The window follows the command line's rules. Blank input is ignored, and
+`exit`, `quit`, or `q` closes the window. A request holding a line break is
+refused, because the command line reads one line per request, and stays in the
+input so you can fix it. One request or answer is handled at a time: Send and
+Enter do nothing while Maria works or waits for your answer, though you can
+keep typing, so a second click or key press is never sent twice, and an answer
+counts only for the approval showing.
+Approve confirms exactly the plan the session offered, through the same check
+the command line uses, so a changed plan is refused rather than run. Cancel
+dismisses the pending approval, prints `Action cancelled.`, and records
+nothing; it cannot stop something that is already running. Approve and Cancel
+never take keyboard focus, so only a deliberate click answers an approval.
+
+The window stays responsive while Maria works, because one worker thread runs
+your requests one at a time, in the foreground and only when you ask. Closing
+the window while Maria is busy says that closing waits for the current
+request; it never approves anything that request produces, and the window
+closes once the session has ended. Closing waits for the current operation and
+has no general GUI-wide deadline. Provider deadlines apply where configured,
+but a stalled operation can delay closing indefinitely. Ctrl+C in the terminal
+you started Maria from is ignored while the window is open; close the window
+instead. A running plan is not interrupted in the window: it finishes, or
+stops at a failure, on its own.
+
+Everything in the window is plain text. Replies are never treated as HTML,
+links are not opened, and referenced files are not loaded. The conversation
+and approval areas cannot be selected or copied from, Maria never writes to
+the clipboard, and pasting into the input works. Maria cannot control your
+operating system's clipboard history. The window title is always `Maria`.
+
+If PyQt6 cannot be loaded, or Qt cannot open windows on this system, `--gui`
+prints `Maria: The desktop GUI is unavailable. Install the optional GUI
+requirements, or start Maria without --gui to use the command line.` and
+returns status 1 before anything is configured or opened. On Windows, when
+Maria was started without a console window, Qt first shows its own error
+dialog in that case. Startup failures read exactly as on the command line,
+and a window that fails, or whose session ends unexpectedly or cannot end
+cleanly, prints a fixed message and returns status 1. A window that fails
+stops taking requests and answers at once, so nothing it was showing can
+still be approved; it ends its session and closes. The command line keeps
+working either way.
 
 ## Supported Commands
 
@@ -335,8 +404,8 @@ too large to send beside the instructions, or a reply too large to keep beside
 its request, is refused with a fixed message rather than cut short, and an
 over-large request is never sent to the model. The conversation lives only in
 memory and is discarded when the session ends, on `exit`, end of input,
-Ctrl+C at the prompt, or any other way the CLI stops, unless you keep it first
-with `save conversation`.
+Ctrl+C at the prompt, or any other way the CLI stops, or when the desktop
+window closes, unless you keep it first with `save conversation`.
 
 Conversation is never recorded on its own: no conversational request or reply
 is written to interaction history or anywhere else unless you save it, and
@@ -557,7 +626,8 @@ Maria's notes about context. A plan is refused whole if any of its actions is,
 and nothing in it runs. Nothing is repaired, and the model is not asked again.
 
 A proposal that passes is shown to you, and it runs only if you approve it
-with `y` or `yes` at the usual confirmation prompt. That holds for all three
+with `y` or `yes` at the usual confirmation prompt, or with Approve in the
+desktop window. That holds for all three
 actions, even though the shipped `calculate`, `list`, and `time` commands run
 without asking. Each proposal needs exactly one approval, for the whole plan
 when it holds several steps, whatever your configuration says about
@@ -597,7 +667,8 @@ Your approval covers exactly the plan you were shown. Nothing asks the model
 again or plans the request again: just before the action runs, Maria checks
 that same plan once more against the three allowed actions, their argument
 rules, and your current permissions, and it runs at most once. Cancelling at
-the prompt runs and records nothing. Maria's notes about context are shown
+the prompt, or with Cancel in the desktop window, runs and records nothing.
+Maria's notes about context are shown
 once, with the approval prompt or the refusal, and are not repeated when you
 approve.
 
@@ -668,7 +739,8 @@ not confirm whether it was recorded, because it may already have been. A plan
 of one step stops at Ctrl+C exactly as before, and if Maria's process ends
 abruptly no report can be shown at all. A step that was never reached has no
 audit summary, and the audit listing does not group one plan's summaries
-together.
+together. In the desktop window Ctrl+C does not reach a running plan, so the
+plan finishes or stops on its own and its report says how.
 
 ## Audit Summaries
 
@@ -946,6 +1018,18 @@ sensitive secrets. Blank input and CLI-only exit or cancelled-confirmation
 paths are not completed interaction records; detailed recording boundaries are
 documented in `docs/architecture.md`.
 
+The desktop window records exactly what the command line records, because both
+go through the same session and Brain. What the window displays is only
+displayed: it is held in the window while it is open, never saved by the
+window, never sent back to Maria as conversation, and gone when the window
+closes, and a new window starts empty apart from its banner. Display history
+is never populated automatically from stored records. Explicit record-reading
+commands still display their results. The window title never shows a request
+or a reply, the window keeps no recent-item list, and Maria shows no crash
+dialog. Anything you copy elsewhere, or an operating system's own clipboard
+history, is outside Maria's control; Maria itself never writes to the
+clipboard.
+
 ## Tests
 
 Run the standard-library test suite from the nested `Maria` application
@@ -970,6 +1054,13 @@ tests run only against a local stub on a socket pair inside the test process,
 and every other model reply is scripted, so the suite needs no Ollama, no
 model, and no network.
 
+The suite also covers the desktop GUI. Its controller and worker tests, and
+the tests that run the same scripts through the command line and the GUI and
+compare everything they showed and stored, need no Qt. The window's own tests
+need PyQt6 and run on Qt's offscreen platform, so no window appears; without
+PyQt6 they are skipped, each with its reason. Passing offscreen tests are not
+a visual check.
+
 ## Project Layout
 
 - `core/`: application coordination, planning, memory, permissions, logging,
@@ -977,6 +1068,10 @@ model, and no network.
   compiler that checks model proposals, and the audit-summary and
   conversation-record vocabularies
 - `tools/`: built-in tools
+- `gui/`: the optional desktop window, its Qt-free controller, and its one
+  session worker
+- `requirements.txt` and `requirements-gui.txt`: the standard-library-only core
+  requirements and the optional GUI requirements
 - `database/`: SQLite database
 - `config/`: TOML configuration, including the named filesystem roots and the
   disabled reasoning template

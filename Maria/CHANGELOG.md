@@ -2,6 +2,43 @@
 
 ## Unreleased
 
+- Maria now has a simple, optional desktop window, opened with
+  `python main.py --gui`, over the same Brain, plan validation, permissions,
+  tools, memory, and audit boundaries as the command line, through the same
+  session. It shows a read-only conversation, a one-line input with Send, a
+  short status line, and, while an approval is pending, the complete approval
+  text Maria produced with Approve and Cancel; every command, record commands
+  included, is typed exactly as on the command line, with the same banner and
+  exit words. Approval is identical to the command line's: Approve confirms
+  only while the exact pending approval the session offered is still pending,
+  through the session's own confirmation and fingerprint check, and Cancel
+  dismisses it and records nothing, so both interfaces show, run, refuse, and
+  record the same things. One request or answer is handled at a time, so a
+  second click or a stale answer is refused, and a request holding a line
+  break is refused because the command line can never send one. One worker
+  thread runs the window's session operations in order so the window stays
+  responsive; closing while busy waits for the current request, never
+  approves what it produces, and ends the session before the window closes,
+  and Ctrl+C in the launching terminal is ignored while the window is open.
+  Closing waits for the current operation and has no general GUI-wide
+  deadline. Provider deadlines apply where configured, but a stalled
+  operation can delay closing indefinitely. Everything is shown as plain
+  text, never as HTML or links; the conversation and approval areas cannot be
+  selected or copied from, Maria never writes to the clipboard, and pasting
+  into the input works. What the window shows is never saved automatically or
+  replayed into the session, and a new window starts with only its banner.
+  Display history is never populated automatically from stored records.
+  Explicit record-reading commands still display their results. PyQt6 and its
+  runtime dependencies are the one optional, GUI-only third-party dependency,
+  pinned in `requirements-gui.txt` and imported only by `gui/window.py`;
+  `requirements.txt` is unchanged, and the command line starts and works
+  exactly as before without Qt. If PyQt6 cannot be loaded or Qt cannot start,
+  `--gui` prints a fixed message and returns status 1 before anything is
+  configured or opened. A window that fails, or whose session ends
+  unexpectedly or cannot end cleanly, also prints a fixed message and returns
+  status 1; a window that fails accepts no further request or answer, ends
+  its session, and closes. No schema, permission, command, configuration
+  field, model instruction, or version change was introduced.
 - The current session's bounded conversation can now be kept on request, and
   the local model can draft a conversation summary that is stored only once
   the owner confirms it. `save conversation` stores exactly the exchanges the

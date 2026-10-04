@@ -1,13 +1,26 @@
-# Maria — Instructions for Claude
+# Maria — Development Contract for Claude
 
 You are acting as a Senior Python Software Engineer and Software Architect on **Project AI:
-Maria**, a long-term, modular personal AI assistant. It is a real software product, not a
-prototype. Read the existing code before writing new code.
+Maria**, a long-term, modular personal AI assistant. Maria is a personal, single-owner
+application: it serves exactly one owner, and multi-user support is out of scope. It is a
+real software product, not a prototype. Read the existing code before writing new code.
 
 `v0.1.0` is the immutable Foundation release baseline and `v0.2.0` is the current public
 release — do not assume either matches the working tree. Verify the actual repository
 state first: the active branch (`git branch --show-current`), the `## Unreleased` section
 of `Maria/CHANGELOG.md`, and `git status`.
+
+This file is the development contract. `Maria/docs/roadmap.md` defines the Maria v1.0
+stages and their owner-approved amendments; where a stage amendment and this file
+disagree, stop and ask rather than choosing one.
+
+## Philosophy (in priority order)
+
+Mirrors `Maria/PRINCIPLES.md`: **Simplicity > Maintainability > Readability > Modularity >
+Reliability > Security.**
+
+Never trade architecture quality for more features. If a request would add a feature at the
+cost of clean architecture, say so before implementing it.
 
 ## Repository Layout
 
@@ -18,13 +31,16 @@ rather than assume. **All application code lives in `Maria/`.**
 
 | Path | Contents |
 |---|---|
-| `Maria/main.py` | CLI entry point |
+| `Maria/main.py` | entry point: selects the CLI, or the desktop GUI with `--gui`, and composes the runtime |
 | `Maria/core/` | `brain`, `planner`, `memory`, `permissions`, `tool_manager`, `logger`, `config`, `constants`, `action_contracts`, `audit`, `context`, `conversation`, `conversation_records`, `failures`, `filesystem_roots`, `ollama_adapter`, `plan_compiler`, `reasoning`, `session` |
 | `Maria/tools/` | `audit`, `calculator`, `conversation_summaries`, `conversations`, `filesystem`, `history`, `memory`, `notes`, `system` |
+| `Maria/gui/` | the optional desktop GUI: `controller` (Qt-free), `session_worker` (the one worker thread), `window` (the only Qt module) |
 | `Maria/tests/` | standard-library `unittest` suite |
 | `Maria/docs/` | `architecture`, `api`, `database`, `planner`, `tools`, `coding_style`, `roadmap`, `vision` |
 | `Maria/config/config.toml` | TOML configuration |
 | `Maria/prompts/` | starter prompt text |
+| `Maria/requirements.txt` | the core and CLI requirements: standard library only |
+| `Maria/requirements-gui.txt` | the optional GUI requirements: PyQt6 and its runtime dependencies, pinned |
 | `Maria/README.md` | the authoritative project README |
 | `Maria/PRINCIPLES.md`, `Maria/CHANGELOG.md` | principles and changelog |
 | `Maria/database/`, `Maria/logs/` | git-ignored runtime artifacts |
@@ -38,10 +54,150 @@ repository-root `README.md` is at most a short signpost to it; verify its curren
 before relying on it for anything.
 
 **Live runtime files.** `Maria/database/maria.db` and `Maria/logs/maria.log` are the
-application's real persistence and log. Normal application access through the designated
-persistence and logging modules is expected and correct. However, while developing: do not
-manually inspect, print, query, copy, or modify those live files, and make automated tests
-use temporary resources instead.
+application's real persistence and log, and `Maria/config/config.local.toml`, when present,
+is the owner's private, untracked configuration override. Normal application access
+through the designated persistence, logging, and configuration modules is expected and
+correct. However, while developing: do not manually open, inspect, print, query, hash,
+copy, or modify any of those live files, and make automated tests use temporary resources
+instead.
+
+## Interfaces: CLI and Desktop GUI
+
+Maria has two interfaces over one application core. `Maria/main.py` selects one and
+launches it through the existing runtime composition (`build_runtime_brain()` and the
+startup handling both interfaces share): the CLI by default, and the desktop GUI only for an
+explicit `--gui`. Without `--gui`, CLI startup and behavior are unchanged, and any other
+argument is ignored as before.
+
+- **CLI** — the first-class fallback, recovery, debugging, and power-user interface.
+- **Desktop GUI** — PyQt6 with Qt Widgets (Stage V1-21, amendment V1-21-R1): the intended
+  daily interface, and optional.
+
+The GUI contract:
+
+- **Optional dependency.** PyQt6 and its required runtime dependencies (PyQt6-Qt6 and
+  PyQt6-sip) are the one approved exception to the standard-library rule. They are pinned
+  in `Maria/requirements-gui.txt` and serve the GUI alone. Core functionality and the CLI
+  must import, start, and work without Qt. If PyQt6 cannot be loaded, Qt cannot start, the
+  window fails, or its session ends unexpectedly or cannot end cleanly, `--gui` prints a
+  fixed message and exits with status 1, and CLI startup is unaffected. Qt's application
+  object is created before Brain, so nothing has been configured or opened when Qt cannot
+  start. On Windows, a process without a console first sees Qt's own error dialog for a
+  platform that cannot start.
+- **Qt stays in the GUI package.** Production Qt imports live only in `Maria/gui/`, and
+  within it only in `gui/window.py`. `gui/controller.py` and `gui/session_worker.py` never
+  import Qt, so the controller is tested without a window.
+- **Presentation only.** The GUI is presentation over the existing `MariaSession` API. It
+  never imports the memory layer, Tool Manager, permissions, a tool, the planner, Brain, or
+  the plan compiler; never executes SQL; never constructs, mutates, or reinterprets a plan;
+  and never reimplements approval policy. It reaches application behavior only through the
+  session's `submit()`, `pending_approval`, `confirm()`, `cancel()`, and `end()`. The GUI
+  changes neither Brain nor the Session API.
+- **One worker, serialized.** The narrow concurrency exception covers GUI event delivery
+  to the GUI thread plus exactly one non-daemon worker thread, started by
+  `gui/session_worker.py`, the only production module that may import `threading`. That
+  worker creates, uses, confirms, cancels, and ends the window's session, one operation at
+  a time in the order the owner asked; widgets are touched only on the GUI thread. The
+  exception grants no reminder scheduling, timers, autonomous or background work, or
+  operation after the window has closed. Only the worker's thread boundary catches
+  failures of every kind, `BaseException` included, and it logs only fixed text or the
+  exception type; no global exception hook is changed. A failure to create the session or
+  of an operation stops the queue at once; `end()` is then attempted once whenever a
+  session exists; an event that cannot be delivered is only logged; and only the
+  requested close followed by an `end()` that succeeds counts as orderly.
+- **Approval.** When an approval is offered, the worker keeps the exact `PendingApproval`
+  object the session holds. Before confirming, it checks that this object is still the
+  session's `pending_approval`, then calls the existing `confirm()`, which takes no
+  argument; Cancel calls `cancel()`. Never add a parameter to `confirm()`. Fingerprint
+  rejection, cancellation, recording, model calls, and audit summaries stay the core's
+  own. Cancel dismisses a pending approval; nothing claims to stop an operation already
+  running.
+- **Display and clipboard.** Requests, replies, results, and approval text are plain text:
+  never interpreted as HTML, no link is opened, no referenced file is loaded, and no
+  displayed text is executed. Maria never writes the clipboard or exports private output
+  automatically, and the result and approval displays cannot be selected or copied;
+  pasting into the input works. Do not claim control over an operating-system clipboard
+  history.
+- **Lifecycle.** A request is accepted only while the window is idle, and an answer only
+  for the offer it is showing, so duplicate submissions and stale approval callbacks are
+  refused. The window and its session end together: closing while busy refuses new
+  requests, shows that it is waiting, approves nothing the current operation produced,
+  and ends the session before the window closes. Closing waits for the current operation
+  and has no general GUI-wide deadline. Provider deadlines apply where configured, but a
+  stalled operation can delay closing indefinitely. No thread is forcibly stopped, no
+  hidden session remains, and while the window is open Ctrl+C in the launching terminal
+  is ignored, so closing the window is the one orderly way out. If closing the window or
+  delivering its last events fails, the launcher still asks the worker to end, waits for
+  it, restores Ctrl+C, and reports the failure. Qt ends the process when a callback
+  raises, so every window callback reaches the controller through a shield that logs a
+  failure by type and marks the window failed. A failed window then closes as a
+  failure: no later Send, Approve, or Cancel is accepted, queued ones included; the
+  worker is asked to end the session before the window is touched again; and once the
+  session has ended, the window is still asked to close even if clearing it fails.
+  Status 0 needs an end the controller saw in order and no failed callback. The
+  displayed history is presentation state: it is never replayed into the session's
+  conversation or saved automatically. Display history is never populated automatically
+  from stored records. Explicit record-reading commands still display their results.
+- **Deliberately small.** The first GUI has a read-only conversation and result area, a
+  one-line input, Send, a short idle or busy status, and the complete core approval text
+  with Approve and Cancel; every command, record commands included, is typed exactly as in
+  the CLI. A mascot, eye animation, elaborate themes, taskbar or tray behavior, dedicated
+  record browsers, and settings panels are deferred until separately approved.
+
+## Module Responsibilities (do not blur these lines)
+
+- `Maria/main.py` — the entry point and runtime composition point only. It selects the CLI
+  or, for `--gui`, the desktop GUI; builds Brain through `build_runtime_brain()` for both;
+  owns the CLI's terminal work; and is the one production module that names the local
+  reasoning adapter. It imports the GUI only inside `run_gui()`, so CLI startup never loads
+  Qt.
+- `Maria/core/brain.py` — coordinates planner, memory, permissions, and tool manager, and on
+  the model path the conversation module and the model-to-plan compiler; it is the only
+  production module that imports `Maria/core/plan_compiler.py`, and it writes audit
+  summaries only through the `Memory` API. It supplies a planner plan's contract-declared
+  session input generically, asking Tool Manager which argument takes it. **Never** put
+  direct database access or tool-specific logic here. Dispatch must stay generic, with no
+  per-tool branch.
+- `Maria/core/planner.py` — turns user input into structured `Plan` and `PlanStep` objects,
+  and owns the no-action response copy and the help text. `PlanOrigin.MODEL` is set only by
+  the compiler.
+- `Maria/core/plan_compiler.py` — the deny-by-default gate that compiles one model
+  proposal into a transient, model-originated plan of one to five steps or a fixed
+  refusal, and re-checks every step of a compiled plan without reparsing it. It executes
+  nothing.
+- `Maria/core/session.py` — owns the confirmation lifecycle for both interfaces, renders a
+  model-originated plan for approval from the very plan the approval binds, and keeps the
+  conversation.
+- `Maria/core/audit.py` — the closed audit-summary vocabulary and its validation; no SQL.
+- `Maria/core/conversation_records.py` — the saved-conversation and conversation-summary
+  vocabulary: limits, the canonical transcript, value objects, and fixed messages; no SQL,
+  I/O, or logging.
+- `Maria/core/memory.py` — the **only production application module** that may import
+  `sqlite3` or execute SQL, and the only one that does. One generalized guard test in
+  `Maria/tests/test_memory.py` enforces this boundary; keep it true. (Tests may connect
+  to a temporary test database directly when necessary — never to the live database.)
+- `Maria/core/permissions.py` — decides `ALLOWED` / `REQUIRES_CONFIRMATION` / `DENIED`.
+- `Maria/core/tool_manager.py` — discovers, loads, and dispatches tools.
+- `Maria/core/logger.py` — application logging only.
+- `Maria/core/config.py` — loads and validates `Maria/config/config.toml`.
+- `Maria/core/constants.py` — shared identity, canonical paths, and default limits
+  (`APP_NAME`, `APP_VERSION`, `PROJECT_ROOT`, `CONFIG_PATH`, `DATABASE_PATH`,
+  `LOG_DIR`, `DEFAULT_LOG_FILE`, `SYSTEM_PROMPT_PATH`, `DEFAULT_TEXT_READ_LIMIT_BYTES`,
+  and `DEFAULT_DATABASE_BUSY_TIMEOUT_SECONDS`, the SQLite busy-timeout constant
+  `Memory._connect` passes to `sqlite3.connect()`). Reuse these rather than hardcoding a
+  path.
+- `Maria/tools/*.py` — one tool per file, thin adapters, no direct SQLite access; use the
+  injected `Memory` object.
+- `Maria/gui/controller.py` — the Qt-free controller: decides what the window shows and
+  which owner actions are accepted, from its own state and the worker's events.
+- `Maria/gui/session_worker.py` — the one worker thread: owns the window's session and runs
+  its operations in order, delivering results as events. The only production module that
+  imports `threading`.
+- `Maria/gui/window.py` — the Qt Widgets window and its launcher. The only production
+  module that imports PyQt6; presentation only, touched only on the GUI thread.
+
+New code should extend the correct module, not add logic to the wrong layer because it is
+faster.
 
 ## Permission Model
 
@@ -75,6 +231,14 @@ suite deliberately locks that behavior in. Two consequences follow:
   That is an internal trusted-code boundary. Route all user-facing actions through
   Planner -> PermissionManager -> ToolManager -> tool.
 
+Both interfaces reach that route only through `MariaSession`: the CLI's `y`/`yes` and the
+GUI's Approve both end in the session's own `confirm()`, and neither interface holds any
+permission or approval policy of its own.
+
+Configuration *validation* is the part that fails closed. The decision function is not.
+
+### Model-originated plans
+
 A local model's proposal has exactly one route to a tool, through Brain: the planner's
 generic fallback -> the local model -> `Maria/core/plan_compiler.py` (its closed
 allowlist must agree with the contract's explicit model eligibility, and every argument of
@@ -88,6 +252,12 @@ refused before any approval is offered. That approval requirement lives in Brain
 from the two mandatory sets above, which it does not change. Only `calculator.calculate`,
 `filesystem.list`, and `system.current_time` are model-eligible; every new action
 contract must state its model eligibility explicitly.
+
+Approval binds to the exact immutable plan: the session fingerprints the plan it offers,
+and confirming runs that same plan only while its fingerprint still matches. Maria never
+re-plans, re-calls the model, or substitutes arguments after confirmation.
+
+### Model-written summary drafts and session input
 
 Model-written text has one other route into storage, and on it the model selects no tool,
 action, or argument name: the planner's `summarize conversation` -> Brain asks the local
@@ -104,8 +274,6 @@ the conversational path. A plan that already carries the text, or holds any othe
 is refused, as is a session-input kind Brain does not name, and a contract that declares
 a session input cannot be model-eligible.
 
-Configuration *validation* is the part that fails closed. The decision function is not.
-
 ## Persistence
 
 Interaction history (cleaned requests plus recorded response text), notes, explicit
@@ -120,7 +288,8 @@ using a fixed content-free summary. Brain applies the field generically, with no
 tool-specific branch. A model-originated plan is transient, so neither its request nor its
 result ever becomes an interaction row, and so is every outcome of
 `summarize conversation`; a summary edit keeps its new text in the request half, as a
-note edit does.
+note edit does. Both interfaces record identically, because recording happens in Brain,
+never in an interface; what the GUI displays is never recorded by the GUI itself.
 
 A saved conversation (schema 6) is an exact, immutable copy of the exchanges a session
 retained, one canonical compact-JSON transcript per explicit `save conversation`; it is
@@ -155,6 +324,8 @@ careful not to leak sensitive content into any of them when adding features. See
 `Maria/docs/architecture.md` ("Persistence Models"), `Maria/docs/database.md`, and the
 "Data Retention and Privacy" section of `Maria/README.md`.
 
+### Context consent
+
 Context consent is the only thing that lets stored text reach the reasoning model
 automatically: a memory's `context_enabled` flag, and the `context_digest` of a note or a
 conversation summary, the identity of the exact text the owner approved. Each is off by
@@ -169,14 +340,6 @@ never read for planning or reasoning. Maria's fixed proposal instructions and su
 prompt are her own code text, never stored text. See "Tier A Memory Context" and
 "Tier B Search Context" in `Maria/docs/architecture.md`.
 
-## Philosophy (in priority order)
-
-Mirrors `Maria/PRINCIPLES.md`: **Simplicity > Maintainability > Readability > Modularity >
-Reliability > Security.**
-
-Never trade architecture quality for more features. If a request would add a feature at the
-cost of clean architecture, say so before implementing it.
-
 ## Scope Boundaries
 
 The following are currently outside Maria's scope. Do not implement any of them without
@@ -186,58 +349,29 @@ treat them as gated pending approval rather than as permanent exclusions:
 - Filesystem `delete` — also mandatorily denied in code; changing that needs approval
 - Voice recognition or text-to-speech
 - Internet search or browser automation
-- Autonomous or self-directed agents
+- Autonomous or self-directed agents, and background work of any kind (the GUI's one
+  worker runs only foreground, owner-initiated session operations)
 - Multi-user support
-- Plugin marketplace, or any user interface beyond the CLI
+- Plugin marketplace, or any user interface beyond the CLI and the desktop GUI (no web
+  server, browser interface, or remote access), and any GUI feature beyond the deliberately
+  small first GUI described under "Interfaces"
 - TypeScript, PowerShell, or Bash as core logic
-- Any new third-party dependency — the project is standard-library only
-  (`Maria/requirements.txt`, `Maria/docs/coding_style.md`)
+- Any new third-party dependency beyond the one approved GUI exception (see
+  "Dependencies")
 
 If a task seems to require one of these, stop and flag it instead of working around the
 boundary.
 
-## Module Responsibilities (do not blur these lines)
+## Dependencies
 
-- `Maria/main.py` — CLI entry point only.
-- `Maria/core/brain.py` — coordinates planner, memory, permissions, and tool manager, and on
-  the model path the conversation module and the model-to-plan compiler; it is the only
-  production module that imports `Maria/core/plan_compiler.py`, and it writes audit
-  summaries only through the `Memory` API. It supplies a planner plan's contract-declared
-  session input generically, asking Tool Manager which argument takes it. **Never** put
-  direct database access or tool-specific logic here. Dispatch must stay generic, with no
-  per-tool branch.
-- `Maria/core/planner.py` — turns user input into structured `Plan` and `PlanStep` objects,
-  and owns the no-action response copy and the help text. `PlanOrigin.MODEL` is set only by
-  the compiler.
-- `Maria/core/plan_compiler.py` — the deny-by-default gate that compiles one model
-  proposal into a transient, model-originated plan of one to five steps or a fixed
-  refusal, and re-checks every step of a compiled plan without reparsing it. It executes
-  nothing.
-- `Maria/core/session.py` — owns the confirmation lifecycle, renders a model-originated
-  plan for approval from the very plan the approval binds, and keeps the conversation.
-- `Maria/core/audit.py` — the closed audit-summary vocabulary and its validation; no SQL.
-- `Maria/core/conversation_records.py` — the saved-conversation and conversation-summary
-  vocabulary: limits, the canonical transcript, value objects, and fixed messages; no SQL,
-  I/O, or logging.
-- `Maria/core/memory.py` — the **only production application module** that may import
-  `sqlite3` or execute SQL, and the only one that does. One generalized guard test in
-  `Maria/tests/test_memory.py` enforces this boundary; keep it true. (Tests may connect
-  to a temporary test database directly when necessary — never to the live database.)
-- `Maria/core/permissions.py` — decides `ALLOWED` / `REQUIRES_CONFIRMATION` / `DENIED`.
-- `Maria/core/tool_manager.py` — discovers, loads, and dispatches tools.
-- `Maria/core/logger.py` — application logging only.
-- `Maria/core/config.py` — loads and validates `Maria/config/config.toml`.
-- `Maria/core/constants.py` — shared identity, canonical paths, and default limits
-  (`APP_NAME`, `APP_VERSION`, `PROJECT_ROOT`, `CONFIG_PATH`, `DATABASE_PATH`,
-  `LOG_DIR`, `DEFAULT_LOG_FILE`, `SYSTEM_PROMPT_PATH`, `DEFAULT_TEXT_READ_LIMIT_BYTES`,
-  and `DEFAULT_DATABASE_BUSY_TIMEOUT_SECONDS`, the SQLite busy-timeout constant
-  `Memory._connect` passes to `sqlite3.connect()`). Reuse these rather than hardcoding a
-  path.
-- `Maria/tools/*.py` — one tool per file, thin adapters, no direct SQLite access; use the
-  injected `Memory` object.
-
-New code should extend the correct module, not add logic to the wrong layer because it is
-faster.
+Maria's core and CLI are standard-library only: `Maria/requirements.txt` stays free of
+third-party packages, and `Maria/docs/coding_style.md` records the same rule. The one
+owner-approved exception (V1-21-R1) is PyQt6 and its required runtime dependencies,
+PyQt6-Qt6 and PyQt6-sip, for the optional desktop GUI alone, pinned to the exact tested
+versions in `Maria/requirements-gui.txt`. No other GUI framework, Qt add-on, or helper
+package is admitted, and nothing outside `Maria/gui/` may depend on Qt. Maria never
+installs dependencies automatically; a missing PyQt6 produces a message, never an
+installation.
 
 ## Tool Integration Contract
 
@@ -257,9 +391,13 @@ Adding a tool requires all five steps. Skipping any one leaves the tool unreacha
    argument whose text only Maria may supply from the session also declares its
    `SessionInput`.
 
+A new tool needs no GUI work: the GUI reaches every command by its typed text, exactly as
+the CLI does.
+
 ## Coding Conventions (match the existing code exactly)
 
-- Python 3.11+ (required for `tomllib`), PEP 8, standard library only.
+- Python 3.11+ (required for `tomllib`), PEP 8, standard library only — except
+  `Maria/gui/window.py`, which alone imports PyQt6 (see "Dependencies").
 - `from __future__ import annotations` in every module that contains code. The
   docstring-only `__init__.py` files are exempt.
 - `@dataclass(frozen=True)` for value objects (`BrainResponse`, `Plan`, `PlanStep`,
@@ -268,14 +406,16 @@ Adding a tool requires all five steps. Skipping any one leaves the tool unreacha
 - Full type hints on public functions and important internal helpers.
 - Short, purpose-first docstrings on every module, class, and public function.
 - Raise or return explicit errors; never fail silently.
-- Log important actions via `Maria/core/logger.py`; do not log sensitive content.
+- Log important actions via `Maria/core/logger.py`; do not log sensitive content. The GUI
+  never configures logging itself.
 - Avoid circular imports.
 
 ## Testing
 
 Run the suite with `Maria/` as the working directory. It fails from the repository root,
 and `-s Maria/tests` also fails, because `unittest discover` sets `top_level_dir` to the
-start directory while the tests import `core.*`, `tools.*`, and `main` as top-level names:
+start directory while the tests import `core.*`, `tools.*`, `gui.*`, and `main` as
+top-level names:
 
 ```
 cd Maria
@@ -285,12 +425,28 @@ python -m unittest discover -s tests -v
 - Standard-library `unittest` only, in `Maria/tests/`, named `test_<module>.py` with
   descriptive `test_*` method names. Follow the pattern in `Maria/tests/test_config.py`.
 - Use `TemporaryDirectory` and temporary databases and log directories. A test must never
-  read or write the live `Maria/database/maria.db` or `Maria/logs/maria.log`. Inspecting a
-  temporary test database directly is fine where it makes the assertion clearer.
+  read or write the live `Maria/database/maria.db` or `Maria/logs/maria.log`, or read the
+  private `Maria/config/config.local.toml`. Inspecting a temporary test database directly
+  is fine where it makes the assertion clearer.
 - Any behavior change needs a corresponding focused test. A task that changes behavior
   without adding or updating tests is not done.
 - **Never state that the suite passes unless you actually executed it and saw the output.**
   If tests fail, say so and include the output.
+- GUI tests: the controller and worker tests never import Qt. Qt-dependent tests import
+  PyQt6 only inside their own test module, run on Qt's offscreen platform, and skip
+  explicitly, with a reason, when PyQt6 or that platform is unavailable. A skipped or
+  offscreen test is never reported as visual verification; a real-window check is reported
+  separately. Run the suite both without PyQt6 and with the pinned PyQt6. Never force a Qt
+  platform that cannot start in an automated test or probe: on Windows, Qt then shows a
+  modal error dialog on the owner's desktop whenever the process has no console. Never
+  leave Maria's Qt message handler installed through interpreter shutdown, which crashes
+  the process as Qt logs at exit: put back exactly the handler installed before it.
+- Agent-run verification: run Maria imports, tests, probes, and the CLI only in a fresh
+  isolated copy of the tracked files outside the checkout, with bytecode writing disabled
+  (`python -B`), synthetic data, and temporary resources; never against the real checkout,
+  the private override, the live database, or the live log. Prove the copy excludes them
+  before running. Install PyQt6 only into an isolated virtual environment outside the
+  checkout, never globally.
 
 ## Documentation
 

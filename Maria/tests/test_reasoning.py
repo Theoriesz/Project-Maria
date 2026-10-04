@@ -134,6 +134,7 @@ PERMITTED_MARIA_IMPORTS = frozenset(
 PRODUCTION_SOURCES = (
     *sorted((PROJECT_ROOT / "core").glob("*.py")),
     *sorted((PROJECT_ROOT / "tools").glob("*.py")),
+    *sorted((PROJECT_ROOT / "gui").glob("*.py")),
     PROJECT_ROOT / "main.py",
 )
 

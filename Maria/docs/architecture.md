@@ -4,9 +4,10 @@ Maria is organized around a small set of modules with clear ownership.
 
 ## Core Flow
 
-1. `main.py` receives user input from the command line. It is also the
-   runtime composition point, the one production module that names the local
-   reasoning adapter.
+1. `main.py` receives user input from the command line, or with `--gui`
+   opens the optional desktop window, which receives it instead; see "GUI
+   Boundary". It is also the runtime composition point, the one production
+   module that names the local reasoning adapter.
 2. `session.py` holds the owner's confirmation state and the session's bounded
    conversation, forwards the request, and renders a plan the local model
    proposed for the owner's approval.
@@ -63,10 +64,10 @@ Maria is organized around a small set of modules with clear ownership.
     on the owner's commands. See "Saved Conversations and Summaries".
 
 An explicit memory request uses the same execution path as every other tool
-request:
+request, from either interface:
 
 ```text
-CLI
+CLI or desktop GUI
 -> MariaSession
 -> MariaBrain
 -> Planner
@@ -89,10 +90,10 @@ tool, through the compiler, the owner's approval, and an audit summary; see
 ## Interaction Recording Boundary
 
 For a normal completed tool request, interaction recording follows this
-boundary:
+boundary, whichever interface took the request:
 
 ```text
-CLI
+CLI or desktop GUI
 -> MariaSession
 -> Brain
 -> Planner
@@ -225,7 +226,9 @@ summary does not rewrite or remove those independent interaction rows.
 Some paths return before this boundary. Blank CLI input is not processed, and
 blank input passed directly to `process()` returns before logging, planning,
 memory context retrieval, or recording. `exit`, `quit`, `q`, main-prompt EOF or
-Ctrl+C, and startup failures do not become interaction rows. An initial
+Ctrl+C, and startup failures do not become interaction rows. The desktop GUI
+keeps the same rules: blank input, an exit word, text refused for holding a
+line break, and closing the window never reach Brain. An initial
 confirmation-required response returns before completed-interaction recording.
 If confirmation is cancelled, the cancellation response is not recorded, and
 neither is a refused confirmation, because neither executed anything. If it is
@@ -301,7 +304,8 @@ command-line entrypoint boundary, before printing the banner. Except for
 `MemoryError`, an `Exception` raised during construction is converted to stable
 stderr output and status 1, while startup `KeyboardInterrupt` maps to status
 130. `MemoryError` and `SystemExit` are not converted into ordinary startup
-failures.
+failures. That handling lives in `_start_brain()`, which `run_gui()` uses too,
+so every startup outcome described here reads the same in both interfaces.
 
 A startup `TypedFailureError` is the one case that reports something more
 specific than the generic message. It carries a `Failure` whose owner-visible
@@ -339,11 +343,132 @@ Brain included, to neither naming nor reaching it. Enabled settings the
 adapter refuses, such as the `private_lan` transport, stop startup through
 the ordinary sanitized failure before anything is created.
 
+## GUI Boundary
+
+The optional desktop GUI (Stage V1-21, amendment V1-21-R1) is PyQt6 with Qt
+Widgets: presentation over the same session contract the CLI uses. `main.py`
+opens it only for an explicit `--gui`; any other argument is ignored, and the
+CLI starts exactly as before. `run_gui()` imports `gui.window` and creates Qt's
+application object first, through `prepare_application()`, so a missing or
+broken PyQt6, or a Qt that cannot show windows here, prints one fixed message
+and returns status 1 before any configuration, log, database, or Brain exists.
+Creating that object is where Qt checks its platform, and a failure there is
+fatal inside Qt rather than an exception; while it is created, Qt's messages,
+which can name host paths, are withheld, and a fatal one becomes the fixed
+message and an immediate exit with status 1, even when standard error is
+missing or cannot be written. As soon as the object exists, or its creation
+fails, the message handler installed before is put back unchanged. On Windows,
+a process without a console first sees Qt's own error dialog for a platform
+that cannot start.
+`run_gui()` then builds Brain through the same `_start_brain()` the CLI uses,
+with the same sanitized startup messages and statuses, and hands the window a
+session factory, never Brain itself. A window that fails, whose session ends
+unexpectedly or cannot end cleanly, or that cannot close in order, is reported
+with another fixed message and status 1, and a window failure is logged by its
+exception type alone. The CLI never imports the GUI package or Qt.
+
+The package has three modules with separate jobs:
+
+- `gui/controller.py` is Qt-free. It decides what the window shows and which
+  owner actions it accepts, from its own state and the worker's events.
+- `gui/session_worker.py` runs the window's one worker thread, the narrow
+  concurrency exception V1-21-R1 grants. That thread creates the session,
+  performs each operation one at a time in the order asked, and ends the
+  session; nothing else touches the session. It is the only production module
+  that imports `threading`. Every failure in that thread, of any kind, is
+  caught at its boundary and logged as fixed text naming at most its
+  exception type, so nothing reaches Python's thread exception hook. A
+  failure to create the session or of an operation stops the queue at once;
+  `end()` is then attempted once whenever a session exists; and the end
+  counts as orderly only after the requested close and an `end()` that
+  succeeded. An event that cannot be delivered is only logged, and the
+  worker carries on.
+- `gui/window.py` draws the window and runs Qt's event loop. It is the only
+  production module that imports PyQt6, and it touches widgets only on the GUI
+  thread; the worker's events reach it through a queued Qt signal.
+
+Brain and the session API are unchanged. Brain is built on the main thread,
+exactly as for the CLI, and is safe to hand to the worker because it holds no
+thread-bound resource: the memory layer opens and closes one SQLite connection
+per operation, and the local adapter opens one socket per request.
+
+The window shows a read-only conversation area, a one-line input with Send, a
+short status line, and, while an approval is pending, the complete approval
+text the core produced, with Approve and Cancel. Requests follow the CLI's
+rules: the text is stripped, blank text is ignored, and `exit`, `quit`, or `q`
+closes the window without reaching Brain. Text holding a line break is refused
+with a fixed message, because the CLI reads one line per request and so can
+never send one, and the input has no length cap that could cut a long request
+short. Only one request or answer is in flight at a time: a request is accepted
+only while the window is idle, and Approve or Cancel only for the offer
+showing, which carries a serial, so a second click or a stale callback is
+refused.
+
+When a request leaves an approval pending, the worker keeps the exact
+`PendingApproval` object the session holds. Approve confirms only while that
+very object is still `session.pending_approval`, and then through the existing
+`confirm()`, which takes no argument and performs the session's own
+fingerprint check; otherwise it confirms nothing, dismisses whatever is
+pending, and shows the core's fixed refusal. Cancel calls `cancel()` and shows
+"Action cancelled.", as the CLI does. Cancel dismisses a pending approval
+only. Nothing stops an operation already running, and Ctrl+C cannot reach the
+worker, so a running plan is never interrupted in the GUI: it finishes or
+stops on its own terms. Fingerprint rejection, recording, model calls, and
+audit summaries are the core's own and identical in both interfaces, which one
+shared test proves by running the same scripts through both.
+
+Everything is plain text: requests, replies, results, and approval text are
+never interpreted as HTML, no link is opened, no referenced file is loaded, and
+no displayed text is executed. The conversation and approval displays cannot
+be selected or copied from and have no context menu; Maria writes nothing to
+the clipboard, and pasting into the input works. Maria cannot control an
+operating-system clipboard history and claims nothing about it. Approve and
+Cancel never take keyboard focus, so only a deliberate click answers an offer,
+and the window title is always "Maria".
+
+The window and its session end together. Closing the window asks the worker to
+end the session after the operation in progress, refuses every action
+meanwhile, never shows an approval that arrives, and lets the window close only
+once the session has ended; a session that ends for any other reason closes
+the window, and the window is asked to close even when clearing it first
+fails. No thread is forcibly stopped: the worker is not a daemon, and
+`run_window()` waits for it before returning, whatever ended Qt's loop, while
+letting Qt deliver events so the window still shows that it is closing and the
+session's end is seen. Closing waits for the current operation and has no
+general GUI-wide deadline. Provider deadlines apply where configured, but a
+stalled operation can delay closing indefinitely. If asking the window to
+close, or delivering its events, raises an `Exception`, `run_window()` logs its
+type alone, still asks the worker to end, waits for it, restores Ctrl+C, and
+returns status 1; anything else raised there propagates only after the same
+request, wait, and restore. While the window is open, Ctrl+C in the launching
+terminal is ignored, because an exception raised inside a Qt callback ends the
+whole process abruptly; the previous handler is restored afterwards. For the
+same reason, every callback the window hands to Qt reaches the controller
+through a shield: a failure is logged by its exception type alone and marks
+the window as failed, and `run_window()` then returns status 1 once the
+session has ended. The controller closes a failed window as a failure. It
+records the failure and starts closing before anything else, so no later
+Send, Approve, or Cancel is accepted, queued ones included, and it asks the
+worker to end the session before touching the window again; an operation
+already running still finishes, and the session's end is still delivered and
+closes the window. Status 0 needs an orderly end that the controller itself
+saw, with no failed callback.
+
+What the window shows is presentation state: it is never replayed into the
+session's conversation or saved automatically, and a new window starts with
+only the banner. Display history is never populated automatically from stored
+records. Explicit record-reading commands still display their results. The GUI
+never configures logging. Its worker logs fixed lines through the same `maria`
+logger, so running both interfaces in one process keeps exactly one managed
+log handler throughout.
+
 ## Session Boundary
 
 `core/session.py` owns the confirmation lifecycle for every interface. It needs
 no standard input, standard output, or terminal, so a headless caller drives
-the same contract the CLI does.
+the same contract the CLI does. The desktop GUI is such a caller: its one
+worker thread drives the session through exactly these methods; see "GUI
+Boundary".
 
 A session is idle or holds exactly one pending approval. Submitting a request
 first discards any approval still pending, then plans exactly once. A
@@ -639,7 +764,8 @@ frozen, never persisted, never logged, and never handed to another module, and
 it reports which decisions came back without making any of them.
 `PermissionManager` itself is unchanged: no new arguments, no bulk-check
 method, no altered precedence, no awareness of arguments or contracts, and no
-permission policy in Brain, the session, `main.py`, Tool Manager, or a tool.
+permission policy in Brain, the session, `main.py`, the GUI, Tool Manager, or a
+tool.
 Brain's rule that a model-originated plan always needs the owner's approval is
 keyed to the plan's origin rather than to any action, and it never overrides a
 denial or changes what `PermissionManager` decides.
@@ -1640,7 +1766,10 @@ whether the summary or the outcome was recorded, never that it is absent or
 unknown. No outcome is ever written merely because a run was interrupted, and
 nothing is retried or resumed. Every other exception propagates exactly as
 before, a plan of one step lets an interruption propagate exactly as V1-18
-did, and an abrupt end of the process can leave no report at all.
+did, and an abrupt end of the process can leave no report at all. All of this
+concerns the CLI, where Ctrl+C reaches the thread running the plan. In the
+desktop GUI the plan runs on the worker thread, which Ctrl+C never reaches, so
+a GUI run is not interrupted; see "GUI Boundary".
 
 **What a summary means.** A summary records that an approved execution attempt
 was authorised for dispatch; by itself it does not prove the tool ran. A
@@ -1726,6 +1855,15 @@ import-boundary guard asserts that Brain, the planner, permissions, Tool
 Manager, the memory layer, configuration, and every tool import no network or
 threading module, directly or through any Maria module they import, and that
 none of them reaches the adapter.
+The desktop GUI package imports from Maria only `core/session.py`,
+`core/constants.py`, `core/logger.py`, and its own modules, never the memory
+layer, Tool Manager, permissions, the planner, Brain, the compiler, or a tool,
+and it executes no SQL and builds no plan. `gui/window.py` is the only
+production module that imports PyQt6, and only its core, GUI, and widget
+modules; `gui/session_worker.py` is the only one besides the adapter that
+imports anything from the guarded network and threading set, and imports
+`threading` alone, under the owner's amendment V1-21-R1. `main.py` imports the
+GUI only inside `run_gui()`, so the CLI never loads Qt.
 
 The brain has no memory-specific dispatch branch. `MemoryTool` contains no SQL;
 it receives the shared `Memory` object and calls its public persistence methods.
@@ -1741,7 +1879,8 @@ tool or action name.
 ## Scope
 
 This foundation intentionally excludes autonomous agents, voice, browser
-automation, internet search, and user interfaces beyond the command line. Future
+automation, internet search, and user interfaces beyond the command line and
+the optional desktop GUI of Stage V1-21. Future
 versions can add richer capabilities by extending the planner, tool manager, and
 tool set without rewriting the foundation.
 
