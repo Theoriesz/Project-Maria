@@ -72,8 +72,8 @@ MARIA_ROOT = Path(__file__).resolve().parents[1]
 
 # The importable production roots. A new top-level production package fails
 # the unscanned-root guard until its stage adds it here, which is also what
-# brings it under every ownership check.
-PRODUCTION_PACKAGES = ("core", "tools")
+# brings it under every ownership check. V1-21 added the desktop GUI package.
+PRODUCTION_PACKAGES = ("core", "tools", "gui")
 PRODUCTION_ENTRY_POINTS = ("main.py",)
 TEST_PACKAGE = "tests"
 

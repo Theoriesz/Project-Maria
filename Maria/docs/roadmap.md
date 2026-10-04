@@ -295,6 +295,10 @@ Public research is not equivalent to unrestricted browser automation.
 - The GUI must not create a second execution or permission architecture.
 - Both interfaces reach the same Brain, plan validation, permissions, tools, memory, and
   audit boundaries.
+- Under V1-21-R1 the GUI uses PyQt6 with Qt Widgets and is optional: it opens only when
+  the owner starts Maria with `--gui`, and Maria's core and CLI need neither Qt nor the
+  GUI package. Its one worker thread runs only the window's foreground, owner-initiated
+  session operations, so it is not background work.
 
 ### Tool-creation policy
 
@@ -320,7 +324,12 @@ Maria may become self-sufficient, but never self-authorizing.
 - Timing, scheduling, notification, and concurrency primitives are confined to the
   narrow reminder-delivery subsystem. That subsystem has no import or call path to
   reasoning, model-to-plan compilation, ToolManager, general tools, project assistance,
-  or internet research. Its exact module shape is decided during Stage V1-23.
+  or internet research. Its exact module shape is decided during Stage V1-23. The one
+  exception, approved by the owner under V1-21-R1, is the GUI package. It may deliver
+  events to the GUI thread and run exactly one worker thread for the window's
+  foreground session operations, one at a time and in order. It schedules nothing,
+  starts no autonomous or background work, and runs nothing after the window has
+  closed, and exactly one of its modules may import `threading`.
 - Exactly two modules may import a network module: the local reasoning adapter and the
   research transport. The reminder-delivery subsystem may use operating-system timing
   and notification primitives, but no network module.
@@ -333,7 +342,8 @@ Maria may become self-sufficient, but never self-authorizing.
   redirects into a forbidden destination, and refusing a resolution that changes into a
   forbidden range between validation and connection. It never contacts the configured
   local-model endpoint.
-- Exactly one package may import a GUI toolkit.
+- Exactly one package may import a GUI toolkit: the `gui` package, which imports PyQt6
+  under V1-21-R1.
 - No production path executes shell commands, subprocesses, dynamically generated code,
   `eval`, `exec`, or model-produced source code. Maria still dispatches registered tools
   through ToolManager; that is the intended execution mechanism and is unaffected.
@@ -341,8 +351,11 @@ Maria may become self-sufficient, but never self-authorizing.
   parses successfully without active provider fields. Machine-specific provider settings
   live only in a deliberately untracked local override, and an enabled configuration
   missing any required active field fails closed.
-- Standard library only. A third-party dependency remains out of scope without explicit
-  owner approval.
+- Standard library only, with one owner-approved exception under V1-21-R1: PyQt6 and
+  its required runtime dependencies, for the optional desktop GUI alone, pinned in
+  `requirements-gui.txt`. `requirements.txt` stays standard-library only, and Maria's
+  core and CLI never need Qt. Any other third-party dependency remains out of scope
+  without explicit owner approval.
 - Every pre-v1.0 deterministic command, and every non-network deterministic command
   added during v1.0, remains available and usable without a model, network transport, or
   GUI toolkit, at every stage. A deterministic command whose purpose inherently requires
@@ -1587,6 +1600,98 @@ they find gets its own focused `fix/<topic>` branch, never a release branch.
 
 - Branch: `feature/desktop-gui`
 - Prerequisites: V1-04, V1-19, V1-20
+- Owner-approved amendment (V1-21-R1). Before the branch opened, the owner directed in
+  writing that this stage use PyQt6 with Qt Widgets and keep the first GUI simple. The
+  owner also authorized recording this amendment, and the global requirements it
+  conflicts with, before any production code. This entry required the standard-library
+  toolkit and excluded every third-party toolkit. It also claimed that no sensitive
+  content would reach a clipboard history, and described approval as returning the
+  pending-approval object. Separately, the global requirements confined concurrency to
+  reminder delivery, kept the project standard-library only, and froze
+  `requirements.txt`. This amendment rewrites four passages of this entry, and nothing
+  else in it changes: the approval and clipboard sentences under "Privacy and
+  security", the toolkit non-goal, and the toolkit completion criterion. "v1.0
+  Architecture Requirements", "GUI and CLI policy", and "v1.0 Completion Criteria" are
+  amended in the same change.
+  - Owner and scope: Maria is a personal, single-owner application. The first GUI is
+    deliberately small. It has one read-only conversation and result area, a one-line
+    text input, Send, and a short idle or busy status. While an approval is pending, it
+    also shows the complete core approval text with Approve and Cancel. Every
+    deterministic command, record commands included, is typed into the input exactly as
+    in the CLI. Deferred: the mascot, eye animation, elaborate themes, taskbar or tray
+    behavior, dedicated record browsers, and settings panels.
+  - Toolkit and dependency exception: PyQt6 with Qt Widgets. PyQt6 and its required
+    runtime dependencies, PyQt6-Qt6 and PyQt6-sip, are an optional, GUI-only exception
+    to the standard-library rule. They are pinned to the tested versions in a separate
+    `requirements-gui.txt`, and `requirements.txt` stays unchanged and standard-library
+    only. No other GUI framework or helper package is admitted. Maria's core and the CLI
+    import, start, and work without Qt, and production Qt imports live only in the GUI
+    package. PyQt6 6.11.0, PyQt6-Qt6 6.11.2, and PyQt6-sip 13.12.0 were confirmed to
+    install from their published wheels and run on the owner's 64-bit Windows Python
+    3.14 build, in an isolated environment, before implementation began.
+  - Concurrency exception: the GUI package may deliver events to the GUI thread and
+    run exactly one worker thread. That worker performs the window's foreground session
+    operations one at a time, in the order the owner asked for them. The exception
+    grants no reminder scheduling, no timer-driven or autonomous work, and no operation
+    after the window has closed. Exactly one GUI module may import `threading`, and
+    every other production module stays under the existing guard.
+  - Approval: when an approval is offered, the GUI keeps the exact `PendingApproval`
+    object the session holds. Before confirming, it checks that this object is still
+    the session's `pending_approval`, then calls the existing `MariaSession.confirm()`,
+    which takes no argument. It dismisses an approval with the existing
+    `MariaSession.cancel()`. Fingerprint rejection, cancellation, recording, model
+    calls, and audit summaries stay the core's own and are identical in both
+    interfaces. Cancel dismisses a pending approval; it never claims to stop an
+    operation already running.
+  - Display and clipboard: requests, replies, results, and approval text are rendered
+    as plain text. Model output is never interpreted as HTML, no link is opened, no
+    referenced file is loaded, and no displayed text is executed. Maria writes nothing
+    to the clipboard and exports no private output automatically. In this version the
+    result and approval displays cannot be selected or copied, while pasting into the
+    input stays available. Maria cannot control an operating-system clipboard history
+    and claims nothing about it.
+  - Lifecycle: the one worker creates, uses, confirms, cancels, and ends the window's
+    session, and widgets are touched only on the GUI thread. A request is accepted only
+    while the window is idle, and an answer only while its own offer is showing, so
+    duplicate submissions and stale approval callbacks are refused. The window and its
+    session end together: the window closes only after the session has ended, and an
+    ending session, for any reason, closes the window. Closing while busy stops new
+    requests and shows that it is waiting. It never approves what the current
+    operation produced. Closing waits for the current operation and has no general
+    GUI-wide deadline. Provider deadlines apply where configured, but a stalled
+    operation can delay closing indefinitely. No thread is forcibly stopped and no
+    hidden session remains. The displayed history is presentation state. It is never
+    replayed into the session's conversation or saved automatically. Display history
+    is never populated automatically from stored records. Explicit record-reading
+    commands still display their results.
+  - Startup: `main.py` keeps CLI startup unchanged and opens the window only for an
+    explicit `--gui`, building Brain through the same runtime composition and startup
+    handling as the CLI, after Qt's application object exists. If PyQt6 cannot be
+    loaded, Qt cannot start, the window fails, or its session ends unexpectedly, Maria
+    prints a fixed message and exits with status 1, and CLI startup keeps working. On
+    Windows, a process without a console first sees Qt's own error dialog for a
+    platform that cannot start, which Maria cannot suppress.
+  - Footprint: new `gui/__init__.py`, `gui/controller.py` (the Qt-free controller),
+    `gui/session_worker.py` (the one worker), and `gui/window.py` (the only Qt module).
+    Also new are `requirements-gui.txt` and focused GUI tests. `main.py` changes for
+    interface selection and startup handling shared with the CLI. `core/brain.py`,
+    `core/session.py`, every other core module, every tool, configuration,
+    `requirements.txt`, the schema, and the version literals are unchanged.
+  - Compatibility: the deliberate changes are the `--gui` option and the optional GUI
+    requirements file. The SQL-ownership and network-import guards also change: their
+    production-root inventories gain `gui`, and the network and threading guard admits
+    `threading` in exactly `gui.session_worker`. Several things stay unchanged: CLI
+    output and its existing tests, recording, approval semantics, and the action
+    inventory of 40 actions, 3 model-eligible, and 19 mandatory confirmations. So do
+    schema 6, version `0.2.0`, configuration, and the model instructions.
+  - Acceptance: the completion criteria below, as rewritten. In addition, the
+    controller and the worker are tested without Qt. Tests cover CLI and GUI parity for
+    deterministic commands, conversation, the summary draft, and model plans. They also
+    cover duplicate and stale actions, responsiveness and orderly closing while busy,
+    plain-text display and privacy, import boundaries, and logging when both
+    interfaces run in one process. The complete suite passes in an isolated copy both
+    without Qt and with the pinned PyQt6, and a small real-window check with synthetic
+    data is reported separately from automated evidence.
 - Purpose: Add the simple desktop interface that becomes the normal daily surface, as a
   pure presentation layer over exactly the Brain, plan validation, permission, tool,
   memory, and audit path the CLI already uses, placed after multi-step approval and
@@ -1601,22 +1706,24 @@ they find gets its own focused `fix/<topic>` branch, never a release branch.
 - Privacy and security: The GUI contains no permission logic, plan construction, plan
   mutation, SQL, or tool execution; a guard test asserts it imports neither the memory
   layer, ToolManager, permissions, nor any tool module, and reaches everything through
-  the session API. Approval returns the same pending-approval object the core issued,
-  and a mismatched fingerprint is rejected identically in both interfaces, asserted by
-  one shared test exercised through both. There is no auto-approve, no remembered
-  approval, no do-not-ask-again, and no capability the CLI cannot reach. No sensitive
-  content appears in window titles, recent-item lists, crash dialogs, clipboard history,
-  or the log, and no absolute host path the CLI would have sanitised. A GUI failure or a
-  missing toolkit must never disable or degrade the CLI.
+  the session API. Approval is bound to the exact pending-approval object the session
+  holds: the GUI checks that it is still pending and then calls the session's existing
+  confirmation method. A mismatched fingerprint is rejected identically in both
+  interfaces, asserted by one shared test exercised through both. There is no
+  auto-approve, no remembered approval, no do-not-ask-again, and no capability the CLI
+  cannot reach. No sensitive content appears in window titles, recent-item lists, crash
+  dialogs, or the log, and no absolute host path the CLI would have sanitised. Maria
+  writes nothing to the clipboard, and the result and approval displays cannot be
+  copied from. A GUI failure or a missing toolkit must never disable or degrade the CLI.
 - Non-goals: No web server, browser interface, or remote access. No GUI-only command,
   shortcut, or setting that bypasses configuration validation. No second execution or
-  permission architecture, no voice, and no window outliving the session. No third-party
-  GUI toolkit: if the standard-library toolkit is unavailable on the owner's Python
-  build, that is an owner decision to raise before implementation, not grounds for a
-  dependency. No out-of-session notification delivery, which is V1-23.
-- Completion criteria: The standard-library toolkit's availability on the owner's Python
-  build is confirmed and recorded before implementation begins, and its absence produces
-  a controlled message while the CLI still works, asserted by test; the toolkit is
+  permission architecture, no voice, and no window outliving the session. No GUI
+  toolkit or helper package beyond PyQt6 and its required runtime dependencies, under
+  V1-21-R1. No out-of-session notification delivery, which is V1-23.
+- Completion criteria: The PyQt6 versions tested on the owner's Python build are
+  confirmed and recorded before implementation begins and pinned in
+  `requirements-gui.txt`, and their absence produces a controlled message while the CLI
+  still works, asserted by test; the toolkit is
   imported only by the GUI package, asserted by an import-boundary guard test; a
   headless test drives the controller layer without creating a window, and
   display-dependent tests are explicitly skipped rather than silently passing; one
@@ -2344,7 +2451,10 @@ v1.0 is complete when:
   parses successfully with no active provider field present, an enabled configuration
   missing any required active field fails closed, and the local override is protected by
   an ignore rule;
-- `requirements.txt` is unchanged and the project is still standard-library only;
+- `requirements.txt` is unchanged and Maria's core and CLI are still standard-library
+  only, and the only third-party packages anywhere are PyQt6 and its required runtime
+  dependencies, confined to the optional GUI through `requirements-gui.txt` under
+  V1-21-R1;
 - tests use only temporary database and log resources, and the live database and log are
   never read, written, or copied;
 - all documentation is synchronized with shipped behavior, and upgrade validation from a

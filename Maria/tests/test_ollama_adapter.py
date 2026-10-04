@@ -1975,6 +1975,14 @@ COMPOSITION_POINT = "main"
 # handling, and no thread, task, or process.
 ADAPTER_NETWORK_IMPORTS = frozenset({"socket"})
 
+# The one other production module the owner's amendment V1-21-R1 lets import
+# from the forbidden set: the desktop GUI's session worker, which runs the
+# window's foreground session operations on one thread. It may import
+# ``threading`` and nothing else from the set: no network module, and no
+# task, process, or further concurrency module.
+GUI_WORKER_MODULE = "gui.session_worker"
+GUI_WORKER_THREAD_IMPORTS = frozenset({"threading"})
+
 # Every Maria module the adapter may reach, directly or not: the failure
 # vocabulary, the reasoning interface, and what that interface itself uses.
 ADAPTER_REACH = frozenset(
@@ -2004,7 +2012,8 @@ GUARDED_CORE_MODULES = (
 # the test package is scanned as production whatever its name, so a new one is
 # checked as soon as it exists; the root-inventory test separately fails until
 # a stage adds it here. This is the V1-10 discovery policy in test_memory.py.
-PRODUCTION_PACKAGES = ("core", "tools")
+# V1-21 added the desktop GUI package.
+PRODUCTION_PACKAGES = ("core", "tools", "gui")
 PRODUCTION_ENTRY_POINTS = ("main.py",)
 TEST_PACKAGE = "tests"
 
@@ -2519,16 +2528,28 @@ def guarded_module_names(root: Path = PROJECT_ROOT) -> list[str]:
 class NetworkImportBoundaryTests(unittest.TestCase):
     """Guard which production modules can reach a network or a thread."""
 
-    def test_only_the_adapter_imports_a_network_or_threading_module(
+    def test_only_the_adapter_and_the_gui_worker_import_a_forbidden_module(
         self,
     ) -> None:
+        """The adapter's socket and, under V1-21-R1, the GUI worker's thread.
+
+        Every other production module, the rest of the GUI package included,
+        imports nothing from the forbidden set, and neither exception
+        reaches beyond its one named module.
+        """
         owners = {
             module_name(path): found
             for path in production_modules()
             if (found := forbidden_in(path))
         }
 
-        self.assertEqual(owners, {ADAPTER_MODULE: set(ADAPTER_NETWORK_IMPORTS)})
+        self.assertEqual(
+            owners,
+            {
+                ADAPTER_MODULE: set(ADAPTER_NETWORK_IMPORTS),
+                GUI_WORKER_MODULE: set(GUI_WORKER_THREAD_IMPORTS),
+            },
+        )
 
     def test_guarded_modules_reach_no_network_or_threading_module(
         self,

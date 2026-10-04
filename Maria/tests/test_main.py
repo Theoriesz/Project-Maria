@@ -2,7 +2,10 @@
 
 from __future__ import annotations
 
+import importlib
+import logging
 import runpy
+import sys
 import unittest
 from contextlib import redirect_stderr, redirect_stdout
 from io import StringIO
@@ -23,6 +26,7 @@ from core.reasoning import (
     ReasoningTransport,
 )
 from core.session import MariaSession
+from tests.gui_fakes import window_module, without_qt
 
 
 MAIN_PATH = Path(__file__).resolve().parents[1] / "main.py"
@@ -38,6 +42,14 @@ STARTUP_INTERRUPTED_MESSAGE = "Maria: Startup interrupted."
 SCHEMA_TOO_NEW_MESSAGE = (
     "Maria: This database was written by a newer version of Maria and "
     "cannot be opened by this one."
+)
+GUI_UNAVAILABLE_MESSAGE = (
+    "Maria: The desktop GUI is unavailable. Install the optional GUI "
+    "requirements, or start Maria without --gui to use the command line."
+)
+GUI_FAILURE_MESSAGE = (
+    "Maria: The desktop GUI stopped unexpectedly. Review the available logs, "
+    "or start Maria without --gui to use the command line."
 )
 RENAME_PLAN = Plan(
     original_request="rename old.txt to new.txt",
@@ -760,6 +772,356 @@ class MainCliTests(unittest.TestCase):
             status = main_module.run_cli(factory)
 
         return status, stdout.getvalue(), stderr.getvalue(), input_mock
+
+
+class InterfaceSelectionTests(unittest.TestCase):
+    """Only ``--gui`` opens the desktop window; plain startup is unchanged."""
+
+    def _selected(self, arguments: list[str] | None) -> str:
+        """Return which interface ``main()`` ran for the given arguments."""
+        with (
+            patch.object(main_module, "run_cli", return_value=0) as cli,
+            patch.object(main_module, "run_gui", return_value=0) as gui,
+        ):
+            self.assertEqual(main_module.main(arguments), 0)
+        ran = [name for name, mock in (("cli", cli), ("gui", gui)) if mock.called]
+        self.assertEqual(len(ran), 1)
+        for mock in (cli, gui):
+            if mock.called:
+                mock.assert_called_once_with()
+        return ran[0]
+
+    def test_the_command_line_runs_unless_the_gui_option_is_given(
+        self,
+    ) -> None:
+        cases = {
+            "no arguments": ([], "cli"),
+            "an unknown option": (["--verbose"], "cli"),
+            "an unrelated word": (["gui"], "cli"),
+            "a near miss": (["--GUI"], "cli"),
+            "the option": (["--gui"], "gui"),
+            "the option among others": (["--verbose", "--gui"], "gui"),
+        }
+        for case, (arguments, expected) in cases.items():
+            with self.subTest(case=case):
+                self.assertEqual(self._selected(arguments), expected)
+
+    def test_without_arguments_main_reads_the_process_arguments(self) -> None:
+        for argv, expected in (
+            (["main.py"], "cli"),
+            (["main.py", "--gui"], "gui"),
+        ):
+            with self.subTest(argv=argv), patch.object(sys, "argv", argv):
+                self.assertEqual(self._selected(None), expected)
+
+    def test_the_gui_option_is_the_only_new_argument(self) -> None:
+        self.assertEqual(main_module.GUI_OPTION, "--gui")
+
+    def test_the_module_entrypoint_opens_the_gui_only_for_the_option(
+        self,
+    ) -> None:
+        factory = Mock(side_effect=AssertionError("Brain must not be built"))
+        stdout = StringIO()
+        stderr = StringIO()
+
+        with (
+            without_qt(),
+            patch.object(main_module.MariaBrain, "from_defaults", factory),
+            patch.object(sys, "argv", [str(MAIN_PATH), "--gui"]),
+            redirect_stdout(stdout),
+            redirect_stderr(stderr),
+            self.assertRaises(SystemExit) as raised,
+        ):
+            runpy.run_path(str(MAIN_PATH), run_name="__main__")
+
+        self.assertEqual(raised.exception.code, 1)
+        factory.assert_not_called()
+        self.assertEqual(stdout.getvalue(), "")
+        self.assertEqual(stderr.getvalue(), f"{GUI_UNAVAILABLE_MESSAGE}\n")
+
+
+class GuiStartupTests(unittest.TestCase):
+    """The GUI starts through the CLI's own composition and startup checks."""
+
+    def setUp(self) -> None:
+        # A failing window is logged; with no log configured here, keep the
+        # line off the captured standard error.
+        quiet = logging.NullHandler()
+        maria = logging.getLogger("maria")
+        maria.addHandler(quiet)
+        self.addCleanup(maria.removeHandler, quiet)
+
+    def _run_gui(
+        self,
+        factory: Mock,
+        run_window: Mock | None = None,
+    ) -> tuple[int, str, str]:
+        """Run ``run_gui`` with a stand-in window module, capturing output."""
+        stdout = StringIO()
+        stderr = StringIO()
+        window = run_window or Mock(return_value=0)
+        with (
+            window_module(window),
+            redirect_stdout(stdout),
+            redirect_stderr(stderr),
+        ):
+            status = main_module.run_gui(factory)
+        return status, stdout.getvalue(), stderr.getvalue()
+
+    def test_an_unavailable_qt_is_a_fixed_message_before_anything_starts(
+        self,
+    ) -> None:
+        factory = Mock(side_effect=AssertionError("Brain must not be built"))
+        stdout = StringIO()
+        stderr = StringIO()
+
+        with without_qt(), redirect_stdout(stdout), redirect_stderr(stderr):
+            status = main_module.run_gui(factory)
+
+        self.assertEqual(status, 1)
+        factory.assert_not_called()
+        self.assertEqual(stdout.getvalue(), "")
+        self.assertEqual(stderr.getvalue(), f"{GUI_UNAVAILABLE_MESSAGE}\n")
+        self.assertNotIn("Traceback", stderr.getvalue())
+        self.assertNotIn("PyQt6", stderr.getvalue())
+
+    def test_the_cli_works_without_qt_even_after_the_gui_was_refused(
+        self,
+    ) -> None:
+        brain = Mock(spec=main_module.MariaBrain)
+        brain.process.return_value = BrainResponse("System ready.")
+
+        stdout = StringIO()
+        stderr = StringIO()
+        recorder = _ImportRecorder()
+
+        with without_qt():
+            with redirect_stdout(StringIO()), redirect_stderr(StringIO()):
+                refused = main_module.run_gui(Mock(return_value=brain))
+            sys.meta_path.insert(0, recorder)
+            try:
+                with (
+                    patch("builtins.input", side_effect=["system", "exit"]),
+                    redirect_stdout(stdout),
+                    redirect_stderr(stderr),
+                ):
+                    status = main_module.run_cli(Mock(return_value=brain))
+                asked_by_the_cli = list(recorder.names)
+                # Positive control: an attempt is seen when one is made.
+                with self.assertRaises(ImportError):
+                    importlib.import_module("gui.window")
+            finally:
+                sys.meta_path.remove(recorder)
+
+        self.assertEqual(refused, 1)
+        self.assertEqual(status, 0)
+        self.assertEqual(
+            stdout.getvalue(),
+            f"{BANNER}\n{HELP_HINT}\nMaria: System ready.\nMaria: Goodbye.\n",
+        )
+        self.assertEqual(stderr.getvalue(), "")
+        # The CLI never even asks for the window module.
+        self.assertEqual(asked_by_the_cli, [])
+        self.assertEqual(recorder.names, ["gui.window"])
+        brain.process.assert_called_once_with("system")
+
+    def test_qt_is_prepared_before_brain_with_the_fixed_message(self) -> None:
+        order: list[str] = []
+        brain = Mock(spec=main_module.MariaBrain)
+
+        def prepare(message: str, status: int) -> None:
+            order.append("prepare")
+            self.assertEqual(message, GUI_UNAVAILABLE_MESSAGE)
+            self.assertEqual(status, 1)
+
+        def factory() -> Mock:
+            order.append("brain")
+            return brain
+
+        with (
+            window_module(Mock(return_value=0), prepare),
+            redirect_stdout(StringIO()),
+            redirect_stderr(StringIO()),
+        ):
+            status = main_module.run_gui(factory)
+
+        self.assertEqual(status, 0)
+        self.assertEqual(order, ["prepare", "brain"])
+
+    def test_a_qt_that_cannot_be_prepared_is_reported_before_brain(
+        self,
+    ) -> None:
+        cases = (
+            (RuntimeError("private-qt-detail"), 1, GUI_UNAVAILABLE_MESSAGE),
+            (KeyboardInterrupt(), 130, STARTUP_INTERRUPTED_MESSAGE),
+        )
+        for error, expected_status, expected_message in cases:
+            with self.subTest(error=type(error).__name__):
+                factory = Mock(side_effect=AssertionError("Brain built"))
+                window = Mock(return_value=0)
+                stdout = StringIO()
+                stderr = StringIO()
+
+                try:
+                    with (
+                        window_module(window, Mock(side_effect=error)),
+                        redirect_stdout(stdout),
+                        redirect_stderr(stderr),
+                    ):
+                        status = main_module.run_gui(factory)
+                except KeyboardInterrupt:
+                    self.fail("The interrupt escaped run_gui.")
+
+                self.assertEqual(status, expected_status)
+                self.assertEqual(stdout.getvalue(), "")
+                self.assertEqual(stderr.getvalue(), f"{expected_message}\n")
+                factory.assert_not_called()
+                window.assert_not_called()
+
+    def test_an_interrupt_while_the_window_starts_reads_like_the_cli(
+        self,
+    ) -> None:
+        try:
+            status, stdout, stderr = self._run_gui(
+                Mock(return_value=Mock(spec=main_module.MariaBrain)),
+                Mock(side_effect=KeyboardInterrupt()),
+            )
+        except KeyboardInterrupt:
+            self.fail("The interrupt escaped run_gui instead of being reported.")
+
+        self.assertEqual(status, 130)
+        self.assertEqual(stdout, "")
+        self.assertEqual(stderr, f"{STARTUP_INTERRUPTED_MESSAGE}\n")
+
+    def test_a_failing_window_is_logged_by_exception_type_only(self) -> None:
+        logger = Mock()
+        with patch.object(main_module, "get_logger", return_value=logger) as named:
+            status, _, stderr = self._run_gui(
+                Mock(return_value=Mock(spec=main_module.MariaBrain)),
+                Mock(side_effect=RuntimeError("private-window-detail")),
+            )
+
+        self.assertEqual(status, 1)
+        self.assertEqual(stderr, f"{GUI_FAILURE_MESSAGE}\n")
+        named.assert_called_once_with("main")
+        logger.error.assert_called_once_with(
+            "The desktop GUI failed: %s.",
+            "RuntimeError",
+        )
+
+    def test_the_gui_builds_brain_like_the_cli_and_hands_over_sessions(
+        self,
+    ) -> None:
+        brain = Mock(spec=main_module.MariaBrain)
+        factory = Mock(return_value=brain)
+        window = Mock(return_value=0)
+
+        status, stdout, stderr = self._run_gui(factory, window)
+
+        self.assertEqual((status, stdout, stderr), (0, "", ""))
+        factory.assert_called_once_with()
+        window.assert_called_once()
+        (session_factory,), kwargs = window.call_args
+        self.assertEqual(kwargs, {})
+        self.assertIsNot(session_factory, brain)
+        session = session_factory()
+        self.assertIsInstance(session, MariaSession)
+        self.assertIs(session.brain, brain)
+        brain.process.assert_not_called()
+
+    def test_the_default_gui_startup_uses_the_runtime_composition(
+        self,
+    ) -> None:
+        brain = Mock(spec=main_module.MariaBrain)
+        with patch.object(
+            main_module.MariaBrain,
+            "from_defaults",
+            return_value=brain,
+        ) as from_defaults:
+            status, _, stderr = self._run_gui(None)
+
+        self.assertEqual((status, stderr), (0, ""))
+        from_defaults.assert_called_once_with(
+            reasoning_factory=main_module.build_reasoning_provider,
+        )
+
+    def test_gui_startup_failures_read_exactly_like_the_cli(self) -> None:
+        cases = (
+            (ValueError("private-gui-startup-detail"), 1, STARTUP_FAILURE_MESSAGE),
+            (
+                TypedFailureError(Failure(FailureKind.DATABASE_SCHEMA_TOO_NEW)),
+                1,
+                SCHEMA_TOO_NEW_MESSAGE,
+            ),
+            (KeyboardInterrupt(), 130, STARTUP_INTERRUPTED_MESSAGE),
+        )
+        for error, expected_status, expected_message in cases:
+            with self.subTest(error=type(error).__name__):
+                window = Mock(return_value=0)
+
+                status, stdout, stderr = self._run_gui(
+                    Mock(side_effect=error),
+                    window,
+                )
+
+                self.assertEqual(status, expected_status)
+                self.assertEqual(stdout, "")
+                self.assertEqual(stderr, f"{expected_message}\n")
+                self.assertNotIn("private-gui-startup-detail", stderr)
+                window.assert_not_called()
+
+    def test_a_window_that_fails_or_ends_unexpectedly_is_reported(
+        self,
+    ) -> None:
+        cases = {
+            "raises": Mock(side_effect=RuntimeError("private-window-detail")),
+            "ends unexpectedly": Mock(return_value=1),
+        }
+        for case, window in cases.items():
+            with self.subTest(case=case):
+                status, stdout, stderr = self._run_gui(
+                    Mock(return_value=Mock(spec=main_module.MariaBrain)),
+                    window,
+                )
+
+                self.assertEqual(status, 1)
+                self.assertEqual(stdout, "")
+                self.assertEqual(stderr, f"{GUI_FAILURE_MESSAGE}\n")
+                self.assertNotIn("private-window-detail", stderr)
+                self.assertNotIn("Traceback", stderr)
+
+    def test_a_memory_error_in_the_window_propagates(self) -> None:
+        error = MemoryError("private-memory-detail")
+
+        with self.assertRaises(MemoryError) as raised:
+            self._run_gui(
+                Mock(return_value=Mock(spec=main_module.MariaBrain)),
+                Mock(side_effect=error),
+            )
+
+        self.assertIs(raised.exception, error)
+
+
+class _ImportRecorder:
+    """Record every attempt to import the window module or PyQt6.
+
+    It sits first among the import finders and finds nothing itself, so it
+    only watches; a module already imported never reaches it.
+    """
+
+    def __init__(self) -> None:
+        self.names: list[str] = []
+
+    def find_spec(
+        self,
+        name: str,
+        path: object = None,
+        target: object = None,
+    ) -> None:
+        """Note one watched import attempt and leave it to the others."""
+        if name == "gui.window" or name.split(".")[0] == "PyQt6":
+            self.names.append(name)
+        return None
 
 
 def _enabled_settings(

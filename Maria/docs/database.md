@@ -381,7 +381,10 @@ by `read note`, note-creation requests, calculator expressions and results,
 remembered or retrieved facts, filesystem paths and failure messages,
 system-information output, and unsupported, malformed, denied, or failed
 request responses. Blank input, CLI-only exit and cancellation paths, startup
-failures, and the initial confirmation-required response are not recorded.
+failures, and the initial confirmation-required response are not recorded. The
+desktop GUI records exactly what the CLI records, through the same session and
+Brain; its exit words, a request refused for holding a line break, and closing
+the window are not recorded, and the GUI writes nothing of its own.
 With reasoning enabled, unsupported input goes to the local reasoning model
 instead, which may reply conversationally or propose one action or a plan of
 two to five, and no

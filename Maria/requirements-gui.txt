@@ -1,0 +1,7 @@
+# Optional: only the desktop GUI (python main.py --gui) needs these.
+# Maria's core and command line need nothing beyond requirements.txt.
+# PyQt6 and its required runtime dependencies, pinned to the versions tested.
+# Install them into a virtual environment, never into a global interpreter.
+PyQt6==6.11.0
+PyQt6-Qt6==6.11.2
+PyQt6-sip==13.12.0
