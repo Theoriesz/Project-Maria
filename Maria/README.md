@@ -13,6 +13,9 @@ without the owner's approval.
 - SQLite, included with Python
 - Optional, for the desktop GUI only: PyQt6 and its runtime dependencies,
   pinned in `requirements-gui.txt`. The command line never needs them.
+- Optional, for dated tasks and timed reminders on a Python without time zone
+  data of its own, such as the Windows builds: the data-only `tzdata` package,
+  pinned in `requirements-time.txt`. Maria never imports or installs it.
 
 ## Setup
 
@@ -30,6 +33,15 @@ with `--gui`:
 ```text
 python -m pip install -r requirements-gui.txt
 python main.py --gui
+```
+
+Dated tasks and timed reminders need your time zone, set in the private
+override described under "Tasks and Reminders". Where Python has no time zone
+data of its own, install the pinned data package too, again ideally into a
+virtual environment:
+
+```text
+python -m pip install -r requirements-time.txt
 ```
 
 ## CLI Exit and Interruption Behavior
@@ -146,6 +158,32 @@ edit summary 1: We agreed to book the train on Friday.
 delete summary 1
 enable summary context 1
 disable summary context 1
+add task Buy milk
+add task due friday: File the tax return
+tasks
+completed tasks
+due tasks
+read task 1
+complete task 1
+reopen task 1
+edit task 1: Buy oat milk
+reschedule task 1: 2026-10-20
+delete task 1
+enable task context 1
+disable task context 1
+add reminder tomorrow 09:00: Call the dentist
+add reminder in 20 minutes: Take the bread out
+reminders
+completed reminders
+due reminders
+read reminder 1
+complete reminder 1
+reopen reminder 1
+edit reminder 1: Call the dentist about Tuesday
+reschedule reminder 1: monday 08:30
+delete reminder 1
+enable reminder context 1
+disable reminder context 1
 system
 time
 history
@@ -166,8 +204,10 @@ the two memory context consent commands `enable memory context <id>` and
 `disable memory context <id>`, `delete audit <id>`, `delete conversation <id>`,
 `summarize conversation`, whose confirmation shows the whole draft, the two
 summary lifecycle commands `edit summary <id>: <new text>` and
-`delete summary <id>`, and the two summary context consent commands
-`enable summary context <id>` and `disable summary context <id>` require
+`delete summary <id>`, the two summary context consent commands
+`enable summary context <id>` and `disable summary context <id>`, `add task`,
+`add reminder`, and for tasks and reminders alike the `edit`, `reschedule`,
+`delete`, `enable ... context`, and `disable ... context` commands require
 explicit confirmation. `delete interaction <id>` targets at most one
 interaction row by ID and removes it when found; it never cascades to notes or
 memories. Each note
@@ -179,10 +219,12 @@ history or notes. `delete audit <id>` targets at most one audit summary by
 positive whole-number ID only and removes it together with its recorded
 outcome; it never cascades into interaction history, notes, or memories.
 `delete conversation <id>` and `delete summary <id>` likewise each target at
-most one saved conversation or summary by ID and never cascade.
-The twenty ID-only planner commands (the sixteen `<id>` commands above that
-require confirmation, plus `read interaction <id>`, `read audit <id>`,
-`read conversation <id>`, and `read summary <id>`) accept a whole number from
+most one saved conversation or summary by ID and never cascade, and so does
+every task and reminder command that names an ID.
+The thirty-six ID-only planner commands (the twenty-six `<id>` commands above
+that require confirmation, plus `read interaction <id>`, `read audit <id>`,
+`read conversation <id>`, `read summary <id>`, and the `read`, `complete`, and
+`reopen` commands for tasks and reminders) accept a whole number from
 1 to 9223372036854775807, the largest integer SQLite stores, with any number of
 leading zeroes; each answers a larger number with its invalid-ID reply before
 anything is planned or confirmed. `read note <id or exact title>` uses its
@@ -194,6 +236,113 @@ intentionally unimplemented.
 With reasoning enabled, every action the local model proposes also needs your
 approval before it runs, even when the matching command would not ask; see
 "Model-Proposed Actions".
+
+## Tasks and Reminders
+
+A task is one line of your text with an optional due date, a calendar date
+with no time. A reminder is one line of text with one moment: the local time,
+offset, and time zone you approved, and the UTC instant they name. Both are
+`open` or `completed`. Every task and reminder command works without a
+language model.
+
+Maria never delivers, notifies, schedules, repeats, or polls anything. A
+reminder is never shown to you unasked: `due reminders` lists the open
+reminders whose moment has come, and `due tasks` the open tasks due today or
+earlier, only when you type them. A reminder does not repeat.
+
+### Your time zone
+
+Dates and times are read in one IANA time zone, which you set in the private
+`config/config.local.toml` described under "Local Reasoning Settings":
+
+```toml
+[time]
+zone = "Area/City"   # your own IANA key, such as Europe/Berlin
+```
+
+The tracked configuration may not hold `[time]`, and a key that is not IANA key
+syntax stops startup. Whether the key's data can be loaded is checked only when
+a date or time is needed. Data comes from time zone files on Python's zoneinfo
+search path or, when those lack the key, from the optional pinned `tzdata`
+package (see "Requirements"). Maria never falls back to UTC, a fixed offset,
+or your computer's own zone: without a usable zone she refuses `due tasks` and
+any new date or time with a fixed message and stores nothing. Every other task
+and reminder command, including adding an undated task, works without it.
+
+### Dates and times
+
+`<date>` is `today`, `tomorrow`, a weekday such as `friday` (the next one, so
+on a Friday `friday` is a week later), `YYYY-MM-DD`, or `in <N> days`.
+`<time>` is `H:MM` or `HH:MM`. A reminder takes a date and a time, optionally
+followed by an offset such as `+01:00`, or `in <N> minutes` or
+`in <N> hours`:
+
+```text
+add reminder tomorrow 09:00: Call the dentist
+add reminder 2026-10-25 02:30 +01:00: Check the clocks
+add reminder in 90 minutes: Take the bread out
+```
+
+Maria reads the clock once per request, before planning, and resolves every
+date and time of that request against that one moment, in your zone. Calendar
+words and `in <N> days` keep the wall time you gave; `in <N> minutes` and
+`in <N> hours` count real elapsed time from the current minute. A new date
+before today, a new reminder time that is not after the current moment, and a
+date more than ten years away are refused, and nothing is stored. Existing
+overdue tasks and reminders stay fully usable.
+
+On a daylight-saving change, a local time that does not exist is refused,
+never shifted. A local time that happens twice is refused unless you add the
+offset of the occurrence you mean, such as `02:30 +01:00`. An offset is
+accepted only when it matches your zone at that local time: on an ordinary
+time it changes nothing, on a repeated one it picks the occurrence, and any
+other offset is refused.
+
+### Adding and changing them
+
+Adding, editing, rescheduling, deleting, and turning consent on or off ask for
+confirmation, and the confirmation shows exactly what would be stored before
+anything is:
+
+```text
+add reminder tomorrow 09:00: Call the dentist
+Confirmation required: reminders.create requires explicit confirmation. Maria will not notify you when this reminder is due, and it does not repeat: type due reminders to see the reminders whose time has come.
+This approval adds a reminder, shown quoted:
+Text: "Call the dentist"
+Time: Monday 2026-10-05 at 09:00, Europe/Berlin (UTC+02:00), which is 2026-10-05 07:00 UTC
+Repeats: never
+```
+
+Approving stores exactly the values shown, even when that moment has passed
+by then. `complete task <id>` and `reopen task <id>`, and the reminder forms,
+change the status only and need no confirmation: completing stamps the time
+of that completion, reopening clears it, and completing again stamps a new
+time. `reschedule task <id>: none` removes a due date. `tasks` and `reminders`
+list the open ones, `completed tasks` and `completed reminders` the completed
+ones, each at most 20 and saying when more exist; open tasks come by due date,
+undated last, and open reminders by their saved instant. `list tasks` and
+`list reminders` still list directories.
+
+A reminder always keeps the time zone it was set in, and is always shown and
+ordered by its saved values; changing your configured zone later changes
+nothing stored. If that zone's rules have since changed so that the saved
+local time no longer has its saved offset, Maria adds a fixed warning and the
+reminder stays at its saved instant: reschedule it to use the current rules.
+When the saved zone cannot be loaded at all, she adds a note that she cannot
+check it. Neither ever refuses or rewrites anything.
+
+### Context consent
+
+A task or reminder reaches your local model only after you confirm
+`enable task context <id>` or `enable reminder context <id>`, which shows its
+exact text and timing, and only while it is open. Enabled open tasks and
+reminders are eligible on every conversational turn, after your enabled
+memories and within the same limits of 16 items and 2 KiB, tasks before
+reminders, each by ID and whole; Maria names those sent, and any left out.
+Editing or rescheduling turns consent off and says so, and completing,
+deleting, or disabling one that was sent clears the session's earlier
+conversation, as for a memory. Reopening makes it eligible again. Maria does
+not check a task or reminder for secrets.
 
 ## Filesystem Access
 
@@ -283,7 +432,7 @@ With the shipped configuration Maria uses no language model, and every command
 works exactly as it always has. Reasoning is off until the owner enables it in
 a private local override. Maria then answers input that matches no command
 with the owner's local Ollama model, which may reply conversationally or
-propose one of three allowed actions, or a plan of two to five of them; a
+propose one of five allowed actions, or a plan of two to five of them; a
 proposed action or plan runs only if the owner approves it. See "Local Ollama Adapter", "Conversation", and "Model-Proposed
 Actions" below.
 
@@ -300,8 +449,9 @@ to one machine. They belong only in `config/config.local.toml`, a private file
 that Git ignores, that Maria never creates, and that no filesystem command can
 read. When it is absent, the shipped disabled configuration applies. When it is
 present, it must be a regular file — not a link, directory, or special entry —
-holding exactly one `[reasoning]` table and nothing else, and that table
-replaces the tracked one completely:
+holding a `[reasoning]` table, a `[time]` table (see "Tasks and Reminders"), or
+both, and nothing else. A `[reasoning]` table replaces the tracked one
+completely:
 
 ```toml
 [reasoning]
@@ -388,17 +538,19 @@ Use the commands above to act.
 Within one session the model sees Maria's fixed instructions, the current
 request, the earlier conversational turns of that session, so a follow-up
 question is understood, the explicit memories you have enabled for context,
-and notes and conversation summaries you have enabled for context that contain
-a word of your request (see "Memory Context", "Note Context and Search", and
-"Saved Conversations and Summaries" below). It never sees a command or its
-result, an earlier proposal or what became of it, a memory, note, or summary
-you have not enabled, a saved conversation, a file, an audit summary, the
-interaction history, or anything from an earlier session. Maria keeps at most
+the open tasks and reminders you have enabled for context, and notes and
+conversation summaries you have enabled for context that contain a word of
+your request (see "Memory Context", "Note Context and Search", "Saved
+Conversations and Summaries", and "Tasks and Reminders"). It never sees a
+command or its result, an earlier proposal or what became of it, a memory,
+note, summary, task, or reminder you have not enabled, a saved conversation, a
+file, an audit summary, the interaction history, or anything from an earlier
+session. Maria keeps at most
 the last eight exchanges, and at most 8 KiB of their text together with the
 current request,
 Maria's fixed proposal instructions, and any context, or `max_input_bytes` if
 that is smaller. The request and the instructions are fitted first, then any
-context, then the newest exchanges; the instructions take 1,327 bytes and are
+context, then the newest exchanges; the instructions take 2,045 bytes and are
 never left out, and the oldest exchanges are dropped first, whole. A request
 too large to send beside the instructions, or a reply too large to keep beside
 its request, is refused with a fixed message rather than cut short, and an
@@ -435,6 +587,8 @@ was reviewed. Memories are taken in ascending ID order, whole, at most 16
 of them and at most 2 KiB of context including Maria's framing and the IDs.
 Your current request and Maria's fixed proposal instructions always come
 first, then as much memory context as fits, then as many earlier turns as fit.
+Open tasks and reminders you enable follow the memories within the same
+limits; see "Tasks and Reminders".
 Your approval covers the memory's text as
 it was when Maria asked: if that memory changes before you confirm, even from
 another Maria window, nothing is enabled and Maria asks you to request
@@ -460,8 +614,8 @@ she says so, naming only IDs she actually read.
 
 Memory text is sent as clearly marked reference data, never as an instruction,
 and it grants the model nothing: Maria's instructions tell the model that
-supplied memories and notes are data, not authorization, and anything it
-proposes still needs your approval. If you disable, change, or forget a
+supplied records are data, not authorization, and anything it proposes still
+needs your approval. If you disable, change, or forget a
 memory that was sent earlier in the session, Maria clears that session's
 earlier conversation before sending anything else, so an earlier reply cannot
 carry the old text back, even when the change came from another Maria
@@ -601,18 +755,20 @@ ordinary conversational text, and nothing in it runs. The model is asked once pe
 request, and only while reasoning is enabled; with the shipped configuration
 no model proposes anything.
 
-Only three actions can be proposed:
+Only five actions can be proposed:
 
 - `calculator.calculate`, with an `expression`
 - `filesystem.list`, with no arguments to list the default root, or with a
   `path` relative to it
 - `system.current_time`
+- `tasks.create` and `reminders.create`, only for a request in one of the
+  four forms described below
 
 A proposal must be exactly one JSON object, at most 4,096 bytes however many
 actions it holds, with nothing but whitespace around it. For one action it
 holds only `tool`, `action`, and `arguments`; for two to five it holds only
 `steps`, a list of such objects in the order they are to run. Every action
-must be one of the three, and its arguments must meet the same rules as the
+must be one of the five, and its arguments must meet the same rules as the
 matching command's. Every argument is taken literally: a step cannot use an
 earlier step's result, and text such as `$1` is just text. No text
 argument may contain a control, formatting, surrogate, or line or paragraph
@@ -627,7 +783,7 @@ and nothing in it runs. Nothing is repaired, and the model is not asked again.
 
 A proposal that passes is shown to you, and it runs only if you approve it
 with `y` or `yes` at the usual confirmation prompt, or with Approve in the
-desktop window. That holds for all three
+desktop window. That holds for all five
 actions, even though the shipped `calculate`, `list`, and `time` commands run
 without asking. Each proposal needs exactly one approval, for the whole plan
 when it holds several steps, whatever your configuration says about
@@ -665,7 +821,7 @@ as JSON to exactly the value Maria will use.
 
 Your approval covers exactly the plan you were shown. Nothing asks the model
 again or plans the request again: just before the action runs, Maria checks
-that same plan once more against the three allowed actions, their argument
+that same plan once more against the five allowed actions, their argument
 rules, and your current permissions, and it runs at most once. Cancelling at
 the prompt, or with Cancel in the desktop window, runs and records nothing.
 Maria's notes about context are shown
@@ -741,6 +897,58 @@ abruptly no report can be shown at all. A step that was never reached has no
 audit summary, and the audit listing does not group one plan's summaries
 together. In the desktop window Ctrl+C does not reach a running plan, so the
 plan finishes or stops on its own and its report says how.
+
+### Tasks and Reminders in Your Own Words
+
+With reasoning enabled, you can also ask for a task or reminder in one of four
+closed English forms, or for two to five of them joined by `and` or `, and`:
+
+```text
+remind me tomorrow at 09:00 to call mom
+remind me to stretch in 20 minutes
+add a task to buy milk
+add a task to file taxes by friday
+```
+
+A reminder's time is `today at`, `tomorrow at`, `on <weekday> at`,
+`on YYYY-MM-DD at`, or `in <N> days at`, then a time and an optional offset,
+or `in <N> minutes` or `in <N> hours`; a task's date is `today`, `tomorrow`, a
+weekday, or `YYYY-MM-DD`. Keywords may be in any case.
+
+The model never decides whether you asked. Maria reads your request herself:
+a creation is accepted only when your whole request is exactly those forms,
+and the proposal must hold one step for each of your items, in order, with its
+text copied exactly and its time or date phrase as you wrote it, apart from
+letter case and extra spaces. Maria then
+builds each step from her own reading and resolves the time herself, so
+nothing the model wrote is stored, and the approval shows the exact values:
+
+```text
+remind me tomorrow at 9:00 to call mom
+Maria's local reasoning model proposed this action. It runs only if you approve it.
+Tool: reminders
+Action: create
+Arguments: {"repeat": "never", "text": "call mom", "when": "2026-10-05T09:00:00+02:00[Europe/Berlin]"}
+
+Maria will not notify you when this reminder is due, and it does not repeat: type due reminders to see the reminders whose time has come.
+No memory context supplied.
+```
+
+Below the proposed steps, an approval shows the same fixed notice a typed
+command's confirmation would, once for each kind of step that carries one,
+however many such steps the plan holds; a plan without such a step shows
+only the steps and the context notice. The notice is for you alone: it is not
+kept in the conversation, recorded, or sent to the model.
+
+A question, a negation, a quotation, an example, a polite wrapper such as
+`please remind me ...`, or a passing mention is not a request, and nothing is
+added. A request that begins like a form but has a missing or vague time, such
+as `remind me tomorrow` or `remind me tomorrow morning to ...`, or whose text
+holds a second request, a retraction or hedge such as `just kidding` or
+`maybe`, or a time word, is refused with a request to say it again, and so is
+a proposal that does not match your request exactly. Nothing is guessed or
+repaired. Each item runs behind its own audit summary, and, as for any
+model-proposed action, the request is not recorded as interaction history.
 
 ## Audit Summaries
 
@@ -877,9 +1085,10 @@ messages. Asking Maria to display a sensitive file or note can therefore copy
 that returned content into interaction history.
 
 Interaction history, notes, facts deliberately saved with `remember`, the
-audit summaries of approved model-proposed actions, saved conversations, and
-conversation summaries are six separate record types in the same SQLite
-database, although the same text can appear in more than one table. The
+audit summaries of approved model-proposed actions, saved conversations,
+conversation summaries, tasks, and reminders are eight separate record types
+in the same SQLite database, although the same text can appear in more than
+one table. The
 configured operational log (`logs/maria.log` by default) is a separate store
 for application events,
 warnings, and failures rather than the interaction store. Avoiding full content
@@ -990,25 +1199,41 @@ edit's does. Deleting a saved conversation or summary does not remove a copy
 the same text may have in another record, and Maria promises no secure
 erasure.
 
+Tasks and reminders are kept until you delete them, with no automatic
+retention period or pruning; completing one keeps it. A listing, a due query,
+or a reading is recorded only as the command you typed and a fixed reply such
+as `Listed open tasks.` or `Displayed reminder <id>.`, and adding, editing, or
+rescheduling records a fixed reply such as `Added task <id>.`, never the text
+or time shown; as for a note edit, the command you typed keeps its text in the
+request half. A task or reminder created from a model proposal is not recorded
+as interaction history at all. `delete task <id>` and `delete reminder <id>`
+each remove at most one row by ID, after mandatory confirmation, cascade into
+no other record, and never reuse a deleted ID; there is no bulk, wildcard,
+clear-all, date-range, or automatic deletion and no undo or recovery, and
+Maria promises no secure erasure. Tasks and reminders are never linked to each
+other or to any other record. The operational log names a task or reminder
+only by its ID, never its text, date, time, zone, or consent identity.
+
 Maria's shipped runtime has no cloud integration and does not itself transmit
 this history. Its only network-capable code is the local Ollama adapter
 described under "Local Ollama Adapter": it can reach only `127.0.0.1:11434` on
 the same machine, it is disabled by default, and when enabled it receives only
 Maria's fixed instructions, the current session's conversation, the explicit
-memories you have enabled for context, notes and conversation summaries you
-have enabled for context that contain a word of the request, and, when you ask
-for a summary, the session's exchanges with Maria's fixed summary request; it
-never receives stored history, a saved conversation, an audit summary, a
-memory, note, or summary you have not enabled, files, or the result of an
-action it proposed.
+memories and the open tasks and reminders you have enabled for context, notes
+and conversation summaries you have enabled for context that contain a word of
+the request, and, when you ask for a summary, the session's exchanges with
+Maria's fixed summary request; it never receives stored history, a saved
+conversation, an audit summary, a memory, note, summary, task, or reminder you
+have not enabled, files, or the result of an action it proposed.
 
 `enable memory context <id>` and `disable memory context <id>` change one
 memory's consent flag, `enable note context <id>` and `disable note context
-<id>` one note's, and `enable summary context <id>` and
-`disable summary context <id>` one summary's, after mandatory confirmation; the
-recorded interaction names only the ID, never the fact, title, body, or text.
-Consent is off for every memory, note, and summary until you turn it on, and
-enabling one does not check it for secrets.
+<id>` one note's, `enable summary context <id>` and
+`disable summary context <id>` one summary's, and the task and reminder forms
+one task's or reminder's, after mandatory confirmation; the recorded
+interaction names only the ID, never the fact, title, body, text, or timing.
+Consent is off for every memory, note, summary, task, and reminder until you
+turn it on, and enabling one does not check it for secrets.
 Configured network-mounted or synchronized paths and operating-system backup
 or sync services remain outside Maria's boundary.
 
@@ -1048,8 +1273,9 @@ Brain, Planner, the reasoning interface, the local Ollama adapter,
 model-proposed actions and plans with their approval, audit summaries, and
 reports, the audit
 commands, saved conversations and conversation summaries with their drafting,
-approval, and context consent, database schema upgrades, and clean startup
-wiring. The adapter's
+approval, and context consent, tasks and reminders with their dates, times,
+time zones, request forms, approvals, and context consent, database schema
+upgrades, and clean startup wiring. The adapter's
 tests run only against a local stub on a socket pair inside the test process,
 and every other model reply is scripted, so the suite needs no Ollama, no
 model, and no network.
@@ -1061,17 +1287,25 @@ need PyQt6 and run on Qt's offscreen platform, so no window appears; without
 PyQt6 they are skipped, each with its reason. Passing offscreen tests are not
 a visual check.
 
+Daylight-saving and rule-change tests build their own time zones inside the
+test, so they never depend on the computer's time zone data. The few tests
+that need real IANA data skip, each with its reason, when no data source
+provides it; run the suite with the pinned `tzdata` installed as well to
+include them.
+
 ## Project Layout
 
 - `core/`: application coordination, planning, memory, permissions, logging,
   configuration, constants, the local reasoning interface and adapter, the
-  compiler that checks model proposals, and the audit-summary and
-  conversation-record vocabularies
+  compiler that checks model proposals, the audit-summary, conversation-record,
+  and task vocabularies, the four task and reminder request forms, and date and
+  time resolution
 - `tools/`: built-in tools
 - `gui/`: the optional desktop window, its Qt-free controller, and its one
   session worker
-- `requirements.txt` and `requirements-gui.txt`: the standard-library-only core
-  requirements and the optional GUI requirements
+- `requirements.txt`, `requirements-gui.txt`, and `requirements-time.txt`: the
+  standard-library-only core requirements, the optional GUI requirements, and
+  the optional time zone data
 - `database/`: SQLite database
 - `config/`: TOML configuration, including the named filesystem roots and the
   disabled reasoning template

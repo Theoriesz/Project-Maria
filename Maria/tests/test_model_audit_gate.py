@@ -91,11 +91,14 @@ CONTEXT_UNCERTAINTY = (
     "Maria cannot verify whether these memories are still current or whether "
     "they conflict with one another."
 )
-# V1-20 names conversation summaries too, since they can be supplied as well.
+# V1-20 names conversation summaries too, since they can be supplied as well,
+# and V1-22 tasks and reminders, which also stop being current when they are
+# no longer open.
 CLEARED_NOTICE = (
     "This session's earlier conversation was cleared because a memory, note, "
-    "or summary supplied to it is no longer enabled with the same text, so the "
-    "copy supplied earlier was invalidated."
+    "summary, task, or reminder supplied to it is no longer enabled with the "
+    "same text, or is no longer open, so the copy supplied earlier was "
+    "invalidated."
 )
 UNREADABLE_NOTICE = (
     "Memory context could not be read, so none was supplied and this "
@@ -158,6 +161,8 @@ RECORD_TABLES = (
     "audit_outcomes",
     "saved_conversations",
     "conversation_summaries",
+    "tasks",
+    "reminders",
 )
 ZERO_ROWS = {table: 0 for table in RECORD_TABLES}
 
@@ -1505,6 +1510,8 @@ class AuditPrivacyTests(_GateTestCase):
                 "audit_outcomes": 4,
                 "saved_conversations": 0,
                 "conversation_summaries": 0,
+                "tasks": 0,
+                "reminders": 0,
             },
         )
         self.assertEqual(

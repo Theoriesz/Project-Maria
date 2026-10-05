@@ -31,12 +31,25 @@ MANDATORY_CONFIRMATION_ACTIONS = frozenset(
         "memory.forget",
         "memory.enable_context",
         "memory.disable_context",
+        "reminders.create",
+        "reminders.edit",
+        "reminders.reschedule",
+        "reminders.delete",
+        "reminders.enable_context",
+        "reminders.disable_context",
+        "tasks.create",
+        "tasks.edit",
+        "tasks.reschedule",
+        "tasks.delete",
+        "tasks.enable_context",
+        "tasks.disable_context",
     }
 )
 
 # What the owner is told, beyond the standard sentence, before approving an
-# action whose consequence is not obvious from its name. Each notice is fixed
-# text and interpolates nothing, so no stored content can reach it.
+# action whose consequence is not obvious from its name, in a deterministic
+# confirmation and a model plan's approval alike. Each notice is fixed text
+# and interpolates nothing, so no stored content can reach it.
 CONFIRMATION_NOTICES = MappingProxyType(
     {
         "audit.delete": (
@@ -70,6 +83,27 @@ CONFIRMATION_NOTICES = MappingProxyType(
             "literally in its title or its body, within Maria's context "
             "limits. Maria does not check the note for passwords or other "
             "secrets, and enabling it does not mean it contains none."
+        ),
+        "reminders.create": (
+            "Maria will not notify you when this reminder is due, and it does "
+            "not repeat: type due reminders to see the reminders whose time "
+            "has come."
+        ),
+        "reminders.enable_context": (
+            "Once enabled, this reminder's text and saved time may be sent to "
+            "your local reasoning model on a conversational turn while it is "
+            "open, after your enabled memories and within Maria's memory "
+            "context limits, so it is not always sent. Maria does not check "
+            "the reminder for passwords or other secrets, and enabling it does "
+            "not mean it contains none."
+        ),
+        "tasks.enable_context": (
+            "Once enabled, this task's text and due date may be sent to your "
+            "local reasoning model on a conversational turn while it is open, "
+            "after your enabled memories and within Maria's memory context "
+            "limits, so it is not always sent. Maria does not check the task "
+            "for passwords or other secrets, and enabling it does not mean it "
+            "contains none."
         ),
     }
 )
@@ -129,7 +163,7 @@ class PermissionManager:
         if action_id in self.confirmation_required:
             self.logger.info("Action %s requires confirmation.", action_id)
             reason = f"{action_id} requires explicit confirmation."
-            notice = CONFIRMATION_NOTICES.get(action_id)
+            notice = self.confirmation_notice(tool_name, action)
             if notice is not None:
                 reason = f"{reason} {notice}"
             return PermissionResult(
@@ -142,3 +176,19 @@ class PermissionManager:
             PermissionDecision.ALLOWED,
             f"{action_id} is allowed.",
         )
+
+    def confirmation_notice(self, tool_name: str, action: str) -> str | None:
+        """Return the fixed notice an approval of this action carries, or None.
+
+        Only an action that requires confirmation, and is not denied, carries
+        one: its entry in ``CONFIRMATION_NOTICES``, which is fixed text.
+        ``check`` appends the same notice to its reason, and a model plan's
+        approval shows it too. Nothing is logged here.
+        """
+        action_id = f"{tool_name}.{action}"
+        if (
+            action_id in self.denied_actions
+            or action_id not in self.confirmation_required
+        ):
+            return None
+        return CONFIRMATION_NOTICES.get(action_id)

@@ -10,5 +10,5 @@ Supported responsibilities:
 - Ask the planner for a small executable plan.
 - Use memory only through the memory module.
 - Use tools only through the tool manager.
-- Require confirmation before file renames or moves and stored-record updates or deletions.
+- Require confirmation before file renames or moves, before adding a task or reminder, and before stored-record updates or deletions, except completing or reopening a task or reminder.
 - Log important actions.

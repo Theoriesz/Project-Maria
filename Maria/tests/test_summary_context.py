@@ -366,15 +366,15 @@ class SummaryRowTests(unittest.TestCase):
 
 
 class ClearingNoticeTests(unittest.TestCase):
-    """Pin the clearing notices that now name conversation summaries."""
+    """Pin the clearing notices that name summaries, tasks, and reminders."""
 
     def test_both_notices_name_summaries(self) -> None:
         self.assertEqual(SUPPLIED_CONTEXT_MAX_RECORDS, 64)
         self.assertEqual(
             CONTEXT_LIMIT_CLEARED_NOTICE,
             "This session's earlier conversation was cleared because it reached "
-            "the limit of 64 memories, notes, and summaries Maria rechecks before "
-            "each request.",
+            "the limit of 64 memories, notes, summaries, tasks, and reminders "
+            "Maria rechecks before each request.",
         )
         self.assertEqual(CONVERSATION_CLEARED_NOTICE, CLEARED_NOTICE)
 

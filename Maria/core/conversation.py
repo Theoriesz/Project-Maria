@@ -24,15 +24,16 @@ exchange the session keeps, and nothing a model writes can change it. There
 is no import path from here to permissions, tool dispatch, or persistence.
 
 The conversation itself belongs to the caller's session, together with the
-fingerprints of every memory, note, and summary supplied since that
-conversation was last cleared. This module keeps no state between turns; it
-only computes what a turn sends and what the session should keep afterwards.
-Before anything is sent, those fingerprints are checked against what a
-bounded read by id finds enabled now, and a conversation whose supplied
-record was disabled, changed, deleted, or forgotten is discarded whole, so an
-earlier reply cannot carry that text back to the model. The check sees
-current state only: a record changed away and back to the identical approved
-text between two checks is indistinguishable from one never changed.
+fingerprints of every memory, note, summary, task, and reminder supplied
+since that conversation was last cleared. This module keeps no state between
+turns; it only computes what a turn sends and what the session should keep
+afterwards. Before anything is sent, those fingerprints are checked against
+what a bounded read by id finds enabled now, and a conversation whose
+supplied record was disabled, changed, completed, deleted, or forgotten is
+discarded whole, so an earlier reply cannot carry that text back to the
+model. The check sees current state only: a record changed away and back to
+the identical approved text between two checks is indistinguishable from one
+never changed.
 
 This module also settles the session text a planner's plan asks Maria to
 supply, from V1-20: the canonical transcript of exactly the retained
@@ -53,19 +54,26 @@ from logging import Logger
 from core.action_contracts import ArgumentContract, SessionInput
 from core.context import (
     CONTEXT_LIMIT_CLEARED_NOTICE,
+    CONTEXT_QUERY_LIMIT,
     CONTEXT_UNREADABLE_NOTICE,
     CONVERSATION_CLEARED_NOTICE,
     NO_MEMORY_CONTEXT_NOTICE,
     SEARCH_QUERY_LIMIT,
     SUPPLIED_CONTEXT_MAX_RECORDS,
+    AgendaSelection,
     ContextFingerprint,
     ContextItem,
     ContextSelection,
     SearchSelection,
+    agenda_omission_notice,
+    agenda_selected_notice,
+    agenda_supplied_notice,
     divergent_notices,
     enabled_memories,
     enabled_notes,
+    enabled_reminders,
     enabled_summaries,
+    enabled_tasks,
     omission_notice,
     search_omission_notice,
     search_selected_notice,
@@ -73,6 +81,7 @@ from core.context import (
     searched_memories_follow,
     searched_notes_whole,
     searched_summaries_whole,
+    select_agenda_context,
     select_memory_context,
     select_search_context,
     selected_notice,
@@ -239,10 +248,11 @@ class ConversationTurn:
 class _SettledReads:
     """Every bounded context read of one turn, validated.
 
-    ``enabled`` is Tier A's read of enabled memories; ``supplied_*`` are the
-    rechecks, by id, of records supplied earlier in the conversation; and
-    ``searched_*`` are Tier B's search results. Each is empty when that read
-    was not needed.
+    ``enabled`` is Tier A's read of enabled memories, and ``enabled_tasks``
+    and ``enabled_reminders`` its reads of enabled open tasks and reminders;
+    ``supplied_*`` are the rechecks, by id, of records supplied earlier in
+    the conversation; and ``searched_*`` are Tier B's search results. Each is
+    empty when that read was not needed.
     """
 
     enabled: tuple[tuple[int, str | None], ...] = ()
@@ -252,6 +262,10 @@ class _SettledReads:
     searched_notes: tuple[tuple[int, str | None, str | None], ...] = ()
     supplied_summaries: tuple[tuple[int, str | None], ...] = ()
     searched_summaries: tuple[tuple[int, str | None], ...] = ()
+    enabled_tasks: tuple[tuple[int, str, str | None], ...] = ()
+    enabled_reminders: tuple[tuple[int, str, str | None], ...] = ()
+    supplied_tasks: tuple[tuple[int, str, str | None], ...] = ()
+    supplied_reminders: tuple[tuple[int, str, str | None], ...] = ()
 
 
 def is_proposal_attempt(text: object) -> bool:
@@ -397,19 +411,24 @@ def converse(
     proposals: bool = False,
     supplied_summaries_read: Sequence[object] = (),
     searched_summaries_read: Sequence[object] = (),
+    enabled_tasks_read: Sequence[object] = (),
+    enabled_reminders_read: Sequence[object] = (),
+    supplied_tasks_read: Sequence[object] = (),
+    supplied_reminders_read: Sequence[object] = (),
 ) -> ConversationTurn:
     """Answer one request conversationally, or hand back a proposal attempt.
 
     ``enabled_memories_read`` is what Brain's bounded Tier A read returned,
-    or None when Brain's context reads failed. The ``supplied_*`` reads are
-    the rechecks, by id, of every record ``supplied_context`` names, and the
-    ``searched_*`` reads are Tier B's search results, summaries included.
-    All of them are settled first. A failed or untrustworthy read sends no
-    context and no earlier exchange, clears the session's conversation and
-    fingerprints, and says so. Otherwise, when a record in
-    ``supplied_context`` is no longer among the enabled records rechecked
-    with the same text, the whole earlier conversation is discarded before
-    anything is sent.
+    or None when Brain's context reads failed, and ``enabled_tasks_read``
+    and ``enabled_reminders_read`` are its reads of enabled open tasks and
+    reminders. The ``supplied_*`` reads are the rechecks, by id, of every
+    record ``supplied_context`` names, and the ``searched_*`` reads are Tier
+    B's search results, summaries included. All of them are settled first.
+    A failed or untrustworthy read sends no context and no earlier exchange,
+    clears the session's conversation and fingerprints, and says so.
+    Otherwise, when a record in ``supplied_context`` is no longer among the
+    enabled records rechecked with the same text, the whole earlier
+    conversation is discarded before anything is sent.
 
     ``proposals`` turns on proposal mode and must be exactly True or False.
     In proposal mode the request selects Maria's fixed proposal
@@ -420,10 +439,11 @@ def converse(
     over the budget on its own, is then refused before the provider is asked
     anything; the instructions are never dropped to make it fit. Otherwise
     the request and the instructions come first, then as much Tier A context
-    as its rule fits, then as many Tier B search matches as fit, memories
-    before notes, with the separator that joins the instructions to the
-    context framing counted against them, then the newest earlier exchanges
-    that fit, and the provider is asked exactly once. When the conversation
+    as its rule fits, memories first and then enabled open tasks and
+    reminders, then as many Tier B search matches as fit, memories before
+    notes, with the separator that joins the instructions to the context
+    framing counted against them, then the newest earlier exchanges that
+    fit, and the provider is asked exactly once. When the conversation
     would then carry more supplied records than Maria rechecks, it is
     discarded before sending instead. A typed failure becomes its fixed
     message.
@@ -462,6 +482,10 @@ def converse(
                 searched_notes_read,
                 supplied_summaries_read,
                 searched_summaries_read,
+                enabled_tasks_read,
+                enabled_reminders_read,
+                supplied_tasks_read,
+                supplied_reminders_read,
             )
         except ValueError:
             reads = None
@@ -475,6 +499,8 @@ def converse(
         reads.supplied_memories,
         reads.supplied_notes,
         reads.supplied_summaries,
+        reads.supplied_tasks,
+        reads.supplied_reminders,
     ):
         log.info("Earlier conversation cleared: supplied memory context changed.")
         before.append(CONVERSATION_CLEARED_NOTICE)
@@ -520,14 +546,21 @@ def converse(
     if proposals:
         context_budget -= len(INSTRUCTION_SEPARATOR.encode("utf-8"))
     selection = select_memory_context(reads.enabled, context_budget)
-    search = select_search_context(
+    agenda = select_agenda_context(
         selection.items,
+        reads.enabled_tasks,
+        reads.enabled_reminders,
+        context_budget,
+    )
+    enabled_items = selection.items + agenda.items
+    search = select_search_context(
+        enabled_items,
         reads.searched_memories,
         reads.searched_notes,
         context_budget,
         reads.searched_summaries,
     )
-    context = selection.items + search.items
+    context = enabled_items + search.items
     if len(_records(supplied) | _records(context)) > SUPPLIED_CONTEXT_MAX_RECORDS:
         # Counted by record, not by digest, so nothing is hashed before the
         # request is known to complete.
@@ -538,6 +571,11 @@ def converse(
         supplied = frozenset()
     history = fitted_history(request, conversation, budget, context, proposals)
     log.info("Memory context selected: %s item(s).", len(selection.items))
+    if reads.enabled_tasks or reads.enabled_reminders:
+        log.info(
+            "Task and reminder context selected: %s item(s).",
+            len(agenda.items),
+        )
     log.info("Search context selected: %s item(s).", len(search.items))
 
     outcome = request_reasoning(
@@ -551,10 +589,10 @@ def converse(
         # and nothing new is tracked: no reply is kept that could repeat it.
         return turn(
             outcome.message,
-            _context_notices(selection, search, delivered=False),
+            _context_notices(selection, search, delivered=False, agenda=agenda),
         )
 
-    notices = _context_notices(selection, search, delivered=True)
+    notices = _context_notices(selection, search, delivered=True, agenda=agenda)
     if proposals and is_proposal_attempt(outcome.text):
         # Handed back untouched for the compiler. A proposal is never kept as
         # an exchange, so the fingerprints of what this request supplied are
@@ -788,6 +826,8 @@ def draft_summary(
     supplied_memories_read: Sequence[object] | None = (),
     supplied_notes_read: Sequence[object] = (),
     supplied_summaries_read: Sequence[object] = (),
+    supplied_tasks_read: Sequence[object] = (),
+    supplied_reminders_read: Sequence[object] = (),
 ) -> SummaryDraft:
     """Ask the provider once for a summary of exactly the retained exchanges.
 
@@ -831,6 +871,11 @@ def draft_summary(
                 enabled_notes(supplied_notes_read, SUPPLIED_CONTEXT_MAX_RECORDS),
                 enabled_summaries(
                     supplied_summaries_read,
+                    SUPPLIED_CONTEXT_MAX_RECORDS,
+                ),
+                enabled_tasks(supplied_tasks_read, SUPPLIED_CONTEXT_MAX_RECORDS),
+                enabled_reminders(
+                    supplied_reminders_read,
                     SUPPLIED_CONTEXT_MAX_RECORDS,
                 ),
             )
@@ -933,6 +978,10 @@ def _settled_reads(
     searched_notes: object,
     supplied_summaries: object = (),
     searched_summaries: object = (),
+    tasks: object = (),
+    reminders: object = (),
+    supplied_tasks: object = (),
+    supplied_reminders: object = (),
 ) -> _SettledReads:
     """Validate every bounded read of one turn, or raise ``ValueError``.
 
@@ -949,6 +998,10 @@ def _settled_reads(
         enabled_notes(searched_notes, SEARCH_QUERY_LIMIT),
         enabled_summaries(supplied_summaries, SUPPLIED_CONTEXT_MAX_RECORDS),
         enabled_summaries(searched_summaries, SEARCH_QUERY_LIMIT),
+        enabled_tasks(tasks, CONTEXT_QUERY_LIMIT),
+        enabled_reminders(reminders, CONTEXT_QUERY_LIMIT),
+        enabled_tasks(supplied_tasks, SUPPLIED_CONTEXT_MAX_RECORDS),
+        enabled_reminders(supplied_reminders, SUPPLIED_CONTEXT_MAX_RECORDS),
     )
     searched_memories_follow(settled.enabled, settled.searched_memories)
     searched_notes_whole(settled.searched_notes)
@@ -968,25 +1021,38 @@ def _context_notices(
     search: SearchSelection,
     *,
     delivered: bool,
+    agenda: AgendaSelection = AgendaSelection(),
 ) -> tuple[str, ...]:
     """Return Maria's notices about what one request carried.
 
-    Tier A's notice comes first, then what its limits left out, then Tier
-    B's notice, what its limits left out, and any possible divergent
-    versions among the selected notes. ``delivered`` says whether the model
-    is known to have received the request; when it is not, the records are
-    named as selected rather than supplied. With no context at all the one
-    notice says none was supplied.
+    Tier A's memory notice comes first, then what its limits left out, then
+    the notice for its tasks and reminders and what the limits left out of
+    them, then Tier B's notice, what its limits left out, and any possible
+    divergent versions among the selected notes. ``delivered`` says whether
+    the model is known to have received the request; when it is not, the
+    records are named as selected rather than supplied. With no context at
+    all the one notice says none was supplied. A request with no eligible
+    task or reminder gets exactly the notices it had before V1-22.
     """
     enabled, searched = selection.items, search.items
+    timed = agenda.items
     notices: list[str] = []
     if enabled:
         notices.append(
             supplied_notice(enabled) if delivered else selected_notice(enabled)
         )
-    elif not searched:
+    elif not searched and not timed:
         notices.append(NO_MEMORY_CONTEXT_NOTICE)
     omitted = omission_notice(selection)
+    if omitted is not None:
+        notices.append(omitted)
+    if timed:
+        notices.append(
+            agenda_supplied_notice(timed)
+            if delivered
+            else agenda_selected_notice(timed)
+        )
+    omitted = agenda_omission_notice(agenda)
     if omitted is not None:
         notices.append(omitted)
     if searched:

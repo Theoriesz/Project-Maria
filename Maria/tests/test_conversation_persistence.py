@@ -95,6 +95,8 @@ TRACKED_TABLES = (
     "audit_outcomes",
     "saved_conversations",
     "conversation_summaries",
+    "tasks",
+    "reminders",
 )
 
 
@@ -233,8 +235,9 @@ class MemorySaveTests(_MemoryTestCase):
         work = _work(statements)
         self.assertEqual(len(work), 1)
         self.assertTrue(work[0].startswith("INSERT INTO saved_conversations"))
-        for table in TRACKED_TABLES[:-2] + ("conversation_summaries",):
-            self.assertNotIn(table, work[0])
+        for table in TRACKED_TABLES:
+            if table != "saved_conversations":
+                self.assertNotIn(table, work[0])
 
     def test_saving_the_same_exchanges_twice_stores_two_rows(self) -> None:
         transcript = encode_transcript((("a", "b"),))
@@ -974,9 +977,13 @@ class CaptureCriteriaTests(unittest.TestCase):
                 self.assertNotIn(shown, transcript)
 
     def test_a_conversation_at_the_byte_bound_saves_byte_for_byte(self) -> None:
+        # V1-22's 2,045-byte proposal instructions leave 6,141 bytes of an
+        # 8,192-byte request for history beside a six-byte prompt, so three
+        # 2,047-byte exchanges are carried, and the newest exchange of 2,051
+        # bytes brings what the session keeps to exactly the 8,192-byte bound.
         provider, harness = _conversing(
             self,
-            lambda request: "r" * 2042,
+            lambda request: "r" * (2045 if request.prompt == "turn 6" else 2041),
         )
         session = harness.session()
         for index in range(1, 7):

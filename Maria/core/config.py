@@ -38,6 +38,7 @@ from core.reasoning import (
     ReasoningSettings,
     ReasoningTransport,
 )
+from core.time_resolution import is_zone_key
 
 
 _PERMISSION_ACTION_PATTERN = re.compile(
@@ -166,8 +167,12 @@ _TRANSPORTS_BY_NAME = {
     transport.value: transport for transport in ReasoningTransport
 }
 
-# The only thing the private override may hold.
-_LOCAL_OVERRIDE_SECTIONS = frozenset({"reasoning"})
+# The only things the private override may hold: a [reasoning] table, a
+# [time] table, or both.
+_LOCAL_OVERRIDE_SECTIONS = frozenset({"reasoning", "time"})
+
+# The exact keys a [time] table accepts: the owner's one IANA time zone key.
+_TIME_KEYS = frozenset({"zone"})
 
 # The override holds a handful of short settings, so anything near this size
 # is not a reasoning block and is refused rather than read in full.
@@ -219,8 +224,20 @@ LOCAL_OVERRIDE_TOML_MESSAGE = (
     "The local configuration override is not valid UTF-8 TOML."
 )
 LOCAL_OVERRIDE_SECTIONS_MESSAGE = (
-    "The local configuration override must contain exactly one [reasoning] "
-    "section and nothing else."
+    "The local configuration override must contain a [reasoning] section, a "
+    "[time] section, or both, and nothing else."
+)
+TIME_SECTION_TABLE_MESSAGE = "The [time] section must be a TOML table."
+TIME_SECTION_KEYS_MESSAGE = (
+    "The [time] section must declare exactly one key, zone."
+)
+TIME_ZONE_MESSAGE = (
+    "time.zone must be an IANA time zone key, such as Area/City, of at most "
+    "64 ASCII letters, digits, underscores, plus or minus signs, and slashes."
+)
+TIME_TRACKED_MESSAGE = (
+    "The tracked configuration must not declare a [time] section; the time "
+    "zone belongs only in the local override."
 )
 
 
@@ -229,7 +246,11 @@ class MariaConfig:
     """Runtime configuration loaded from config.toml.
 
     ``reasoning`` defaults to the disabled settings, which is what every
-    configuration without an enabled local override means.
+    configuration without an enabled local override means. ``time_zone`` is
+    the owner's IANA time zone key from the override's ``[time]`` table, or
+    None when none is configured; only resolving new task and reminder
+    timing and the due-task query need it, and nothing falls back to another
+    zone without it.
     """
 
     app_name: str
@@ -244,6 +265,7 @@ class MariaConfig:
     confirmation_required: frozenset[str]
     denied_actions: frozenset[str]
     reasoning: ReasoningSettings = DISABLED_REASONING
+    time_zone: str | None = None
 
 
 def load_config(
@@ -262,16 +284,23 @@ def load_config(
     other caller, including every test that loads the shipped file, never
     reads the owner's private settings. When an override path is named and
     nothing is there, the tracked configuration applies unchanged. When
-    something is there, it must be a regular file holding exactly one
-    ``[reasoning]`` table, and that table replaces the tracked one
-    completely: nothing is merged and no missing field is borrowed. Anything
-    else stops loading with a fixed message.
+    something is there, it must be a regular file holding a ``[reasoning]``
+    table, a ``[time]`` table, or both, and nothing else. A ``[reasoning]``
+    table replaces the tracked one completely: nothing is merged and no
+    missing field is borrowed. A ``[time]`` table names the owner's one time
+    zone, which the tracked file may never declare. Anything else stops
+    loading with a fixed message.
     """
     if not config_path.exists():
         raise FileNotFoundError(f"Configuration file not found: {config_path}")
 
     with config_path.open("rb") as config_file:
         raw_config = tomllib.load(config_file)
+
+    # A time zone is location-like and personal, so it lives only in the
+    # untracked override; a tracked one is refused rather than ignored.
+    if "time" in raw_config:
+        raise ValueError(TIME_TRACKED_MESSAGE)
 
     app = raw_config.get("app", {})
     paths = raw_config.get("paths", {})
@@ -320,15 +349,19 @@ def load_config(
     )
 
     # The tracked file is settled in full before the private override is
-    # even looked at, and the override can change the reasoning settings
-    # alone: every other field comes from the tracked file whatever the
-    # override holds.
+    # even looked at, and the override can change the reasoning settings and
+    # the time zone alone: every other field comes from the tracked file
+    # whatever the override holds.
     if local_override_path is None:
         return config
-    overriding = _local_override_reasoning(local_override_path)
+    overriding = _local_override(local_override_path)
     if overriding is None:
         return config
-    return replace(config, reasoning=overriding)
+    if overriding.reasoning is not None:
+        config = replace(config, reasoning=overriding.reasoning)
+    if overriding.time_zone is not None:
+        config = replace(config, time_zone=overriding.time_zone)
+    return config
 
 
 def _resolve_project_path(value: Any) -> Path:
@@ -558,20 +591,61 @@ def _reasoning_settings(table: dict[str, Any]) -> ReasoningSettings:
     )
 
 
-def _local_override_reasoning(path: Path) -> ReasoningSettings | None:
-    """Return the private override's reasoning settings, or None when absent.
+@dataclass(frozen=True, repr=False)
+class _LocalOverride:
+    """What the private override settled: its reasoning settings and zone.
 
-    The override may hold one [reasoning] table and nothing else, so it can
-    never reach permissions, roots, logging, paths, or any other section.
+    Each is None when the override does not declare that section. Neither
+    is shown by ``repr``.
+    """
+
+    reasoning: ReasoningSettings | None
+    time_zone: str | None
+
+    def __repr__(self) -> str:
+        """Name the type without showing any setting."""
+        return "_LocalOverride(<redacted>)"
+
+
+def _local_override(path: Path) -> _LocalOverride | None:
+    """Return the private override's settings, or None when it is absent.
+
+    The override may hold a [reasoning] table, a [time] table, or both, and
+    nothing else, so it can never reach permissions, roots, logging, paths,
+    or any other section.
     """
     entry = _local_override_entry(path)
     if entry is None:
         return None
 
     document = _local_override_document(_local_override_bytes(path, entry))
-    if set(document) != _LOCAL_OVERRIDE_SECTIONS:
+    sections = set(document)
+    if not sections or not sections <= _LOCAL_OVERRIDE_SECTIONS:
         raise ValueError(LOCAL_OVERRIDE_SECTIONS_MESSAGE)
-    return _reasoning_settings(_reasoning_table(document["reasoning"]))
+    reasoning = None
+    if "reasoning" in document:
+        reasoning = _reasoning_settings(_reasoning_table(document["reasoning"]))
+    time_zone = None
+    if "time" in document:
+        time_zone = _time_zone(document["time"])
+    return _LocalOverride(reasoning, time_zone)
+
+
+def _time_zone(value: Any) -> str:
+    """Return the [time] table's one zone key, refusing anything else.
+
+    Only the key's syntax is settled here: whether time zone data for it can
+    be loaded is a question for the operations that need it, so a missing
+    data source never stops startup.
+    """
+    if not isinstance(value, dict):
+        raise ValueError(TIME_SECTION_TABLE_MESSAGE)
+    if set(value) != _TIME_KEYS:
+        raise ValueError(TIME_SECTION_KEYS_MESSAGE)
+    zone = value["zone"]
+    if not is_zone_key(zone):
+        raise ValueError(TIME_ZONE_MESSAGE)
+    return zone
 
 
 # Each reader below settles its failure inside the handler and raises its

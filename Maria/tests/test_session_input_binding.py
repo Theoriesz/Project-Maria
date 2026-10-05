@@ -551,6 +551,26 @@ class LeafModuleTests(unittest.TestCase):
             "text",
             "save conversation",
             "summarize conversation",
+            # V1-22: no task or reminder tool, action, or argument either.
+            "tasks",
+            "reminders",
+            "list",
+            "due",
+            "read",
+            "complete",
+            "reopen",
+            "edit",
+            "reschedule",
+            "delete",
+            "enable_context",
+            "disable_context",
+            "when",
+            "repeat",
+            "never",
+            "as_of",
+            "status",
+            "id",
+            "text_digest",
         ):
             with self.subTest(name=name):
                 self.assertNotIn(name, constants)

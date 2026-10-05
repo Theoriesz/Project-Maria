@@ -32,8 +32,8 @@ rather than assume. **All application code lives in `Maria/`.**
 | Path | Contents |
 |---|---|
 | `Maria/main.py` | entry point: selects the CLI, or the desktop GUI with `--gui`, and composes the runtime |
-| `Maria/core/` | `brain`, `planner`, `memory`, `permissions`, `tool_manager`, `logger`, `config`, `constants`, `action_contracts`, `audit`, `context`, `conversation`, `conversation_records`, `failures`, `filesystem_roots`, `ollama_adapter`, `plan_compiler`, `reasoning`, `session` |
-| `Maria/tools/` | `audit`, `calculator`, `conversation_summaries`, `conversations`, `filesystem`, `history`, `memory`, `notes`, `system` |
+| `Maria/core/` | `brain`, `planner`, `memory`, `permissions`, `tool_manager`, `logger`, `config`, `constants`, `action_contracts`, `audit`, `context`, `conversation`, `conversation_records`, `failures`, `filesystem_roots`, `ollama_adapter`, `plan_compiler`, `reasoning`, `session`, `task_records`, `task_requests`, `time_resolution` |
+| `Maria/tools/` | `audit`, `calculator`, `conversation_summaries`, `conversations`, `filesystem`, `history`, `memory`, `notes`, `reminders`, `system`, `tasks` |
 | `Maria/gui/` | the optional desktop GUI: `controller` (Qt-free), `session_worker` (the one worker thread), `window` (the only Qt module) |
 | `Maria/tests/` | standard-library `unittest` suite |
 | `Maria/docs/` | `architecture`, `api`, `database`, `planner`, `tools`, `coding_style`, `roadmap`, `vision` |
@@ -41,6 +41,7 @@ rather than assume. **All application code lives in `Maria/`.**
 | `Maria/prompts/` | starter prompt text |
 | `Maria/requirements.txt` | the core and CLI requirements: standard library only |
 | `Maria/requirements-gui.txt` | the optional GUI requirements: PyQt6 and its runtime dependencies, pinned |
+| `Maria/requirements-time.txt` | the optional time zone data: the data-only `tzdata`, pinned with its hash |
 | `Maria/README.md` | the authoritative project README |
 | `Maria/PRINCIPLES.md`, `Maria/CHANGELOG.md` | principles and changelog |
 | `Maria/database/`, `Maria/logs/` | git-ignored runtime artifacts |
@@ -155,16 +156,33 @@ The GUI contract:
   the model path the conversation module and the model-to-plan compiler; it is the only
   production module that imports `Maria/core/plan_compiler.py`, and it writes audit
   summaries only through the `Memory` API. It supplies a planner plan's contract-declared
-  session input generically, asking Tool Manager which argument takes it. **Never** put
-  direct database access or tool-specific logic here. Dispatch must stay generic, with no
-  per-tool branch.
+  session input generically, asking Tool Manager which argument takes it. It reads the
+  current time exactly once per request, through its one clock seam, after the empty-request
+  check and before planning, and hands that reference instant with the configured time
+  zone key to the planner and the compiler; it holds no date logic, and confirmation reads
+  no clock. **Never** put direct database access or tool-specific logic here. Dispatch must
+  stay generic, with no per-tool branch.
 - `Maria/core/planner.py` — turns user input into structured `Plan` and `PlanStep` objects,
   and owns the no-action response copy and the help text. `PlanOrigin.MODEL` is set only by
-  the compiler.
+  the compiler. The same text, reference instant, and configured zone always give the same
+  plan; only the task and reminder branches use the instant and the zone.
 - `Maria/core/plan_compiler.py` — the deny-by-default gate that compiles one model
   proposal into a transient, model-originated plan of one to five steps or a fixed
-  refusal, and re-checks every step of a compiled plan without reparsing it. It executes
-  nothing.
+  refusal, and re-checks every step of a compiled plan without reparsing the proposal. A
+  creation step compiles only from the owner's own supported request, which it parses
+  through `Maria/core/task_requests.py` and resolves through
+  `Maria/core/time_resolution.py`; Maria builds the step from that extraction, never from
+  the model's values. It executes nothing.
+- `Maria/core/time_resolution.py` — the leaf for timing: the closed timing grammar, its
+  resolution against a supplied reference instant and zone, gap and fold classification,
+  zone loading through `zoneinfo`, and the rule-change check. It reads no clock, has no
+  SQL, logs nothing, and imports only the standard library.
+- `Maria/core/task_requests.py` — the four supported natural-language creation forms:
+  segmentation, form matching, body and timing extraction, and the body guards. It reads no
+  clock and logs nothing.
+- `Maria/core/task_records.py` — the task and reminder vocabulary: limits, statuses,
+  canonical formats, the stored-timing integrity rule, value objects, and fixed messages;
+  no SQL, I/O, or logging.
 - `Maria/core/session.py` — owns the confirmation lifecycle for both interfaces, renders a
   model-originated plan for approval from the very plan the approval binds, and keeps the
   conversation.
@@ -179,7 +197,9 @@ The GUI contract:
 - `Maria/core/permissions.py` — decides `ALLOWED` / `REQUIRES_CONFIRMATION` / `DENIED`.
 - `Maria/core/tool_manager.py` — discovers, loads, and dispatches tools.
 - `Maria/core/logger.py` — application logging only.
-- `Maria/core/config.py` — loads and validates `Maria/config/config.toml`.
+- `Maria/core/config.py` — loads and validates `Maria/config/config.toml` and the private
+  override, which may hold only `[reasoning]` and `[time]`; a `[time]` section in the
+  tracked file is refused.
 - `Maria/core/constants.py` — shared identity, canonical paths, and default limits
   (`APP_NAME`, `APP_VERSION`, `PROJECT_ROOT`, `CONFIG_PATH`, `DATABASE_PATH`,
   `LOG_DIR`, `DEFAULT_LOG_FILE`, `SYSTEM_PROMPT_PATH`, `DEFAULT_TEXT_READ_LIMIT_BYTES`,
@@ -210,8 +230,11 @@ faster.
   `memory.forget`, `memory.enable_context`, `memory.disable_context`,
   `audit.delete`, `conversations.delete`, `conversation_summaries.create`,
   `conversation_summaries.edit`, `conversation_summaries.delete`,
-  `conversation_summaries.enable_context`, and
-  `conversation_summaries.disable_context`
+  `conversation_summaries.enable_context`, `conversation_summaries.disable_context`,
+  `tasks.create`, `tasks.edit`, `tasks.reschedule`, `tasks.delete`,
+  `tasks.enable_context`, `tasks.disable_context`, `reminders.create`, `reminders.edit`,
+  `reminders.reschedule`, `reminders.delete`, `reminders.enable_context`, and
+  `reminders.disable_context` (thirty-one in all)
 
 `PermissionManager.__init__` and `Maria/core/config.py` union these into whatever
 configuration supplies, so **configuration can extend the mandatory baseline but can never
@@ -250,12 +273,34 @@ model-originated (`PlanOrigin.MODEL`) plan needs that one approval even when
 PermissionManager answers `ALLOWED` for every step, and a plan with any `DENIED` action is
 refused before any approval is offered. That approval requirement lives in Brain and is separate
 from the two mandatory sets above, which it does not change. Only `calculator.calculate`,
-`filesystem.list`, and `system.current_time` are model-eligible; every new action
-contract must state its model eligibility explicitly.
+`filesystem.list`, `system.current_time`, `tasks.create`, and `reminders.create` are
+model-eligible; every new action contract must state its model eligibility explicitly.
+
+A creation step (`tasks.create` or `reminders.create`) compiles only when the owner's
+whole cleaned request is one to five items in the four supported forms of V1-22-R1
+(`remind me <timing> to <body>`, `remind me to <body> <timing>`, `add a task to <body>`,
+and `add a task to <body> by <date>`), parsed by `Maria/core/task_requests.py` with its
+closed body guards. The proposal must hold exactly one creation step per item, in order,
+whose `text` equals the item's body exactly and whose timing phrase equals the item's
+own after canonical tokenization (ASCII letters lowercased, single spaces, digits as
+written). Maria then builds each step from her own extraction, resolving the owner's
+phrase at the request's one reference instant; no model value enters the plan, so the
+model can add no body, time, or item. Raw argument checks run before the parse, and the
+parse, the binding, and the resolution run before the existing step checks. This is a
+declared, deterministic exception to "the compiler substitutes nothing": only the timing
+value is replaced, by Maria's resolution of the owner's own words.
 
 Approval binds to the exact immutable plan: the session fingerprints the plan it offers,
 and confirming runs that same plan only while its fingerprint still matches. Maria never
 re-plans, re-calls the model, or substitutes arguments after confirmation.
+
+The approval text shows the exact compiled steps and then, before the turn's context
+notices, the fixed `CONFIRMATION_NOTICES` text of every step PermissionManager resolved
+as confirmation-required, each distinct notice once, in plan order (V1-22-R1, owner
+decision A), so a reminder from the owner's own words says Maria will not notify before
+it is approved. Brain asks `PermissionManager.confirmation_notice()` for each such step
+generically. The notices are display only: never part of the plan, its arguments, or its
+fingerprint, and never kept in the conversation, recorded, or sent to a model.
 
 ### Model-written summary drafts and session input
 
@@ -272,30 +317,47 @@ supplies session input only in `process`, for a planner's plan holding exactly
 DETERMINISTIC as its own origin: never at confirmation, for a model-originated plan, or on
 the conversational path. A plan that already carries the text, or holds any other step,
 is refused, as is a session-input kind Brain does not name, and a contract that declares
-a session input cannot be model-eligible.
+a session input cannot be model-eligible. A task or reminder creation adds no route for
+model-written text: what it stores is the owner's own text, extracted by Maria.
 
 ## Persistence
 
 Interaction history (cleaned requests plus recorded response text), notes, explicit
-memories, audit summaries, saved conversations, and conversation summaries are six
-separate SQLite record types. Maria normally records most requests together with the
-result message it displayed. `ToolExecutionResult.recorded_message`, when set, replaces
-only the response half of that record; when Brain records an interaction, the cleaned
-`user_input` is preserved unchanged. `history.read`, `audit.list`, `audit.read`,
-`conversations.list`, `conversations.read`, `conversation_summaries.list`, and
-`conversation_summaries.read` are the only current actions that set this field, each
-using a fixed content-free summary. Brain applies the field generically, with no
-tool-specific branch. A model-originated plan is transient, so neither its request nor its
-result ever becomes an interaction row, and so is every outcome of
-`summarize conversation`; a summary edit keeps its new text in the request half, as a
-note edit does. Both interfaces record identically, because recording happens in Brain,
-never in an interface; what the GUI displays is never recorded by the GUI itself.
+memories, audit summaries, saved conversations, conversation summaries, tasks, and
+reminders are eight separate SQLite record types. Maria normally records most requests
+together with the result message it displayed. `ToolExecutionResult.recorded_message`,
+when set, replaces only the response half of that record; when Brain records an
+interaction, the cleaned `user_input` is preserved unchanged. `history.read`,
+`audit.list`, `audit.read`, `conversations.list`, `conversations.read`,
+`conversation_summaries.list`, `conversation_summaries.read`, `tasks.create`,
+`tasks.list`, `tasks.due`, `tasks.read`, `tasks.edit`, `tasks.reschedule`,
+`reminders.create`, `reminders.list`, `reminders.due`, `reminders.read`,
+`reminders.edit`, and `reminders.reschedule` are the only current actions that set this
+field, each using a fixed content-free summary. Brain applies the field generically, with
+no tool-specific branch. A model-originated plan is transient, so neither its request nor
+its result ever becomes an interaction row, and so is every outcome of
+`summarize conversation`; a summary, task, or reminder edit keeps its new text in the
+request half, as a note edit does. Both interfaces record identically, because recording
+happens in Brain, never in an interface; what the GUI displays is never recorded by the
+GUI itself.
 
 A saved conversation (schema 6) is an exact, immutable copy of the exchanges a session
 retained, one canonical compact-JSON transcript per explicit `save conversation`; it is
 never edited, never becomes context, and is never read for planning or reasoning. A
 conversation summary holds one text of at most 2,048 UTF-8 bytes that the owner approved
 word for word, or later edited, and its own context consent.
+
+Tasks and reminders (schema 7, V1-22-R1) are independent records: no foreign key,
+trigger, index, cascade, recurrence, or delivered marker. A task holds one line of text
+of at most 512 UTF-8 bytes, an optional calendar `due_date`, a status of `open` or
+`completed`, UTC stamps, and its own context consent. A reminder holds the same text,
+status, stamps, and consent, plus `remind_time`, its canonical RFC 9557 local time,
+offset, and zone exactly as approved, and `remind_utc`, the saved instant, which must
+equal that local time minus its offset on every write and read. `remind_utc` alone orders
+reminders and selects due ones, and a later time zone rule change only adds a warning:
+nothing is rewritten, rescheduled, or refused. A row Maria could not have written is
+refused privately on read. Due and overdue are queries only; nothing is delivered,
+notified, scheduled, polled, or repeated.
 
 An audit summary (schema 5: an `audit_summaries` row plus at most one `audit_outcomes`
 row) records that the owner approved one model-proposed execution attempt and Maria
@@ -307,19 +369,26 @@ means the execution is unknown, and a summary alone never proves the tool ran. A
 several steps gets one summary per step reached for dispatch and none for later steps;
 no stored value groups a plan's summaries.
 
-Sixteen lifecycle actions can update or remove an existing stored record:
-`history.delete`, `notes.retitle`, `notes.edit`, `notes.delete`, `notes.enable_context`,
-`notes.disable_context`, `memory.update`, `memory.forget`, `memory.enable_context`,
-`memory.disable_context`, `audit.delete`, `conversations.delete`,
-`conversation_summaries.edit`, `conversation_summaries.delete`,
-`conversation_summaries.enable_context`, and `conversation_summaries.disable_context`.
-Each requires explicit confirmation and targets at most one row selected by id, with one
-owner-approved exception: `audit.delete` removes one logical audit summary, its summary
-row together with its optional outcome row, in one transaction, and summary ids are
-never reused. Saved-conversation and conversation-summary ids are never reused either.
+Thirty lifecycle actions can update or remove an existing stored record. These twenty-six
+require explicit confirmation: `history.delete`, `notes.retitle`, `notes.edit`,
+`notes.delete`, `notes.enable_context`, `notes.disable_context`, `memory.update`,
+`memory.forget`, `memory.enable_context`, `memory.disable_context`, `audit.delete`,
+`conversations.delete`, `conversation_summaries.edit`, `conversation_summaries.delete`,
+`conversation_summaries.enable_context`, `conversation_summaries.disable_context`,
+`tasks.edit`, `tasks.reschedule`, `tasks.delete`, `tasks.enable_context`,
+`tasks.disable_context`, `reminders.edit`, `reminders.reschedule`, `reminders.delete`,
+`reminders.enable_context`, and `reminders.disable_context`. The four complete and
+reopen actions, `tasks.complete`, `tasks.reopen`, `reminders.complete`, and
+`reminders.reopen`, are allowed under the owner's explicit permission-risk decision
+(V1-22-R1, D7a): each changes one row's status only, complete stamps the time of that
+completion, reopen clears it, and an earlier completion time is never restored. Every
+lifecycle action targets at most one row selected by id, with one owner-approved
+exception: `audit.delete` removes one logical audit summary, its summary row together
+with its optional outcome row, in one transaction, and summary ids are never reused.
+Saved-conversation, conversation-summary, task, and reminder ids are never reused either.
 There is no bulk, wildcard, clear-all, or date-range deletion; no automatic retention or
 pruning; no cascade between
-the six record types; no undo or revision history; and no guarantee of secure erasure. Be
+the eight record types; no undo or revision history; and no guarantee of secure erasure. Be
 careful not to leak sensitive content into any of them when adding features. See
 `Maria/docs/architecture.md` ("Persistence Models"), `Maria/docs/database.md`, and the
 "Data Retention and Privacy" section of `Maria/README.md`.
@@ -327,18 +396,25 @@ careful not to leak sensitive content into any of them when adding features. See
 ### Context consent
 
 Context consent is the only thing that lets stored text reach the reasoning model
-automatically: a memory's `context_enabled` flag, and the `context_digest` of a note or a
-conversation summary, the identity of the exact text the owner approved. Each is off by
-default, changes only through its two confirmed consent actions, and is turned off by
-`memory.update`, by `notes.retitle` and `notes.edit`, or by `conversation_summaries.edit`
-respectively; a note or summary whose text no longer matches its stored identity is never
-eligible. Enabled memories are sent on every model-backed turn (Tier A, first 16 by id)
-or found by literal search beyond that window (Tier B), and enabled notes and conversation
-summaries only by literal search. Consent is not inspection: Maria cannot tell a secret
-from other free text. Interaction history, saved conversations, and audit summaries are
-never read for planning or reasoning. Maria's fixed proposal instructions and summary
-prompt are her own code text, never stored text. See "Tier A Memory Context" and
-"Tier B Search Context" in `Maria/docs/architecture.md`.
+automatically: a memory's `context_enabled` flag, and the `context_digest` of a note, a
+conversation summary, a task, or a reminder, the identity of the exact text the owner
+approved, a task's or reminder's timing included. Each is off by default, changes only
+through its two confirmed consent actions, and is turned off by `memory.update`, by
+`notes.retitle` and `notes.edit`, by `conversation_summaries.edit`, by `tasks.edit` and
+`tasks.reschedule`, or by `reminders.edit` and `reminders.reschedule` respectively; a
+record whose text or timing no longer matches its stored identity is never eligible.
+Enabled memories are sent on every model-backed turn (Tier A, first 16 by id) or found
+by literal search beyond that window (Tier B), and enabled notes and conversation
+summaries only by literal search. Enabled open tasks, then reminders, are eligible for
+Tier A after memories, by ascending id and only within Tier A's unchanged bounds, so an
+eligible one is not always sent; a completed one is not eligible until it is reopened,
+and neither is one whose stamps break the record rules. A task or reminder Tier A read
+admits a row's values only as typed text, or NULL where allowed, within small
+stored-byte bounds before any of them reaches Python. Consent is not inspection: Maria
+cannot tell a secret from other free text. Interaction history, saved conversations, and
+audit summaries are never read for planning or reasoning. Maria's fixed proposal
+instructions and summary prompt are her own code text, never stored text. See "Tier A
+Memory Context" and "Tier B Search Context" in `Maria/docs/architecture.md`.
 
 ## Scope Boundaries
 
@@ -356,8 +432,10 @@ treat them as gated pending approval rather than as permanent exclusions:
   server, browser interface, or remote access), and any GUI feature beyond the deliberately
   small first GUI described under "Interfaces"
 - TypeScript, PowerShell, or Bash as core logic
-- Any new third-party dependency beyond the one approved GUI exception (see
-  "Dependencies")
+- Any new third-party dependency beyond the approved GUI and time zone data exceptions
+  (see "Dependencies")
+- Reminder delivery, notification, timers, polling, or recurrence; tasks and reminders
+  are records and queries only (V1-22-R1), and delivery is the separately gated V1-23
 
 If a task seems to require one of these, stop and flag it instead of working around the
 boundary.
@@ -369,9 +447,15 @@ third-party packages, and `Maria/docs/coding_style.md` records the same rule. Th
 owner-approved exception (V1-21-R1) is PyQt6 and its required runtime dependencies,
 PyQt6-Qt6 and PyQt6-sip, for the optional desktop GUI alone, pinned to the exact tested
 versions in `Maria/requirements-gui.txt`. No other GUI framework, Qt add-on, or helper
-package is admitted, and nothing outside `Maria/gui/` may depend on Qt. Maria never
-installs dependencies automatically; a missing PyQt6 produces a message, never an
-installation.
+package is admitted, and nothing outside `Maria/gui/` may depend on Qt. The second
+owner-approved exception (V1-22-R1) is the data-only `tzdata` package, optional and
+pinned with its hash in `Maria/requirements-time.txt`. No Maria module imports it:
+standard-library `zoneinfo` loads it only when no configured time zone files on its
+search path provide a key. Only resolving new task or reminder timing and `due tasks`
+need time zone data; everything else, the CLI included, works without it, and nothing
+falls back to UTC, a fixed offset, or the operating system's zone. Maria never installs
+dependencies automatically; a missing PyQt6 or missing time zone data produces a message,
+never an installation.
 
 ## Tool Integration Contract
 
@@ -397,7 +481,9 @@ the CLI does.
 ## Coding Conventions (match the existing code exactly)
 
 - Python 3.11+ (required for `tomllib`), PEP 8, standard library only — except
-  `Maria/gui/window.py`, which alone imports PyQt6 (see "Dependencies").
+  `Maria/gui/window.py`, which alone imports PyQt6, and the optional `tzdata` data, which
+  only standard-library `zoneinfo` loads (see "Dependencies"). Only
+  `Maria/core/time_resolution.py` imports `zoneinfo`.
 - `from __future__ import annotations` in every module that contains code. The
   docstring-only `__init__.py` files are exempt.
 - `@dataclass(frozen=True)` for value objects (`BrainResponse`, `Plan`, `PlanStep`,
@@ -441,12 +527,19 @@ python -m unittest discover -s tests -v
   modal error dialog on the owner's desktop whenever the process has no console. Never
   leave Maria's Qt message handler installed through interpreter shutdown, which crashes
   the process as Qt logs at exit: put back exactly the handler installed before it.
+- Time zone tests: daylight-saving and rule-change tests use synthetic zones built in the
+  test, loaded through `ZoneInfo.from_file` or through `zoneinfo.reset_tzpath()` pointed
+  at a temporary directory with the zoneinfo cache cleared, and always restore the search
+  path and clear the cache afterwards. A test that needs real IANA data skips explicitly,
+  with a reason, when no data source provides it. Never write a zone the owner actually
+  uses into a tracked file. Run the suite both without and with the pinned `tzdata`, as
+  well as without and with the pinned PyQt6.
 - Agent-run verification: run Maria imports, tests, probes, and the CLI only in a fresh
   isolated copy of the tracked files outside the checkout, with bytecode writing disabled
   (`python -B`), synthetic data, and temporary resources; never against the real checkout,
   the private override, the live database, or the live log. Prove the copy excludes them
-  before running. Install PyQt6 only into an isolated virtual environment outside the
-  checkout, never globally.
+  before running. Install PyQt6 and `tzdata` only into isolated virtual environments
+  outside the checkout, never globally.
 
 ## Documentation
 

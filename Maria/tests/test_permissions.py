@@ -10,6 +10,7 @@ from unittest.mock import Mock
 
 from core.config import load_config
 from core.permissions import (
+    CONFIRMATION_NOTICES,
     MANDATORY_CONFIRMATION_ACTIONS,
     MANDATORY_DENIED_ACTIONS,
     PermissionDecision,
@@ -74,6 +75,25 @@ ENABLE_SUMMARY_CONTEXT_NOTICE = (
     "more characters from your request appears literally in it, within "
     "Maria's context limits. Maria does not check the summary for passwords "
     "or other secrets, and enabling it does not mean it contains none."
+)
+# V1-22's reminder and task notices, pinned the same way.
+CREATE_REMINDER_NOTICE = (
+    "Maria will not notify you when this reminder is due, and it does not "
+    "repeat: type due reminders to see the reminders whose time has come."
+)
+ENABLE_TASK_CONTEXT_NOTICE = (
+    "Once enabled, this task's text and due date may be sent to your local "
+    "reasoning model on a conversational turn while it is open, after your "
+    "enabled memories and within Maria's memory context limits, so it is not "
+    "always sent. Maria does not check the task for passwords or other "
+    "secrets, and enabling it does not mean it contains none."
+)
+ENABLE_REMINDER_CONTEXT_NOTICE = (
+    "Once enabled, this reminder's text and saved time may be sent to your "
+    "local reasoning model on a conversational turn while it is open, after "
+    "your enabled memories and within Maria's memory context limits, so it is "
+    "not always sent. Maria does not check the reminder for passwords or "
+    "other secrets, and enabling it does not mean it contains none."
 )
 
 
@@ -391,10 +411,25 @@ class PermissionManagerTests(unittest.TestCase):
                     "conversation_summaries.enable_context",
                     "conversation_summaries.disable_context",
                     "conversations.delete",
+                    # V1-22: both creates show their exact text and timing
+                    # before storage, and every change to an existing task or
+                    # reminder but complete and reopen is confirmed.
+                    "tasks.create",
+                    "tasks.edit",
+                    "tasks.reschedule",
+                    "tasks.delete",
+                    "tasks.enable_context",
+                    "tasks.disable_context",
+                    "reminders.create",
+                    "reminders.edit",
+                    "reminders.reschedule",
+                    "reminders.delete",
+                    "reminders.enable_context",
+                    "reminders.disable_context",
                 }
             ),
         )
-        self.assertEqual(len(MANDATORY_CONFIRMATION_ACTIONS), 19)
+        self.assertEqual(len(MANDATORY_CONFIRMATION_ACTIONS), 31)
         self.assertEqual(
             MANDATORY_DENIED_ACTIONS,
             frozenset({"filesystem.delete", "filesystem.write"}),
@@ -582,6 +617,12 @@ class PermissionManagerTests(unittest.TestCase):
                         reason = f"{reason} {STORE_SUMMARY_NOTICE}"
                     if action_id == "conversation_summaries.enable_context":
                         reason = f"{reason} {ENABLE_SUMMARY_CONTEXT_NOTICE}"
+                    if action_id == "reminders.create":
+                        reason = f"{reason} {CREATE_REMINDER_NOTICE}"
+                    if action_id == "tasks.enable_context":
+                        reason = f"{reason} {ENABLE_TASK_CONTEXT_NOTICE}"
+                    if action_id == "reminders.enable_context":
+                        reason = f"{reason} {ENABLE_REMINDER_CONTEXT_NOTICE}"
                     with self.subTest(action_id=action_id):
                         self.assertEqual(
                             manager.check(tool_name, action),
@@ -590,6 +631,59 @@ class PermissionManagerTests(unittest.TestCase):
                                 reason,
                             ),
                         )
+
+    def test_an_approval_notice_is_the_fixed_text_of_a_confirmed_action(
+        self,
+    ) -> None:
+        manager = self._manager()
+        expected = {
+            "audit.delete": DELETE_AUDIT_NOTICE,
+            "memory.enable_context": ENABLE_CONTEXT_NOTICE,
+            "notes.enable_context": ENABLE_NOTE_CONTEXT_NOTICE,
+            "conversation_summaries.create": STORE_SUMMARY_NOTICE,
+            "conversation_summaries.enable_context": ENABLE_SUMMARY_CONTEXT_NOTICE,
+            "reminders.create": CREATE_REMINDER_NOTICE,
+            "tasks.enable_context": ENABLE_TASK_CONTEXT_NOTICE,
+            "reminders.enable_context": ENABLE_REMINDER_CONTEXT_NOTICE,
+        }
+
+        self.assertEqual(set(expected), set(CONFIRMATION_NOTICES))
+        for action_id, notice in expected.items():
+            with self.subTest(action=action_id):
+                tool_name, action = action_id.split(".")
+                self.assertEqual(manager.confirmation_notice(tool_name, action), notice)
+                self.assertEqual(
+                    manager.check(tool_name, action).reason,
+                    f"{action_id} requires explicit confirmation. {notice}",
+                )
+        for tool_name, action in (
+            ("tasks", "create"),
+            ("filesystem", "rename"),
+            ("calculator", "calculate"),
+            ("tasks", "complete"),
+            ("filesystem", "delete"),
+            ("calendar", "create"),
+        ):
+            with self.subTest(action=f"{tool_name}.{action}"):
+                self.assertIsNone(manager.confirmation_notice(tool_name, action))
+        # Asking for a notice logs nothing; only ``check`` logs a decision.
+        manager.logger.reset_mock()
+        manager.confirmation_notice("reminders", "create")
+        self.assertEqual(manager.logger.mock_calls, [])
+
+    def test_a_denied_or_unconfirmed_action_carries_no_approval_notice(
+        self,
+    ) -> None:
+        denied = self._manager(denied_actions={"reminders.create"})
+        self.assertIs(
+            denied.check("reminders", "create").decision,
+            PermissionDecision.DENIED,
+        )
+        self.assertIsNone(denied.confirmation_notice("reminders", "create"))
+
+        # A configured confirmation of an action without a notice adds none.
+        extended = self._manager(confirmation_required={"calculator.calculate"})
+        self.assertIsNone(extended.confirmation_notice("calculator", "calculate"))
 
     @staticmethod
     def _manager(

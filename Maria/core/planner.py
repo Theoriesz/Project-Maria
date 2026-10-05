@@ -18,9 +18,57 @@ from types import MappingProxyType
 from typing import Any
 
 from core.logger import get_logger
+from core.task_requests import CREATION_TEXT_MESSAGE, is_creation_text
+from core.time_resolution import (
+    ResolvedTime,
+    TimingContext,
+    TimingFailure,
+    iso_date_text,
+    local_today,
+    parse_reminder_command,
+    parse_task_command,
+    reference_instant_text,
+    resolve_reminder_time,
+    resolve_task_date,
+)
 
 
 SUPPORTED_ARGUMENT_VALUE_TYPES = (str, int)
+
+# Fixed usage and clarification lines for the task and reminder commands.
+# None interpolates anything the request supplied.
+ADD_TASK_USAGE = "Use: add task <text> or add task due <date>: <text>"
+ADD_TASK_DUE_USAGE = (
+    "Use: add task due <date>: <text>, where <date> is today, tomorrow, a "
+    "weekday, YYYY-MM-DD, or in <N> days"
+)
+ADD_REMINDER_USAGE = (
+    "Use: add reminder <date> <time> [<offset>]: <text> or add reminder in "
+    "<N> minutes|hours: <text>, where <date> is today, tomorrow, a weekday, "
+    "YYYY-MM-DD, or in <N> days and <time> is HH:MM"
+)
+RESCHEDULE_TASK_USAGE = (
+    "Use: reschedule task <id>: <date or none>, where <date> is today, "
+    "tomorrow, a weekday, YYYY-MM-DD, or in <N> days"
+)
+RESCHEDULE_REMINDER_USAGE = (
+    "Use: reschedule reminder <id>: <date> <time> [<offset>] or in <N> "
+    "minutes|hours"
+)
+TASK_ID_USAGE_MESSAGE = "Task id must be a positive whole number."
+REMINDER_ID_USAGE_MESSAGE = "Reminder id must be a positive whole number."
+TIMING_UNAVAILABLE_MESSAGE = (
+    "Maria cannot resolve dates and times for this request."
+)
+NOTHING_SAVED = "Nothing was saved."
+
+# The literal values the task and reminder plans carry: a listing's two
+# statuses, the value that clears a task's due date, and the one repeat a
+# reminder has. A test holds them to ``core.task_records``.
+_STATUS_OPEN = "open"
+_STATUS_COMPLETED = "completed"
+_NO_DUE_DATE = "none"
+_REPEAT_NEVER = "never"
 
 
 class PlanArguments(Mapping[str, Any]):
@@ -455,12 +503,22 @@ class Planner:
     def __init__(self, logger: Logger | None = None) -> None:
         self.logger = logger or get_logger(__name__)
 
-    def create_plan(self, user_input: str) -> Plan:
+    def create_plan(
+        self,
+        user_input: str,
+        *,
+        timing: TimingContext | None = None,
+    ) -> Plan:
         """Create a plan for a supported request.
 
-        The request text is the planner's only input. No stored record, no
-        interaction history, and no memory context is consulted, so the same
-        text always produces the same plan.
+        The request text and ``timing``, the request's one reference instant
+        and configured time zone, are the planner's only inputs. No stored
+        record, no interaction history, and no memory context is consulted,
+        and no clock is read, so the same text, instant, and zone always
+        produce the same plan. Only the task and reminder branches use the
+        instant and the zone; without ``timing`` they answer that dates and
+        times cannot be resolved, and every other command plans exactly as
+        it always has.
         """
         text = user_input.strip()
         lowered = text.lower()
@@ -946,6 +1004,12 @@ class Planner:
                 {"id": summary_id},
             )
 
+        agenda = _task_plan(text, lowered, timing)
+        if agenda is None:
+            agenda = _reminder_plan(text, lowered, timing)
+        if agenda is not None:
+            return agenda
+
         if lowered in {"system", "system info", "status", "sys", "sys info"}:
             return self._single_step(text, "system", "overview", {})
 
@@ -979,6 +1043,306 @@ class Planner:
             steps=(),
             response_if_no_action=response,
         )
+
+
+# The task and reminder commands that take only an id, by command words and
+# the action each one plans.
+_TASK_ID_COMMANDS = (
+    ("read task", "read"),
+    ("complete task", "complete"),
+    ("reopen task", "reopen"),
+    ("delete task", "delete"),
+    ("enable task context", "enable_context"),
+    ("disable task context", "disable_context"),
+)
+_REMINDER_ID_COMMANDS = (
+    ("read reminder", "read"),
+    ("complete reminder", "complete"),
+    ("reopen reminder", "reopen"),
+    ("delete reminder", "delete"),
+    ("enable reminder context", "enable_context"),
+    ("disable reminder context", "disable_context"),
+)
+
+
+def _task_plan(
+    text: str,
+    lowered: str,
+    timing: TimingContext | None,
+) -> Plan | None:
+    """Return the plan for a task command, or None when the text is not one.
+
+    New timing is resolved here, once, against the request's own reference
+    instant and configured zone, so the plan carries the canonical date and
+    the owner's confirmation shows it before anything is stored. Only
+    ``due tasks`` and a dated add or reschedule need the zone.
+    """
+    if lowered == "tasks":
+        return Planner._single_step(
+            text,
+            "tasks",
+            "list",
+            {"status": _STATUS_OPEN},
+        )
+    if lowered == "completed tasks":
+        return Planner._single_step(
+            text,
+            "tasks",
+            "list",
+            {"status": _STATUS_COMPLETED},
+        )
+    if lowered == "due tasks":
+        if timing is None:
+            return Planner._no_action(text, TIMING_UNAVAILABLE_MESSAGE)
+        today = local_today(timing)
+        if isinstance(today, TimingFailure):
+            return Planner._no_action(text, today.message)
+        return Planner._single_step(
+            text,
+            "tasks",
+            "due",
+            {"as_of": iso_date_text(today)},
+        )
+    if lowered == "add task":
+        return Planner._no_action(text, ADD_TASK_USAGE)
+    if lowered.startswith("add task "):
+        operand = text[len("add task ") :].strip()
+        if operand.lower().startswith("due ") and ":" in operand:
+            phrase, task_text = operand[len("due ") :].split(":", maxsplit=1)
+            phrase, task_text = phrase.strip(), task_text.strip()
+            spec = parse_task_command(phrase)
+            if spec is None or not task_text:
+                return Planner._no_action(text, ADD_TASK_DUE_USAGE)
+            if not is_creation_text(task_text):
+                return Planner._no_action(text, CREATION_TEXT_MESSAGE)
+            due = _task_due(text, spec, timing)
+            if type(due) is Plan:
+                return due
+            return Planner._single_step(
+                text,
+                "tasks",
+                "create",
+                {"text": task_text, "due": due},
+            )
+        if not is_creation_text(operand):
+            return Planner._no_action(text, CREATION_TEXT_MESSAGE)
+        return Planner._single_step(text, "tasks", "create", {"text": operand})
+
+    identified = _id_command(text, lowered, "tasks", _TASK_ID_COMMANDS)
+    if identified is not None:
+        return identified
+
+    if lowered == "edit task":
+        return Planner._no_action(text, "Use: edit task <id>: <new text>")
+    if lowered.startswith("edit task "):
+        parsed = _parse_id_and_colon_operand(text[len("edit task ") :].strip())
+        if parsed is None or not parsed[1]:
+            return Planner._no_action(text, "Use: edit task <id>: <new text>")
+        task_id = _parse_positive_ascii_id(parsed[0])
+        if task_id is None:
+            return Planner._no_action(text, TASK_ID_USAGE_MESSAGE)
+        if not is_creation_text(parsed[1]):
+            return Planner._no_action(text, CREATION_TEXT_MESSAGE)
+        return Planner._single_step(
+            text,
+            "tasks",
+            "edit",
+            {"id": task_id, "text": parsed[1]},
+        )
+
+    if lowered == "reschedule task":
+        return Planner._no_action(text, RESCHEDULE_TASK_USAGE)
+    if lowered.startswith("reschedule task "):
+        parsed = _parse_id_and_colon_operand(
+            text[len("reschedule task ") :].strip()
+        )
+        if parsed is None or not parsed[1]:
+            return Planner._no_action(text, RESCHEDULE_TASK_USAGE)
+        task_id = _parse_positive_ascii_id(parsed[0])
+        if task_id is None:
+            return Planner._no_action(text, TASK_ID_USAGE_MESSAGE)
+        if parsed[1].lower() == _NO_DUE_DATE:
+            due: str | Plan = _NO_DUE_DATE
+        else:
+            spec = parse_task_command(parsed[1])
+            if spec is None:
+                return Planner._no_action(text, RESCHEDULE_TASK_USAGE)
+            due = _task_due(text, spec, timing)
+            if type(due) is Plan:
+                return due
+        return Planner._single_step(
+            text,
+            "tasks",
+            "reschedule",
+            {"id": task_id, "due": due},
+        )
+    return None
+
+
+def _reminder_plan(
+    text: str,
+    lowered: str,
+    timing: TimingContext | None,
+) -> Plan | None:
+    """Return the plan for a reminder command, or None when it is not one.
+
+    New timing is resolved here, once, against the request's own reference
+    instant and configured zone, so the plan carries the canonical local
+    time, offset, and zone, and the owner's confirmation shows it before
+    anything is stored. ``due reminders`` needs no zone: it compares saved
+    instants with the reference instant itself.
+    """
+    if lowered == "reminders":
+        return Planner._single_step(
+            text,
+            "reminders",
+            "list",
+            {"status": _STATUS_OPEN},
+        )
+    if lowered == "completed reminders":
+        return Planner._single_step(
+            text,
+            "reminders",
+            "list",
+            {"status": _STATUS_COMPLETED},
+        )
+    if lowered == "due reminders":
+        if timing is None:
+            return Planner._no_action(text, TIMING_UNAVAILABLE_MESSAGE)
+        return Planner._single_step(
+            text,
+            "reminders",
+            "due",
+            {"as_of": reference_instant_text(timing)},
+        )
+    if lowered == "add reminder":
+        return Planner._no_action(text, ADD_REMINDER_USAGE)
+    if lowered.startswith("add reminder "):
+        parsed = _timing_and_text(text[len("add reminder ") :].strip())
+        if parsed is None or not parsed[1]:
+            return Planner._no_action(text, ADD_REMINDER_USAGE)
+        spec, reminder_text = parsed
+        if not is_creation_text(reminder_text):
+            return Planner._no_action(text, CREATION_TEXT_MESSAGE)
+        when = _reminder_when(text, spec, timing)
+        if type(when) is Plan:
+            return when
+        return Planner._single_step(
+            text,
+            "reminders",
+            "create",
+            {"text": reminder_text, "when": when, "repeat": _REPEAT_NEVER},
+        )
+
+    identified = _id_command(text, lowered, "reminders", _REMINDER_ID_COMMANDS)
+    if identified is not None:
+        return identified
+
+    if lowered == "edit reminder":
+        return Planner._no_action(text, "Use: edit reminder <id>: <new text>")
+    if lowered.startswith("edit reminder "):
+        parsed_edit = _parse_id_and_colon_operand(
+            text[len("edit reminder ") :].strip()
+        )
+        if parsed_edit is None or not parsed_edit[1]:
+            return Planner._no_action(text, "Use: edit reminder <id>: <new text>")
+        reminder_id = _parse_positive_ascii_id(parsed_edit[0])
+        if reminder_id is None:
+            return Planner._no_action(text, REMINDER_ID_USAGE_MESSAGE)
+        if not is_creation_text(parsed_edit[1]):
+            return Planner._no_action(text, CREATION_TEXT_MESSAGE)
+        return Planner._single_step(
+            text,
+            "reminders",
+            "edit",
+            {"id": reminder_id, "text": parsed_edit[1]},
+        )
+
+    if lowered == "reschedule reminder":
+        return Planner._no_action(text, RESCHEDULE_REMINDER_USAGE)
+    if lowered.startswith("reschedule reminder "):
+        parsed_move = _parse_id_and_colon_operand(
+            text[len("reschedule reminder ") :].strip()
+        )
+        if parsed_move is None or not parsed_move[1]:
+            return Planner._no_action(text, RESCHEDULE_REMINDER_USAGE)
+        reminder_id = _parse_positive_ascii_id(parsed_move[0])
+        if reminder_id is None:
+            return Planner._no_action(text, REMINDER_ID_USAGE_MESSAGE)
+        spec = parse_reminder_command(parsed_move[1])
+        if spec is None:
+            return Planner._no_action(text, RESCHEDULE_REMINDER_USAGE)
+        when = _reminder_when(text, spec, timing)
+        if type(when) is Plan:
+            return when
+        return Planner._single_step(
+            text,
+            "reminders",
+            "reschedule",
+            {"id": reminder_id, "when": when, "repeat": _REPEAT_NEVER},
+        )
+    return None
+
+
+def _id_command(
+    text: str,
+    lowered: str,
+    tool_name: str,
+    commands: tuple[tuple[str, str], ...],
+) -> Plan | None:
+    """Return the plan for an id-only task or reminder command, or None."""
+    message = (
+        TASK_ID_USAGE_MESSAGE if tool_name == "tasks" else REMINDER_ID_USAGE_MESSAGE
+    )
+    for words, action in commands:
+        if lowered == words:
+            return Planner._no_action(text, f"Use: {words} <id>")
+        if lowered.startswith(f"{words} "):
+            record_id = _parse_positive_ascii_id(text[len(words) + 1 :].strip())
+            if record_id is None:
+                return Planner._no_action(text, message)
+            return Planner._single_step(text, tool_name, action, {"id": record_id})
+    return None
+
+
+def _task_due(text: str, spec: object, timing: TimingContext | None) -> str | Plan:
+    """Return a task date resolved at the request's instant, or a refusal plan."""
+    if timing is None:
+        return Planner._no_action(text, TIMING_UNAVAILABLE_MESSAGE)
+    resolved = resolve_task_date(spec, timing)
+    if isinstance(resolved, TimingFailure):
+        return Planner._no_action(text, f"{resolved.message} {NOTHING_SAVED}")
+    return iso_date_text(resolved)
+
+
+def _reminder_when(
+    text: str,
+    spec: object,
+    timing: TimingContext | None,
+) -> str | Plan:
+    """Return a reminder time resolved at the request's instant, or a refusal."""
+    if timing is None:
+        return Planner._no_action(text, TIMING_UNAVAILABLE_MESSAGE)
+    resolved = resolve_reminder_time(spec, timing)
+    if type(resolved) is not ResolvedTime:
+        return Planner._no_action(text, f"{resolved.message} {NOTHING_SAVED}")
+    return resolved.canonical
+
+
+def _timing_and_text(value: str) -> tuple[object, str] | None:
+    """Parse ``<timing>: <text>``, splitting at the colon that ends the timing.
+
+    A clock time and an offset hold colons of their own, so each colon is
+    tried in turn and the first one that follows a whole timing phrase is
+    the separator; any later colon stays literal inside the text.
+    """
+    position = value.find(":")
+    while position >= 0:
+        spec = parse_reminder_command(value[:position].strip())
+        if spec is not None:
+            return spec, value[position + 1 :].strip()
+        position = value.find(":", position + 1)
+    return None
 
 
 def _remove_first_word(text: str) -> str:
@@ -1091,6 +1455,33 @@ def _help_text() -> str:
         "- delete summary <id>\n"
         "- enable summary context <id>\n"
         "- disable summary context <id>\n"
+        "- add task <text>\n"
+        "- add task due <date>: <text>\n"
+        "- tasks\n"
+        "- completed tasks\n"
+        "- due tasks\n"
+        "- read task <id>\n"
+        "- complete task <id>\n"
+        "- reopen task <id>\n"
+        "- edit task <id>: <new text>\n"
+        "- reschedule task <id>: <date or none>\n"
+        "- delete task <id>\n"
+        "- enable task context <id>\n"
+        "- disable task context <id>\n"
+        "- add reminder <date> <time> [<offset>]: <text>\n"
+        "- add reminder in <N> minutes|hours: <text>\n"
+        "- reminders\n"
+        "- completed reminders\n"
+        "- due reminders\n"
+        "- read reminder <id>\n"
+        "- complete reminder <id>\n"
+        "- reopen reminder <id>\n"
+        "- edit reminder <id>: <new text>\n"
+        "- reschedule reminder <id>: <date> <time> [<offset>] or in <N> "
+        "minutes|hours\n"
+        "- delete reminder <id>\n"
+        "- enable reminder context <id>\n"
+        "- disable reminder context <id>\n"
         "- system\n"
         "- time\n"
         "- history\n"

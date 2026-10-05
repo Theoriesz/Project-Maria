@@ -1,0 +1,9 @@
+# Optional: time zone data for task and reminder timing, approved under
+# V1-22-R1. Only resolving new task or reminder timing and the due-task query
+# need time zone data; everything else, the command line included, works
+# without it. Standard-library zoneinfo loads this data-only package when no
+# configured time zone files on its search path provide a key; no Maria
+# module imports it. Pinned with its hash to the version tested (IANA 2026e).
+# Install it into a virtual environment, never into a global interpreter:
+#   python -m pip install --require-hashes -r requirements-time.txt
+tzdata==2026.5 --hash=sha256:b683bd1b6659ddcd810ff02ad09ba821d4bf1065072805063eb35c49617905ac

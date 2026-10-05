@@ -27,6 +27,7 @@ import unittest
 from collections.abc import Iterator
 from contextlib import ExitStack, contextmanager
 from dataclasses import FrozenInstanceError, replace
+from datetime import datetime, timezone
 from pathlib import Path
 from types import SimpleNamespace
 from typing import Any
@@ -70,6 +71,7 @@ from core.planner import (
     is_model_plan,
 )
 from core.reasoning import ReasoningRequest, ReasoningResponse, request_reasoning
+from core.time_resolution import TimingContext
 from core.tool_manager import BUILT_IN_TOOL_MODULES, ToolManager
 from tests.log_assertions import assert_log_omits
 from tests.reasoning_fakes import (
@@ -91,6 +93,7 @@ from tests.test_reasoning import (
     peak_allocation,
     rendered,
 )
+from tests.zone_fixtures import CENTRAL_RULES, SYNTHETIC_KEY, SyntheticZones
 from tools.audit import AuditTool
 from tools.calculator import CalculatorTool
 from tools.conversation_summaries import ConversationSummariesTool
@@ -99,7 +102,9 @@ from tools.filesystem import FilesystemTool
 from tools.history import HistoryTool
 from tools.memory import MemoryTool
 from tools.notes import NotesTool
+from tools.reminders import RemindersTool
 from tools.system import SystemTool
+from tools.tasks import TasksTool
 
 
 REQUEST = "Please help with this."
@@ -111,8 +116,34 @@ REQUEST_SENTINEL = "owner-request-sentinel-3d8b1f0a6e"
 BACKSLASH = chr(92)
 
 EXPECTED_ALLOWLIST = frozenset(
+    {
+        "calculator.calculate",
+        "filesystem.list",
+        "system.current_time",
+        "tasks.create",
+        "reminders.create",
+    }
+)
+
+# V1-22: the two creation actions compile only from the owner's own supported
+# request, and from Maria's own extraction of it, so they never compile from
+# a model's arguments exactly as supplied; tests.test_task_reminder_model
+# covers them end to end, and CreationRecheckTests below covers checking them
+# again. These are the open actions that do.
+AS_SUPPLIED_ALLOWLIST = frozenset(
     {"calculator.calculate", "filesystem.list", "system.current_time"}
 )
+
+# A creation request and the steps Maria builds for it at Saturday
+# 2027-10-30, 10:03:27 local at +02:00 under the synthetic central rules:
+# friday is 2027-11-05, and tomorrow at 9:00 falls after the repeated hour,
+# at +01:00.
+CREATION_REFERENCE = datetime(2027, 10, 30, 8, 3, 27, tzinfo=timezone.utc)
+CREATION_REQUEST = (
+    "add a task to pay rent by friday and remind me tomorrow at 9:00 to call mom"
+)
+CREATION_DUE = "2027-11-05"
+CREATION_WHEN = f"2027-10-31T09:00:00+01:00[{SYNTHETIC_KEY}]"
 
 # The actions PermissionManager allows with an empty configuration that the
 # model may nevertheless never propose. Deleting an audit summary is absent
@@ -138,6 +169,18 @@ PERMITTED_BUT_CLOSED = frozenset(
         "notes.list",
         "notes.read",
         "system.overview",
+        # V1-22: reading, listing, due queries, complete, and reopen are
+        # allowed and closed to the model.
+        "tasks.list",
+        "tasks.due",
+        "tasks.read",
+        "tasks.complete",
+        "tasks.reopen",
+        "reminders.list",
+        "reminders.due",
+        "reminders.read",
+        "reminders.complete",
+        "reminders.reopen",
     }
 )
 
@@ -156,6 +199,14 @@ EXPECTED_REJECTION_CODES = frozenset(
         "out_of_range",
         "unsafe_text",
         "unsafe_path",
+        "not_a_creation_request",
+        "creation_request_unclear",
+        "creation_mismatch",
+        "time_past",
+        "time_too_far",
+        "time_nonexistent",
+        "time_ambiguous",
+        "time_zone_unavailable",
     }
 )
 
@@ -206,6 +257,36 @@ VALID_ARGUMENTS: dict[str, dict[str, Any]] = {
     "notes.disable_context": {"id": 1},
     "system.overview": {},
     "system.current_time": {},
+    "tasks.create": {"text": "Pay rent", "due": "2026-10-09"},
+    "tasks.list": {"status": "open"},
+    "tasks.due": {"as_of": "2026-10-04"},
+    "tasks.read": {"id": 1},
+    "tasks.complete": {"id": 1},
+    "tasks.reopen": {"id": 1},
+    "tasks.edit": {"id": 1, "text": "Pay the rent"},
+    "tasks.reschedule": {"id": 1, "due": "none"},
+    "tasks.delete": {"id": 1},
+    "tasks.enable_context": {"id": 1, "text_digest": DIGEST},
+    "tasks.disable_context": {"id": 1},
+    "reminders.create": {
+        "text": "Call mom",
+        "when": "2026-10-05T09:00:00+02:00[Europe/Berlin]",
+        "repeat": "never",
+    },
+    "reminders.list": {"status": "completed"},
+    "reminders.due": {"as_of": "2026-10-04T08:03:27Z"},
+    "reminders.read": {"id": 1},
+    "reminders.complete": {"id": 1},
+    "reminders.reopen": {"id": 1},
+    "reminders.edit": {"id": 1, "text": "Call mom back"},
+    "reminders.reschedule": {
+        "id": 1,
+        "when": "2026-10-06T18:30:00+02:00[Europe/Berlin]",
+        "repeat": "never",
+    },
+    "reminders.delete": {"id": 1},
+    "reminders.enable_context": {"id": 1, "text_digest": DIGEST},
+    "reminders.disable_context": {"id": 1},
 }
 
 # What the compiler must do with each V1-12 category. The out-of-range
@@ -478,7 +559,9 @@ _TRIPWIRE_TARGETS = (
     (HistoryTool, "execute"),
     (MemoryTool, "execute"),
     (NotesTool, "execute"),
+    (RemindersTool, "execute"),
     (SystemTool, "execute"),
+    (TasksTool, "execute"),
     (PermissionManager, "check"),
     (Memory, "initialize"),
     (sqlite3, "connect"),
@@ -646,7 +729,11 @@ class AllowlistTests(unittest.TestCase):
                 self.assertIs(outcome, ProposalRejection.NOT_MODEL_ELIGIBLE)
 
     def test_every_open_action_compiles_from_valid_arguments(self) -> None:
-        for identifier in sorted(MODEL_ACTION_ALLOWLIST):
+        self.assertEqual(
+            MODEL_ACTION_ALLOWLIST - AS_SUPPLIED_ALLOWLIST,
+            {"tasks.create", "reminders.create"},
+        )
+        for identifier in sorted(AS_SUPPLIED_ALLOWLIST):
             arguments = VALID_ARGUMENTS[identifier]
             with self.subTest(action=identifier):
                 outcome = _compile(_proposal(*_split(identifier), arguments))
@@ -656,6 +743,16 @@ class AllowlistTests(unittest.TestCase):
                     _hand_built(*_split(identifier), arguments),
                 )
                 self.assertIs(outcome.origin, PlanOrigin.MODEL)
+        # A creation action never compiles from its arguments alone: this
+        # request is not one of the supported forms.
+        for identifier in ("tasks.create", "reminders.create"):
+            with self.subTest(action=identifier):
+                self.assertIs(
+                    _compile(
+                        _proposal(*_split(identifier), VALID_ARGUMENTS[identifier])
+                    ),
+                    ProposalRejection.NOT_A_CREATION_REQUEST,
+                )
 
 
 class PermissionOrderTests(unittest.TestCase):
@@ -1719,7 +1816,7 @@ class ModelPlanRecheckTests(unittest.TestCase):
         self.assertEqual(logger.mock_calls, [])
 
     def test_a_plan_its_registry_no_longer_opens_is_refused(self) -> None:
-        for identifier in sorted(MODEL_ACTION_ALLOWLIST):
+        for identifier in sorted(AS_SUPPLIED_ALLOWLIST):
             plan = _compile(
                 _proposal(*_split(identifier), VALID_ARGUMENTS[identifier])
             )
@@ -1930,7 +2027,7 @@ class ModelPlanRecheckTests(unittest.TestCase):
     def test_checking_again_parses_builds_and_reaches_nothing(self) -> None:
         plans = [
             _compile(_proposal(*_split(identifier), VALID_ARGUMENTS[identifier]))
-            for identifier in sorted(MODEL_ACTION_ALLOWLIST)
+            for identifier in sorted(AS_SUPPLIED_ALLOWLIST)
         ]
         plans += [
             _hand_built("filesystem", "list", {"path": path})
@@ -1971,7 +2068,7 @@ class ModelPlanRecheckTests(unittest.TestCase):
         # wires, and each plan was left exactly as it was.
         self.assertEqual(
             outcomes,
-            [None] * len(MODEL_ACTION_ALLOWLIST)
+            [None] * len(AS_SUPPLIED_ALLOWLIST)
             + [ProposalRejection.UNSAFE_PATH] * 5
             + [ProposalRejection.NOT_MODEL_ELIGIBLE]
             * (len(VALID_ARGUMENTS) - len(MODEL_ACTION_ALLOWLIST)),
@@ -1997,6 +2094,303 @@ class ModelPlanRecheckTests(unittest.TestCase):
         logger.warning.assert_called_once_with(
             "Refused a compiled model plan: code=%s",
             "unsafe_path",
+        )
+        self.assertEqual(len(logger.mock_calls), 1)
+
+
+def _creation_plan(request: str, *steps: PlanStep) -> Plan:
+    """Return a model plan built by hand around any steps, for any request."""
+    return Plan(
+        original_request=request,
+        steps=steps,
+        recording=RecordingPolicy.TRANSIENT,
+        origin=PlanOrigin.MODEL,
+    )
+
+
+class CreationRecheckTests(unittest.TestCase):
+    """Prove a creation plan is checked again against the owner's request.
+
+    Checking again parses the request once more, with no clock and nothing
+    resolved, and the plan must still hold exactly one creation step per
+    requested item, in order, of the item's kind, carrying the item's body
+    and, for a task, a due date exactly when the item names one, with no two
+    items alike. Each step's canonical timing is then held to its contract.
+    """
+
+    def setUp(self) -> None:
+        SyntheticZones(self, {SYNTHETIC_KEY: CENTRAL_RULES})
+        self.task = PlanStep(
+            "tasks",
+            "create",
+            {"text": "pay rent", "due": CREATION_DUE},
+        )
+        self.reminder = PlanStep(
+            "reminders",
+            "create",
+            {"text": "call mom", "when": CREATION_WHEN, "repeat": "never"},
+        )
+
+    def faithful_plan(self) -> Plan:
+        """Compile the creation request from a faithful proposal."""
+        plan = compile_proposal(
+            CREATION_REQUEST,
+            ReasoningResponse(
+                json.dumps(
+                    {
+                        "steps": [
+                            {
+                                "tool": "tasks",
+                                "action": "create",
+                                "arguments": {"text": "pay rent", "due": "friday"},
+                            },
+                            {
+                                "tool": "reminders",
+                                "action": "create",
+                                "arguments": {
+                                    "text": "call mom",
+                                    "when": "tomorrow at 9:00",
+                                    "repeat": "never",
+                                },
+                            },
+                        ]
+                    }
+                )
+            ),
+            BUILT_IN_ACTION_CONTRACTS,
+            logger=Mock(spec=logging.Logger),
+            timing=TimingContext(CREATION_REFERENCE, SYNTHETIC_KEY),
+        )
+        self.assertIs(type(plan), Plan)
+        return plan
+
+    def test_a_faithful_creation_plan_passes_again_unchanged(self) -> None:
+        plan = self.faithful_plan()
+        fingerprint = plan.fingerprint
+
+        self.assertEqual(
+            plan,
+            _creation_plan(CREATION_REQUEST, self.task, self.reminder),
+        )
+        self.assertIsNone(_recheck(plan))
+        self.assertEqual(plan.fingerprint, fingerprint)
+
+    def test_every_departure_from_the_request_is_a_mismatch(self) -> None:
+        def reminder(text: str) -> PlanStep:
+            return PlanStep(
+                "reminders",
+                "create",
+                {"text": text, "when": CREATION_WHEN, "repeat": "never"},
+            )
+
+        renamed = PlanStep(
+            "tasks",
+            "create",
+            {"text": "pay the rent", "due": CREATION_DUE},
+        )
+        undated = PlanStep("tasks", "create", {"text": "pay rent"})
+        other = PlanStep("system", "current_time", {})
+        cases = {
+            "changed task text": (renamed, self.reminder),
+            "changed reminder text": (self.task, reminder("call dad")),
+            "dropped due date": (undated, self.reminder),
+            "swapped order": (self.reminder, self.task),
+            "wrong kind for the body": (reminder("pay rent"), self.reminder),
+            "missing item": (self.task,),
+            "extra item": (self.task, self.reminder, self.reminder),
+            "extra other step": (self.task, self.reminder, other),
+            "item replaced by another action": (self.task, other),
+        }
+        for name, steps in cases.items():
+            with self.subTest(case=name):
+                self.assertIs(
+                    _recheck(_creation_plan(CREATION_REQUEST, *steps)),
+                    ProposalRejection.CREATION_MISMATCH,
+                )
+
+    def test_an_undated_item_stays_undated(self) -> None:
+        request = "add a task to water the plants"
+        undated = PlanStep("tasks", "create", {"text": "water the plants"})
+        dated = PlanStep(
+            "tasks",
+            "create",
+            {"text": "water the plants", "due": CREATION_DUE},
+        )
+
+        self.assertIsNone(_recheck(_creation_plan(request, undated)))
+        self.assertIs(
+            _recheck(_creation_plan(request, dated)),
+            ProposalRejection.CREATION_MISMATCH,
+        )
+
+    def test_a_request_that_is_no_supported_form_is_refused_again(self) -> None:
+        cases = (
+            ("What does a task mean?", ProposalRejection.NOT_A_CREATION_REQUEST),
+            (
+                "please add a task to pay rent",
+                ProposalRejection.NOT_A_CREATION_REQUEST,
+            ),
+            ("add a task to", ProposalRejection.CREATION_REQUEST_UNCLEAR),
+            (
+                "add a task to pay rent maybe",
+                ProposalRejection.CREATION_REQUEST_UNCLEAR,
+            ),
+            (
+                "remind me soon to call mom",
+                ProposalRejection.CREATION_REQUEST_UNCLEAR,
+            ),
+        )
+        for request, expected in cases:
+            with self.subTest(request=request):
+                self.assertIs(_recheck(_creation_plan(request, self.task)), expected)
+
+    def test_two_items_alike_are_unclear_again(self) -> None:
+        milk = PlanStep("tasks", "create", {"text": "buy milk"})
+        cases = (
+            ("add a task to buy milk and add a task to buy milk", milk),
+            (
+                "remind me tomorrow at 9:00 to call mom and "
+                "remind me to call mom tomorrow at 09:00",
+                self.reminder,
+            ),
+        )
+        for request, step in cases:
+            with self.subTest(request=request):
+                self.assertIs(
+                    _recheck(_creation_plan(request, step, step)),
+                    ProposalRejection.CREATION_REQUEST_UNCLEAR,
+                )
+
+    def test_each_steps_canonical_timing_is_held_to_its_contract(self) -> None:
+        def task(due: object) -> PlanStep:
+            return PlanStep("tasks", "create", {"text": "pay rent", "due": due})
+
+        def reminder(**changes: object) -> PlanStep:
+            arguments: dict[str, object] = {
+                "text": "call mom",
+                "when": CREATION_WHEN,
+                "repeat": "never",
+            }
+            arguments.update(changes)
+            return PlanStep(
+                "reminders",
+                "create",
+                {name: value for name, value in arguments.items() if value is not None},
+            )
+
+        cases = (
+            ("a task's phrase", (task("friday"), self.reminder), "out_of_range"),
+            ("an impossible date", (task("2027-02-30"), self.reminder), "out_of_range"),
+            (
+                "a reminder's phrase",
+                (self.task, reminder(when="tomorrow at 9:00")),
+                "out_of_range",
+            ),
+            (
+                "a time with no zone",
+                (self.task, reminder(when="2027-10-31T09:00:00+01:00")),
+                "out_of_range",
+            ),
+            ("a repeat", (self.task, reminder(repeat="daily")), "out_of_range"),
+            ("no repeat", (self.task, reminder(repeat=None)), "missing_argument"),
+            ("an extra argument", (self.task, reminder(note="x")), "extra_argument"),
+            ("a number for a time", (self.task, reminder(when=9)), "wrong_type"),
+        )
+        for name, steps, code in cases:
+            with self.subTest(case=name):
+                outcome = _recheck(_creation_plan(CREATION_REQUEST, *steps))
+                self.assertIs(type(outcome), ProposalRejection)
+                self.assertEqual(outcome.code, code)
+
+    def test_eligibility_is_checked_first(self) -> None:
+        closed = _registry_with("tasks.create", ModelEligibility.NOT_MODEL_ELIGIBLE)
+        plan = _creation_plan(CREATION_REQUEST, self.task, self.reminder)
+
+        self.assertIs(_recheck(plan, closed), ProposalRejection.NOT_MODEL_ELIGIBLE)
+        self.assertIs(
+            _recheck(_creation_plan("hello there", self.task), closed),
+            ProposalRejection.NOT_MODEL_ELIGIBLE,
+        )
+
+    def test_checking_again_resolves_parses_builds_and_reaches_nothing(
+        self,
+    ) -> None:
+        plans = [
+            self.faithful_plan(),
+            _creation_plan(CREATION_REQUEST, self.reminder, self.task),
+            _creation_plan("add a task to pay rent maybe", self.task),
+            _creation_plan("hello there", self.task),
+        ]
+        fingerprints = [plan.fingerprint for plan in plans]
+
+        with (
+            patch.object(
+                plan_compiler_module,
+                "resolve_task_date",
+                side_effect=AssertionError("a date was resolved"),
+            ) as resolve_date,
+            patch.object(
+                plan_compiler_module,
+                "resolve_reminder_time",
+                side_effect=AssertionError("a time was resolved"),
+            ) as resolve_time,
+            patch.object(
+                plan_compiler_module.json,
+                "loads",
+                side_effect=AssertionError("a proposal was parsed"),
+            ) as loads,
+            patch.object(
+                plan_compiler_module,
+                "Plan",
+                side_effect=AssertionError("a plan was built"),
+            ) as plan_class,
+            patch.object(
+                plan_compiler_module,
+                "PlanStep",
+                side_effect=AssertionError("a step was built"),
+            ) as step_class,
+            _tripwires() as mocks,
+        ):
+            outcomes = [_recheck(plan) for plan in plans]
+
+        self.assertEqual(
+            outcomes,
+            [
+                None,
+                ProposalRejection.CREATION_MISMATCH,
+                ProposalRejection.CREATION_REQUEST_UNCLEAR,
+                ProposalRejection.NOT_A_CREATION_REQUEST,
+            ],
+        )
+        self.assertEqual([plan.fingerprint for plan in plans], fingerprints)
+        mocks.update(
+            {
+                "resolve_task_date": resolve_date,
+                "resolve_reminder_time": resolve_time,
+                "json.loads": loads,
+                "Plan": plan_class,
+                "PlanStep": step_class,
+            }
+        )
+        for name, mock in mocks.items():
+            with self.subTest(tripwire=name):
+                mock.assert_not_called()
+
+    def test_a_creation_refusal_logs_only_its_code(self) -> None:
+        request = f"add a task to {REQUEST_SENTINEL}"
+        step = PlanStep("tasks", "create", {"text": FAKE_PAYLOAD_SENTINEL})
+        logger = Mock(spec=logging.Logger)
+
+        outcome = recheck_model_plan(
+            _creation_plan(request, step),
+            BUILT_IN_ACTION_CONTRACTS,
+            logger=logger,
+        )
+
+        self.assertIs(outcome, ProposalRejection.CREATION_MISMATCH)
+        logger.warning.assert_called_once_with(
+            "Refused a compiled model plan: code=%s",
+            "creation_mismatch",
         )
         self.assertEqual(len(logger.mock_calls), 1)
 
@@ -2444,6 +2838,9 @@ class CompilerImportBoundaryTests(unittest.TestCase):
             "core.logger",
             "core.planner",
             "core.reasoning",
+            # V1-22: the supported request forms and the timing leaf.
+            "core.task_requests",
+            "core.time_resolution",
         }
     )
 
@@ -2458,6 +2855,9 @@ class CompilerImportBoundaryTests(unittest.TestCase):
             "core.logger",
             "core.planner",
             "core.reasoning",
+            # V1-22: exactly two more, the request forms and the timing leaf.
+            "core.task_requests",
+            "core.time_resolution",
         }
     )
 
@@ -2519,6 +2919,24 @@ class CompilerImportBoundaryTests(unittest.TestCase):
                 self.assertEqual(forbidden_imports(source), set())
                 self.assertNotIn("sqlite3", _direct_imports(source))
                 self.assertNotIn("subprocess", _direct_imports(source))
+
+    def test_v1_22_widens_the_reach_by_exactly_its_two_leaves(self) -> None:
+        # The reach V1-21 left, written out by hand.
+        before = {
+            "core.plan_compiler",
+            "core.action_contracts",
+            "core.constants",
+            "core.context",
+            "core.failures",
+            "core.logger",
+            "core.planner",
+            "core.reasoning",
+        }
+
+        self.assertEqual(
+            _maria_reach("core.plan_compiler"),
+            before | {"core.task_requests", "core.time_resolution"},
+        )
 
     def test_only_brain_reaches_the_compiler(self) -> None:
         compiler_path = Path(plan_compiler_module.__file__).resolve()

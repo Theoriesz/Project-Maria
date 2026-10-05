@@ -181,7 +181,10 @@ Maria may automatically search local stored information, but retrieval is tiered
 bounded.
 
 - **Tier A — automatically usable when relevant:** explicit memories marked
-  context-enabled, owner preferences, active tasks and reminders, active-project facts.
+  context-enabled, owner preferences, active-project facts, and, under V1-22-R1, open
+  tasks and reminders the owner has enabled for context. Such a task or reminder is
+  eligible only after memories and only within Tier A's existing selection order and
+  bounds, so an eligible one can be left out.
 - **Tier B — automatically searchable, bounded, with visible provenance:** notes the
   owner has enabled for context, conversation summaries the owner has enabled for
   context, context-enabled explicit memories beyond Tier A's bounded window, project
@@ -189,9 +192,10 @@ bounded.
   ones by id, not older ones.
 - **Tier C — requires explicit selection or approved workflow scope:** raw interaction
   history, saved conversations, arbitrary files, logs, credentials, sensitive records,
-  unrelated project data. Every memory, note, or conversation summary without context
-  consent is treated as a sensitive record: Maria cannot tell sensitive free text from
-  any other, so consent, not inspection, is the boundary.
+  unrelated project data. Every memory, note, conversation summary, task, or reminder
+  without context consent is treated as a sensitive record, and so is a completed task
+  or reminder and one changed since its consent: Maria cannot tell sensitive free text
+  from any other, so consent, not inspection, is the boundary.
 
 Every context item included in reasoning carries deterministic provenance produced by
 Maria — a memory, note, conversation summary, task, reminder, or project id, or a file
@@ -321,8 +325,14 @@ Maria may become self-sufficient, but never self-authorizing.
 - The database gains a schema version independent of `APP_VERSION`, with an ordered,
   idempotent, atomic forward migration runner.
 - Recording is a generic per-plan policy on `Plan`; Brain keeps no tool-specific branch.
-- Timing, scheduling, notification, and concurrency primitives are confined to the
-  narrow reminder-delivery subsystem. That subsystem has no import or call path to
+- Timing, scheduling, notification, and concurrency primitives (anything that sleeps,
+  waits for a moment, arms a timer, schedules, defers, or polls work, or runs code
+  later) are confined to the narrow reminder-delivery subsystem. Under V1-22-R1,
+  reading the current time once in the foreground of an owner-initiated request (to
+  stamp a record, resolve the owner's date, or answer a due query), calendar arithmetic
+  with `datetime` and `zoneinfo`, and a foreground request deadline are not such
+  primitives, and none of them authorizes scheduling, background work, or delivery.
+  The reminder-delivery subsystem has no import or call path to
   reasoning, model-to-plan compilation, ToolManager, general tools, project assistance,
   or internet research. Its exact module shape is decided during Stage V1-23. The one
   exception, approved by the owner under V1-21-R1, is the GUI package. It may deliver
@@ -351,11 +361,15 @@ Maria may become self-sufficient, but never self-authorizing.
   parses successfully without active provider fields. Machine-specific provider settings
   live only in a deliberately untracked local override, and an enabled configuration
   missing any required active field fails closed.
-- Standard library only, with one owner-approved exception under V1-21-R1: PyQt6 and
+- Standard library only, with two owner-approved exceptions. Under V1-21-R1: PyQt6 and
   its required runtime dependencies, for the optional desktop GUI alone, pinned in
-  `requirements-gui.txt`. `requirements.txt` stays standard-library only, and Maria's
-  core and CLI never need Qt. Any other third-party dependency remains out of scope
-  without explicit owner approval.
+  `requirements-gui.txt`. Under V1-22-R1: the data-only `tzdata` package, optional and
+  pinned in `requirements-time.txt`, which Maria's code never imports; standard-library
+  `zoneinfo` loads it when no configured time zone files provide a key.
+  `requirements.txt` stays standard-library only, Maria's core and CLI never need Qt,
+  and everything but resolving new timing and the due-task query works without time
+  zone data. Any other third-party dependency remains out of scope without explicit
+  owner approval.
 - Every pre-v1.0 deterministic command, and every non-network deterministic command
   added during v1.0, remains available and usable without a model, network transport, or
   GUI toolkit, at every stage. A deterministic command whose purpose inherently requires
@@ -1740,6 +1754,319 @@ they find gets its own focused `fix/<topic>` branch, never a release branch.
 
 - Branch: `feature/structured-tasks-and-reminders`
 - Prerequisites: V1-06, V1-10, V1-15
+- Owner-approved amendment (V1-22-R1). The V1-22 read-only entry audit found four
+  problems. This entry named four tool-integration steps where the contract requires
+  five. It placed active tasks and reminders in Tier A without the explicit consent that
+  the contract makes the only automatic route for stored text. It proposed creation as
+  allowed while requiring resolved timing to be shown before storage. It left undecided
+  the time zone source, the date and daylight-saving rules, the attachment model,
+  recurrence, the permissions for creation and for complete and reopen, and how a model
+  proposal is bound to the owner's own request. The audit also found that the
+  timing-primitive rule needed a clarification. The owner approved the resolution below
+  in writing, with decisions D1 to D9, D1a and D7a included, as recommended, before the
+  branch opened, and this entry is amended in the V1-22 pull request itself. The text
+  after this amendment stays recorded exactly as it was written, except that its
+  completion criteria now name all five tool-integration steps. "v1.0 Operating
+  Policies" (Memory and context policy), "v1.0 Architecture Requirements", and "v1.0
+  Completion Criteria" are amended in the same change. The stage also relies on V1-17,
+  V1-18, and V1-21, all merged before it opened.
+  - Pre-branch step: an owner-authorized, isolated compatibility check selected the pin
+    `tzdata==2026.5` before the branch opened: IANA time zone data 2026e, from the
+    official PyPI distribution, wheel `tzdata-2026.5-py2.py3-none-any.whl` with SHA-256
+    `b683bd1b6659ddcd810ff02ad09ba821d4bf1065072805063eb35c49617905ac`. The owner's
+    64-bit Windows Python 3.14 build has no time zone data of its own. In an isolated
+    environment where that package was the only source, it loaded representative keys,
+    and gaps, folds, and RFC 9557 round trips resolved correctly.
+  - Records (schema 7): one appended step, `create_tasks_and_reminders`, creates
+    `tasks` and `reminders`, both empty.
+    - Text is 1 to 512 UTF-8 bytes, on one line, equal to its stripped form, with no
+      character in Cc, Cf, Cs, Zl, or Zp.
+    - A task has an optional calendar `due_date` (`YYYY-MM-DD`, no time or zone).
+    - A reminder has `remind_time`, its canonical RFC 9557 local time, offset, and zone
+      exactly as approved (`YYYY-MM-DDTHH:MM:SS+HH:MM[Area/City]`), and `remind_utc`,
+      the saved instant (`YYYY-MM-DDTHH:MM:SSZ`).
+    - Both have a status of `open` or `completed`, UTC stamps `created_at`,
+      `updated_at`, and `completed_at` (set only while completed), and a nullable
+      `context_digest`.
+    - SQL checks only the byte-count non-empty text, the status set, the date and
+      instant shapes, and the digest length.
+    - Every other rule is enforced by `core/task_records.py` and the memory layer on
+      write and on read, and is tested separately from SQL.
+    - There is no foreign key, trigger, index, cascade, recurrence column, or delivered
+      marker, and ids are never reused.
+  - Stored timing:
+    - `remind_utc` must equal the instant encoded by `remind_time`'s local date and
+      time minus its offset, on write and on read; no zone data is needed for that.
+    - A row that breaks that, or any other rule, is corrupt and is refused privately on
+      read, with a fixed message, and a listing holding it refuses as a whole.
+    - A later time zone rule change is not corruption. The saved values agree with the
+      zone's current rules when the saved offset is one of the offsets at which the
+      saved local time exists under those rules, so a correctly chosen repeated time
+      still agrees. Otherwise the original values are shown with a fixed warning, the
+      saved instant keeps ordering and due selection, and nothing is rewritten or
+      refused.
+  - Time zone (D1, D1a):
+    - One IANA key in the private override's new `[time] zone` setting, resolved by
+      standard-library `zoneinfo` in a leaf module, `core/time_resolution.py`. The
+      tracked configuration may not hold `[time]`, and a malformed key refuses startup.
+    - Each reminder keeps the zone it was resolved in, and a later change of
+      configuration never reinterprets a stored record.
+    - There is no per-request zone. A request naming another zone or an abbreviation is
+      unclear. An explicit offset is accepted only when it matches the configured zone
+      at the given local time, and for a repeated local time it selects the occurrence
+      (wording clarified by the owner on review, decision B below).
+    - Data comes from configured time zone files on zoneinfo's search path, or from the
+      optional, pinned, data-only `tzdata` in `requirements-time.txt`, which Maria never
+      installs and never imports. `requirements.txt` stays standard-library only.
+    - Only resolving new timing (an undated task needs none) and `due tasks` need the
+      zone. Every other operation on existing records works without it.
+    - Nothing falls back to UTC, a fixed offset, or the operating system's zone.
+  - The reference instant and dates (D2):
+    - Brain reads one clock once per request, before planning. That instant serves
+      every timing decision of the request, every creation step included, and
+      confirmation reads none.
+    - `today`, `tomorrow`, a weekday (the first such date strictly after today, so on a
+      Monday `monday` is seven days later), `YYYY-MM-DD`, and `in N days` are calendar
+      dates in the configured zone; `in N days` is calendar arithmetic. Reminders also
+      need a wall time, applied on that date.
+    - `in N minutes` and `in N hours` are elapsed time in UTC from the reference
+      truncated to the minute, shown with their true offset.
+    - Missing, vague, or unsupported timing is refused with a clarification.
+    - New timing is refused when it is not after the reference instant (a reminder) or
+      before local today (a task's date), or when its local date is beyond the
+      inclusive ten-year horizon: the same month and day ten years after local today,
+      with February 29 mapping to February 28.
+    - Existing overdue records stay fully usable.
+    - Approval stores exactly the approved values even when they have become due, and
+      nothing is shifted or resolved again.
+  - Daylight saving (D3): a nonexistent local time is refused and never shifted. A
+    repeated one is refused unless an offset is given that equals one of its valid
+    offsets, and any offset that is not valid for the local time is refused.
+  - Independent records (D4) and no recurrence (D5): no linkage between tasks,
+    reminders, or any other record type. A reminder's plan carries `repeat: "never"`.
+  - Commands and permissions (D7, D7a): twenty-six commands and twenty-two actions; the
+    inventory grows from 40 to 62.
+    - Tasks: `add task <text>`, `add task due <date>: <text>`, `tasks`,
+      `completed tasks`, `due tasks`, `read task <id>`, `complete task <id>`,
+      `reopen task <id>`, `edit task <id>: <new text>`,
+      `reschedule task <id>: <date or none>`, `delete task <id>`,
+      `enable task context <id>`, and `disable task context <id>`.
+    - Reminders: `add reminder <date> <time> [<offset>]: <text>`,
+      `add reminder in <N> minutes|hours: <text>`, `reminders`, `completed reminders`,
+      `due reminders`, `read reminder <id>`, `complete reminder <id>`,
+      `reopen reminder <id>`, `edit reminder <id>: <new text>`,
+      `reschedule reminder <id>: <timing>`, `delete reminder <id>`,
+      `enable reminder context <id>`, and `disable reminder context <id>`.
+    - `<date>` is `today`, `tomorrow`, a weekday, `YYYY-MM-DD`, or `in N day(s)`;
+      `<time>` is `H:MM` or `HH:MM` from 00:00 to 23:59; `<offset>` is `+HH:MM` or
+      `-HH:MM`. `list tasks` and `list reminders` stay directory listings, and no
+      deterministic command begins with `remind me` or `add a task to`.
+    - Both creates are mandatory confirmations, with previews of the exact text and
+      resolved timing before storage. So are edit, reschedule, delete, and both consent
+      actions. The mandatory set grows from 19 to 31, and the confirmation notices from
+      5 to 8 (`reminders.create`, `tasks.enable_context`, and
+      `reminders.enable_context`).
+    - Lists, due queries, reads, complete, and reopen are allowed, each with a written
+      risk note.
+    - Complete and reopen restore status only: complete stamps the time of that
+      completion, reopen clears it, and the original completion time is never
+      restored.
+    - `CLAUDE.md`'s lifecycle enumeration grows to thirty actions, 26 of them
+      confirmation-required and the four complete and reopen actions allowed.
+  - Model proposals (D8, D9):
+    - `tasks.create` and `reminders.create` become model-eligible (3 to 5), join the
+      allowlist and the audit vocabulary (target `none`), and are bound to the owner's
+      request.
+    - A creation step compiles only when the whole request is one to five items, each in
+      one of four closed forms, parsed by `core/task_requests.py` under these normative
+      rules:
+      - Preparation: a request holding any Cc, Cf, Cs, Zl, or Zp character is not a
+        supported request. One trailing `.` is removed. A request that then ends with
+        `?` is a question and is not supported.
+      - Matching: keywords, timing tokens, and joiners are matched ASCII
+        case-insensitively, separated by exactly one space. The body keeps the owner's
+        characters.
+      - Items: split at ` and ` or `, and ` immediately followed by `remind me ` or
+        `add a task to `; no other joiner splits. More than five items is unclear.
+      - Forms:
+        - F1: `remind me <timing> to <body>`.
+        - F2: `remind me to <body> <timing>`, with the timing ending the segment.
+        - F3: `add a task to <body>`.
+        - F4: `add a task to <body> by <date>`, with the date ending the segment.
+        - The word after `remind me ` picks F1 or F2 (`to` means F2). A final ` by `
+          plus a date picks F4.
+        - An F2 suffix is identified by the token immediately before `at`, or by a
+          minute or hour unit.
+      - Timing: `<timing>` is one of:
+        - `today at T`, `tomorrow at T`, `on WEEKDAY at T`, `on YYYY-MM-DD at T`, or
+          `in N day(s) at T`;
+        - `in N minute(s)` or `in N hour(s)`.
+
+        T is `H:MM` or `HH:MM` (00:00 to 23:59), optionally followed by a space and a
+        `+HH:MM` or `-HH:MM` offset. WEEKDAY is `monday` to `sunday`. N is ASCII
+        digits with no leading zero: days 1-366, minutes 1-1,440, hours 1-168. `<date>`
+        is `today`, `tomorrow`, a weekday, or `YYYY-MM-DD`.
+      - Body: verbatim, with only its surrounding whitespace stripped; 1 to 512 UTF-8
+        bytes. The request is unclear when the body contains any of these closed
+        guards:
+        - punctuation: `?`, `!`, `;`, a double quotation mark (`"`, U+201C, or
+          U+201D), or a sentence break, a `.` followed by a space and more text;
+        - a form prefix, `remind me` or `add a task to`, anywhere, ASCII
+          case-insensitively;
+        - a timing word: after splitting on whitespace, removing each word's
+          non-alphanumeric characters at both ends, and casefolding (the V1-16 rule), a
+          word equal to today, tonight, tomorrow, yesterday, monday, tuesday,
+          wednesday, thursday, friday, saturday, sunday, morning, afternoon, evening,
+          noon, midnight, week, weekend, month, year, next, later, soon, by, due,
+          before, until, or deadline;
+        - a timing token: a word shaped `[0-9]{4}-[0-9]{2}-[0-9]{2}`,
+          `[0-9]{1,2}:[0-9]{2}`, or `[0-9]{1,2}(:[0-9]{2})?(am|pm)`; a word of ASCII
+          digits followed by the word `am` or `pm`; or the word `in`, a word of ASCII
+          digits, and one of the unit words minute, minutes, hour, hours, day, days,
+          week, weeks, month, months, year, or years;
+        - a retraction, hedge, or example phrase, as whole words: never mind,
+          nevermind, forget it, forget that, cancel that, scratch that, don't, dont, do
+          not, not sure, maybe, perhaps, just kidding, for example, or for instance,
+          with either U+0027 or U+2019 as the apostrophe.
+      - Duplicates: two items of the same kind and body whose timing resolves to the
+        same value, or which are both undated, are unclear.
+    - Binding: the proposal must hold only creation steps, exactly one per item and in
+      order. Each step's `text` must equal the item's body exactly. Its timing phrase
+      must equal the item's phrase after canonical tokenization (ASCII keywords
+      lowercased, single spaces, digits as written), a task carries `due` exactly when
+      its item is dated, and a reminder's `repeat` is `never`.
+    - Gate order:
+      1. The byte cap, strict JSON, and the shape with its five-step bound.
+      2. Allowlist and eligibility.
+      3. Raw argument checks: type, size, unsafe characters, then ASCII. `text` is 1 to
+         512 UTF-8 bytes and not blank; `when` and `due` are 1 to 64 characters of
+         printable ASCII; `repeat` is `never`.
+      4. The parse and the binding.
+      5. Resolution of the owner's own phrases at the shared instant, then the duplicate
+         rule.
+      6. The existing step checks on the canonical values.
+
+      The first failure decides the refusal, and nothing compiles partially. A proposal
+      with no creation step compiles exactly as before.
+    - Maria builds each step from its own extraction; no model value enters the plan.
+      `recheck_model_plan` parses the plan's request again with no clock and verifies
+      the items, the canonical formats, and the duplicate rule.
+    - A request that does not begin with a form prefix, ends in a question, or carries a
+      guarded token in its body never produces a creation approval. That covers
+      questions, negations, quotations, examples, reported speech, polite wrappers,
+      casual mentions, retractions, and hedges.
+    - Eight fixed rejection kinds are added (13 to 21): NOT_A_CREATION_REQUEST,
+      CREATION_REQUEST_UNCLEAR, CREATION_MISMATCH, TIME_PAST, TIME_TOO_FAR,
+      TIME_NONEXISTENT, TIME_AMBIGUOUS, and TIME_ZONE_UNAVAILABLE.
+    - The five-step bound, all-or-nothing compilation, one approval, and the per-step
+      audit are unchanged.
+  - Context consent (D6):
+    - Consent is per record, off by default, through the four confirmed consent
+      commands, and bound to the exact text and timing: the SHA-256 of the compact JSON
+      array `[text, due or ""]` for a task and `[text, remind_time]` for a reminder.
+    - Edits and reschedules revoke it.
+    - Consented open items are eligible for Tier A after memories, tasks before
+      reminders and each by ascending id, taken whole or not at all, subject to the
+      unchanged bounds of 16 items and 2,048 bytes and the request budget; an eligible
+      item left out is named in a notice.
+    - Completing, deleting, editing, rescheduling, or disabling clears a conversation
+      that carried the item.
+    - Reopening makes it eligible again.
+    - A request that selects none keeps V1-21's context bytes.
+  - Recording and privacy:
+    - Deterministic commands are recorded, with content-free replies where content would
+      show (`recorded_message` grows from 7 to 19 actions).
+    - Model creation is transient.
+    - Logs carry ids and fixed codes only.
+    - Due-now and overdue are queries, and nothing is delivered, notified, scheduled,
+      polled, repeated, or generated.
+  - Footprint:
+    - New: `core/time_resolution.py` (timing grammar, resolution, gap and fold, zone
+      loading, the rule-change check), `core/task_requests.py` (the four request
+      forms), `core/task_records.py` (storage vocabulary and canonical validators),
+      `tools/tasks.py` and `tools/reminders.py` (eleven actions each), and
+      `requirements-time.txt` (the pin above).
+    - Changed: `core/brain.py` (one clock seam and capture per request, timing
+      composition, context reads), `core/plan_compiler.py`, `core/planner.py`,
+      `core/memory.py`, `core/constants.py`, `core/action_contracts.py` (text formats
+      and allowed values), `core/audit.py`, `core/reasoning.py`, `core/permissions.py`,
+      `core/tool_manager.py`, `core/config.py`, `core/context.py`, and
+      `core/conversation.py`; `core/session.py` in its docstring only; and the
+      starter prompt's confirmation line (`prompts/system_prompt.txt`), a text no
+      request carries, under D7a.
+    - Unchanged: `main.py`, `gui/*`, `core/ollama_adapter.py`, `core/failures.py`,
+      `config/config.toml`, `requirements.txt`, and the version literals.
+  - Compatibility: the deliberate changes are the 26 commands and help lines, schema 7,
+    the proposal instruction text, the generalized conversation-cleared notices, the
+    `[time]` section, the compiler's new gates and rejection kinds, and Brain's one
+    clock reading per request. Everything else stays byte-identical, including the
+    routing, replies, and recording of existing commands.
+  - Non-goals added. None of these is in scope:
+    - a per-request time zone;
+    - natural-language creation forms beyond the four, or in other languages;
+    - date words beyond the closed grammar;
+    - recurrence;
+    - task and reminder linkage;
+    - an index;
+    - any change to `system.current_time`;
+    - any delivery, notification, timer, or background work.
+  - Global amendments in the same change:
+    - Tier A in the memory and context policy;
+    - the clarified timing-primitive sentence and the time zone data exception in the
+      architecture requirements;
+    - the completion criteria admitting `tzdata` beside PyQt6;
+    - five integration steps in the completion criterion below.
+  - Acceptance: the entry audit's 46-row matrix, in addition to the criteria below.
+    - Storage: the migration ladder from every earlier start to 7, atomicity and drift
+      refusal, the frozen schemas, the SQL guarantees and the API rules tested
+      separately, externally inserted malformed rows refused privately, a simulated
+      rule change shown with the warning and no rewrite, a correctly chosen repeated
+      time with no warning, operations without zone data, and no id reuse or cascade.
+    - Planner: every command and usage line, the unchanged directory listings and
+      filesystem verbs, the request forms reaching the generic fallback, and the help
+      placement.
+    - Time: one clock call per request and none at confirmation, midnight crossing,
+      calendar and elapsed arithmetic, the horizon, gaps and folds, the scope of the
+      past refusal, late approval, and no model influence on deterministic timing.
+    - Contracts, permissions, and approval: 62 actions, 5 eligible and audited, 31
+      mandatory confirmations, exact previews before storage, and model approvals
+      showing the canonical arguments and, after decision A below, the fixed notices
+      of their confirmation-required steps.
+    - Model path: faithful F1 to F4 and joined requests; refusals for non-requests,
+      invented or vague timing, timing and body mismatches, swapped or extra steps,
+      joined second requests, duplicates, raw-check failures before resolution, and the
+      six-item limit; and casual conversation creating nothing.
+    - Lifecycle, context, recording, and boundaries: transitions, due queries,
+      no delivery, consent and selection, rechecks, unchanged context bytes,
+      content-free recording, log sentinels, CLI and GUI parity, import boundaries, and
+      configuration.
+    - The full suite passes in an isolated copy, without and with the pinned PyQt6, and
+      without and with the pinned `tzdata`.
+    - Tests needing real time zone data skip explicitly, with a reason, when it is
+      absent; daylight-saving and rule-change tests use synthetic zones built in-test.
+  - Owner decisions on review, made before the pull request and recorded with it:
+    - A, approval display: a model plan's approval also shows, after its exact
+      compiled steps and before the turn's context notices, the fixed confirmation
+      notice of each step that requires confirmation, each distinct notice once, in
+      plan order, so a reminder created from the owner's own words says before
+      approval that Maria will not notify. This limited display amendment changes
+      nothing else: the compiled arguments, the plan binding and fingerprint, one
+      approval for the whole plan, and confirmation without a provider call stay as
+      they are; Brain asks PermissionManager generically and gains no tool or action
+      routing; and no notice enters the retained conversation, interaction history,
+      or a model request. A plan with no such notice is shown as before.
+    - B, offsets: D1 is clarified as above. Wrong offsets and nonexistent local times
+      stay refused.
+    - C, context integrity: Tier A selection and rechecks also refuse a task or
+      reminder whose `created_at` or `updated_at` is malformed, or an open one with a
+      `completed_at`, by the existing record rules, so a supplied record invalidated
+      this way clears the conversation like any other change. Every value a task or
+      reminder context read hands to Python is first typed and bounded inside SQLite
+      by its stored bytes in the file's own encoding, and a refused row never counts
+      toward the selection limit. Saved timing is never reinterpreted under current zone rules,
+      no clock is read, and older summary records are unchanged.
+    - D, configuration representation: redacting `MariaConfig`'s debug
+      representation is deferred; it is unchanged in V1-22.
 - Purpose: Add tasks and reminders as first-class record types with due dates and a
   confirmed lifecycle, including natural-language time resolution the owner can see and
   correct, completing the secretary role with no delivery mechanism and no
@@ -1786,7 +2113,7 @@ they find gets its own focused `fix/<topic>` branch, never a release branch.
   the canonical timezone source and any override, how relative dates are interpreted,
   how daylight-saving ambiguous or nonexistent local times are handled, the task and
   reminder attachment model and the cascade semantics that follow from it, and the
-  initial recurrence scope. All four tool-integration steps are completed for each tool;
+  initial recurrence scope. All five tool-integration steps are completed for each tool;
   migrations run through the V1-09 runner from the frozen v0.2.0 baseline fixture and
   are idempotent and atomic; every new action has a contract entry, an explicit
   model-eligibility decision, an explicit permission-risk decision, and passes the
@@ -2454,7 +2781,8 @@ v1.0 is complete when:
 - `requirements.txt` is unchanged and Maria's core and CLI are still standard-library
   only, and the only third-party packages anywhere are PyQt6 and its required runtime
   dependencies, confined to the optional GUI through `requirements-gui.txt` under
-  V1-21-R1;
+  V1-21-R1, and the data-only `tzdata`, optional and pinned in `requirements-time.txt`
+  under V1-22-R1;
 - tests use only temporary database and log resources, and the live database and log are
   never read, written, or copied;
 - all documentation is synchronized with shipped behavior, and upgrade validation from a

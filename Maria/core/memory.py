@@ -36,7 +36,9 @@ from core.context import (
     SUPPLIED_CONTEXT_MAX_RECORDS,
     ContextConsentOutcome,
     note_digest,
+    reminder_digest,
     summary_digest,
+    task_digest,
 )
 from core.conversation_records import (
     CONVERSATION_SUMMARY_ID_MESSAGE,
@@ -57,6 +59,40 @@ from core.conversation_records import (
 )
 from core.failures import Failure, FailureKind, TypedFailureError
 from core.logger import get_logger
+from core.task_records import (
+    AS_OF_DATE_MESSAGE,
+    AS_OF_INSTANT_MESSAGE,
+    CONTEXT_DIGEST_LENGTH,
+    CONTEXT_DIGEST_MESSAGE,
+    DUE_DATE_LENGTH,
+    DUE_DATE_MESSAGE,
+    REMIND_TIME_MAX_LENGTH,
+    REMIND_TIME_MESSAGE,
+    REMINDER_ID_MESSAGE,
+    STATUS_COMPLETED,
+    STATUS_OPEN,
+    TASK_ID_MESSAGE,
+    TASK_LIST_LIMIT_MESSAGE,
+    TASK_MAXIMUM_ID,
+    TASK_QUERY_LIMIT,
+    TASK_RECORD_MESSAGE,
+    TASK_STATUS_MESSAGE,
+    TASK_TEXT_MESSAGE,
+    UTC_INSTANT_LENGTH,
+    RecordUpdate,
+    Reminder,
+    StatusChange,
+    Task,
+    is_context_digest,
+    is_due_date,
+    is_lifecycle,
+    is_status,
+    is_task_text,
+    is_task_timestamp,
+    is_utc_instant,
+    task_timestamp,
+    timing_agrees,
+)
 
 _DATABASE_BUSY_MESSAGE = "Database is busy. Try again shortly."
 
@@ -97,14 +133,16 @@ _UNVERSIONED_SCHEMA = 0
 # per-memory context-consent column. Version 4 adds the per-note context
 # consent column, which holds the approved text's identity. Version 5 adds the
 # two audit-summary tables. Version 6 adds the saved-conversation and
-# conversation-summary tables. The current version lives in ``core.constants``
-# as ``DATABASE_SCHEMA_VERSION``.
+# conversation-summary tables. Version 7 adds the task and reminder tables.
+# The current version lives in ``core.constants`` as
+# ``DATABASE_SCHEMA_VERSION``.
 _SCHEMA_BEFORE_EXPLICIT_MEMORIES = 1
 _SCHEMA_V0_2_BASELINE = 2
 _SCHEMA_MEMORY_CONTEXT_CONSENT = 3
 _SCHEMA_NOTE_CONTEXT_CONSENT = 4
 _SCHEMA_AUDIT_SUMMARIES = 5
 _SCHEMA_CONVERSATION_RECORDS = 6
+_SCHEMA_TASKS_AND_REMINDERS = 7
 
 # The live schema. These statements describe the database this build expects
 # and are what a brand-new database is created from, so they move whenever the
@@ -204,6 +242,51 @@ _CREATE_CONVERSATION_SUMMARIES_TABLE = """
     )
 """
 
+# ``tasks`` and ``reminders`` hold the owner's tasks and reminders, each
+# independent of every other table: no foreign key, trigger, index, cascade,
+# recurrence column, or delivered marker. SQL checks only what it can check
+# by shape: non-empty text by byte count, the status set, the date and
+# instant shapes, and the consent digest's length. Every other rule, from
+# the text's characters and a real calendar date to a reminder's saved
+# instant agreeing exactly with its saved local time and offset, is Maria's
+# own, checked in Python on every write and every read. ``remind_utc`` is the
+# saved instant that orders reminders and selects due ones. AUTOINCREMENT
+# keeps a deleted record's id from ever being reused.
+_CREATE_TASKS_TABLE = """
+    CREATE TABLE IF NOT EXISTS tasks (
+        id INTEGER PRIMARY KEY AUTOINCREMENT,
+        text TEXT NOT NULL CHECK (length(CAST(text AS BLOB)) > 0),
+        due_date TEXT CHECK (
+            due_date IS NULL
+            OR due_date GLOB '[0-9][0-9][0-9][0-9]-[0-9][0-9]-[0-9][0-9]'
+        ),
+        status TEXT NOT NULL CHECK (status IN ('open', 'completed')),
+        created_at TEXT NOT NULL,
+        updated_at TEXT NOT NULL,
+        completed_at TEXT,
+        context_digest TEXT
+            CHECK (context_digest IS NULL OR length(context_digest) = 64)
+    )
+"""
+
+_CREATE_REMINDERS_TABLE = """
+    CREATE TABLE IF NOT EXISTS reminders (
+        id INTEGER PRIMARY KEY AUTOINCREMENT,
+        text TEXT NOT NULL CHECK (length(CAST(text AS BLOB)) > 0),
+        remind_time TEXT NOT NULL,
+        remind_utc TEXT NOT NULL CHECK (
+            remind_utc GLOB
+                '[0-9][0-9][0-9][0-9]-[0-9][0-9]-[0-9][0-9]T[0-9][0-9]:[0-9][0-9]:[0-9][0-9]Z'
+        ),
+        status TEXT NOT NULL CHECK (status IN ('open', 'completed')),
+        created_at TEXT NOT NULL,
+        updated_at TEXT NOT NULL,
+        completed_at TEXT,
+        context_digest TEXT
+            CHECK (context_digest IS NULL OR length(context_digest) = 64)
+    )
+"""
+
 _CREATE_INTERACTIONS_INDEX = """
     CREATE INDEX IF NOT EXISTS idx_interactions_created_at
         ON interactions (created_at)
@@ -222,6 +305,8 @@ _CURRENT_SCHEMA_STATEMENTS: tuple[str, ...] = (
     _CREATE_AUDIT_OUTCOMES_TABLE,
     _CREATE_SAVED_CONVERSATIONS_TABLE,
     _CREATE_CONVERSATION_SUMMARIES_TABLE,
+    _CREATE_TASKS_TABLE,
+    _CREATE_REMINDERS_TABLE,
     _CREATE_INTERACTIONS_INDEX,
     _CREATE_NOTES_INDEX,
 )
@@ -361,6 +446,43 @@ _HISTORICAL_CONVERSATION_SUMMARIES_TABLE = """
     )
 """
 
+# The two tables the version 7 step creates, frozen with the version 7
+# schema. Both start empty, and the step touches no existing table or row.
+_HISTORICAL_TASKS_TABLE = """
+    CREATE TABLE tasks (
+        id INTEGER PRIMARY KEY AUTOINCREMENT,
+        text TEXT NOT NULL CHECK (length(CAST(text AS BLOB)) > 0),
+        due_date TEXT CHECK (
+            due_date IS NULL
+            OR due_date GLOB '[0-9][0-9][0-9][0-9]-[0-9][0-9]-[0-9][0-9]'
+        ),
+        status TEXT NOT NULL CHECK (status IN ('open', 'completed')),
+        created_at TEXT NOT NULL,
+        updated_at TEXT NOT NULL,
+        completed_at TEXT,
+        context_digest TEXT
+            CHECK (context_digest IS NULL OR length(context_digest) = 64)
+    )
+"""
+
+_HISTORICAL_REMINDERS_TABLE = """
+    CREATE TABLE reminders (
+        id INTEGER PRIMARY KEY AUTOINCREMENT,
+        text TEXT NOT NULL CHECK (length(CAST(text AS BLOB)) > 0),
+        remind_time TEXT NOT NULL,
+        remind_utc TEXT NOT NULL CHECK (
+            remind_utc GLOB
+                '[0-9][0-9][0-9][0-9]-[0-9][0-9]-[0-9][0-9]T[0-9][0-9]:[0-9][0-9]:[0-9][0-9]Z'
+        ),
+        status TEXT NOT NULL CHECK (status IN ('open', 'completed')),
+        created_at TEXT NOT NULL,
+        updated_at TEXT NOT NULL,
+        completed_at TEXT,
+        context_digest TEXT
+            CHECK (context_digest IS NULL OR length(context_digest) = 64)
+    )
+"""
+
 # Every version's complete schema, newest first. A marker is never taken at
 # its word: whatever version a database claims, its structure is checked
 # against the entry for that version before anything is migrated, so a file
@@ -369,6 +491,22 @@ _HISTORICAL_CONVERSATION_SUMMARIES_TABLE = """
 # one up to DATABASE_SCHEMA_VERSION therefore needs an entry here, and the
 # migration ladder refuses to run if one is missing.
 _FROZEN_SCHEMAS: tuple[tuple[int, tuple[str, ...]], ...] = (
+    (
+        _SCHEMA_TASKS_AND_REMINDERS,
+        (
+            _HISTORICAL_INTERACTIONS_TABLE,
+            _HISTORICAL_NOTES_TABLE_WITH_CONTEXT_CONSENT,
+            _HISTORICAL_MEMORIES_TABLE_WITH_CONTEXT_CONSENT,
+            _HISTORICAL_AUDIT_SUMMARIES_TABLE,
+            _HISTORICAL_AUDIT_OUTCOMES_TABLE,
+            _HISTORICAL_SAVED_CONVERSATIONS_TABLE,
+            _HISTORICAL_CONVERSATION_SUMMARIES_TABLE,
+            _HISTORICAL_TASKS_TABLE,
+            _HISTORICAL_REMINDERS_TABLE,
+            _HISTORICAL_INTERACTIONS_INDEX,
+            _HISTORICAL_NOTES_INDEX,
+        ),
+    ),
     (
         _SCHEMA_CONVERSATION_RECORDS,
         (
@@ -508,6 +646,14 @@ _MIGRATIONS: tuple[_Migration, ...] = (
             _HISTORICAL_CONVERSATION_SUMMARIES_TABLE,
         ),
     ),
+    _Migration(
+        version=_SCHEMA_TASKS_AND_REMINDERS,
+        name="create_tasks_and_reminders",
+        statements=(
+            _HISTORICAL_TASKS_TABLE,
+            _HISTORICAL_REMINDERS_TABLE,
+        ),
+    ),
 )
 
 
@@ -524,6 +670,13 @@ _FACT_DIGEST_PATTERN = re.compile(r"[0-9a-f]{64}")
 _CONTEXT_MATCH_FUNCTION = "maria_context_match"
 _NOTE_APPROVED_FUNCTION = "maria_note_approved"
 _SUMMARY_APPROVED_FUNCTION = "maria_summary_approved"
+
+# The SQL functions a task or reminder context read registers, on its own
+# connection only: each tests whether one row is still exactly the text and
+# timing its consent approved, and holds only values Maria could have
+# written, before the row can be returned or counted.
+_TASK_APPROVED_FUNCTION = "maria_task_approved"
+_REMINDER_APPROVED_FUNCTION = "maria_reminder_approved"
 
 # The reasons a saved-conversation or conversation-summary call's log line
 # may give. Each is this module's own fixed phrase: nothing SQLite reports
@@ -3172,6 +3325,807 @@ class Memory:
         settled = (_bounded_summary_row(row, max_text_bytes) for row in rows)
         return [row for row in settled if row is not None]
 
+    # Tasks and reminders, from V1-22. Each is an independent record: no
+    # call here touches any other table. Every value is checked against
+    # ``core.task_records`` before it is written and settled into a value
+    # object after it is read, so a row Maria could not have written is
+    # refused privately with a fixed failure, never repaired. The text,
+    # dates, times, zones, instants, and digests are never logged: a log
+    # line names an id and a fixed phrase only.
+
+    def create_task(self, text: str, due_date: str | None = None) -> int:
+        """Store one approved task and return its id.
+
+        ``text`` must be task text and ``due_date`` None or a calendar date,
+        both checked before the database is opened. The task starts open,
+        with its context consent off. Failures carry a fixed message and no
+        cause or context.
+        """
+        if not is_task_text(text):
+            raise ValueError(TASK_TEXT_MESSAGE)
+        if due_date is not None and not is_due_date(due_date):
+            raise ValueError(DUE_DATE_MESSAGE)
+        return self._insert_agenda(_TASKS, text, (due_date,))
+
+    def list_tasks(
+        self,
+        status: str,
+        limit: int = TASK_QUERY_LIMIT,
+    ) -> list[Task]:
+        """Return at most ``limit`` tasks with one status.
+
+        Open tasks come by due date, undated after dated, then by id;
+        completed ones by latest completion first, then by id, newest first.
+        A listing holding any row Maria could not have written refuses as a
+        whole.
+        """
+        if not is_status(status):
+            raise ValueError(TASK_STATUS_MESSAGE)
+        order = (
+            "due_date IS NULL, due_date, id"
+            if status == STATUS_OPEN
+            else "completed_at DESC, id DESC"
+        )
+        rows = self._agenda_rows(
+            _TASKS,
+            "status = ?",
+            (status,),
+            order,
+            limit,
+            "list tasks",
+        )
+        return self._settled_or_refused(_settled_tasks(rows), "list tasks")
+
+    def due_tasks(self, as_of: str, limit: int = TASK_QUERY_LIMIT) -> list[Task]:
+        """Return open tasks due on or before ``as_of``, earliest first.
+
+        ``as_of`` is a calendar date, the plan's local today; no clock is
+        read here. Undated tasks are never due.
+        """
+        if not is_due_date(as_of):
+            raise ValueError(AS_OF_DATE_MESSAGE)
+        rows = self._agenda_rows(
+            _TASKS,
+            "status = ? AND due_date IS NOT NULL AND due_date <= ?",
+            (STATUS_OPEN, as_of),
+            "due_date, id",
+            limit,
+            "list due tasks",
+        )
+        return self._settled_or_refused(_settled_tasks(rows), "list due tasks")
+
+    def get_task(self, task_id: int) -> Task | None:
+        """Return one task, or None if absent; a malformed row is refused."""
+        row = self._agenda_row(_TASKS, task_id, "read task")
+        if row is None:
+            return None
+        return self._settled_or_refused(_settled_tasks([row]), "read task")[0]
+
+    def complete_task(self, task_id: int) -> StatusChange:
+        """Mark one open task completed, stamping the time of completion."""
+        return self._set_agenda_status(_TASKS, task_id, STATUS_COMPLETED)
+
+    def reopen_task(self, task_id: int) -> StatusChange:
+        """Mark one completed task open again, clearing its completion time.
+
+        The earlier completion time is not kept anywhere, so a later
+        completion stamps a new one.
+        """
+        return self._set_agenda_status(_TASKS, task_id, STATUS_OPEN)
+
+    def edit_task(self, task_id: int, text: str) -> RecordUpdate:
+        """Replace one task's text, turning its context consent off first."""
+        if not is_task_text(text):
+            raise ValueError(TASK_TEXT_MESSAGE)
+        return self._rewrite_agenda(_TASKS, task_id, {"text": text}, "edit task")
+
+    def reschedule_task(self, task_id: int, due_date: str | None) -> RecordUpdate:
+        """Replace or clear one task's due date, turning its consent off first."""
+        if due_date is not None and not is_due_date(due_date):
+            raise ValueError(DUE_DATE_MESSAGE)
+        return self._rewrite_agenda(
+            _TASKS,
+            task_id,
+            {"due_date": due_date},
+            "reschedule task",
+        )
+
+    def delete_task(self, task_id: int) -> bool:
+        """Delete one task by id, touching no other record."""
+        return self._delete_agenda(_TASKS, task_id)
+
+    def enable_task_context(
+        self,
+        task_id: int,
+        expected_text_digest: str | None,
+    ) -> ContextConsentOutcome:
+        """Turn one task's context consent on, only for the approved text.
+
+        The identity covers the task's exact text and due date together, so
+        an approval bound to one never enables another; see
+        ``enable_conversation_summary_context`` for the transaction.
+        """
+        return self._enable_agenda_context(_TASKS, task_id, expected_text_digest)
+
+    def disable_task_context(self, task_id: int) -> bool:
+        """Turn one task's context consent off by id."""
+        return self._disable_agenda_context(_TASKS, task_id)
+
+    def list_context_tasks(
+        self,
+        limit: int,
+        max_text_bytes: int,
+    ) -> list[dict[str, Any]]:
+        """Return enabled open tasks still exactly as approved, by ascending id.
+
+        This is Tier A's task read. A task is returned only while it is
+        open, its consent is on, its text and due date are values Maria
+        could have written and still exactly the ones that consent approved,
+        and its stamps follow the record rules, with no completion stamp;
+        any other is never returned or counted toward ``limit``, and none of
+        its values reaches Python unless it is already typed and bounded.
+        Each row holds ``id``, ``text``, and ``due``.
+        """
+        return self._context_agenda_rows(_TASKS, max_text_bytes, limit)
+
+    def context_tasks_by_id(
+        self,
+        task_ids: Sequence[int],
+        max_text_bytes: int,
+    ) -> list[dict[str, Any]]:
+        """Return which of ``task_ids`` are still eligible context now.
+
+        This is the recheck of tasks already supplied to a conversation, by
+        ``list_context_tasks``'s rule, reading only the named ids.
+        """
+        identifiers = _require_record_ids(task_ids)
+        return self._context_agenda_rows(
+            _TASKS,
+            max_text_bytes,
+            len(identifiers),
+            identifiers,
+        )
+
+    def create_reminder(
+        self,
+        text: str,
+        remind_time: str,
+        remind_utc: str,
+    ) -> int:
+        """Store one approved reminder and return its id.
+
+        ``remind_time`` must be a canonical reminder time and ``remind_utc``
+        exactly the instant it encodes, both checked before the database is
+        opened, together with the text. The reminder starts open, with its
+        context consent off.
+        """
+        if not is_task_text(text):
+            raise ValueError(TASK_TEXT_MESSAGE)
+        if not timing_agrees(remind_time, remind_utc):
+            raise ValueError(REMIND_TIME_MESSAGE)
+        return self._insert_agenda(_REMINDERS, text, (remind_time, remind_utc))
+
+    def list_reminders(
+        self,
+        status: str,
+        limit: int = TASK_QUERY_LIMIT,
+    ) -> list[Reminder]:
+        """Return at most ``limit`` reminders with one status.
+
+        Open reminders come by saved instant, then by id; completed ones by
+        latest completion first, then by id, newest first.
+        """
+        if not is_status(status):
+            raise ValueError(TASK_STATUS_MESSAGE)
+        order = (
+            "remind_utc, id"
+            if status == STATUS_OPEN
+            else "completed_at DESC, id DESC"
+        )
+        rows = self._agenda_rows(
+            _REMINDERS,
+            "status = ?",
+            (status,),
+            order,
+            limit,
+            "list reminders",
+        )
+        return self._settled_or_refused(
+            _settled_reminders(rows),
+            "list reminders",
+        )
+
+    def due_reminders(
+        self,
+        as_of: str,
+        limit: int = TASK_QUERY_LIMIT,
+    ) -> list[Reminder]:
+        """Return open reminders whose saved instant is at or before ``as_of``.
+
+        ``as_of`` is a UTC instant, the plan's reference instant; only saved
+        instants are compared, so no time zone data and no clock is needed.
+        """
+        if not is_utc_instant(as_of):
+            raise ValueError(AS_OF_INSTANT_MESSAGE)
+        rows = self._agenda_rows(
+            _REMINDERS,
+            "status = ? AND remind_utc <= ?",
+            (STATUS_OPEN, as_of),
+            "remind_utc, id",
+            limit,
+            "list due reminders",
+        )
+        return self._settled_or_refused(
+            _settled_reminders(rows),
+            "list due reminders",
+        )
+
+    def get_reminder(self, reminder_id: int) -> Reminder | None:
+        """Return one reminder, or None if absent; a malformed row is refused."""
+        row = self._agenda_row(_REMINDERS, reminder_id, "read reminder")
+        if row is None:
+            return None
+        return self._settled_or_refused(
+            _settled_reminders([row]),
+            "read reminder",
+        )[0]
+
+    def complete_reminder(self, reminder_id: int) -> StatusChange:
+        """Mark one open reminder completed, stamping the time of completion."""
+        return self._set_agenda_status(_REMINDERS, reminder_id, STATUS_COMPLETED)
+
+    def reopen_reminder(self, reminder_id: int) -> StatusChange:
+        """Mark one completed reminder open again, clearing its completion time."""
+        return self._set_agenda_status(_REMINDERS, reminder_id, STATUS_OPEN)
+
+    def edit_reminder(self, reminder_id: int, text: str) -> RecordUpdate:
+        """Replace one reminder's text, turning its context consent off first."""
+        if not is_task_text(text):
+            raise ValueError(TASK_TEXT_MESSAGE)
+        return self._rewrite_agenda(
+            _REMINDERS,
+            reminder_id,
+            {"text": text},
+            "edit reminder",
+        )
+
+    def reschedule_reminder(
+        self,
+        reminder_id: int,
+        remind_time: str,
+        remind_utc: str,
+    ) -> RecordUpdate:
+        """Replace one reminder's saved time, turning its consent off first."""
+        if not timing_agrees(remind_time, remind_utc):
+            raise ValueError(REMIND_TIME_MESSAGE)
+        return self._rewrite_agenda(
+            _REMINDERS,
+            reminder_id,
+            {"remind_time": remind_time, "remind_utc": remind_utc},
+            "reschedule reminder",
+        )
+
+    def delete_reminder(self, reminder_id: int) -> bool:
+        """Delete one reminder by id, touching no other record."""
+        return self._delete_agenda(_REMINDERS, reminder_id)
+
+    def enable_reminder_context(
+        self,
+        reminder_id: int,
+        expected_text_digest: str | None,
+    ) -> ContextConsentOutcome:
+        """Turn one reminder's context consent on, only for the approved text.
+
+        The identity covers the reminder's exact text and saved time
+        together, so a later change of time zone rules neither changes nor
+        revokes it.
+        """
+        return self._enable_agenda_context(
+            _REMINDERS,
+            reminder_id,
+            expected_text_digest,
+        )
+
+    def disable_reminder_context(self, reminder_id: int) -> bool:
+        """Turn one reminder's context consent off by id."""
+        return self._disable_agenda_context(_REMINDERS, reminder_id)
+
+    def list_context_reminders(
+        self,
+        limit: int,
+        max_text_bytes: int,
+    ) -> list[dict[str, Any]]:
+        """Return enabled open reminders still exactly as approved, by id.
+
+        As ``list_context_tasks``; each row holds ``id``, ``text``, and
+        ``when``, the saved canonical time.
+        """
+        return self._context_agenda_rows(_REMINDERS, max_text_bytes, limit)
+
+    def context_reminders_by_id(
+        self,
+        reminder_ids: Sequence[int],
+        max_text_bytes: int,
+    ) -> list[dict[str, Any]]:
+        """Return which of ``reminder_ids`` are still eligible context now."""
+        identifiers = _require_record_ids(reminder_ids)
+        return self._context_agenda_rows(
+            _REMINDERS,
+            max_text_bytes,
+            len(identifiers),
+            identifiers,
+        )
+
+    def _insert_agenda(
+        self,
+        table: _AgendaTable,
+        text: str,
+        timing: tuple[str | None, ...],
+    ) -> int:
+        """Insert one open record with consent off and return its id."""
+        timestamp = task_timestamp()
+        if not is_task_timestamp(timestamp):
+            raise ValueError(TASK_RECORD_MESSAGE)
+        columns = ", ".join(("text", *table.timing_columns))
+        placeholders = ", ".join("?" for _ in range(1 + len(timing)))
+        record_id: object = None
+        inserted = False
+        failure: str | None = None
+        try:
+            with self._connection(classify_contention=False) as connection:
+                cursor = connection.execute(
+                    f"""
+                    INSERT INTO {table.name} (
+                        {columns}, status, created_at, updated_at
+                    )
+                    VALUES ({placeholders}, ?, ?, ?)
+                    """,
+                    (text, *timing, STATUS_OPEN, timestamp, timestamp),
+                )
+                inserted = cursor.rowcount == 1
+                record_id = cursor.lastrowid
+        except sqlite3.Error as exc:
+            failure = _record_failure_reason(exc)
+        if failure is None and not inserted:
+            failure = _RECORD_NO_ROW_INSERTED
+        if failure is None and not is_record_id(record_id):
+            failure = _RECORD_INVALID_ID
+        if failure is not None:
+            raise self._record_failure(f"store {table.noun}", failure)
+        self.logger.info("Stored %s %s.", table.noun, record_id)
+        return record_id
+
+    def _agenda_rows(
+        self,
+        table: _AgendaTable,
+        condition: str,
+        parameters: tuple[Any, ...],
+        order: str,
+        limit: int,
+        operation: str,
+    ) -> list[sqlite3.Row]:
+        """Run one bounded listing of a table, with this module's own SQL."""
+        if type(limit) is not int or not 1 <= limit <= TASK_QUERY_LIMIT:
+            raise ValueError(TASK_LIST_LIMIT_MESSAGE)
+        rows: list[sqlite3.Row] = []
+        failure: str | None = None
+        try:
+            with self._connection(classify_contention=False) as connection:
+                rows = connection.execute(
+                    f"""
+                    SELECT {table.columns}
+                    FROM {table.name}
+                    WHERE {condition}
+                    ORDER BY {order}
+                    LIMIT ?
+                    """,
+                    (*parameters, limit),
+                ).fetchall()
+        except sqlite3.Error as exc:
+            failure = _record_failure_reason(exc)
+        if failure is not None:
+            raise self._record_failure(operation, failure)
+        return rows
+
+    def _agenda_row(
+        self,
+        table: _AgendaTable,
+        record_id: int,
+        operation: str,
+    ) -> sqlite3.Row | None:
+        """Return one record's row by id, or None when there is none."""
+        if not is_record_id(record_id):
+            raise ValueError(table.id_message)
+        if record_id > TASK_MAXIMUM_ID:
+            return None
+        row: sqlite3.Row | None = None
+        failure: str | None = None
+        try:
+            with self._connection(classify_contention=False) as connection:
+                row = connection.execute(
+                    f"""
+                    SELECT {table.columns}
+                    FROM {table.name}
+                    WHERE id = ?
+                    """,
+                    (record_id,),
+                ).fetchone()
+        except sqlite3.Error as exc:
+            failure = _record_failure_reason(exc)
+        if failure is not None:
+            raise self._record_failure(operation, failure)
+        return row
+
+    def _settled_or_refused(
+        self,
+        settled: list[Any] | None,
+        operation: str,
+    ) -> list[Any]:
+        """Return settled records, or refuse privately when a row was malformed.
+
+        The failure is raised here, outside every handler, so it has no
+        cause or context, and only the fixed reason is logged.
+        """
+        if settled is None:
+            raise self._record_failure(operation, _RECORD_UNEXPECTED_VALUE)
+        return settled
+
+    def _set_agenda_status(
+        self,
+        table: _AgendaTable,
+        record_id: int,
+        status: str,
+    ) -> StatusChange:
+        """Change one record's status only, reporting what happened.
+
+        Completing stamps the time of this completion; reopening clears it.
+        Nothing else about the record changes, its consent included, and a
+        record that already has the status is left exactly as it was.
+        """
+        if not is_record_id(record_id):
+            raise ValueError(table.id_message)
+        if record_id > TASK_MAXIMUM_ID:
+            return StatusChange.NOT_FOUND
+        completed_at = task_timestamp() if status == STATUS_COMPLETED else None
+        if status == STATUS_COMPLETED and not is_task_timestamp(completed_at):
+            raise ValueError(TASK_RECORD_MESSAGE)
+        previous = STATUS_OPEN if status == STATUS_COMPLETED else STATUS_COMPLETED
+        outcome = StatusChange.NOT_FOUND
+        failure: str | None = None
+        try:
+            with self._connection(classify_contention=False) as connection:
+                cursor = connection.execute(
+                    f"""
+                    UPDATE {table.name}
+                    SET status = ?, completed_at = ?
+                    WHERE id = ? AND status = ?
+                    """,
+                    (status, completed_at, record_id, previous),
+                )
+                if cursor.rowcount == 1:
+                    outcome = StatusChange.CHANGED
+                elif connection.execute(
+                    f"SELECT 1 FROM {table.name} WHERE id = ?",
+                    (record_id,),
+                ).fetchone() is not None:
+                    outcome = StatusChange.UNCHANGED
+        except sqlite3.Error as exc:
+            failure = _record_failure_reason(exc)
+        verb = "complete" if status == STATUS_COMPLETED else "reopen"
+        if failure is not None:
+            raise self._record_failure(f"{verb} {table.noun}", failure)
+        if outcome is StatusChange.CHANGED:
+            self.logger.info(
+                "%s %s %s.",
+                "Completed" if status == STATUS_COMPLETED else "Reopened",
+                table.noun,
+                record_id,
+            )
+        return outcome
+
+    def _rewrite_agenda(
+        self,
+        table: _AgendaTable,
+        record_id: int,
+        changes: dict[str, str | None],
+        operation: str,
+    ) -> RecordUpdate:
+        """Write new text or timing to one record, consent off first.
+
+        Consent belongs to the exact text and timing the owner approved, so
+        an edit or a reschedule always leaves it off: it is turned off in the
+        same transaction as the new values and ``updated_at`` are written,
+        so no other connection can enable it in between and a failure rolls
+        both back. A record that does not exist changes in neither
+        statement.
+        """
+        if not is_record_id(record_id):
+            raise ValueError(table.id_message)
+        if record_id > TASK_MAXIMUM_ID:
+            return RecordUpdate(False)
+        updated_at = task_timestamp()
+        if not is_task_timestamp(updated_at):
+            raise ValueError(TASK_RECORD_MESSAGE)
+        assignments = ", ".join(f"{column} = ?" for column in changes)
+        result = RecordUpdate(False)
+        failure: str | None = None
+        try:
+            with self._connection(classify_contention=False) as connection:
+                consent_cursor = connection.execute(
+                    f"""
+                    UPDATE {table.name}
+                    SET context_digest = NULL
+                    WHERE id = ? AND context_digest IS NOT NULL
+                    """,
+                    (record_id,),
+                )
+                cursor = connection.execute(
+                    f"""
+                    UPDATE {table.name}
+                    SET {assignments}, updated_at = ?
+                    WHERE id = ?
+                    """,
+                    (*changes.values(), updated_at, record_id),
+                )
+                result = RecordUpdate(
+                    cursor.rowcount == 1,
+                    consent_cursor.rowcount == 1,
+                )
+        except sqlite3.Error as exc:
+            failure = _record_failure_reason(exc)
+        if failure is not None:
+            raise self._record_failure(operation, failure)
+        if result.updated:
+            self.logger.info(
+                "%s %s %s.",
+                "Edited" if "text" in changes else "Rescheduled",
+                table.noun,
+                record_id,
+            )
+        if result.context_consent_cleared:
+            self.logger.info(
+                "Turned off context consent for changed %s %s.",
+                table.noun,
+                record_id,
+            )
+        return result
+
+    def _delete_agenda(self, table: _AgendaTable, record_id: int) -> bool:
+        """Delete one record by id; its text is never read, logged, or returned."""
+        if not is_record_id(record_id):
+            raise ValueError(table.id_message)
+        if record_id > TASK_MAXIMUM_ID:
+            return False
+        deleted = False
+        failure: str | None = None
+        try:
+            with self._connection(classify_contention=False) as connection:
+                cursor = connection.execute(
+                    f"DELETE FROM {table.name} WHERE id = ?",
+                    (record_id,),
+                )
+                deleted = cursor.rowcount == 1
+        except sqlite3.Error as exc:
+            failure = _record_failure_reason(exc)
+        if failure is not None:
+            raise self._record_failure(f"delete {table.noun}", failure)
+        if deleted:
+            self.logger.info("Deleted %s %s.", table.noun, record_id)
+        return deleted
+
+    def _enable_agenda_context(
+        self,
+        table: _AgendaTable,
+        record_id: int,
+        expected_text_digest: str | None,
+    ) -> ContextConsentOutcome:
+        """Turn one record's consent on, only while it is the approved text.
+
+        The check and the change are one write transaction: ``BEGIN
+        IMMEDIATE`` takes the write lock before the row is read, and the
+        UPDATE applies only while the text and timing are still exactly the
+        ones checked. A record whose values are not all ones Maria could
+        have written, or whose identity is not the approved one, is
+        ``TARGET_CHANGED`` and left unchanged.
+        """
+        if not is_record_id(record_id):
+            raise ValueError(table.id_message)
+        if expected_text_digest is not None and not is_context_digest(
+            expected_text_digest
+        ):
+            raise ValueError(CONTEXT_DIGEST_MESSAGE)
+        if record_id > TASK_MAXIMUM_ID:
+            return ContextConsentOutcome.NOT_FOUND
+        timing_columns = ", ".join(table.timing_columns)
+        matches = " AND ".join(
+            f"{column} IS ?" for column in ("text", *table.timing_columns)
+        )
+        outcome = ContextConsentOutcome.NOT_FOUND
+        failure: str | None = None
+        try:
+            with self._connection(classify_contention=False) as connection:
+                connection.execute("BEGIN IMMEDIATE")
+                row = connection.execute(
+                    f"""
+                    SELECT text, {timing_columns}
+                    FROM {table.name}
+                    WHERE id = ?
+                    """,
+                    (record_id,),
+                ).fetchone()
+                if row is None:
+                    outcome = ContextConsentOutcome.NOT_FOUND
+                elif (
+                    expected_text_digest is None
+                    or _agenda_identity(table, tuple(row)) != expected_text_digest
+                ):
+                    outcome = ContextConsentOutcome.TARGET_CHANGED
+                else:
+                    cursor = connection.execute(
+                        f"""
+                        UPDATE {table.name}
+                        SET context_digest = ?
+                        WHERE id = ? AND {matches}
+                        """,
+                        (expected_text_digest, record_id, *tuple(row)),
+                    )
+                    outcome = (
+                        ContextConsentOutcome.ENABLED
+                        if cursor.rowcount == 1
+                        else ContextConsentOutcome.TARGET_CHANGED
+                    )
+        except sqlite3.Error as exc:
+            failure = _record_failure_reason(exc)
+        if failure is not None:
+            raise self._record_failure(
+                f"change {table.noun} context consent",
+                failure,
+            )
+        if outcome is ContextConsentOutcome.ENABLED:
+            self.logger.info(
+                "Enabled context consent for %s %s.",
+                table.noun,
+                record_id,
+            )
+        elif outcome is ContextConsentOutcome.TARGET_CHANGED:
+            self.logger.info(
+                "Refused context consent for %s %s: approved text changed.",
+                table.noun,
+                record_id,
+            )
+        return outcome
+
+    def _disable_agenda_context(self, table: _AgendaTable, record_id: int) -> bool:
+        """Turn one record's consent off; True when a row matched."""
+        if not is_record_id(record_id):
+            raise ValueError(table.id_message)
+        if record_id > TASK_MAXIMUM_ID:
+            return False
+        matched = False
+        failure: str | None = None
+        try:
+            with self._connection(classify_contention=False) as connection:
+                cursor = connection.execute(
+                    f"UPDATE {table.name} SET context_digest = NULL WHERE id = ?",
+                    (record_id,),
+                )
+                matched = cursor.rowcount == 1
+        except sqlite3.Error as exc:
+            failure = _record_failure_reason(exc)
+        if failure is not None:
+            raise self._record_failure(
+                f"change {table.noun} context consent",
+                failure,
+            )
+        if matched:
+            self.logger.info(
+                "Disabled context consent for %s %s.",
+                table.noun,
+                record_id,
+            )
+        return matched
+
+    def _context_agenda_rows(
+        self,
+        table: _AgendaTable,
+        max_text_bytes: int,
+        limit: int,
+        identifiers: tuple[int, ...] = (),
+    ) -> list[dict[str, Any]]:
+        """Run one bounded read of eligible tasks or reminders, by id or all.
+
+        Every check runs inside SQLite, row by row, before a row can be
+        returned or counted toward ``limit``. The status comes first. Then,
+        before any value is handed to Python, every value the registered
+        check will receive must be text, or NULL where Maria could have
+        written NULL, within its stored-byte bound in the file's own
+        encoding: the text, the timing, the two stamps, and the consent
+        identity, while the completion stamp of an open record may only be
+        NULL. Only a row passing all of that reaches the check, which admits
+        it only while its text and timing are values Maria could have
+        written, still exactly the ones its consent approved, and its stamps
+        follow the record rules. The rows are settled again in Python
+        afterwards. Every value travels as a bound parameter; the statement
+        text around them is this module's own.
+        """
+        if type(max_text_bytes) is not int or max_text_bytes < 1:
+            raise ValueError("A text size bound must be a positive whole number.")
+        safe_limit = max(1, min(limit, 100))
+        bounded = (
+            _StoredColumn("text", max_text_bytes),
+            *table.timing,
+            *_CONTEXT_STAMPS,
+            _CONTEXT_DIGEST,
+        )
+        checked = ", ".join(
+            (
+                "text",
+                *table.timing_columns,
+                *(column.name for column in _CONTEXT_STAMPS),
+                "completed_at",
+                _CONTEXT_DIGEST.name,
+            )
+        )
+        guards = " AND ".join(
+            (*(column.guard for column in bounded), "completed_at IS NULL")
+        )
+        rows: list[sqlite3.Row] = []
+        failure: str | None = None
+        try:
+            with self._connection(classify_contention=False) as connection:
+                bounds = tuple(
+                    _stored_bound(connection, column.length) for column in bounded
+                )
+                connection.create_function(
+                    table.approved_function,
+                    len(bounded) + 1,
+                    _approved_agenda_check(table, max_text_bytes),
+                    deterministic=True,
+                )
+                selection = ""
+                parameters: tuple[Any, ...] = ()
+                if identifiers:
+                    placeholders = ", ".join("?" for _ in identifiers)
+                    selection = f"AND id IN ({placeholders})"
+                    parameters = identifiers
+                rows = connection.execute(
+                    f"""
+                    SELECT id, {checked}
+                    FROM {table.name}
+                    WHERE status = ?
+                        {selection}
+                        AND CASE
+                            WHEN {guards}
+                            THEN {table.approved_function}({checked})
+                            ELSE 0
+                        END
+                    ORDER BY id ASC
+                    LIMIT ?
+                    """,
+                    (STATUS_OPEN, *parameters, *bounds, safe_limit),
+                ).fetchall()
+        except sqlite3.Error as exc:
+            failure = _record_failure_reason(exc)
+        if failure is not None:
+            raise self._record_failure(f"read {table.noun} context", failure)
+        settled: list[dict[str, Any]] = []
+        for row in rows:
+            record_id, values = row[0], tuple(row)[1:]
+            if type(record_id) is not int or not _approved_agenda_values(
+                table,
+                values,
+                max_text_bytes,
+            ):
+                continue
+            settled.append(
+                {
+                    "id": record_id,
+                    "text": values[0],
+                    table.context_field: values[1],
+                }
+            )
+        return settled
+
     @contextmanager
     def _connection(
         self,
@@ -3599,6 +4553,238 @@ def _settled_conversation_summaries(
         except ValueError:
             return None
     return summaries
+
+
+@dataclass(frozen=True)
+class _StoredColumn:
+    """One column a context read hands to Python, with its stored bound.
+
+    ``length`` is the most a value Maria writes there can hold: characters
+    for a canonical value, which is always ASCII and so as many UTF-8 bytes,
+    or UTF-8 bytes for the text. ``nullable`` says whether NULL is a value
+    Maria could have written there.
+    """
+
+    name: str
+    length: int
+    nullable: bool = False
+
+    @property
+    def guard(self) -> str:
+        """Return SQL that admits this column's value only when it is bounded.
+
+        The value must be text, or NULL where that is allowed, whose stored
+        bytes in the file's own encoding, NUL characters and all, are within
+        the bound the statement supplies as its next parameter. A length or
+        GLOB check alone would not do: both stop at the first NUL.
+        """
+        bounded = (
+            f"(typeof({self.name}) = 'text' "
+            f"AND length(CAST({self.name} AS BLOB)) <= ?)"
+        )
+        if self.nullable:
+            return f"({self.name} IS NULL OR {bounded})"
+        return bounded
+
+
+@dataclass(frozen=True)
+class _AgendaTable:
+    """One of the two V1-22 tables, as this module's own SQL names it.
+
+    Every name here is Maria's own constant text, so interpolating one into
+    a statement never carries anything a caller supplied.
+    """
+
+    name: str
+    noun: str
+    timing: tuple[_StoredColumn, ...]
+    id_message: str
+    approved_function: str
+    context_field: str
+
+    @property
+    def timing_columns(self) -> tuple[str, ...]:
+        """Return the names of the columns that hold the record's timing."""
+        return tuple(column.name for column in self.timing)
+
+    @property
+    def columns(self) -> str:
+        """Return every column a read settles into a value object."""
+        return ", ".join(
+            (
+                "id",
+                "text",
+                *self.timing_columns,
+                "status",
+                "created_at",
+                "updated_at",
+                "completed_at",
+                "context_digest",
+            )
+        )
+
+
+_TASKS = _AgendaTable(
+    name="tasks",
+    noun="task",
+    timing=(_StoredColumn("due_date", DUE_DATE_LENGTH, nullable=True),),
+    id_message=TASK_ID_MESSAGE,
+    approved_function=_TASK_APPROVED_FUNCTION,
+    context_field="due",
+)
+_REMINDERS = _AgendaTable(
+    name="reminders",
+    noun="reminder",
+    timing=(
+        _StoredColumn("remind_time", REMIND_TIME_MAX_LENGTH),
+        _StoredColumn("remind_utc", UTC_INSTANT_LENGTH),
+    ),
+    id_message=REMINDER_ID_MESSAGE,
+    approved_function=_REMINDER_APPROVED_FUNCTION,
+    context_field="when",
+)
+
+# The two stamps a context read hands its Python check after the text and
+# the timing. The completion stamp follows them, admitted only as NULL,
+# since an open record never holds one, and the consent identity comes last.
+_CONTEXT_STAMPS = (
+    _StoredColumn("created_at", UTC_INSTANT_LENGTH),
+    _StoredColumn("updated_at", UTC_INSTANT_LENGTH),
+)
+_CONTEXT_DIGEST = _StoredColumn("context_digest", CONTEXT_DIGEST_LENGTH)
+
+
+def _agenda_identity(table: _AgendaTable, fields: tuple[object, ...]) -> str | None:
+    """Return the consent identity of a record's text and timing, or None.
+
+    ``fields`` are the text and the timing columns, in the table's order.
+    None means they are not all values Maria could have written: task text,
+    a calendar date or none for a task, and for a reminder a canonical time
+    with exactly the instant it encodes. Only valid values are ever hashed.
+    """
+    if table is _TASKS:
+        text, due_date = fields
+        if not is_task_text(text) or (
+            due_date is not None and not is_due_date(due_date)
+        ):
+            return None
+        return task_digest(text, due_date)
+    text, remind_time, remind_utc = fields
+    if not is_task_text(text) or not timing_agrees(remind_time, remind_utc):
+        return None
+    return reminder_digest(text, remind_time)
+
+
+def _approved_agenda_values(
+    table: _AgendaTable,
+    values: tuple[object, ...],
+    max_bytes: int,
+) -> bool:
+    """Return whether an open record's values make it eligible context.
+
+    ``values`` are the text, the timing columns, the created, updated, and
+    completion stamps, and the consent identity, in that order. The text and
+    timing must be values Maria could have written, the text within
+    ``max_bytes`` UTF-8 bytes, and their identity the one the consent
+    holds; the stamps must follow the record rules for an open record.
+    """
+    timing_end = 1 + len(table.timing)
+    fields = values[:timing_end]
+    stamps = values[timing_end:-1]
+    approved = values[-1]
+    return (
+        len(stamps) == 3
+        and _is_within_bound(fields[0], max_bytes)
+        and type(approved) is str
+        and _agenda_identity(table, fields) == approved
+        and is_lifecycle(STATUS_OPEN, *stamps)
+    )
+
+
+def _approved_agenda_check(
+    table: _AgendaTable,
+    max_bytes: int,
+) -> Callable[..., int]:
+    """Return a context read's check that a row is still its approved text.
+
+    SQLite calls the check only with values it has already bounded and
+    typed. It answers 1 only for a row ``_approved_agenda_values`` admits,
+    and 0 otherwise, so a row changed outside Maria is never returned or
+    counted.
+    """
+
+    def approved(*values: object) -> int:
+        return int(_approved_agenda_values(table, values, max_bytes))
+
+    return approved
+
+
+def _settled_tasks(rows: Sequence[sqlite3.Row]) -> list[Task] | None:
+    """Return stored rows as validated tasks, or None for any malformed row.
+
+    A stored consent must be NULL or a lowercase hexadecimal SHA-256, and a
+    task reads as context-enabled only while that identity is exactly its
+    current text and due date. Any other value makes the whole result None
+    rather than raising, so the caller's fixed failure is raised outside
+    every handler and the refused value travels nowhere.
+    """
+    tasks: list[Task] = []
+    for row in rows:
+        approved = row["context_digest"]
+        if approved is not None and not is_context_digest(approved):
+            return None
+        identity = _agenda_identity(_TASKS, (row["text"], row["due_date"]))
+        try:
+            tasks.append(
+                Task(
+                    row["id"],
+                    row["text"],
+                    row["due_date"],
+                    row["status"],
+                    row["created_at"],
+                    row["updated_at"],
+                    row["completed_at"],
+                    approved is not None and identity == approved,
+                )
+            )
+        except ValueError:
+            return None
+    return tasks
+
+
+def _settled_reminders(rows: Sequence[sqlite3.Row]) -> list[Reminder] | None:
+    """Return stored rows as validated reminders, or None for any bad row.
+
+    As ``_settled_tasks``, and a reminder whose saved instant is not exactly
+    the one its saved local time and offset encode is malformed too, even
+    when both are individually well formed.
+    """
+    reminders: list[Reminder] = []
+    for row in rows:
+        approved = row["context_digest"]
+        if approved is not None and not is_context_digest(approved):
+            return None
+        identity = _agenda_identity(
+            _REMINDERS,
+            (row["text"], row["remind_time"], row["remind_utc"]),
+        )
+        try:
+            reminders.append(
+                Reminder(
+                    row["id"],
+                    row["text"],
+                    row["remind_time"],
+                    row["remind_utc"],
+                    row["status"],
+                    row["created_at"],
+                    row["updated_at"],
+                    row["completed_at"],
+                    approved is not None and identity == approved,
+                )
+            )
+        except ValueError:
+            return None
+    return reminders
 
 
 def _settled_audit_summaries(

@@ -16,6 +16,7 @@ Supported command families:
 - Interaction-history commands
 - Audit-summary commands
 - Saved-conversation and conversation-summary commands
+- Task and reminder commands
 - Read-only system information commands
 
 Input that matches no command receives the planner's generic no-action
@@ -25,7 +26,11 @@ response:
 I do not have an executable plan for that yet. Type 'help' to see supported commands.
 ```
 
-The planner knows nothing about conversation or memory context. When
+The planner knows nothing about conversation or memory context. Besides the
+request text it receives, by keyword only, the request's `TimingContext`,
+the one reference instant Brain read and the configured time zone key, which
+only the task and reminder commands read; see "Task and Reminder Grammar".
+When
 reasoning is enabled, Brain answers exactly that generic fallback with the
 local model's reply instead of showing it. A reply whose first character after
 any spaces, tabs, carriage returns, or line feeds is `{` is treated as a
@@ -584,8 +589,9 @@ when the planner's plan reaches `process`, and refuses a plan that already
 carries one.
 
 The seven ID commands take a positive numeric ID through the same parser as
-`read interaction` and the audit commands, so there are now twenty ID-only
-planner commands. An invalid ID returns
+`read interaction` and the audit commands, which made twenty ID-only planner
+commands; V1-22's sixteen task and reminder ID commands make thirty-six. An
+invalid ID returns
 `Saved conversation id must be a positive whole number.` or
 `Conversation summary id must be a positive whole number.`, and a bare command
 returns its usage response:
@@ -609,7 +615,7 @@ summary command: it keeps its existing meaning, a `filesystem.list` step for
 the path `summaries`.
 
 `help` lists the eleven commands after `disable memory context <id>` and
-before `system`:
+before the task and reminder commands:
 
 ```text
 - save conversation
@@ -627,6 +633,99 @@ before `system`:
 
 None of the eleven actions is model-eligible, so a reasoning model's proposal
 naming one is refused, and a saved conversation is never sent to the model.
+
+## Task and Reminder Grammar
+
+Task and reminder commands use strict command syntax, and their keywords are
+ASCII case-insensitive; see "Tasks Tool" and "Reminders Tool" in
+`docs/tools.md` and "Tasks and Reminders" in `docs/architecture.md`. Each
+creates one step, carrying canonical values only:
+
+| Command | Tool and action | Arguments |
+| --- | --- | --- |
+| `tasks` / `completed tasks` | `tasks.list` | `{"status": "open"}` / `{"status": "completed"}` |
+| `due tasks` | `tasks.due` | `{"as_of": local today, YYYY-MM-DD}` |
+| `add task <text>` | `tasks.create` | `{"text": text}` |
+| `add task due <date>: <text>` | `tasks.create` | `{"text": text, "due": YYYY-MM-DD}` |
+| `read`, `complete`, `reopen`, `delete task <id>` | `tasks.read`, `.complete`, `.reopen`, `.delete` | `{"id": id}` |
+| `edit task <id>: <new text>` | `tasks.edit` | `{"id": id, "text": new_text}` |
+| `reschedule task <id>: <date or none>` | `tasks.reschedule` | `{"id": id, "due": YYYY-MM-DD or "none"}` |
+| `enable` / `disable task context <id>` | `tasks.enable_context` / `.disable_context` | `{"id": id}` |
+| `reminders` / `completed reminders` | `reminders.list` | `{"status": "open"}` / `{"status": "completed"}` |
+| `due reminders` | `reminders.due` | `{"as_of": reference instant, YYYY-MM-DDTHH:MM:SSZ}` |
+| `add reminder <timing>: <text>` | `reminders.create` | `{"text": text, "when": canonical, "repeat": "never"}` |
+| `read`, `complete`, `reopen`, `delete reminder <id>` | `reminders.read`, `.complete`, `.reopen`, `.delete` | `{"id": id}` |
+| `edit reminder <id>: <new text>` | `reminders.edit` | `{"id": id, "text": new_text}` |
+| `reschedule reminder <id>: <timing>` | `reminders.reschedule` | `{"id": id, "when": canonical, "repeat": "never"}` |
+| `enable` / `disable reminder context <id>` | `reminders.enable_context` / `.disable_context` | `{"id": id}` |
+
+`<date>` is `today`, `tomorrow`, a weekday name, `YYYY-MM-DD`, or
+`in <N> day(s)`, and a reminder's `<timing>` is a `<date>`, one space, and
+`H:MM` or `HH:MM`, optionally one more space and a `+HH:MM` or `-HH:MM`
+offset, or `in <N> minute(s)` or `in <N> hour(s)`; there is no `on` or `at`.
+`add reminder` splits at the first colon that ends a whole timing, so a
+time's or an offset's own colon is never the separator and a later colon
+stays in the text. `add task due` applies when the operand begins with
+`due ` and holds a colon, and `edit` and `reschedule` split on the first colon
+only. The planner resolves every date and time once, against the request's
+`TimingContext`, in the configured zone, so the plan carries canonical values
+and the confirmation shows them before anything is stored. Without a timing
+context it answers `Maria cannot resolve dates and times for this request.`;
+without a usable zone, `due tasks` answers the zone message and a new date or
+time answers it followed by `Nothing was saved.`, as do a past, too distant,
+skipped, or ambiguous date or time; `due reminders` compares saved instants
+with the reference instant and needs no zone, and an undated `add task` and
+`reschedule task <id>: none` need no timing at all.
+
+New text must be one line of 1 to 512 UTF-8 bytes, with no outer whitespace
+and no control or formatting character, or the shared text message is the
+answer and nothing is offered. Every `<id>` takes the shared ID parser, so
+an invalid one returns `Task id must be a positive whole number.` or
+`Reminder id must be a positive whole number.`, and a bare or malformed
+command returns its fixed usage line. `tasks`, `completed tasks`, `due tasks`,
+`reminders`, `completed reminders`, and `due reminders` match only the whole
+request. `list tasks` and `list reminders` keep their meaning as
+`filesystem.list` steps, `move task 3 to tomorrow` is still a file move, and
+no command begins with `remind me` or `add a task to`: those natural-language
+forms reach the generic fallback, and the reasoning model when it is enabled.
+
+`add task`, `add reminder`, and the edit, reschedule, delete, and consent
+commands always require confirmation; listing, the due queries, reading,
+completing, and reopening run without asking. `help` lists the twenty-six
+commands after the conversation-record commands and before `system`:
+
+```text
+- add task <text>
+- add task due <date>: <text>
+- tasks
+- completed tasks
+- due tasks
+- read task <id>
+- complete task <id>
+- reopen task <id>
+- edit task <id>: <new text>
+- reschedule task <id>: <date or none>
+- delete task <id>
+- enable task context <id>
+- disable task context <id>
+- add reminder <date> <time> [<offset>]: <text>
+- add reminder in <N> minutes|hours: <text>
+- reminders
+- completed reminders
+- due reminders
+- read reminder <id>
+- complete reminder <id>
+- reopen reminder <id>
+- edit reminder <id>: <new text>
+- reschedule reminder <id>: <date> <time> [<offset>] or in <N> minutes|hours
+- delete reminder <id>
+- enable reminder context <id>
+- disable reminder context <id>
+```
+
+Only `tasks.create` and `reminders.create` are model-eligible, and only for a
+request in one of the four natural-language forms that Maria's own parse
+reads; see "Model-to-Plan Compilation Gate" in `docs/architecture.md`.
 
 ## Plan Shape
 

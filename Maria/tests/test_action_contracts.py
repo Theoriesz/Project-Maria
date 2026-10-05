@@ -6,6 +6,7 @@ import logging
 import unittest
 from collections.abc import Mapping
 from dataclasses import FrozenInstanceError
+from datetime import datetime, timezone
 from pathlib import Path
 from tempfile import TemporaryDirectory
 from types import MappingProxyType
@@ -18,8 +19,11 @@ from core.action_contracts import (
     MAXIMUM_EXPRESSION_LENGTH,
     MAXIMUM_LIST_LIMIT,
     MAXIMUM_SUMMARY_LENGTH,
+    MAXIMUM_TASK_TEXT_LENGTH,
     MAXIMUM_TRANSCRIPT_LENGTH,
     MINIMUM_LIST_LIMIT,
+    REPEAT_VALUES,
+    TASK_STATUSES,
     ActionContract,
     ActionContractRegistry,
     ArgumentContract,
@@ -27,6 +31,7 @@ from core.action_contracts import (
     ContractViolation,
     ModelEligibility,
     RootClass,
+    TextFormat,
 )
 from core.config import MariaConfig
 from core.filesystem_roots import (
@@ -36,8 +41,10 @@ from core.filesystem_roots import (
     RootPolicy,
 )
 from core.memory import Memory
-from core.planner import PlanArguments
+from core.planner import PlanArguments, Planner
+from core.time_resolution import TimingContext
 from core.tool_manager import ToolManager
+from tests.zone_fixtures import CENTRAL_RULES, SYNTHETIC_KEY, SyntheticZones
 
 
 EXPECTED_ACTION_IDENTIFIERS = frozenset(
@@ -80,8 +87,30 @@ EXPECTED_ACTION_IDENTIFIERS = frozenset(
         "notes.delete",
         "notes.enable_context",
         "notes.disable_context",
+        "reminders.create",
+        "reminders.list",
+        "reminders.due",
+        "reminders.read",
+        "reminders.complete",
+        "reminders.reopen",
+        "reminders.edit",
+        "reminders.reschedule",
+        "reminders.delete",
+        "reminders.enable_context",
+        "reminders.disable_context",
         "system.overview",
         "system.current_time",
+        "tasks.create",
+        "tasks.list",
+        "tasks.due",
+        "tasks.read",
+        "tasks.complete",
+        "tasks.reopen",
+        "tasks.edit",
+        "tasks.reschedule",
+        "tasks.delete",
+        "tasks.enable_context",
+        "tasks.disable_context",
     }
 )
 EXPECTED_PATH_FIELDS = frozenset(
@@ -98,9 +127,16 @@ UNREGISTERED_ACTIONS = ("write", "delete")
 
 # The approved V1-17-R1 classification, written out independently of both
 # the registry and the compiler's allowlist. V1-18-R1 keeps it: every audit
-# action is closed to the model.
+# action is closed to the model. V1-22-R1 opens the two creation actions,
+# which compile only from the owner's own supported request.
 EXPECTED_MODEL_ELIGIBLE = frozenset(
-    {"calculator.calculate", "filesystem.list", "system.current_time"}
+    {
+        "calculator.calculate",
+        "filesystem.list",
+        "system.current_time",
+        "tasks.create",
+        "reminders.create",
+    }
 )
 EXPECTED_NOT_MODEL_ELIGIBLE = EXPECTED_ACTION_IDENTIFIERS - EXPECTED_MODEL_ELIGIBLE
 
@@ -420,9 +456,10 @@ class RegistryCompletenessTests(unittest.TestCase):
             BUILT_IN_ACTION_CONTRACTS.action_identifiers,
             EXPECTED_ACTION_IDENTIFIERS,
         )
-        # V1-20 adds four saved-conversation and seven conversation-summary
-        # actions to V1-18's twenty-nine.
-        self.assertEqual(len(EXPECTED_ACTION_IDENTIFIERS), 40)
+        # V1-20 added four saved-conversation and seven conversation-summary
+        # actions to V1-18's twenty-nine, and V1-22 adds eleven task and
+        # eleven reminder actions.
+        self.assertEqual(len(EXPECTED_ACTION_IDENTIFIERS), 62)
 
     def test_registry_and_loaded_tool_inventory_agree_in_both_directions(self) -> None:
         with TemporaryDirectory() as name:
@@ -460,7 +497,7 @@ class RegistryCompletenessTests(unittest.TestCase):
         ]
 
         self.assertEqual(len(identifiers), len(set(identifiers)))
-        self.assertEqual(len(identifiers), 40)
+        self.assertEqual(len(identifiers), 62)
 
     def test_no_contract_exists_for_a_mandatorily_denied_filesystem_action(
         self,
@@ -498,10 +535,14 @@ class RegistryCompletenessTests(unittest.TestCase):
             if argument.value_type is str
         ]
 
-        # V1-20 adds five: a summary's text and pinned identity on create,
+        # V1-20 added five: a summary's text and pinned identity on create,
         # the new text on edit, the pinned identity on enable_context, and a
-        # save's transcript.
-        self.assertEqual(len(text_fields), 23)
+        # save's transcript. V1-22 adds sixteen: seven for tasks (text and
+        # due on create, status, as_of, the new text, the new due date, and
+        # the pinned identity) and nine for reminders (text, when, and repeat
+        # on create, status, as_of, the new text, when and repeat on
+        # reschedule, and the pinned identity).
+        self.assertEqual(len(text_fields), 39)
         for contract, argument in text_fields:
             with self.subTest(field=f"{contract.identifier}.{argument.name}"):
                 self.assertIsInstance(argument.allow_blank, bool)
@@ -552,12 +593,22 @@ class RegistryCompletenessTests(unittest.TestCase):
                     FACT_DIGEST_LENGTH
                 ),
                 "conversations.save.transcript": MAXIMUM_TRANSCRIPT_LENGTH,
+                # V1-22: task and reminder text has its own ceiling, and each
+                # pinned identity is exactly a SHA-256. Formatted values are
+                # bounded by their format instead.
+                "tasks.create.text": MAXIMUM_TASK_TEXT_LENGTH,
+                "tasks.edit.text": MAXIMUM_TASK_TEXT_LENGTH,
+                "tasks.enable_context.text_digest": FACT_DIGEST_LENGTH,
+                "reminders.create.text": MAXIMUM_TASK_TEXT_LENGTH,
+                "reminders.edit.text": MAXIMUM_TASK_TEXT_LENGTH,
+                "reminders.enable_context.text_digest": FACT_DIGEST_LENGTH,
             },
         )
         self.assertEqual(MAXIMUM_EXPRESSION_LENGTH, 200)
         self.assertEqual(FACT_DIGEST_LENGTH, 64)
         self.assertEqual(MAXIMUM_SUMMARY_LENGTH, 2048)
         self.assertEqual(MAXIMUM_TRANSCRIPT_LENGTH, 65536)
+        self.assertEqual(MAXIMUM_TASK_TEXT_LENGTH, 512)
         self.assertEqual(
             minimums,
             {
@@ -565,6 +616,8 @@ class RegistryCompletenessTests(unittest.TestCase):
                 "notes.enable_context.text_digest",
                 "conversation_summaries.create.text_digest",
                 "conversation_summaries.enable_context.text_digest",
+                "tasks.enable_context.text_digest",
+                "reminders.enable_context.text_digest",
             },
         )
         digest = BUILT_IN_ACTION_CONTRACTS.contract_for(
@@ -678,6 +731,11 @@ class RegistryCompletenessTests(unittest.TestCase):
                 # preview of a draft or of the stored text.
                 ("conversation_summaries", "create", "text_digest"),
                 ("conversation_summaries", "enable_context", "text_digest"),
+                # V1-22: a task may have no due date, and a task's or
+                # reminder's enable is pinned like a note's.
+                ("tasks", "create", "due"),
+                ("tasks", "enable_context", "text_digest"),
+                ("reminders", "enable_context", "text_digest"),
             },
         )
 
@@ -717,7 +775,7 @@ class ModelEligibilityClassificationTests(unittest.TestCase):
         )
         self.assertEqual(eligible, EXPECTED_MODEL_ELIGIBLE)
         self.assertEqual(closed, EXPECTED_NOT_MODEL_ELIGIBLE)
-        self.assertEqual((len(eligible), len(closed)), (3, 37))
+        self.assertEqual((len(eligible), len(closed)), (5, 57))
         for identifier, decision in classified.items():
             with self.subTest(action=identifier):
                 self.assertIs(type(decision), ModelEligibility)
@@ -903,7 +961,7 @@ class RegistryConstructionTests(unittest.TestCase):
                 "sample", "run", model_eligibility=NOT_ELIGIBLE
             )
 
-        self.assertEqual(len(BUILT_IN_ACTION_CONTRACTS.action_identifiers), 40)
+        self.assertEqual(len(BUILT_IN_ACTION_CONTRACTS.action_identifiers), 62)
 
     def test_unsupported_declared_type_is_rejected(self) -> None:
         with self.assertRaises(ValueError):
@@ -2376,6 +2434,224 @@ class BoundaryTests(unittest.TestCase):
         self.assertIsNone(violation)
         self.assertIs(arguments["fact"], original)
         self.assertEqual(arguments["fact"], original)
+
+
+# V1-22: Saturday 2027-10-30, 10:03:27 local at +02:00 in the synthetic zone,
+# and one canonical reminder time.
+TIMING_REFERENCE = datetime(2027, 10, 30, 8, 3, 27, tzinfo=timezone.utc)
+CANONICAL_WHEN = f"2027-10-31T09:00:00+01:00[{SYNTHETIC_KEY}]"
+
+# Every task and reminder command form, with each optional part both ways.
+TASK_AND_REMINDER_COMMANDS = (
+    "add task buy milk",
+    "add task due friday: buy milk",
+    "tasks",
+    "completed tasks",
+    "due tasks",
+    "read task 1",
+    "complete task 1",
+    "reopen task 1",
+    "edit task 1: buy oat milk",
+    "reschedule task 1: none",
+    "reschedule task 1: in 3 days",
+    "delete task 1",
+    "enable task context 1",
+    "disable task context 1",
+    "add reminder tomorrow 9:00: call mom",
+    "add reminder 2027-10-31 02:30 +01:00: call mom",
+    "add reminder in 20 minutes: stir",
+    "reminders",
+    "completed reminders",
+    "due reminders",
+    "read reminder 1",
+    "complete reminder 1",
+    "reopen reminder 1",
+    "edit reminder 1: call dad",
+    "reschedule reminder 1: tomorrow 18:30",
+    "reschedule reminder 1: in 2 hours",
+    "delete reminder 1",
+    "enable reminder context 1",
+    "disable reminder context 1",
+)
+
+
+class TaskAndReminderContractTests(unittest.TestCase):
+    """Pin V1-22's closed formats, and prove every command's step meets them."""
+
+    def test_closed_formats_are_declared_on_exactly_these_fields(self) -> None:
+        declared = {
+            (contract.tool_name, contract.action, argument.name): (
+                argument.text_format,
+                argument.allowed_values,
+            )
+            for contract in BUILT_IN_ACTION_CONTRACTS.contracts
+            for argument in contract.arguments
+            if argument.text_format is not None or argument.allowed_values is not None
+        }
+        zoned = (TextFormat.ZONED_LOCAL_TIME, None)
+        calendar_date = (TextFormat.ISO_DATE, None)
+        statuses = (None, ("open", "completed"))
+        never = (None, ("never",))
+
+        self.assertEqual(
+            declared,
+            {
+                ("reminders", "create", "when"): zoned,
+                ("reminders", "create", "repeat"): never,
+                ("reminders", "list", "status"): statuses,
+                ("reminders", "due", "as_of"): (TextFormat.UTC_INSTANT, None),
+                ("reminders", "reschedule", "when"): zoned,
+                ("reminders", "reschedule", "repeat"): never,
+                ("tasks", "create", "due"): calendar_date,
+                ("tasks", "list", "status"): statuses,
+                ("tasks", "due", "as_of"): calendar_date,
+                ("tasks", "reschedule", "due"): (TextFormat.ISO_DATE_OR_NONE, None),
+            },
+        )
+        self.assertEqual(TASK_STATUSES, ("open", "completed"))
+        self.assertEqual(REPEAT_VALUES, ("never",))
+
+    def test_malformed_timing_and_closed_values_are_refused(self) -> None:
+        reminder = {"text": "call mom", "when": CANONICAL_WHEN, "repeat": "never"}
+        cases = (
+            (
+                "tasks",
+                "create",
+                {"text": "pay rent", "due": "2026-10-09"},
+                "due",
+                ("2026-02-30", "friday", "none", "2026-10-9", "2026-10-09 "),
+            ),
+            (
+                "tasks",
+                "reschedule",
+                {"id": 1, "due": "none"},
+                "due",
+                ("None", "2026-02-30", "tomorrow"),
+            ),
+            (
+                "tasks",
+                "due",
+                {"as_of": "2026-10-04"},
+                "as_of",
+                ("2026-10-04T08:03:27Z", "today"),
+            ),
+            ("tasks", "list", {"status": "open"}, "status", ("done", "Open", "open ")),
+            (
+                "reminders",
+                "create",
+                reminder,
+                "when",
+                (
+                    "tomorrow at 9:00",
+                    "2027-10-31T09:00:00+01:00",
+                    "2027-10-31T09:00:15+01:00[Maria/Synthetic]",
+                    "2027-02-30T09:00:00+01:00[Maria/Synthetic]",
+                    "2027-10-31T24:00:00+01:00[Maria/Synthetic]",
+                    "2027-10-31T09:00:00-00:00[Maria/Synthetic]",
+                    "2027-10-31T09:00:00+01:00[/etc/localtime]",
+                ),
+            ),
+            ("reminders", "create", reminder, "repeat", ("daily", "Never", "never ")),
+            (
+                "reminders",
+                "reschedule",
+                {"id": 1, "when": CANONICAL_WHEN, "repeat": "never"},
+                "when",
+                ("in 2 hours", "2027-10-31T09:00:00Z"),
+            ),
+            (
+                "reminders",
+                "due",
+                {"as_of": "2026-10-04T08:03:27Z"},
+                "as_of",
+                ("2026-10-04", "2026-10-04T08:03:27+00:00", "2026-10-04T08:03Z"),
+            ),
+            ("reminders", "list", {"status": "completed"}, "status", ("closed",)),
+        )
+        for tool_name, action, valid, field, refused in cases:
+            with self.subTest(field=f"{tool_name}.{action}.{field}"):
+                self.assertIsNone(
+                    BUILT_IN_ACTION_CONTRACTS.validate(tool_name, action, valid)
+                )
+            for value in refused:
+                with self.subTest(field=f"{tool_name}.{action}.{field}", value=value):
+                    violation = BUILT_IN_ACTION_CONTRACTS.validate(
+                        tool_name,
+                        action,
+                        {**valid, field: value},
+                    )
+                    self.assertIsNotNone(violation)
+                    self.assertEqual(
+                        (violation.kind, violation.field),
+                        (ContractFailure.OUT_OF_RANGE, field),
+                    )
+
+    def test_blank_task_and_reminder_values_are_refused(self) -> None:
+        for tool_name, action, field, base in (
+            ("tasks", "create", "text", {}),
+            ("tasks", "create", "due", {"text": "pay rent"}),
+            ("tasks", "edit", "text", {"id": 1}),
+            ("tasks", "reschedule", "due", {"id": 1}),
+            ("tasks", "due", "as_of", {}),
+            ("tasks", "list", "status", {}),
+            (
+                "reminders",
+                "create",
+                "text",
+                {"when": CANONICAL_WHEN, "repeat": "never"},
+            ),
+            ("reminders", "create", "when", {"text": "x", "repeat": "never"}),
+            ("reminders", "create", "repeat", {"text": "x", "when": CANONICAL_WHEN}),
+            ("reminders", "edit", "text", {"id": 1}),
+            ("reminders", "reschedule", "when", {"id": 1, "repeat": "never"}),
+            ("reminders", "due", "as_of", {}),
+            ("reminders", "list", "status", {}),
+        ):
+            for blank in ("", "   ", " \t\r\n "):
+                with self.subTest(
+                    field=f"{tool_name}.{action}.{field}",
+                    blank=ascii(blank),
+                ):
+                    violation = BUILT_IN_ACTION_CONTRACTS.validate(
+                        tool_name,
+                        action,
+                        {**base, field: blank},
+                    )
+                    self.assertIsNotNone(violation)
+                    self.assertEqual(
+                        (violation.kind, violation.field),
+                        (ContractFailure.OUT_OF_RANGE, field),
+                    )
+
+    def test_every_task_and_reminder_command_plans_a_contract_valid_step(
+        self,
+    ) -> None:
+        SyntheticZones(self, {SYNTHETIC_KEY: CENTRAL_RULES})
+        timing = TimingContext(TIMING_REFERENCE, SYNTHETIC_KEY)
+        planner = Planner(logger=Mock(spec=logging.Logger))
+        covered = set()
+
+        for command in TASK_AND_REMINDER_COMMANDS:
+            with self.subTest(command=command):
+                plan = planner.create_plan(command, timing=timing)
+                (step,) = plan.steps
+                covered.add(f"{step.tool_name}.{step.action}")
+                self.assertIsNone(
+                    BUILT_IN_ACTION_CONTRACTS.validate(
+                        step.tool_name,
+                        step.action,
+                        step.arguments,
+                    )
+                )
+
+        self.assertEqual(
+            covered,
+            {
+                identifier
+                for identifier in EXPECTED_ACTION_IDENTIFIERS
+                if identifier.startswith(("tasks.", "reminders."))
+            },
+        )
 
 
 class _ConvertingProbe:

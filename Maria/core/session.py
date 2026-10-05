@@ -8,12 +8,12 @@ command line and any future interface share one contract.
 A session also owns its conversation: the completed conversational exchanges
 of this session alone, bounded in count and size, held in process memory, and
 discarded when the session ends. Beside it the session keeps the fingerprints
-of every memory, note, and conversation summary supplied to the model since
-that conversation was last cleared, at most ``SUPPLIED_CONTEXT_MAX_RECORDS``
-of them and never the records' text, so a later turn can discard the whole
-conversation before an earlier reply carries a revoked record back. Brain
-keeps nothing between requests, so a new session always starts with no
-conversation and can never observe another's.
+of every memory, note, conversation summary, task, and reminder supplied to
+the model since that conversation was last cleared, at most
+``SUPPLIED_CONTEXT_MAX_RECORDS`` of them and never the records' text, so a
+later turn can discard the whole conversation before an earlier reply carries
+a revoked record back. Brain keeps nothing between requests, so a new session
+always starts with no conversation and can never observe another's.
 
 The conversation is handed to Brain with every request, exactly as held.
 Only an explicit save or summary request makes anything of it durable, and
@@ -28,8 +28,9 @@ its approval: for every step, in order, the declared tool and action and
 every argument exactly, quoted by ``approval_quoted``, from the very plan
 whose fingerprint the approval is then bound to, and before that binding
 exists. A plan of several steps is approved once, as a whole. Brain supplies
-only the turn's context notices, which are shown once below the rendering
-and are never kept with the approval or shown again when it is confirmed.
+the fixed approval notice of each step awaiting confirmation, once each, and
+then the turn's context notices, all shown once below the rendering and never
+kept with the approval or shown again when it is confirmed.
 
 What becomes pending is one bounded snapshot of the plan, and confirming
 reads the pending plan once more, as a snapshot, compares that snapshot's
