@@ -22,7 +22,7 @@ import unittest
 from collections.abc import Iterable
 from contextlib import closing
 from pathlib import Path
-from unittest.mock import Mock, call, patch
+from unittest.mock import ANY, Mock, call, patch
 
 from core.action_contracts import (
     BUILT_IN_ACTION_CONTRACTS,
@@ -209,6 +209,8 @@ RECORD_TABLES = (
     "audit_outcomes",
     "saved_conversations",
     "conversation_summaries",
+    "tasks",
+    "reminders",
 )
 ZERO_COUNTS = {table: 0 for table in RECORD_TABLES}
 SEEDED_COUNTS = {**ZERO_COUNTS, "audit_summaries": 3, "audit_outcomes": 2}
@@ -1412,7 +1414,7 @@ class AuditSessionTests(unittest.TestCase):
             self.harness.row_counts(),
             {**SEEDED_COUNTS, "interactions": 1},
         )
-        self.harness.create_plan.assert_called_once_with("audit")
+        self.harness.create_plan.assert_called_once_with("audit", timing=ANY)
         # Brain validates the plan, then dispatch validates the step again.
         self.assertEqual(
             self.harness.validate_action.call_args_list,
@@ -1599,7 +1601,7 @@ class AuditSessionTests(unittest.TestCase):
                 "audit_outcomes": 1,
             },
         )
-        self.harness.create_plan.assert_called_once_with("delete audit 2")
+        self.harness.create_plan.assert_called_once_with("delete audit 2", timing=ANY)
         self.harness.execute_tool.assert_called_once_with("audit", "delete", {"id": 2})
         self.harness.delete_audit_summary.assert_called_once_with(2)
         self.harness.prepare_confirmation.assert_called_once()
@@ -1948,11 +1950,12 @@ class AuditWithReasoningTests(unittest.TestCase):
         self.assertEqual(request.context, ())
         self.assertEqual(request.history, ())
         # V1-20's "summary" source is the owner's conversation summaries,
-        # read only from their own table; no audit summary is ever a source,
-        # which the two audit reads below never being called still proves.
+        # read only from their own table, and V1-22's "task" and "reminder"
+        # sources read only theirs; no audit summary is ever a source, which
+        # the two audit reads below never being called still proves.
         self.assertEqual(
             {source.value for source in ContextSource},
-            {"memory", "note", "summary"},
+            {"memory", "note", "summary", "task", "reminder"},
         )
         self.harness.list_audit_summaries.assert_not_called()
         self.harness.get_audit_summary.assert_not_called()

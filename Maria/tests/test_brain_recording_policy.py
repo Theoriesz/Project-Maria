@@ -42,8 +42,15 @@ from core.permissions import (
 )
 from core.planner import Plan, Planner, PlanStep, RecordingPolicy
 from core.session import MariaSession
+from core.time_resolution import TimingContext
 from core.tool_manager import PreparedConfirmation, ToolExecutionResult, ToolManager
+from tests.zone_fixtures import CENTRAL_RULES, SYNTHETIC_KEY, SyntheticZones
 
+
+# The moment every corpus request is planned at: Brain's pinned clock, which
+# _controlled_environment sets to the system clock's own pinned moment.
+CORPUS_REFERENCE = datetime(2031, 2, 2, 20, 5, 6, tzinfo=timezone.utc)
+CORPUS_TIMING = TimingContext(CORPUS_REFERENCE, SYNTHETIC_KEY)
 
 RUN = "run"
 CONFIRM = "confirm"
@@ -90,6 +97,33 @@ HELP_TEXT = (
     "- delete summary <id>\n"
     "- enable summary context <id>\n"
     "- disable summary context <id>\n"
+    "- add task <text>\n"
+    "- add task due <date>: <text>\n"
+    "- tasks\n"
+    "- completed tasks\n"
+    "- due tasks\n"
+    "- read task <id>\n"
+    "- complete task <id>\n"
+    "- reopen task <id>\n"
+    "- edit task <id>: <new text>\n"
+    "- reschedule task <id>: <date or none>\n"
+    "- delete task <id>\n"
+    "- enable task context <id>\n"
+    "- disable task context <id>\n"
+    "- add reminder <date> <time> [<offset>]: <text>\n"
+    "- add reminder in <N> minutes|hours: <text>\n"
+    "- reminders\n"
+    "- completed reminders\n"
+    "- due reminders\n"
+    "- read reminder <id>\n"
+    "- complete reminder <id>\n"
+    "- reopen reminder <id>\n"
+    "- edit reminder <id>: <new text>\n"
+    "- reschedule reminder <id>: <date> <time> [<offset>] or in <N> "
+    "minutes|hours\n"
+    "- delete reminder <id>\n"
+    "- enable reminder context <id>\n"
+    "- disable reminder context <id>\n"
     "- system\n"
     "- time\n"
     "- history\n"
@@ -423,6 +457,80 @@ COMMAND_CORPUS: tuple[CorpusEntry, ...] = (
         "Conversation summary not found: 1.",
         CONFIRM,
     ),
+    # V1-22's task and reminder commands run after V1-20's, so every id listed
+    # above is unchanged. Brain's clock and the configured zone are pinned by
+    # _controlled_environment: the reference instant is Sunday 2031-02-02
+    # 21:05:06 at +01:00 in a synthetic central European zone. A reply that
+    # would show a record's text or timing records a fixed line naming only
+    # the id; every other row is the fixed text shown, and an edit's request
+    # keeps its new text, as a note edit does. The request forms reach the
+    # model only, so with reasoning off they get the generic fallback.
+    _records("add task", "Use: add task <text> or add task due <date>: <text>"),
+    _records_nothing("add task Pay rent", CANCEL),
+    _records("add task Pay rent", "Added task 1.", CONFIRM),
+    _records("add task due friday: Call the bank", "Added task 2.", CONFIRM),
+    _records(
+        "add task due someday: Call the bank",
+        "Use: add task due <date>: <text>, where <date> is today, tomorrow, a "
+        "weekday, YYYY-MM-DD, or in <N> days",
+    ),
+    _records(
+        "add task due 2031-02-01: Too late",
+        "That date or time has already passed. Nothing was saved.",
+    ),
+    _records("tasks", "Listed open tasks."),
+    _records("due tasks", "Listed due tasks."),
+    _records("read task 1", "Displayed task 1."),
+    _records("read task x", "Task id must be a positive whole number."),
+    _records("read task 9", "Task not found: 9."),
+    _records("complete task 1", "Completed task 1."),
+    _records("complete task 1", "Task 1 is already completed, so nothing changed."),
+    _records("completed tasks", "Listed completed tasks."),
+    _records("reopen task 1", "Reopened task 1."),
+    _records("edit task 1: Pay the rent", "Edited task 1.", CONFIRM),
+    _records("reschedule task 1: tomorrow", "Rescheduled task 1.", CONFIRM),
+    _records("enable task context 1", "Enabled context for task 1.", CONFIRM),
+    _records("reschedule task 1: none", "Rescheduled task 1.", CONFIRM),
+    _records("disable task context 1", "Disabled context for task 1.", CONFIRM),
+    _records("delete task 2", "Deleted task 2.", CONFIRM),
+    _records("delete task 2", "Task not found: 2.", CONFIRM),
+    _records(
+        "add reminder",
+        "Use: add reminder <date> <time> [<offset>]: <text> or add reminder in "
+        "<N> minutes|hours: <text>, where <date> is today, tomorrow, a weekday, "
+        "YYYY-MM-DD, or in <N> days and <time> is HH:MM",
+    ),
+    _records("add reminder tomorrow 09:00: Call mom", "Added reminder 1.", CONFIRM),
+    _records(
+        "add reminder in 20 minutes: Check the oven",
+        "Added reminder 2.",
+        CONFIRM,
+    ),
+    _records(
+        "add reminder today 08:00: Too late",
+        "That date or time has already passed. Nothing was saved.",
+    ),
+    _records("reminders", "Listed open reminders."),
+    _records("due reminders", "Listed due reminders."),
+    _records("read reminder 1", "Displayed reminder 1."),
+    _records("complete reminder 2", "Completed reminder 2."),
+    _records("completed reminders", "Listed completed reminders."),
+    _records("reopen reminder 2", "Reopened reminder 2."),
+    _records("edit reminder 1: Call mom back", "Edited reminder 1.", CONFIRM),
+    _records("reschedule reminder 1: in 2 hours", "Rescheduled reminder 1.", CONFIRM),
+    _records(
+        "enable reminder context 1",
+        "Enabled context for reminder 1.",
+        CONFIRM,
+    ),
+    _records(
+        "disable reminder context 1",
+        "Disabled context for reminder 1.",
+        CONFIRM,
+    ),
+    _records("delete reminder 2", "Deleted reminder 2.", CONFIRM),
+    _records("add a task to buy milk", UNSUPPORTED_RESPONSE),
+    _records("remind me tomorrow at 09:00 to call mom", UNSUPPORTED_RESPONSE),
     _records_nothing("   ", RUN),
     _records_nothing("", REFUSE),
 )
@@ -547,12 +655,13 @@ class CommandCorpusRecordingRegressionTests(unittest.TestCase):
         planned = {
             f"{step.tool_name}.{step.action}"
             for command, _outcome, _expected in entries
-            for step in planner.create_plan(command).steps
+            for step in planner.create_plan(command, timing=CORPUS_TIMING).steps
         }
         zero_step = [
             command
             for command, _outcome, expected in entries
-            if expected and not planner.create_plan(command).steps
+            if expected
+            and not planner.create_plan(command, timing=CORPUS_TIMING).steps
         ]
 
         self.assertEqual(planned, BUILT_IN_ACTION_CONTRACTS.action_identifiers)
@@ -883,9 +992,14 @@ class _PolicyPlanner:
         self.inner = Planner(logger=_quiet_logger("tests.recording_policy.planner"))
         self.policy = policy
 
-    def create_plan(self, user_input: str) -> Plan:
+    def create_plan(
+        self,
+        user_input: str,
+        *,
+        timing: TimingContext | None = None,
+    ) -> Plan:
         """Return the real plan, rebuilt with the chosen policy if one is set."""
-        plan = self.inner.create_plan(user_input)
+        plan = self.inner.create_plan(user_input, timing=timing)
         if self.policy is None:
             return plan
         return dataclasses.replace(plan, recording=self.policy)
@@ -2126,6 +2240,7 @@ class _CorpusHarness:
             log_level="DEBUG",
             confirmation_required=frozenset(),
             denied_actions=denied_actions,
+            time_zone=SYNTHETIC_KEY,
         )
 
         logger = _quiet_logger("tests.recording_policy.corpus")
@@ -2261,7 +2376,15 @@ def _controlled_environment(test: unittest.TestCase) -> None:
     moment = datetime(2031, 2, 3, 4, 5, 6, tzinfo=timezone(timedelta(hours=8)))
     ticks = itertools.count(1)
     gibibyte = 1024**3
+    # V1-22: Brain's one clock reads the same moment, in UTC, and the task
+    # and reminder commands resolve it in a synthetic zone named only here.
+    SyntheticZones(test, {SYNTHETIC_KEY: CENTRAL_RULES})
     patches = (
+        patch.object(
+            brain_module,
+            "_reference_instant",
+            return_value=CORPUS_REFERENCE,
+        ),
         patch.object(
             memory_module,
             "_utc_timestamp",

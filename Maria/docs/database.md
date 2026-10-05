@@ -27,7 +27,8 @@ counter over Maria's schema history rather than a release number:
 | 3 | Adds the per-memory `context_enabled` consent column to `memories`, off for every row. |
 | 4 | Adds the per-note `context_digest` consent column to `notes`, off (NULL) for every row. |
 | 5 | Adds the `audit_summaries` and `audit_outcomes` tables, both empty, which hold the audit summaries of approved model-proposed actions. |
-| 6 | Adds the `saved_conversations` and `conversation_summaries` tables, both empty, which hold explicitly saved conversations and owner-approved conversation summaries. This is the current schema. |
+| 6 | Adds the `saved_conversations` and `conversation_summaries` tables, both empty, which hold explicitly saved conversations and owner-approved conversation summaries. |
+| 7 | Adds the `tasks` and `reminders` tables, both empty, which hold the owner's tasks and reminders. This is the current schema. |
 
 Versions 1 and 2 are the only shapes that can exist without a marker, because
 every database Maria creates or migrates from this build onwards is stamped.
@@ -211,7 +212,7 @@ database. Both boundaries classify contention themselves rather than
 inheriting the shared conversion, because that conversion logs the exception
 on its way past and these record a fixed event code instead.
 
-There are five migrations. `create_memories` brings a version 1 database to
+There are six migrations. `create_memories` brings a version 1 database to
 version 2 by adding the `memories` table; Maria does not copy or infer explicit
 memories from existing interaction rows. `add_memory_context_consent` brings a
 version 2 database to version 3 with one statement:
@@ -279,8 +280,49 @@ schema plus these two statements; a database created new at version 6
 fingerprints exactly as a migrated one does. Neither table refers to the
 other or to any other table: there is no foreign key, trigger, extra index, or
 cascade. Adding them changed neither the frozen schemas of versions 1 through
-5 nor the statements of the earlier steps. No step rewrites a row or deletes
-anything.
+5 nor the statements of the earlier steps. `create_tasks_and_reminders` brings
+a version 6 database to version 7 the same way, with two statements:
+
+```sql
+CREATE TABLE tasks (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    text TEXT NOT NULL CHECK (length(CAST(text AS BLOB)) > 0),
+    due_date TEXT CHECK (
+        due_date IS NULL
+        OR due_date GLOB '[0-9][0-9][0-9][0-9]-[0-9][0-9]-[0-9][0-9]'
+    ),
+    status TEXT NOT NULL CHECK (status IN ('open', 'completed')),
+    created_at TEXT NOT NULL,
+    updated_at TEXT NOT NULL,
+    completed_at TEXT,
+    context_digest TEXT
+        CHECK (context_digest IS NULL OR length(context_digest) = 64)
+);
+CREATE TABLE reminders (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    text TEXT NOT NULL CHECK (length(CAST(text AS BLOB)) > 0),
+    remind_time TEXT NOT NULL,
+    remind_utc TEXT NOT NULL CHECK (
+        remind_utc GLOB
+            '[0-9][0-9][0-9][0-9]-[0-9][0-9]-[0-9][0-9]T[0-9][0-9]:[0-9][0-9]:[0-9][0-9]Z'
+    ),
+    status TEXT NOT NULL CHECK (status IN ('open', 'completed')),
+    created_at TEXT NOT NULL,
+    updated_at TEXT NOT NULL,
+    completed_at TEXT,
+    context_digest TEXT
+        CHECK (context_digest IS NULL OR length(context_digest) = 64)
+);
+```
+
+Both start empty, the step touches no existing table, row, or AUTOINCREMENT
+high-water mark, and the frozen version 7 schema is the frozen version 6
+schema plus these two statements; a database created new at version 7
+fingerprints exactly as a migrated one does. Neither table refers to the other
+or to any other table, and neither holds a recurrence column, a delivered
+marker, or an index. Adding them changed neither the frozen schemas of
+versions 1 through 6 nor the statements of the earlier steps. No step rewrites
+a row or deletes anything.
 
 Every step runs its own frozen historical statements, never the live schema
 statements a new database is created from. The version 2 step therefore creates
@@ -294,7 +336,8 @@ and requires the frozen successor, so no step can drift that way again.
 ### No pre-migration backup
 
 V1-09 writes no backup copy before migrating, and that is a decision rather
-than an omission; V1-15's, V1-16's, V1-18's, and V1-20's steps keep it true. Every
+than an omission; V1-15's, V1-16's, V1-18's, V1-20's, and V1-22's steps keep it
+true. Every
 step is additive schema change plus the version stamp, committed in a single
 transaction that SQLite rolls back in full on any failure, so the failure a
 backup would protect
@@ -621,6 +664,53 @@ control character. Empty text and an empty blob are still refused, in UTF-8
 and UTF-16 databases alike. A transcript is canonical JSON, which writes every
 NUL as an escape, so its plain `length()` check needs no such care.
 
+### tasks
+
+Stores one task: the owner's text with an optional calendar due date, its
+status, and its context consent.
+
+| Column | Type and constraints | Purpose |
+| --- | --- | --- |
+| id | INTEGER PRIMARY KEY AUTOINCREMENT | Stable task identifier, never reused |
+| text | TEXT NOT NULL, at least one byte | The approved or edited text: 1 to 512 UTF-8 bytes, equal to its stripped form, with no control, format, surrogate, or separator character |
+| due_date | TEXT, NULL or shaped `YYYY-MM-DD` | The calendar due date, with no time or zone; NULL for an undated task |
+| status | TEXT NOT NULL, `open` or `completed` | The task's status |
+| created_at | TEXT NOT NULL | Maria's own UTC timestamp to the second, `YYYY-MM-DDTHH:MM:SSZ` |
+| updated_at | TEXT NOT NULL | The same form; refreshed by an edit or a reschedule only |
+| completed_at | TEXT | The time of the latest completion while completed; NULL while open |
+| context_digest | TEXT, NULL or exactly 64 characters | The owner's context consent: NULL while off, otherwise the SHA-256 of the compact JSON array `[text, due_date or ""]` the owner approved |
+
+### reminders
+
+Stores one reminder: the owner's text with one moment, its status, and its
+context consent.
+
+| Column | Type and constraints | Purpose |
+| --- | --- | --- |
+| id | INTEGER PRIMARY KEY AUTOINCREMENT | Stable reminder identifier, never reused |
+| text | TEXT NOT NULL, at least one byte | As for a task |
+| remind_time | TEXT NOT NULL | The canonical RFC 9557 local time, offset, and IANA zone exactly as approved, `YYYY-MM-DDTHH:MM:SS+HH:MM[Area/City]`, with zero seconds |
+| remind_utc | TEXT NOT NULL, shaped `YYYY-MM-DDTHH:MM:SSZ` | The saved instant: exactly `remind_time`'s local date and time minus its offset. It alone orders reminders and selects due ones |
+| status | TEXT NOT NULL, `open` or `completed` | The reminder's status |
+| created_at, updated_at, completed_at | As for a task | |
+| context_digest | TEXT, NULL or exactly 64 characters | The SHA-256 of the compact JSON array `[text, remind_time]` the owner approved, or NULL |
+
+SQL checks only the byte-count non-empty text, the status set, the shapes of
+`due_date` and `remind_utc`, and the digest length. It accepts by design what
+only Maria's rules refuse: text holding a NUL or a control character, text
+over 512 bytes or with outer whitespace, a well-shaped but impossible date
+such as `2026-02-30`, a malformed `remind_time`, and a `remind_utc` that
+disagrees with it. The memory layer applies every rule from
+`core/task_records.py` before writing, before any SQL runs, and settles every
+row into a validated value object after reading, so a row inserted from
+outside Maria that breaks a rule is refused privately on read, a listing
+holding one refusing as a whole, with the fixed record message and nothing
+logged from the row. The timing agreement takes offset arithmetic only and no
+time zone data. A later change to a zone's rules is not a broken row: the
+reminder keeps its saved instant and values, and its tool adds a warning.
+Neither table refers to the other or to any other table, and there is no
+foreign key, trigger, index, recurrence column, or delivered marker.
+
 ## Interaction Retrieval
 
 `history` requests the newest interactions via `get_recent_interactions()`.
@@ -699,8 +789,9 @@ because it only narrows what can be sent. Re-enabling an enabled memory, or
 disabling a disabled one, succeeds without changing anything. Neither the fact
 nor its digest is ever logged or returned in a result.
 
-`list_context_memories(limit, max_fact_bytes)` is the only read of Tier A
-context. It returns enabled memories only, in ascending `id` order, with the
+`list_context_memories(limit, max_fact_bytes)` is Tier A's memory read, beside
+the task and reminder reads described under "Tasks and Reminders". It returns
+enabled memories only, in ascending `id` order, with the
 limit clamped to 1 through 100, each as `id`, `fact`, and `oversized`. The
 bound is on UTF-8 bytes whatever the file's text encoding, and a fact longer
 than `max_fact_bytes` is returned with no text and `oversized` true. SQLite
@@ -1061,12 +1152,73 @@ names at most an id and a count; an `edit summary` request keeps its new text
 in the request half, as a note edit does. Deleting either record never
 cascades, and AUTOINCREMENT keeps a deleted id from being reused.
 
+## Tasks and Reminders
+
+The `tasks` and `reminders` tables hold the owner's tasks and reminders. The
+`Memory` methods that write them check every value against
+`core/task_records.py` before the database is opened, and every read settles
+its rows into validated `Task` and `Reminder` objects, a single malformed row
+refusing the whole read with `Unable to <operation>.` and the reason
+`a stored value is not one Maria can show`, never repaired. Each write is one
+transaction: a create inserts one open row with consent off and both stamps
+equal; a complete or reopen changes `status` and `completed_at` only, with
+`WHERE status = ?` so a record already in that status is left as it was; an
+edit or reschedule turns consent off and writes the new value and
+`updated_at` in the same transaction; a delete removes one row by id; and
+enabling consent runs under `BEGIN IMMEDIATE`, storing the approved identity
+only while the text and timing are still exactly the ones it names.
+
+Listings and due queries read at most 21 rows, the tools showing 20. Open
+tasks are ordered by due date with undated ones last, then by id; open
+reminders by `remind_utc`, then by id; completed records by latest completion
+first. `due_tasks(as_of)` compares calendar dates and `due_reminders(as_of)`
+saved UTC instants, both as text in fixed-width forms, so neither needs time
+zone data or a clock; the caller supplies the date or instant from the
+request's reference instant.
+
+`list_context_tasks` and `list_context_reminders` are Tier A's task and
+reminder reads, and `context_tasks_by_id` and `context_reminders_by_id` their
+rechecks by id. Each returns, in ascending id order, only open records whose
+consent is on, whose text is within the byte bound in the file's own
+encoding, whose text and timing are values Maria could have written that
+still give exactly the approved identity, and whose `created_at` and
+`updated_at` are valid stamps with `completed_at` NULL, as the record rules
+require of an open record. The schema's own checks cannot ensure that a
+value is small: `length()` and `GLOB` stop at the first NUL, so a valid
+looking date, instant, or digest followed by NUL and any suffix passes them,
+`remind_time` and the stamps have no check at all, and a BLOB passes too.
+So, inside SQLite and before any value reaches Python, every value the
+registered deterministic check will receive must be text, or NULL where Maria
+could have written NULL, within its stored-byte bound in the file's own
+encoding, measured as `length(CAST(value AS BLOB))`: the text within the
+caller's bound, `due_date` within 10 characters' worth, `remind_time` within
+91, `remind_utc` and both stamps within 20, and `context_digest` within 64,
+doubled in a UTF-16 file; `completed_at` must be NULL. Only then does the
+check apply the canonical forms, the timing agreement, the approved identity,
+and the record rules. All of this runs before a row is returned or counted
+toward the limit, so a row changed or inserted outside Maria is skipped and
+never counted, and the rows are settled again in Python afterwards. A
+completed, disabled, edited, or rescheduled record is never returned. The
+bounds do not make undecodable bytes decodable: a value stored as text whose
+bytes are not valid in the file's encoding cannot be handed to the check, so
+the read fails with its fixed error and no context is sent, as for any other
+record type's context read.
+
+Every failure follows the conversation-record rule: contention raises the
+shared busy message, anything else `Unable to <operation>.`, each with no cause
+or context, and the log receives one fixed line naming the operation and a
+fixed reason. A successful write logs only its id and a fixed phrase. No text,
+date, time, zone, offset, instant, or digest is ever logged. The two tools,
+`tools/tasks.py` and `tools/reminders.py`, reach these tables only through
+those `Memory` methods, and AUTOINCREMENT keeps a deleted id from being
+reused.
+
 ## Data Considerations
 
 Interaction history, notes, explicit memories, audit summaries, saved
-conversations, and conversation summaries are distinct persistent concepts and
-use separate tables in the same configured database; an audit summary spans
-two of them, `audit_summaries` and `audit_outcomes`. The same
+conversations, conversation summaries, tasks, and reminders are distinct
+persistent concepts and use separate tables in the same configured database;
+an audit summary spans two of them, `audit_summaries` and `audit_outcomes`. The same
 text may nevertheless appear more than once: an explicit fact can occur in its
 `remember` request, the `memories` table, and later recall or list responses;
 a note body can remain in an interaction response as well as the `notes` table.
@@ -1074,19 +1226,24 @@ Likewise, file or note content returned in a response remains independent of
 its original source. Removing or changing source data outside Maria does not
 automatically remove matching text from existing interaction rows. An audit
 summary holds none of that text, while a saved conversation or a summary can
-repeat any of it. All of these tables share one database file; external
-removal or replacement affects all six datasets.
+repeat any of it, and a task's or reminder's text can also remain in the
+request half of the command that added or edited it. All of these tables share
+one database file; external removal or replacement affects all eight
+datasets.
 
 In the current implementation, `delete interaction <id>`,
 `delete note <id>`, and `forget memory <id>` each target at most one row by ID
 and remove it when found, `delete audit <id>` removes at most one audit
 summary, its summary row together with any outcome row,
-`delete conversation <id>` and `delete summary <id>` each remove at most one
-row, and `retitle note <id>`, `edit note <id>`, `update memory <id>`, and
-`edit summary <id>` each change one stored row; Maria still exposes no API or
-CLI operation to prune or bulk-delete interaction history, bulk-delete or
-clear notes, bulk-delete or clear explicit memories, bulk-delete or clear
-audit summaries, or bulk-delete or clear saved conversations or summaries.
+`delete conversation <id>`, `delete summary <id>`, `delete task <id>`, and
+`delete reminder <id>` each remove at most one row, and `retitle note <id>`,
+`edit note <id>`, `update memory <id>`, `edit summary <id>`, and the task and
+reminder edit, reschedule, complete, reopen, and consent commands each change
+one stored row; Maria still exposes no API or CLI operation to prune or
+bulk-delete interaction history, bulk-delete or clear notes, bulk-delete or
+clear explicit memories, bulk-delete or clear audit summaries, bulk-delete or
+clear saved conversations or summaries, or bulk-delete, clear, or delete by
+date range tasks or reminders.
 Removing one record never
 cascades into another record type, so forgetting a memory leaves any copy of
 its text that already exists in `interactions` untouched, and deleting an
@@ -1111,9 +1268,10 @@ Do not submit or request display of passwords, API keys, access tokens, private
 keys, recovery codes, confidential credentials, or other highly sensitive
 secrets. In particular, reading a sensitive file or note can copy its returned
 content into interaction history, saving a conversation copies whatever its
-exchanges said, and enabling a note, memory, or summary for context lets its
-entire text reach the local reasoning model: Maria does not check consented
-or saved text for secrets and cannot tell sensitive text from any other.
+exchanges said, and enabling a note, memory, summary, task, or reminder for
+context lets its entire text reach the local reasoning model: Maria does not
+check consented or saved text for secrets and cannot tell sensitive text from
+any other.
 
 ## Connection Timeouts and Contention
 
@@ -1167,13 +1325,15 @@ method), with their `_reporting_consent` forms. Their SQL, transactions,
 rollback and closing, success logging, recognised uniqueness conflicts, and
 owner-visible messages are unchanged. The audit methods
 (`record_audit_summary`, `record_audit_outcome`, `list_audit_summaries`,
-`get_audit_summary`, and `delete_audit_summary`) and every saved-conversation
-and conversation-summary method follow the same rule, as described under
-"Audit Summaries" and "Saved Conversations and Conversation Summaries" above.
+`get_audit_summary`, and `delete_audit_summary`), every saved-conversation
+and conversation-summary method, and every task and reminder method follow the
+same rule, as described under "Audit Summaries", "Saved Conversations and
+Conversation Summaries", and "Tasks and Reminders" above.
 
 Busy/locked contention is still converted as described above, and outside the
-audit and conversation-record methods that conversion still logs SQLite's busy
-exception and attaches it, because its message is SQLite's own fixed text.
+audit, conversation-record, and task and reminder methods that conversion
+still logs SQLite's busy exception and attaches it, because its message is
+SQLite's own fixed text.
 Those methods classify contention themselves: they raise the same busy
 message, but log only their fixed line and attach nothing. Initialization and `schema_version()`
 never read a stored record's text; they record only their fixed event codes,
@@ -1190,4 +1350,6 @@ executes no SQL. `tools/conversations.py` and
 `tools/conversation_summaries.py` reach their tables only through `Memory`'s
 conversation-record methods, and `core/conversation_records.py` holds the
 vocabulary they, the memory layer, and the conversation module share, and
-executes no SQL.
+executes no SQL. `tools/tasks.py` and `tools/reminders.py` reach theirs only
+through `Memory`'s task and reminder methods, and `core/task_records.py`
+holds the vocabulary they and the memory layer share, and executes no SQL.

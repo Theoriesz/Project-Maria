@@ -42,6 +42,8 @@ AUDITED_ACTIONS = frozenset(
         "calculator.calculate",
         "filesystem.list",
         "system.current_time",
+        "tasks.create",
+        "reminders.create",
     }
 )
 

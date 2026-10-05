@@ -5,13 +5,19 @@ manager, and tool manager, and, when a reasoning provider was supplied, the
 conversation module. It does not directly perform database work, tool logic,
 or any provider-specific work, and it never imports a reasoning adapter.
 
-The planner receives the request text and nothing else. The only stored
-inputs to reasoning are records the owner enabled for context - Tier A
-memories and what Tier B's bounded search finds among enabled memories,
-notes, and conversation summaries - read through the memory layer's bounded
-context queries on the conversational path, and on a summary request only by
-id, to recheck the records supplied to the conversation; interaction history
-and saved conversations are never read for planning or reasoning.
+Brain reads the current time exactly once per request, through its one clock
+seam, after the empty-request check and before planning, and hands that
+reference instant with the configured time zone key to the planner and, on
+the model path, to the compiler; every timing decision of the request uses
+it, and confirming an approved plan reads no clock. Brain holds no date
+logic itself. Besides the request text and that timing, the planner receives
+nothing. The only stored inputs to reasoning are records the owner enabled
+for context - Tier A memories and enabled open tasks and reminders, and what
+Tier B's bounded search finds among enabled memories, notes, and
+conversation summaries - read through the memory layer's bounded context
+queries on the conversational path, and on a summary request only by id, to
+recheck the records supplied to the conversation; interaction history and
+saved conversations are never read for planning or reasoning.
 
 A planner's plan whose one step's contract declares a session input, from
 V1-20, is given that text here, generically, before anything else checks it:
@@ -40,6 +46,7 @@ from __future__ import annotations
 
 from collections.abc import Callable, Sequence
 from dataclasses import dataclass, replace
+from datetime import datetime, timezone
 from enum import Enum
 from logging import Logger
 
@@ -102,6 +109,7 @@ from core.reasoning import (
     ReasoningResponse,
     ReasoningSettings,
 )
+from core.time_resolution import TimingContext
 from core.tool_manager import ToolExecutionResult, ToolManager
 
 
@@ -139,6 +147,15 @@ _STEP_INTERRUPTED = "interrupted, so its outcome is unknown."
 AUDIT_SUMMARY_UNCONFIRMED_NOTICE = (
     "Maria could not confirm whether its audit summary was recorded."
 )
+
+
+def _reference_instant() -> datetime:
+    """Return the current moment as an aware UTC datetime.
+
+    This is Brain's one clock seam. ``process`` calls it exactly once per
+    request, before planning, and nothing else in Brain reads a clock.
+    """
+    return datetime.now(timezone.utc)
 
 
 def audit_recorded_notice(summary_id: int) -> str:
@@ -189,11 +206,12 @@ class BrainResponse:
     leaves it None, so no command, its result, a proposal, a summary draft,
     or a failed conversational turn ever becomes conversation.
     ``supplied_context`` travels with it: the fingerprints of every memory,
-    note, and conversation summary supplied since that conversation was last
-    cleared, which the session keeps beside it.
+    note, conversation summary, task, and reminder supplied since that
+    conversation was last cleared, which the session keeps beside it.
 
     A model-originated plan awaiting approval comes back with
-    ``needs_confirmation`` set, the plan itself, and as ``text`` only
+    ``needs_confirmation`` set, the plan itself, and as ``text`` the fixed
+    approval notice of each step awaiting confirmation, once each, then
     Maria's notices about that turn's context. The session renders the plan
     above them, from the very plan it then binds the approval to.
     """
@@ -221,6 +239,10 @@ class _ContextReads:
     searched_notes: Sequence[object] = ()
     supplied_summaries: Sequence[object] = ()
     searched_summaries: Sequence[object] = ()
+    enabled_tasks: Sequence[object] = ()
+    enabled_reminders: Sequence[object] = ()
+    supplied_tasks: Sequence[object] = ()
+    supplied_reminders: Sequence[object] = ()
 
 
 @dataclass(frozen=True)
@@ -481,14 +503,21 @@ class MariaBrain:
         input: that plan is given exactly the text it declares, here and
         nowhere else, before contracts, permissions, or any tool see it; see
         ``_with_session_input``. A plan that declares none is untouched.
+
+        The clock is read once, right after the empty-request check and
+        before planning, for every request whether or not it involves
+        timing, and that one reference instant, with the configured time
+        zone key, is what the planner and any model proposal of this request
+        resolve timing against, however long the model takes to reply.
         """
         cleaned_input = user_input.strip()
         if not cleaned_input:
             return BrainResponse("Please enter a request.")
+        timing = TimingContext(_reference_instant(), _configured_zone(self.config))
 
         self.logger.info("Received user request.")
 
-        plan = self.planner.create_plan(cleaned_input)
+        plan = self.planner.create_plan(cleaned_input, timing=timing)
 
         if (
             self.reasoning is not None
@@ -496,7 +525,12 @@ class MariaBrain:
             and own_origin(plan) is PlanOrigin.DETERMINISTIC
             and is_generic_fallback(plan)
         ):
-            return self._converse(cleaned_input, conversation, supplied_context)
+            return self._converse(
+                cleaned_input,
+                conversation,
+                supplied_context,
+                timing,
+            )
 
         # A deterministic plan is read once, here, so asking whether it
         # declares a session input never reads its steps a second time: what
@@ -521,6 +555,7 @@ class MariaBrain:
         request: str,
         conversation: tuple[ReasoningExchange, ...],
         supplied_context: frozenset[ContextFingerprint],
+        timing: TimingContext | None = None,
     ) -> BrainResponse:
         """Answer one unrecognised request with the local model.
 
@@ -566,12 +601,17 @@ class MariaBrain:
             proposals=True,
             supplied_summaries_read=reads.supplied_summaries,
             searched_summaries_read=reads.searched_summaries,
+            enabled_tasks_read=reads.enabled_tasks,
+            enabled_reminders_read=reads.enabled_reminders,
+            supplied_tasks_read=reads.supplied_tasks,
+            supplied_reminders_read=reads.supplied_reminders,
         )
         if turn.proposal is not None:
             response = self._consider_proposal(
                 request,
                 turn.proposal,
                 turn.notices,
+                timing,
             )
         elif own_origin(turn.plan) is PlanOrigin.DETERMINISTIC and (
             is_conversational_plan(turn.plan)
@@ -604,21 +644,25 @@ class MariaBrain:
         request: str,
         proposal: ReasoningResponse,
         notices: tuple[str, ...],
+        timing: TimingContext | None = None,
     ) -> BrainResponse:
         """Compile one proposal attempt, then offer or refuse the plan.
 
         The compiler is handed the owner's cleaned request, the reply exactly
-        as it arrived, and Tool Manager's active contract registry. A refused
-        proposal answers with its fixed message and nothing is repaired,
-        retried, or asked of the model again. A compiled plan is offered for
-        approval through ``_run_model_plan``. Either way the turn's notices
-        are shown exactly once, with that answer, and are kept nowhere.
+        as it arrived, Tool Manager's active contract registry, and the
+        request's one timing context, which only a creation step's timing
+        uses. A refused proposal answers with its fixed message and nothing
+        is repaired, retried, or asked of the model again. A compiled plan is
+        offered for approval through ``_run_model_plan``. Either way the
+        turn's notices are shown exactly once, with that answer, and are kept
+        nowhere.
         """
         outcome = compile_proposal(
             request,
             proposal,
             self.tool_manager.contracts,
             self.logger,
+            timing=timing,
         )
         if type(outcome) is ProposalRejection:
             return BrainResponse(with_notices(outcome.message, notices))
@@ -633,14 +677,15 @@ class MariaBrain:
 
         Tier A's read of enabled memories always runs: in ascending id order,
         one row more than can be sent, and never the text of a fact too long
-        ever to be sent. Records supplied earlier in the conversation are
-        then rechecked by id, and only when there are any. Tier B's searches
-        run only when the request yields search terms: its memory search
-        only when Tier A's read found more enabled memories than it
-        considers, starting after the last one it considered, and its note
-        and summary searches over notes and summaries the owner enabled.
-        Every read goes through the memory layer's own bounded query; nothing
-        is kept once the turn ends.
+        ever to be sent. Its reads of enabled open tasks and reminders whose
+        text and timing are still the approved ones always run too, the same
+        way. Records supplied earlier in the conversation are then rechecked
+        by id, and only when there are any. Tier B's searches run only when
+        the request yields search terms: its memory search only when Tier A's
+        read found more enabled memories than it considers, starting after
+        the last one it considered, and its note and summary searches over
+        notes and summaries the owner enabled. Every read goes through the
+        memory layer's own bounded query; nothing is kept once the turn ends.
 
         Any read that fails, or a Tier A read too malformed to start the
         search from, ends them all: the turn is handed None and fails closed.
@@ -655,8 +700,34 @@ class MariaBrain:
             memory_ids = supplied_record_ids(supplied, ContextSource.MEMORY)
             note_ids = supplied_record_ids(supplied, ContextSource.NOTE)
             summary_ids = supplied_record_ids(supplied, ContextSource.SUMMARY)
+            task_ids = supplied_record_ids(supplied, ContextSource.TASK)
+            reminder_ids = supplied_record_ids(supplied, ContextSource.REMINDER)
             return _ContextReads(
                 enabled=enabled,
+                enabled_tasks=self.memory.list_context_tasks(
+                    limit=CONTEXT_QUERY_LIMIT,
+                    max_text_bytes=CONTEXT_MAX_BYTES,
+                ),
+                enabled_reminders=self.memory.list_context_reminders(
+                    limit=CONTEXT_QUERY_LIMIT,
+                    max_text_bytes=CONTEXT_MAX_BYTES,
+                ),
+                supplied_tasks=(
+                    self.memory.context_tasks_by_id(
+                        task_ids,
+                        max_text_bytes=CONTEXT_MAX_BYTES,
+                    )
+                    if task_ids
+                    else ()
+                ),
+                supplied_reminders=(
+                    self.memory.context_reminders_by_id(
+                        reminder_ids,
+                        max_text_bytes=CONTEXT_MAX_BYTES,
+                    )
+                    if reminder_ids
+                    else ()
+                ),
                 supplied_memories=(
                     self.memory.context_memories_by_id(
                         memory_ids,
@@ -732,8 +803,26 @@ class MariaBrain:
             memory_ids = supplied_record_ids(supplied, ContextSource.MEMORY)
             note_ids = supplied_record_ids(supplied, ContextSource.NOTE)
             summary_ids = supplied_record_ids(supplied, ContextSource.SUMMARY)
+            task_ids = supplied_record_ids(supplied, ContextSource.TASK)
+            reminder_ids = supplied_record_ids(supplied, ContextSource.REMINDER)
             return _ContextReads(
                 enabled=(),
+                supplied_tasks=(
+                    self.memory.context_tasks_by_id(
+                        task_ids,
+                        max_text_bytes=CONTEXT_MAX_BYTES,
+                    )
+                    if task_ids
+                    else ()
+                ),
+                supplied_reminders=(
+                    self.memory.context_reminders_by_id(
+                        reminder_ids,
+                        max_text_bytes=CONTEXT_MAX_BYTES,
+                    )
+                    if reminder_ids
+                    else ()
+                ),
                 supplied_memories=(
                     self.memory.context_memories_by_id(
                         memory_ids,
@@ -845,6 +934,8 @@ class MariaBrain:
             ),
             supplied_notes_read=reads.supplied_notes,
             supplied_summaries_read=reads.supplied_summaries,
+            supplied_tasks_read=reads.supplied_tasks,
+            supplied_reminders_read=reads.supplied_reminders,
         )
         return _SessionInputBinding(
             summary_draft_plan(request, draft),
@@ -1098,9 +1189,10 @@ class MariaBrain:
         other plan needs exactly one approval from the owner for the whole
         plan, including when every action is allowed outright: an unapproved
         plan comes back for approval, as the very same immutable plan and
-        never prepared or rebound, with ``notices`` as its whole text, and
-        an approved one goes to ``_dispatch_model_plan``. ``notices`` are
-        shown with an offer or a refusal; an approved plan has none.
+        never prepared or rebound, whose whole text is the fixed notice of
+        each step awaiting confirmation, once each, then ``notices``, and an
+        approved one goes to ``_dispatch_model_plan``. ``notices`` are shown
+        with an offer or a refusal; an approved plan has none.
         """
         refusal = self._model_plan_refusal(plan)
         if refusal is not None:
@@ -1130,11 +1222,31 @@ class MariaBrain:
                     resolved_step.step.action,
                 )
             return BrainResponse(
-                "\n".join(notices),
+                "\n".join((*self._approval_notices(resolved), *notices)),
                 needs_confirmation=True,
                 plan=plan,
             )
         return self._dispatch_model_plan(plan, confirmed=confirmed)
+
+    def _approval_notices(self, resolved: _ResolvedPlan) -> tuple[str, ...]:
+        """Return the fixed notices a model plan's approval shows, once each.
+
+        PermissionManager is asked, by each step's own tool and action, for
+        the notice of every step it resolved as needing confirmation, so no
+        tool or action is named here; each distinct notice is kept once, in
+        plan order. A notice is PermissionManager's fixed text and repeats
+        nothing stored, proposed, or requested. It is shown with the offer
+        alone, never added to the plan, and kept nowhere.
+        """
+        shown: list[str] = []
+        for resolved_step in resolved.confirmation_required_steps:
+            notice = self.permissions.confirmation_notice(
+                resolved_step.step.tool_name,
+                resolved_step.step.action,
+            )
+            if type(notice) is str and notice and notice not in shown:
+                shown.append(notice)
+        return tuple(shown)
 
     def _model_plan_refusal(self, plan: Plan) -> str | None:
         """Return why a model-originated plan cannot proceed, or None.
@@ -1451,6 +1563,17 @@ class MariaBrain:
             for result in results
         ]
         return "\n".join(recorded_texts)
+
+
+def _configured_zone(config: object) -> str | None:
+    """Return the configured time zone key, or None when there is none.
+
+    A loaded configuration holds a validated key or None; anything else
+    counts as no zone, so timing that needs one is refused rather than
+    resolved against something that is not a configured key.
+    """
+    zone = getattr(config, "time_zone", None)
+    return zone if type(zone) is str else None
 
 
 def _tool_result(result: object) -> ToolExecutionResult:

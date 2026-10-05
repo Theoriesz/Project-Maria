@@ -31,7 +31,7 @@ from dataclasses import dataclass, replace
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from typing import Any
-from unittest.mock import Mock, patch
+from unittest.mock import ANY, Mock, patch
 
 import core.brain as brain_module
 import core.plan_compiler as plan_compiler_module
@@ -189,6 +189,8 @@ RECORD_TABLES = (
     "audit_outcomes",
     "saved_conversations",
     "conversation_summaries",
+    "tasks",
+    "reminders",
 )
 ZERO_ROWS = dict.fromkeys(RECORD_TABLES, 0)
 ONE_AUDITED_RUN = {**ZERO_ROWS, "audit_summaries": 1, "audit_outcomes": 1}
@@ -927,7 +929,7 @@ class ModelConfirmationTests(_ApprovalTestCase):
                 # Confirming asked the model nothing, planned nothing again,
                 # prepared nothing, and kept nothing as conversation.
                 self.assertEqual(harness.provider.calls, 1)
-                harness.create_plan.assert_called_once_with(REQUEST)
+                harness.create_plan.assert_called_once_with(REQUEST, timing=ANY)
                 harness.prepare_confirmation.assert_not_called()
                 self.assertEqual(session.conversation, ())
 

@@ -2,6 +2,59 @@
 
 ## Unreleased
 
+- Maria now keeps structured tasks and reminders (V1-22, amendment V1-22-R1),
+  with twenty-six commands that work in both interfaces with no model present.
+  A task is one line of text with an optional calendar due date; a reminder is
+  one line of text with one moment, stored as the exact local time, offset,
+  and IANA time zone the owner approved together with the UTC instant they
+  name. `add task`, `add reminder`, `edit`, `reschedule`, `delete`, and both
+  context consent commands need confirmation, and every confirmation shows the
+  exact text and the resolved date or time before anything is stored; `tasks`,
+  `reminders`, `completed tasks`, `completed reminders`, `due tasks`,
+  `due reminders`, `read`, `complete`, and `reopen` run without asking.
+  Completing stamps the time of that completion and reopening clears it.
+  Nothing is ever delivered, notified, scheduled, polled, or repeated: due and
+  overdue items are shown only when the owner asks. Dates and times use one
+  IANA zone set in the private override's new `[time]` section, resolved by
+  standard-library `zoneinfo` from the system's time zone files or the
+  optional, pinned, data-only `tzdata` in the new `requirements-time.txt`,
+  never by falling back to UTC, a fixed offset, or the computer's own zone.
+  Maria reads the clock once per request, before planning, and resolves every
+  date and time of that request against that one moment, so a late model
+  reply or a late approval changes nothing; new timing in the past or more than
+  ten years away is refused, a local time a daylight-saving change skips is
+  refused rather than shifted, one it repeats needs the offset of the
+  occurrence meant, and an offset is accepted only when it matches the zone at
+  that local time. A reminder keeps its saved instant if its zone's rules
+  later change, with a warning, and nothing is rewritten. With reasoning
+  enabled, the owner may also ask in one of four closed English forms, such as
+  `remind me tomorrow at 09:00 to call mom` or
+  `add a task to pay rent by friday`, or two to five joined by "and": the
+  local model may then propose `tasks.create` or `reminders.create`, but only a
+  request that is wholly those forms in Maria's own reading compiles, every
+  step is built from Maria's extraction with nothing taken from the model, and
+  questions, negations, quotations, examples, casual mentions, retractions,
+  hedges, and vague or invented times are refused with nothing added. Before
+  any model plan is approved, its approval shows, after the exact steps, the
+  fixed notice of each step that carries one, once, so a reminder from the
+  owner's own words says, as a typed `add reminder` does, that Maria will not
+  notify; the notice is kept nowhere. The model-eligible actions grow from
+  three to five, the mandatory confirmations from 19 to 31, the compiler's
+  refusal kinds from 13 to 21, and the proposal instructions to 2,045 bytes.
+  Open tasks and reminders reach the model only
+  with their own context consent, off by default and bound to their exact text
+  and timing, after the enabled memories within the unchanged Tier A limits,
+  and only while their stamps follow the record rules; every value a task or
+  reminder context read hands to Python is typed and bounded inside SQLite
+  first, so no oversized or binary stored value reaches it, and a request
+  that selects none is byte for byte what it was. Schema version 7 adds
+  the empty `tasks` and `reminders` tables through one appended migration that
+  touches no existing row, with no link, cascade, recurrence, or delivery
+  column, and both conversation-clearing notices now name tasks and
+  reminders. Listings, readings, and changes record only content-free lines in
+  interaction history, model-created items record none, and logs name ids and
+  fixed codes only. `requirements.txt`, the shipped configuration, and the
+  version stay unchanged.
 - Maria now has a simple, optional desktop window, opened with
   `python main.py --gui`, over the same Brain, plan validation, permissions,
   tools, memory, and audit boundaries as the command line, through the same

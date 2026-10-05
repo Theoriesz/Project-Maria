@@ -70,6 +70,7 @@ from core.reasoning import (
     request_content_bytes,
     request_reasoning,
 )
+from core.time_resolution import TimingContext
 from tests.log_assertions import assert_log_omits
 from tests.schema_fixtures import V0_2_0_BASELINE_SCHEMA
 from tests.test_brain_recording_policy import _quiet_logger
@@ -92,11 +93,14 @@ UNREADABLE_NOTICE = (
     "Memory context could not be read, so none was supplied and this "
     "session's earlier conversation was cleared."
 )
-# V1-20 names conversation summaries too, since they can be supplied as well.
+# V1-20 names conversation summaries too, since they can be supplied as well,
+# and V1-22 tasks and reminders, which also stop being current when they are
+# no longer open.
 CLEARED_NOTICE = (
     "This session's earlier conversation was cleared because a memory, note, "
-    "or summary supplied to it is no longer enabled with the same text, so the "
-    "copy supplied earlier was invalidated."
+    "summary, task, or reminder supplied to it is no longer enabled with the "
+    "same text, or is no longer open, so the copy supplied earlier was "
+    "invalidated."
 )
 ENABLE_CONFIRMATION = (
     "Confirmation required: memory.enable_context requires explicit "
@@ -1306,9 +1310,13 @@ class NoInteractionHistoryTests(unittest.TestCase):
         for name, spy in reads.items():
             with self.subTest(method=name):
                 spy.assert_not_called()
+        # The planner is handed the request text and, from V1-22, the
+        # request's own reference instant and configured zone, and nothing
+        # read from storage.
         for call in harness.create_plan.call_args_list:
             self.assertEqual(len(call.args), 1)
-            self.assertEqual(call.kwargs, {})
+            self.assertEqual(set(call.kwargs), {"timing"})
+            self.assertIs(type(call.kwargs["timing"]), TimingContext)
 
     def test_no_conversational_module_names_an_interaction_read(self) -> None:
         for module in ("brain", "conversation", "context", "reasoning", "session"):

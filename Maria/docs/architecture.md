@@ -11,16 +11,23 @@ Maria is organized around a small set of modules with clear ownership.
 2. `session.py` holds the owner's confirmation state and the session's bounded
    conversation, forwards the request, and renders a plan the local model
    proposed for the owner's approval.
-3. `brain.py` coordinates the request. On the model-backed conversational path
-   only, it reads the owner's enabled memory context, and what a bounded
-   literal search finds among enabled memories, notes, and conversation
-   summaries, through the memory layer and `context.py`; it reads no
-   interaction history or saved conversation for planning or reasoning. For a
-   planner's plan whose one step's contract declares a session input, it
-   supplies that text itself, generically: the canonical transcript of the
-   session's retained exchanges for a save, or a summary draft from the local
-   model; see "Saved Conversations and Summaries".
-4. `planner.py` converts explicit commands into structured plan steps.
+3. `brain.py` coordinates the request. It reads one clock once per request,
+   right after the empty-request check and before planning, through its one
+   seam, `_reference_instant()`, and hands that instant with the configured
+   time zone key, as one `TimingContext`, to the planner and to the compiler;
+   see "Tasks and Reminders". On the model-backed conversational path only, it
+   reads the owner's enabled memory context and enabled open tasks and
+   reminders, and what a bounded literal search finds among enabled memories,
+   notes, and conversation summaries, through the memory layer and
+   `context.py`; it reads no interaction history or saved conversation for
+   planning or reasoning. For a planner's plan whose one step's contract
+   declares a session input, it supplies that text itself, generically: the
+   canonical transcript of the session's retained exchanges for a save, or a
+   summary draft from the local model; see "Saved Conversations and
+   Summaries".
+4. `planner.py` converts explicit commands into structured plan steps,
+   resolving a task's date or a reminder's time against the request's timing
+   context, so the plan carries canonical values.
 5. `action_contracts.py` declares which tool actions exist and which arguments
    each one accepts. Brain validates every step of a plan against it before any
    permission is evaluated.
@@ -29,7 +36,8 @@ Maria is organized around a small set of modules with clear ownership.
 7. `tool_manager.py` dispatches allowed actions to registered tools.
 8. Tools perform their focused work and return a `ToolExecutionResult`.
 9. `memory.py` owns persistent interactions, notes, explicit memories, audit
-   summaries, saved conversations, and conversation summaries in SQLite.
+   summaries, saved conversations, conversation summaries, tasks, and
+   reminders in SQLite.
 10. `brain.py` forms the final response and, on recordable completion paths,
     attempts to record the cleaned request and response as an interaction. An
     approved model-proposed action records no interaction: Brain commits its
@@ -62,6 +70,15 @@ Maria is organized around a small set of modules with clear ownership.
     objects, and fixed messages. `tools/conversations.py` and
     `tools/conversation_summaries.py` store, list, read, edit, and delete them
     on the owner's commands. See "Saved Conversations and Summaries".
+17. `time_resolution.py` is the one module that reads and resolves dates and
+    times, `task_requests.py` parses the four natural-language request forms,
+    and `task_records.py` is the vocabulary of tasks and reminders: limits,
+    statuses, canonical forms, value objects, and fixed messages. All three
+    are leaves that log nothing; the first two read no clock, and the third
+    reads one only for the memory layer's write stamps. `tools/tasks.py` and
+    `tools/reminders.py` add, list, query, read, complete, reopen, edit,
+    reschedule, and delete them on the owner's commands. See "Tasks and
+    Reminders".
 
 An explicit memory request uses the same execution path as every other tool
 request, from either interface:
@@ -177,18 +194,25 @@ row is written; only the plan's recording policy decides that.
 
 In the current implementation, successful `history.read`, `audit.list`,
 `audit.read`, `conversations.list`, `conversations.read`,
-`conversation_summaries.list`, and `conversation_summaries.read` results are
-the only ones that supply a non-`None` `recorded_message`. For
+`conversation_summaries.list`, and `conversation_summaries.read` results,
+and V1-22's twelve, `create`, `list`, `due`, `read`, `edit`, and `reschedule`
+for tasks and for reminders, are the only ones that supply a non-`None`
+`recorded_message`: nineteen actions. For
 `history.read` that keeps redisplayed interaction content from being
 duplicated into a new interaction row, the two audit actions record only
-`Listed audit summaries.` and `Displayed audit summary <id>.`, and the four
+`Listed audit summaries.` and `Displayed audit summary <id>.`, the four
 conversation-record actions record only `Listed saved conversations.`,
 `Displayed saved conversation <id>.`, `Listed conversation summaries.`, and
-`Displayed conversation summary <id>.`, so no listing, summary field,
-transcript, or summary text reaches interaction history that way. Every other
+`Displayed conversation summary <id>.`, and the task and reminder actions
+record only fixed lines such as `Added task <id>.`, `Listed open tasks.`,
+`Listed due reminders.`, `Displayed reminder <id>.`, `Edited task <id>.`, and
+`Rescheduled reminder <id>.`, so no listing, summary field, transcript,
+summary text, task or reminder text, date, or time reaches interaction
+history that way. Every other
 current tool result, including `history.delete`, `notes.retitle`,
 `notes.edit`, `notes.delete`, `audit.delete`, `conversations.save`,
-`conversations.delete`, and every conversation-summary mutation, leaves the
+`conversations.delete`, every conversation-summary mutation, and the task and
+reminder `complete`, `reopen`, `delete`, and consent actions, leaves the
 field as `None` and therefore retains the existing message-as-recorded
 behavior; those displayed messages are already short, content-free
 summaries naming at most an id and a count, so no override is needed.
@@ -204,21 +228,25 @@ already-computed successful deletion response is still returned unchanged;
 the deletion is not rolled back and no compensating write is attempted, so an
 interaction row recording the deletion is not guaranteed in that case.
 
-`notes.retitle`, `notes.edit`, `notes.delete`, `audit.delete`, and the
-conversation-record mutations follow that identical boundary:
-`Memory.retitle_note()`, `Memory.edit_note()`, `Memory.delete_note()`,
-`Memory.delete_audit_summary()`, `Memory.save_conversation()`,
-`Memory.delete_saved_conversation()`, `Memory.edit_conversation_summary()`,
-`Memory.delete_conversation_summary()`, and the two summary consent methods
-each commit in their own transaction, independently of the later
-`Memory.record_interaction()` call. A recording failure after a committed
+`notes.retitle`, `notes.edit`, `notes.delete`, `audit.delete`, the
+conversation-record mutations, and every task and reminder mutation follow
+that identical boundary: `Memory.retitle_note()`, `Memory.edit_note()`,
+`Memory.delete_note()`, `Memory.delete_audit_summary()`,
+`Memory.save_conversation()`, `Memory.delete_saved_conversation()`,
+`Memory.edit_conversation_summary()`, `Memory.delete_conversation_summary()`,
+the two summary consent methods, and the task and reminder create, complete,
+reopen, edit, reschedule, delete, and consent methods each commit in their
+own transaction, independently of the later `Memory.record_interaction()`
+call. A recording failure after a committed
 mutation is logged, does not roll the mutation back, does not
 replace the successful response, and triggers no compensating write or retry.
 
 Because Brain records the original cleaned request as the `user_input` half of
 an interaction, a `retitle note` command retains its new title, an `edit
-note` command its new body, and an `edit summary` command its new text in
-interaction history even though the recorded response is content-free.
+note` command its new body, an `edit summary` command its new text, and an
+`add task`, `add reminder`, `edit task`, `edit reminder`, or `reschedule`
+command its text or timing phrase in interaction history even though the
+recorded response is content-free.
 `recorded_message` can only change the response half of a recorded
 interaction, never the request half, so later editing or deleting the note or
 summary does not rewrite or remove those independent interaction rows.
@@ -252,7 +280,8 @@ interaction write is attempted.
 Brain reads no interaction history for planning or reasoning. Until V1-15 it
 retrieved up to three recent interaction rows on every request and handed them
 to the planner, which discarded them unused; that feed is gone, and
-`Planner.create_plan()` now accepts the cleaned request text and nothing else.
+`Planner.create_plan()` now accepts the cleaned request text and, by keyword
+only, the request's `TimingContext`, and nothing else.
 The `history` command still reads recent rows through its own tool, and
 interaction rows remain Tier C, as saved conversations are: no automatic path
 hands one to the planner or to the reasoning model.
@@ -502,10 +531,11 @@ surrogate code point is refused rather than quoted, because two separate
 surrogates would decode as one different character; no compiled plan can hold
 one. The result is printable ASCII that decodes as JSON back to exactly the
 argument values, so nothing in it can hide, reorder, or start a new line, and
-nothing is truncated. Brain's context notices for that turn follow below it,
-once; they
-are not kept with the approval or shown again on confirmation. A plan that
-cannot be rendered raises `ValueError` and never becomes pending.
+nothing is truncated. Brain's notices follow below it, once: the fixed
+approval notice of each step awaiting confirmation, once each, then the
+turn's context notices; they are not kept with the approval or shown again
+on confirmation. A plan that cannot be rendered raises `ValueError` and never
+becomes pending.
 
 What becomes pending is one snapshot of the plan, taken by `plan_snapshot`: a
 well-formed model plan is its own, and a deterministic plan that is not an
@@ -582,14 +612,16 @@ malformed present arrays stop configuration loading instead of weakening it.
 When an action is both denied and confirmation-required, denial wins.
 
 In the current implementation, the mandatory confirmation baseline is
-nineteen actions: `audit.delete`, `conversations.delete`,
+thirty-one actions: `audit.delete`, `conversations.delete`,
 `conversation_summaries.create`, `conversation_summaries.edit`,
 `conversation_summaries.delete`, `conversation_summaries.enable_context`,
 `conversation_summaries.disable_context`, `filesystem.rename`,
 `filesystem.move`, `history.delete`, `notes.retitle`, `notes.edit`,
 `notes.delete`, `notes.enable_context`, `notes.disable_context`,
-`memory.update`, `memory.forget`, `memory.enable_context`, and
-`memory.disable_context`. The confirmation for `memory.enable_context` also
+`memory.update`, `memory.forget`, `memory.enable_context`,
+`memory.disable_context`, and, from V1-22, `create`, `edit`, `reschedule`,
+`delete`, `enable_context`, and `disable_context` for both `tasks` and
+`reminders`. The confirmation for `memory.enable_context` also
 carries a fixed notice, from `CONFIRMATION_NOTICES` in `core/permissions.py`,
 that an enabled memory may be sent to the local reasoning model on any
 conversational turn within Maria's memory context limits, and that Maria does
@@ -606,12 +638,37 @@ text the local model wrote, which can repeat anything said in the session,
 including text from memories or notes it was given, that its context consent
 starts off, and that Maria does not check it for passwords or other secrets;
 the confirmation for `conversation_summaries.enable_context` carries the
-note notice's counterpart for one summary's entire text.
+note notice's counterpart for one summary's entire text. The confirmation for
+`reminders.create` carries one that Maria will not notify the owner when the
+reminder is due and that it does not repeat, so `due reminders` is how to see
+it, and the confirmations for `tasks.enable_context` and
+`reminders.enable_context` carry one that the record's text and timing may be
+sent to the local model on a conversational turn while it is open, after the
+enabled memories and within the memory context limits, and that Maria does not
+check it for secrets: eight notices in all. A deterministic plan's
+confirmation request shows each notice as part of its step's permission
+reason. A model plan's approval shows, after the exact compiled steps and
+before the turn's context notices, the notice of every step PermissionManager
+resolved as requiring confirmation, each distinct notice once, in plan order
+(owner decision A on V1-22-R1), so a reminder created from the owner's own
+words says, before it is approved, that Maria will not notify the owner.
+Brain asks `PermissionManager.confirmation_notice()` for each such step
+generically and names no tool or action. The notices are display only: the
+plan, its arguments, its fingerprint, the one approval for the whole plan,
+and confirmation, which asks the model nothing, are unchanged, and a notice
+never enters the retained conversation, interaction history, or a model
+request. A plan none of whose steps carries a notice is shown exactly as
+before.
 `audit.list`, `audit.read`, `conversations.save`, `conversations.list`,
 `conversations.read`, `conversation_summaries.list`,
 `conversation_summaries.read`, `history.list`, `history.search`,
 `history.read`, `notes.create`, `notes.list`, `notes.read`, `memory.store`,
-`memory.search`, and `memory.list` are allowed by default. These entries live
+`memory.search`, `memory.list`, and `list`, `due`, `read`, `complete`, and
+`reopen` for both `tasks` and `reminders` are allowed by default. The V1-22
+ten each carry a written risk note: a listing, a due query, or a reading
+only shows the owner's own records and records a content-free line, and
+completing or reopening changes the status alone, never the text, timing, or
+consent, reversibly and without deleting anything. These entries live
 in `MANDATORY_CONFIRMATION_ACTIONS` in `core/permissions.py` rather than in
 `config/config.toml`, so configuration can add restrictions on top of them but
 can never remove them.
@@ -622,7 +679,8 @@ the owner, for the whole plan, even when every one of its actions is allowed
 outright, and a plan with any denied action is refused before any approval is
 offered. That requirement adds no entry to
 either mandatory set and changes no decision `PermissionManager` makes, so the
-three model-eligible actions keep their permission policies; see
+five model-eligible actions keep their permission policies, the two creation
+actions remaining confirmation-required in any case; see
 "Model-Originated Execution and Audit".
 
 Direct tool invocation bypasses planning and permission checks and therefore
@@ -659,9 +717,10 @@ int — is rejected when the contract is constructed rather than ignored.
 Every contract also declares its model eligibility, `MODEL_ELIGIBLE` or
 `NOT_MODEL_ELIGIBLE`, as a required keyword with no default, so no action can
 be declared without that decision. Only `calculator.calculate`,
-`filesystem.list`, and `system.current_time` are model-eligible; every other
-action, the three audit actions and the eleven conversation-record actions
-included, is not. The
+`filesystem.list`, `system.current_time`, `tasks.create`, and
+`reminders.create` are model-eligible; every other action, the three audit
+actions, the eleven conversation-record actions, and the other twenty task
+and reminder actions included, is not. The
 classification is independent of permission and approves nothing by itself;
 see "Model-to-Plan Compilation Gate".
 
@@ -686,8 +745,22 @@ measured on the stripped text exactly as `CalculatorTool` measures it before
 handing the expression to `evaluate_expression`. The text identities a
 confirmation pins declare exactly 64 characters, and the conversation-record
 texts declare their character ceilings above, their exact UTF-8 limits being
-settled by `core/conversation_records.py`. No other field declares a minimum
-length beyond being non-blank.
+settled by `core/conversation_records.py`. A task's or reminder's text
+declares a 512-character ceiling, its exact rule settled by
+`core/task_records.py`. No other field declares a minimum length beyond being
+non-blank.
+
+A text field may also be closed. `allowed_values` restricts it to a declared
+set, such as a listing's status, `open` or `completed`, or a reminder's
+`repeat`, which is only `never`. `text_format` restricts it to one closed
+format, matched whole: `ISO_DATE` (`YYYY-MM-DD`, a real date),
+`ISO_DATE_OR_NONE` (that, or `none`), `ZONED_LOCAL_TIME` (a canonical
+`YYYY-MM-DDTHH:MM:00+HH:MM[Area/City]` with a real minute, a whole-minute
+offset written `+00:00` when zero, and an IANA key of at most 64 characters),
+or `UTC_INSTANT` (`YYYY-MM-DDTHH:MM:SSZ`, a real second). A value outside
+either is out of range. A format checks syntax and calendar validity only and
+consults no time zone's rules; a test holds each to the record layer's own
+validators.
 
 Validation rejects; it never repairs. It performs no coercion, parsing,
 truncation, clamping, default insertion, or normalization of casing or
@@ -931,14 +1004,14 @@ the schema advances. Startup settles that version once, classifies an
 unversioned database structurally against the shapes Maria actually shipped,
 runs any missing forward migrations in order, and refuses a database stamped
 newer than the running build before writing anything.
-`docs/database.md` describes the rules; the six record types below are
-unchanged by them. The current schema is version 6, whose one appended
-migration, `create_conversation_records`, creates the two empty
-conversation-record tables, `saved_conversations` and
-`conversation_summaries`, and changes no existing table or row; version 5's
-`create_audit_summaries` created the two audit tables the same way.
+`docs/database.md` describes the rules; the eight record types below are
+unchanged by them. The current schema is version 7, whose one appended
+migration, `create_tasks_and_reminders`, creates the two empty tables `tasks`
+and `reminders` and changes no existing table or row; version 6's
+`create_conversation_records` created the two conversation-record tables,
+and version 5's `create_audit_summaries` the two audit tables, the same way.
 
-Maria keeps six kinds of persistent data separate:
+Maria keeps eight kinds of persistent data separate:
 
 - **Interaction history** records cleaned requests and the responses chosen
   for recording on the four recording branches described above, for every
@@ -1008,6 +1081,20 @@ Maria keeps six kinds of persistent data separate:
   "Saved Conversations and Summaries" and "Tier B Search Context" below.
   Nothing cascades between the conversation records and any other record
   type, and these are never the content-free audit summaries above.
+- **Tasks** are one line of the owner's text, 1 to 512 UTF-8 bytes, with an
+  optional calendar due date, and **reminders** one line of text with one
+  moment: `remind_time`, the canonical local time, offset, and IANA zone the
+  owner approved, and `remind_utc`, exactly the instant those encode, which
+  alone orders reminders and selects due ones. Each is `open` or
+  `completed`, keeps `created_at` and `updated_at`, has `completed_at` only
+  while completed, and carries its own context consent, the identity of
+  exactly its approved text and timing. They are added, edited, rescheduled,
+  deleted, and given or denied consent only through confirmation-gated
+  commands, one row by id, while listing, due queries, reading, completing,
+  and reopening are allowed; nothing recurs, nothing is delivered, and ids are
+  never reused. Tasks and reminders are independent of each other and of
+  every other record type, with no link and no cascade; see "Tasks and
+  Reminders" below.
 
 On the completed paths described above, memory commands and their responses
 also appear in interaction history when recording succeeds. A stored fact can
@@ -1032,9 +1119,10 @@ compensating rollback, retry, or replay.
 deliberately contains no transport, no model, and no provider. A
 `ReasoningRequest` holds one bounded prompt; in `history`, the earlier
 exchanges of the current conversation, oldest first; and in `context`, the
-records Maria selected — Tier A memories, then Tier B search matches — each a
-`ContextItem` from `core/context.py` bearing the source and record id Maria
-read. Both are empty by default. A request's one switch,
+records Maria selected — Tier A memories, tasks, and reminders, then Tier B
+search matches — each a `ContextItem` from `core/context.py` bearing the source
+and record id Maria read, and for a task or reminder its timing. Both are
+empty by default. A request's one switch,
 `proposal_instructions`, must be exactly `True` or `False` and is `False` by
 default; it selects Maria's own fixed `PROPOSAL_INSTRUCTIONS`, which no caller
 can change, and a request with it off is exactly what a request was before
@@ -1054,7 +1142,8 @@ proposal instructions and, with context, the two-byte separator that joins them
 to the context instructions. No role name, message structure, model
 identifier, or transport framing counts. The context is validated again every
 time it is measured, rather than trusted from construction: at most 16 Tier A
-memories first, rendering on their own to at most 2 KiB, then at most 8 Tier B
+items first, memories, then tasks, then reminders, rendering on their own to
+at most 2 KiB, then at most 8 Tier B
 items grouped by source, each group in strictly ascending id order with no
 memory in both tiers, at most 24 items rendering to at most 4,096 bytes in all.
 Construction bounds that total by the 1 MiB hard
@@ -1100,9 +1189,13 @@ exclusion keeps out of every filesystem capability. `load_config` reads it only
 when a caller names it; `MariaBrain.from_defaults()` is the one caller that
 does. An absent override leaves the shipped disabled configuration. A present
 one must be a regular file — a link, including a dangling one, a directory, or
-a special entry is refused before anything is opened — holding exactly one
-`[reasoning]` table, which replaces the tracked table completely with nothing
-merged or borrowed. The override cannot reach any other section. Every refusal
+a special entry is refused before anything is opened — holding a
+`[reasoning]` table, a `[time]` table, or both, and nothing else. A
+`[reasoning]` table replaces the tracked table completely with nothing merged
+or borrowed; a `[time]` table holds exactly one key, `zone`, an IANA time zone
+key of at most 64 characters checked by syntax alone, which becomes
+`MariaConfig.time_zone`. The tracked file may not hold `[time]` at all. The
+override cannot reach any other section. Every refusal
 is a fixed message raised with no cause or context, so neither the file's text
 nor a parser's or the operating system's error text survives in it, and
 configuration loading logs nothing.
@@ -1193,7 +1286,7 @@ With a reasoning provider present and reasoning enabled, Maria answers the one
 kind of request its planner has no command for, its exact generic fallback,
 with the owner's local model, in the context of the current session's earlier
 conversational turns: with a text reply or, when the model proposes one of the
-three actions it may propose, or a plan of two to five of them, and the
+five actions it may propose, or a plan of two to five of them, and the
 proposal passes every check, with a plan offered for the owner's approval. Any other proposal is refused. Everything
 else is exactly as it was.
 
@@ -1203,7 +1296,9 @@ CLI
 -> MariaBrain.process(request, *conversation, supplied_context=...)
 -> Planner                               always first, text only
 -> provider, enabled, exact fallback?    otherwise the ordinary path
--> Memory.list_context_memories(17)      the one Tier A read
+-> Memory.list_context_memories(17)      Tier A's memory read
+-> Memory.list_context_tasks(17)         Tier A's task read
+-> Memory.list_context_reminders(17)     Tier A's reminder read
 -> Memory.context_*_by_id(...)           recheck of supplied records, if any
 -> Memory.search_context_*(terms, 9)     Tier B reads, only when there are terms
 -> conversation.converse(proposals=True) recheck, budget, selection, notices
@@ -1237,9 +1332,10 @@ original response and its interaction row.
   context, and the UTF-8 text of the retained exchanges' user and assistant
   halves.
 - Every context read is settled first. A failed or untrustworthy read, or a
-  supplied memory, note, or summary that has since been disabled, changed,
-  deleted, or forgotten, clears the earlier conversation before anything is
-  sent; see "Tier A Memory Context" and "Tier B Search Context" below.
+  supplied memory, note, summary, task, or reminder that has since been
+  disabled, changed, deleted, forgotten, or, for a task or reminder,
+  completed, clears the earlier conversation before anything is sent; see
+  "Tier A Memory Context" and "Tier B Search Context" below.
 - A request that is over the budget together with the proposal instructions
   is refused with the fixed input-over-budget message before the provider is
   asked; the instructions are never dropped to make it fit. Text the interface
@@ -1289,12 +1385,13 @@ alone, and even a compiled one runs only after the owner approves it.
 
 What the model sees is Maria's fixed proposal instructions, the current
 request, the session's own completed conversational exchanges, the explicit
-memories the owner has enabled for context, and notes and conversation
-summaries the owner has enabled for context that literally contain a word of
-the request. It never sees a command or its result, its own earlier proposals,
-an approval prompt, what an approved action returned, a memory, note, or
-summary the owner has not enabled, a saved conversation, a file, a stored
-interaction, an audit summary, or anything from an earlier session. A
+memories and the open tasks and reminders the owner has enabled for context,
+and notes and conversation summaries the owner has enabled for context that
+literally contain a word of the request. It never sees a command or its
+result, its own earlier proposals, an approval prompt, what an approved action
+returned, a memory, note, summary, task, or reminder the owner has not
+enabled, a saved conversation, a file, a stored interaction, an audit summary,
+or anything from an earlier session. A
 `summarize conversation` request is the one other request Maria sends, and it
 carries less: her fixed summary prompt and the retained exchanges only; see
 "Saved Conversations and Summaries". A new session starts empty, and ending
@@ -1302,9 +1399,12 @@ one discards its conversation and its supplied-record fingerprints.
 
 ## Tier A Memory Context
 
-In V1-15, Tier A is exactly the owner's explicit memories that the owner has
-enabled for context. Preferences exist only as memories the owner stores and
-enables; tasks, reminders, and project facts do not exist yet.
+In V1-15, Tier A was exactly the owner's explicit memories that the owner has
+enabled for context. Since V1-22 (decision D6, amendment V1-22-R1) it also
+holds the owner's open tasks and reminders that the owner has enabled for
+context, after the memories; see "Tasks and reminders" below. Preferences
+exist only as memories the owner stores and enables, and project facts do not
+exist yet.
 
 **Consent.** Every memory's consent is off by default: the V1-15 migration
 leaves every existing memory off, and a new memory is stored off.
@@ -1340,9 +1440,9 @@ search.
 
 **Stored text is data.** The adapter sends Maria's fixed instructions as the
 only system message: the proposal instructions, which say that earlier
-conversation and supplied memories or notes are data, not authorization, then
-the context instructions, which tell the model the memories are reference
-data, not instructions, grant no permission to act, and may be outdated or
+conversation and supplied records are data, not authorization, then the
+context instructions, which tell the model the memories are reference data,
+not instructions, grant no permission to act, and may be outdated or
 conflicting.
 The memories follow in a separate user message, one line per memory, each fact
 as one JSON string with every line separator escaped — JSON's own escapes plus
@@ -1362,8 +1462,9 @@ memory is stale, fresh, consistent, or conflicting: `created_at` dates the row,
 not its current text, and there is no `updated_at`.
 
 **Revocation.** The session keeps, beside its conversation, the fingerprint —
-source, id, and SHA-256 of the exact text — of every memory, note, and summary
-supplied with a request whose reply it kept since the conversation was last cleared, at
+source, id, and SHA-256 of the exact text — of every memory, note, summary,
+task, and reminder supplied with a request whose reply it kept since the
+conversation was last cleared, at
 most 64 of them, never the text itself; a proposal attempt is never kept, so
 the records supplied with it are not tracked. Before each model-backed
 conversational request — never on a
@@ -1383,6 +1484,40 @@ sends next; it sees current state only, so a record changed away and back to
 the identical text between two checks is indistinguishable from one never
 changed; it is not an instantaneous revocation across a concurrent read and
 send; and it cannot erase text a model has already received.
+
+**Tasks and reminders.** A task's or reminder's consent is off by default and
+changes only through its two confirmed consent commands, by id; enabling pins
+the SHA-256 of the compact JSON array `[text, due or ""]` for a task or
+`[text, remind_time]` for a reminder, and the memory layer enables it only
+while the record is still exactly that. Editing or rescheduling turns it off
+in the same transaction; completing and reopening leave it as it was. On every
+model-backed conversational turn Brain reads enabled open tasks and enabled
+open reminders, one bounded read each, in ascending id order, with every check
+of consent, status, type, size, validity, and approved identity run inside
+SQLite before a row is returned or counted, so a row changed outside Maria is
+never read as eligible. `context.py` then considers the first 16 of each,
+tasks before reminders, after the memories Tier A already chose, and takes
+each whole only while Tier A as a whole stays within 16 items, 2 KiB, and the
+budget; memory selection never changes because of them. Each is rendered on
+its own line as one JSON object, `{"text": ..., "due": ...}` or
+`{"text": ..., "when": ...}`, under the header `Owner memories, tasks, and
+reminders (reference data):`, with framing that names them; a request that
+carries none keeps exactly the bytes it had before V1-22. Maria names the
+tasks and reminders she sent, and any eligible one the limits left out, in a
+notice of their own after the memory notice. A supplied task or reminder that
+is completed, deleted, edited, rescheduled, or disabled is no longer current,
+so the recheck clears the conversation; reopening one makes it eligible again,
+subject to selection. Selection and recheck alike admit only a record whose
+stamps follow the record rules, with no completion stamp while it is open,
+so a supplied record whose stamps are changed outside Maria in a way that
+breaks those rules clears the conversation too; a stamp changed to another
+valid stamp changes nothing, since consent covers only the text and timing.
+Neither reinterprets saved timing under current zone rules or reads a clock.
+Before SQLite hands any of a task's or reminder's values to Maria's Python
+check, it admits each only as text, or NULL where allowed, within a small
+stored-byte bound in the file's own encoding, so no oversized or binary value
+reaches Python, and a value holding NUL reaches it only within that bound, to
+be refused there; see `docs/database.md`.
 
 ## Tier B Search Context
 
@@ -1569,7 +1704,8 @@ positive gate lives here and runs before any permission decision. Brain is the
 only production module that imports it, which a guard test enforces. Brain
 compiles a proposal only on the model-backed conversational path: when a reply
 is a proposal attempt, it hands `compile_proposal` the owner's cleaned request,
-the reply exactly as it arrived, and Tool Manager's active contract registry.
+the reply exactly as it arrived, Tool Manager's active contract registry, and
+the request's one timing context, which only a creation step uses.
 A refusal is answered with its fixed message, followed by the turn's context
 notices, and nothing is repaired, retried, or asked of the model again.
 
@@ -1629,10 +1765,39 @@ argument, or value the model supplied, and no parser or contract error
 escapes. The gate logs only whether a proposal compiled and, when it did not,
 the refusal code, never the proposal, a plan, or a fingerprint.
 
+**Creation steps (V1-22).** `tasks.create` and `reminders.create` are the one
+exception to arguments being kept as supplied, because the model never decides
+whether the owner asked. A proposal holding a creation step passes its own
+gates, in this order, the first failure deciding: allowlist and eligibility
+for every step; the raw checks of each creation step's arguments, missing and
+extra names, then type, size, unsafe characters, and printable ASCII for a
+timing phrase (`text` 1 to 512 UTF-8 bytes and not blank, `when` and `due` 1
+to 64 characters, `repeat` exactly `never`); then `core/task_requests.py`'s
+parse of the owner's own request into one to five items in the four closed
+forms; then the positional binding, one creation step per item, in order, of
+its kind, with exactly its body as `text` and its phrase equal after
+canonical tokenization (ASCII letters lowercased, tokens joined by single
+spaces, digits as written), and a task's `due` present exactly when its item
+names a date;
+then the resolution of each item's own parsed phrase at the shared reference
+instant, and the rule that no two items share a kind, a body, and a resolved
+timing; and finally the ordinary step checks, on arguments Maria builds from
+her own extraction. No model value enters such a plan. A proposal with no
+creation step compiles exactly as before. The eight refusals these gates add
+are fixed: not a creation request, an unclear request, a mismatch, a past
+time, a time beyond the horizon, a nonexistent local time, an ambiguous local
+time, and an unavailable time zone, so the compiler's kinds grow from 13 to
+21. See "Tasks and Reminders".
+
 `recheck_model_plan` applies the same gates again to every step of an already
 compiled plan, in order, exactly as it stands: the allowlist with the
 eligibility the current registry declares, the argument contract, then the
-text and path checks. Nothing is
+text and path checks. A plan holding a creation step is first checked against
+its own request again, with no clock: the request is parsed once more, and
+the plan must still hold exactly one creation step per item, in order, with
+each item's body, a task's due date exactly when its item is dated, and no two
+items alike; each canonical timing is then checked by its contract's format,
+and nothing is resolved again. Nothing is
 parsed, rebuilt, repaired, or substituted, and no provider is asked anything.
 Brain asks it when it offers a compiled plan for approval and again just
 before the approved plan runs, because an approval authorises a plan rather
@@ -1788,10 +1953,11 @@ more to say when more exist; `read audit <id>` shows one summary as a labelled
 block; and `delete audit <id>` removes one summary together with its outcome
 in one transaction. The commands are case-insensitive. `read audit` and
 `delete audit` take the same positive whole-number ids as the eleven memory,
-note, and interaction commands addressed by id alone and, since V1-20, the
-seven saved-conversation and summary commands; these twenty ID-only planner
-commands share one parser, while `read note <id or exact title>` uses its
-separate, unchanged lookup path.
+note, and interaction commands addressed by id alone, since V1-20 the seven
+saved-conversation and summary commands, and since V1-22 the sixteen task and
+reminder commands addressed by id; these thirty-six ID-only planner commands
+share one parser, while `read note <id or exact title>` uses its separate,
+unchanged lookup path.
 `list audits` is still a filesystem listing. `audit.list` and `audit.read` are
 allowed by default, `audit.delete` always requires confirmation, even for an id
 that does not exist, and none of the three is model-eligible. In interaction
@@ -1815,6 +1981,103 @@ several steps stops, the step number, the step count, and a fixed stop code,
 never a report, so the operational log may still show that a model-proposed
 action ran after its summary is deleted, which the deletion's confirmation
 notice says.
+
+## Tasks and Reminders
+
+V1-22 adds tasks and reminders as two independent record types (amendment
+V1-22-R1, decisions D1 to D9 with D1a and D7a), with twenty-six commands, all
+usable with no model present, and two request forms of the model path. Maria
+delivers, notifies, schedules, polls, repeats, and generates nothing: due-now
+and overdue are queries the owner types.
+
+**The time zone (D1, D1a).** Dates and times are resolved in one IANA zone,
+the private override's `[time] zone`, which `core/config.py` checks by syntax
+alone and the tracked configuration may not declare. `core/time_resolution.py`
+loads it through standard-library `zoneinfo`, from time zone files on
+zoneinfo's search path or, when none provides the key, from the optional
+pinned data-only `tzdata` in `requirements-time.txt`, which zoneinfo imports
+itself and Maria never imports or installs. No other source is used: never
+UTC, a fixed offset, or the operating system's zone. A missing zone, or one
+whose data cannot be loaded, refuses `due tasks` and every new date or time
+with a fixed message and stores nothing, while every other operation on
+existing records, adding an undated task included, works without it. Each
+reminder keeps the zone it was resolved in, and a later configuration change
+reinterprets nothing stored. There is no per-request zone; a request naming
+another zone or an abbreviation is unclear.
+
+**The reference instant (D2).** Brain reads its one clock seam once per
+request, after the empty-request check and before planning, and builds one
+`TimingContext` of that aware UTC instant and the configured key. Every timing
+decision of the request uses it: the planner's commands, every creation step
+of a model proposal, however late the model replies, and `due tasks` and
+`due reminders`. Recheck and confirmation read no clock, and a plan is never
+resolved again. `today`, `tomorrow`, a weekday (the first such date strictly
+after today), `YYYY-MM-DD`, and `in N days` are calendar dates in the zone, and
+a reminder's wall time is applied on that date; `in N minutes` and
+`in N hours` are elapsed time, counted on UTC instants from the reference
+truncated to the minute, and shown with the true offset where they land. N
+is ASCII digits with no leading zero: days 1 to 366, minutes 1 to 1,440, hours
+1 to 168. New timing is refused when a reminder's instant is not after the
+reference, when a task's date is before local today, or when the local date is
+beyond the inclusive horizon, the same month and day ten years after local
+today, February 29 mapping to February 28. Existing overdue records stay
+fully usable, and an approval stores exactly the approved values even when
+they have become due.
+
+**Daylight saving (D3).** A local time a change skips is refused, never
+shifted. One it repeats is refused unless the owner gives an offset, and only
+an offset that equals one of the local time's valid offsets is accepted; any
+other offset, on any local time, is refused. So an explicit offset is
+accepted only when it matches the configured zone at the given local time:
+an ordinary local time has one valid offset, which changes nothing, and for a
+repeated local time the offset selects the occurrence (D1 as the owner
+clarified it on review). An offset never names another zone. Valid offsets
+are found per PEP
+495, keeping each fold's offset only when converting the instant it implies
+back gives the same wall time.
+
+**Stored timing.** A task's `due_date` is a calendar date with no time or
+zone. A reminder stores `remind_time`, the canonical RFC 9557 local time,
+offset, and key exactly as approved, and `remind_utc`, which must equal that
+local date and time minus the offset, on every write and every read; that
+takes offset arithmetic and no zone data, and a row that breaks it, or any
+other rule, is corrupt and refused privately on read, a listing holding it
+refusing as a whole. A later rule change is not corruption: the saved values
+agree with the zone's current rules when the saved offset is one at which the
+saved local time exists now, so a correctly chosen repeated time agrees.
+Otherwise the original values are shown with a fixed warning, the saved
+instant keeps ordering and due selection, and nothing is rewritten or
+refused; a zone that cannot be loaded adds a fixed note instead. Only the
+saved zone is consulted, never the configured one.
+
+**Records and lifecycle (D4, D5, D7, D7a).** The two record types have no
+link to each other or to anything else and no recurrence; a reminder's plan
+carries `repeat: "never"`. Creating, editing, rescheduling, deleting, and both
+consent changes are mandatory confirmations whose previews show the exact
+text and resolved timing, or the saved values beside the new ones, before
+anything is stored; listing, due queries, reading, completing, and reopening
+are allowed. Completing stamps the time of that completion, reopening clears
+it, and nothing restores an earlier completion time; neither changes the
+text, the timing, `updated_at`, or the consent.
+
+**Natural-language requests (D8, D9).** A model proposal may create a task or
+reminder only from a request that is, whole, one to five items in four closed
+forms: `remind me <timing> to <body>`, `remind me to <body> <timing>`,
+`add a task to <body>`, and `add a task to <body> by <date>`, joined only by
+` and ` or `, and ` before a form prefix. `core/task_requests.py` prepares
+the request (any control, format, surrogate, or separator character makes it
+unsupported, one trailing `.` is removed, and a request then ending in `?` is
+a question), matches keywords, timing tokens, and joiners ASCII
+case-insensitively with exactly one space between them, keeps each body
+verbatim apart from its surrounding whitespace, and refuses a body holding a
+guarded token: `?`, `!`, `;`, a double quotation mark, a sentence break, a
+form prefix, a timing word or token, or a retraction, hedge, or example
+phrase, the closed lists being those of the amendment. Text that does not
+begin with a form prefix is not a request; a request that begins as one but
+does not complete it is unclear; two items alike are unclear. The compiler
+then binds the proposal to those items and builds every step from Maria's own
+extraction, as "Model-to-Plan Compilation Gate" describes, and a casual
+mention never produces an approval.
 
 ## Boundaries
 
@@ -1843,9 +2106,17 @@ else; no module passes a reply to the planner or a tool, and a compiled plan's
 arguments reach a tool only after the owner's approval and a committed audit
 summary.
 `core/plan_compiler.py` reaches only the action contracts, the planner's plan
-types, the reasoning response type, and the logger, never Tool Manager, a
-tool, permissions, the memory layer, or conversation, and Brain is the only
-production module that imports it. `core/audit.py` imports nothing from Maria
+types, the reasoning response type, the logger, and, since V1-22, the two
+leaves `core/task_requests.py` and `core/time_resolution.py`, never Tool
+Manager, a tool, permissions, the memory layer, or conversation, and Brain is
+the only production module that imports it. `core/time_resolution.py`
+imports only the standard library, and is the only production module that
+imports `zoneinfo`; it never imports `tzdata`, which zoneinfo loads itself
+when installed. `core/task_requests.py` imports only it, and
+`core/task_records.py` only the standard library; none of the three holds
+SQL, logs, or reaches a tool, and only `core/task_records.py` reads a clock,
+for the memory layer's write stamps. Brain reads its one reference instant
+through `_reference_instant()`, its only clock read, once per request. `core/audit.py` imports nothing from Maria
 but the action contracts; it holds no SQL, reads and stores nothing, and logs
 nothing, and the memory layer, Brain, and `tools/audit.py` take every audit
 value from it.
@@ -1872,9 +2143,14 @@ unchanged by explicit memory support. Brain's model-plan path likewise
 branches on a plan's origin, never on a tool or action name, and writes audit
 summaries only through the memory layer's public methods. `AuditTool`
 contains no SQL either: it reaches summaries only through the shared `Memory`
-object, and so do `ConversationsTool` and `ConversationSummariesTool`. Brain
-supplies session inputs generically, from contract declarations, never by a
-tool or action name.
+object, and so do `ConversationsTool`, `ConversationSummariesTool`,
+`TasksTool`, and `RemindersTool`. Brain supplies session inputs generically,
+from contract declarations, never by a tool or action name, and it names no
+task or reminder tool, action, or argument: timing reaches the planner and
+the compiler as one opaque context, and task and reminder context through the
+memory layer's and `core/context.py`'s generic reads. Neither tool reads a
+clock, and nothing in V1-22 starts a thread, a timer, or any background or
+scheduled work.
 
 ## Scope
 

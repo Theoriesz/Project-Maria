@@ -2567,7 +2567,7 @@ class MultiStepInstructionTests(unittest.TestCase):
     """Prove the instructions name the compiler's limits and no budget grew."""
 
     def test_the_instructions_name_the_compiler_step_limits(self) -> None:
-        self.assertEqual(len(PROPOSAL_INSTRUCTIONS.encode("utf-8")), 1327)
+        self.assertEqual(len(PROPOSAL_INSTRUCTIONS.encode("utf-8")), 2045)
         span = f"{MODEL_PROPOSAL_MIN_STEPS} to {PLAN_MAX_STEPS}"
         self.assertIn(f"A proposal for {span} actions must be one JSON object", PROPOSAL_INSTRUCTIONS)
         self.assertIn(f'"steps": an array of {span} such action objects', PROPOSAL_INSTRUCTIONS)
@@ -2582,18 +2582,19 @@ class MultiStepInstructionTests(unittest.TestCase):
         self.assertEqual(MODEL_PROPOSAL_MAX_NESTING, 8)
         self.assertEqual(CONVERSATION_MAX_BYTES, 8 * 1024)
 
-    def test_a_bare_request_may_carry_6865_prompt_bytes_at_the_ceiling(self) -> None:
-        self.assertEqual(request_content_bytes("x" * 6865, (), 8192, (), True), 8192)
-        self.assertGreater(request_content_bytes("x" * 6866, (), 8192, (), True), 8192)
+    def test_a_bare_request_may_carry_6147_prompt_bytes_at_the_ceiling(self) -> None:
+        # V1-22's instructions are 2,045 bytes, so 8,192 - 2,045 remain.
+        self.assertEqual(request_content_bytes("x" * 6147, (), 8192, (), True), 8192)
+        self.assertGreater(request_content_bytes("x" * 6148, (), 8192, (), True), 8192)
 
         settings = enabled_settings(max_input_bytes=8192)
         logger = _quiet_logger("tests.multi_step_plans.budget")
         within = ScriptedProvider.replying("A reply.")
-        converse(within, settings, "x" * 6865, (), logger, proposals=True)
+        converse(within, settings, "x" * 6147, (), logger, proposals=True)
         self.assertEqual(within.calls, 1)
 
         beyond = ScriptedProvider.replying("A reply.")
-        turn = converse(beyond, settings, "x" * 6866, (), logger, proposals=True)
+        turn = converse(beyond, settings, "x" * 6148, (), logger, proposals=True)
         self.assertEqual(beyond.calls, 0)
         self.assertEqual(turn.plan.response_if_no_action, OVER_BUDGET_TEXT)
 

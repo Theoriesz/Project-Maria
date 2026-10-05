@@ -46,7 +46,9 @@ EXPECTED_MODULES = (
     "tools.history",
     "tools.memory",
     "tools.notes",
+    "tools.reminders",
     "tools.system",
+    "tools.tasks",
 )
 EXPECTED_TOOL_NAMES = frozenset(
     {
@@ -58,7 +60,9 @@ EXPECTED_TOOL_NAMES = frozenset(
         "history",
         "memory",
         "notes",
+        "reminders",
         "system",
+        "tasks",
     }
 )
 

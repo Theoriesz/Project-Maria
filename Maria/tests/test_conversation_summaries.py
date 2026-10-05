@@ -250,6 +250,10 @@ CONTEXT_READS = (
     "search_context_memories",
     "search_context_notes",
     "search_context_summaries",
+    "list_context_tasks",
+    "list_context_reminders",
+    "context_tasks_by_id",
+    "context_reminders_by_id",
 )
 
 
@@ -1549,7 +1553,7 @@ class NulBodyTests(unittest.TestCase):
         )
         self.memory.initialize()
         self.assertEqual(_database_encoding(self.database_path), self.encoding)
-        self.assertEqual(self.memory.schema_version(), 6)
+        self.assertEqual(self.memory.schema_version(), 7)
 
     def raw(self, statement: str, parameters: tuple = ()) -> None:
         """Run one statement through a second, raw connection."""

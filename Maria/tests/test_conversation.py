@@ -185,6 +185,9 @@ ZERO_ROWS = {
     # V1-20: no conversational turn may save a conversation or a summary.
     "saved_conversations": 0,
     "conversation_summaries": 0,
+    # V1-22: nor may it add a task or a reminder.
+    "tasks": 0,
+    "reminders": 0,
 }
 
 # Since V1-15 every model-backed conversational response ends with Maria's own
@@ -424,6 +427,8 @@ class _Harness:
                     "audit_outcomes",
                     "saved_conversations",
                     "conversation_summaries",
+                    "tasks",
+                    "reminders",
                 )
             }
         finally:
@@ -1373,9 +1378,10 @@ class CommandCorpusWithReasoningTests(unittest.TestCase):
     """Prove every command records byte-identical rows with reasoning on.
 
     The whole command corpus runs through a controller with reasoning
-    enabled. Its three generic-fallback entries become conversational and
-    record nothing; every other entry is compared, row for row, with the
-    same entry run through a disabled controller that skips those three.
+    enabled. Its five generic-fallback entries, V1-22's two request forms
+    among them, become conversational and record nothing; every other entry
+    is compared, row for row, with the same entry run through a disabled
+    controller that skips those five.
 
     V1-20's two session-input commands read the exchanges a session
     retains, and only a session with reasoning on can retain any. Each is
@@ -1400,7 +1406,13 @@ class CommandCorpusWithReasoningTests(unittest.TestCase):
         }
         self.assertEqual(
             fallback,
-            {"sing me an unsupported song", "list", "histories"},
+            {
+                "sing me an unsupported song",
+                "list",
+                "histories",
+                "add a task to buy milk",
+                "remind me tomorrow at 09:00 to call mom",
+            },
         )
         session_bound = {
             command
@@ -1443,8 +1455,8 @@ class CommandCorpusWithReasoningTests(unittest.TestCase):
                 )
 
         self.assertEqual(enabled.all_rows(), disabled.all_rows())
-        # Positive control: the three fallback replies were retained until
-        # the first session-input command, so ending the session there was
+        # Positive control: the three fallback replies before it were retained
+        # until the first session-input command, so ending the session there was
         # what kept the comparison like for like.
         self.assertEqual(discarded, [3, 0])
         # Neither session-input command reached the provider: with nothing

@@ -38,13 +38,17 @@ exactly the planner's generic no-action fallback, holding exactly
 `DETERMINISTIC` as its own origin. It is then answered in the
 context of `conversation`, the caller's earlier exchanges passed positionally,
 oldest first, with `supplied_context`, the fingerprints of the memories,
-notes, and conversation summaries supplied since that conversation began (see
-"Conversation"). Only then does Brain read context: Tier A through
-`Memory.list_context_memories(limit=17, max_fact_bytes=2048)`; the records
+notes, conversation summaries, tasks, and reminders supplied since that
+conversation began (see "Conversation"). Only then does Brain read context:
+Tier A through `Memory.list_context_memories(limit=17, max_fact_bytes=2048)`,
+`Memory.list_context_tasks(limit=17, max_text_bytes=2048)`, and
+`Memory.list_context_reminders(limit=17, max_text_bytes=2048)`; the records
 `supplied_context` names, only when there are any, through
 `Memory.context_memories_by_id(ids, max_fact_bytes=2048)`,
-`Memory.context_notes_by_id(ids, max_text_bytes=2048)`, and
-`Memory.context_summaries_by_id(ids, max_text_bytes=2048)`; and, only when
+`Memory.context_notes_by_id(ids, max_text_bytes=2048)`,
+`Memory.context_summaries_by_id(ids, max_text_bytes=2048)`,
+`Memory.context_tasks_by_id(ids, max_text_bytes=2048)`, and
+`Memory.context_reminders_by_id(ids, max_text_bytes=2048)`; and, only when
 `context.search_terms(request)` yields terms, Tier B through
 `Memory.search_context_notes(terms, limit=9, max_text_bytes=2048)`,
 `Memory.search_context_summaries(terms, limit=9, max_text_bytes=2048)`, and,
@@ -57,8 +61,20 @@ action or a plan of two to five, which Brain compiles and then offers for the
 owner's approval or refuses; see "Model-Originated Plans" below. With disabled settings the
 fallback keeps its original response and interaction row even if a provider
 was supplied, and no context read happens. The planner receives the cleaned
-request text alone, and no interaction history is read. `supplied_context` is
-the only keyword accepted; no keyword can approve anything.
+request text and the request's `TimingContext`, and no interaction history is
+read. `supplied_context` is the only keyword accepted; no keyword can approve
+anything.
+
+Right after the empty-request check and before planning, `process` reads the
+clock exactly once, through the module function `brain._reference_instant()`,
+Brain's one clock seam, and builds
+`TimingContext(reference, _configured_zone(config))`, the configured
+`time_zone` when it is text and None otherwise. That one context is handed to
+`Planner.create_plan(..., timing=...)` and, on the model path, to
+`compile_proposal(..., timing=...)`, so every date and time of the request,
+every creation step of a proposal included, resolves against one instant, and
+an empty request reads no clock. `execute_confirmed_plan` reads none, and
+nothing resolves a plan's timing again; see "Time Resolution".
 
 Every other plan holding exactly `DETERMINISTIC` as its own origin is read
 once, as `plan_snapshot()` takes it, and a plan whose steps cannot be read
@@ -72,7 +88,7 @@ that there is nothing to save. For `SessionInput.CONVERSATION_SUMMARY_DRAFT`,
 Brain checks the step's permission first, refusing a denied one with
 `Permission denied: <reason>` before anything is read or sent, then refuses
 when no provider is present or reasoning is disabled, then rechecks by id,
-through the three `context_*_by_id` reads only, every record `supplied_context`
+through the five `context_*_by_id` reads only, every record `supplied_context`
 names, and `conversation.draft_summary()` asks the provider at most once;
 `conversation.summary_draft_plan()` builds the transient result. A plan that
 already carries the declared argument, or holds any other step, gets
@@ -90,15 +106,16 @@ conversation as it stands after that reply, and to `()` by a model-backed
 turn that had to clear the conversation, whatever that turn then produced,
 including a refused proposal or a plan awaiting approval. A summary request
 whose recheck cleared the conversation also returns `()`. `supplied_context`
-travels with it: the fingerprints of every memory, note, and summary supplied
-since that conversation was last cleared, at most 64. Every other response,
+travels with it: the fingerprints of every memory, note, summary, task, and
+reminder supplied since that conversation was last cleared, at most 64. Every other response,
 including a failed or refused conversational turn that cleared nothing and
 every proposal turn that cleared nothing, leaves `conversation` `None`, so
 neither a proposal nor the fingerprints of what it was given are ever kept.
 
 A model-originated plan awaiting approval comes back with `needs_confirmation`
-set, `plan` holding that very plan, and as `text` only Maria's notices about
-the turn's context; the session renders the plan above them (see "Session").
+set, `plan` holding that very plan, and as `text` the fixed approval notice of
+each step awaiting confirmation, once each, then Maria's notices about the
+turn's context; the session renders the plan above them (see "Session").
 
 `main.build_reasoning_provider(settings: ReasoningSettings) ->
 ReasoningProvider | None` and `main.build_runtime_brain() -> MariaBrain`
@@ -263,8 +280,9 @@ the conversation, or sent to a model. With no preview the request is exactly
 as before.
 
 These renderings are Brain's, for deterministic plans. A model-originated plan
-gets none: Brain returns only the turn's notices, and the session renders the
-plan itself, naming its declared tool and action and showing every argument
+gets none: Brain returns only the fixed approval notices of its steps awaiting
+confirmation and the turn's notices, and the session renders the plan itself,
+naming its declared tool and action and showing every argument
 value exactly (see "Session"). Those values are only what the model proposed,
 never a path Maria resolved, and the compiler admits only plain relative text
 as a path argument. That rendering is likewise never recorded, logged,
@@ -321,8 +339,15 @@ action is allowed outright: the requirement is Brain's own, and no permission
 policy changes.
 Through `process` the plan comes back with `needs_confirmation` set, as the
 very same immutable plan, never passed to `ToolManager.prepare_confirmation()`,
-and with only the turn's notices as text, which the session shows below its
-rendering of the plan.
+and with its notices as text, which the session shows below its rendering of
+the plan: first the fixed notice of every step `PermissionManager.check()`
+resolved as `requires_confirmation`, asked of
+`PermissionManager.confirmation_notice()` by the step's own tool and action,
+each distinct notice once and in plan order, then the turn's notices (owner
+decision A on V1-22-R1). A plan whose steps carry no notice has only the
+turn's notices, as before. The notices change nothing about the plan or its
+approval and are never kept in the conversation, recorded, or sent to a
+model.
 
 Through `execute_confirmed_plan` the same checks run again, for every step,
 without reparsing, rebuilding, or substituting anything and without asking a
@@ -432,16 +457,17 @@ supplied-record fingerprints. A confirmation-required response becomes the
 single pending approval. When its plan does not hold exactly `DETERMINISTIC`
 as its own origin, the session first replaces the response's text with
 `render_model_approval(plan)`, followed, after a blank line, by Brain's
-notices when there are any, so the owner sees exactly the plan the approval
-then binds; a plan that cannot be rendered, which includes any that is not
-exactly a well-formed model-originated plan, raises `ValueError`, and nothing
-becomes pending. What becomes pending is one snapshot of the plan, as
-`plan_snapshot` takes it: a well-formed model plan is its own, and a
-deterministic plan is snapshotted unless it already is one, raising
-`ValueError(PLAN_STEP_LIMIT_MESSAGE)` when it cannot be, so the plan rendered
-and fingerprinted is the snapshot confirmation compares and runs. A response
-carrying a `conversation` replaces the session's conversation, held to the
-retention limits again here, and replaces its fingerprints with the
+notices when there are any, the fixed approval notices of its steps and then
+the turn's notices, so the owner sees exactly the plan the approval then
+binds and what approving it means; a plan that cannot be rendered, which
+includes any that is not exactly a well-formed model-originated plan, raises
+`ValueError`, and nothing becomes pending. What becomes pending is one
+snapshot of the plan, as `plan_snapshot` takes it: a well-formed model plan
+is its own, and a deterministic plan is snapshotted unless it already is one,
+raising `ValueError(PLAN_STEP_LIMIT_MESSAGE)` when it cannot be, so the plan
+rendered and fingerprinted is the snapshot confirmation compares and runs. A
+response carrying a `conversation` replaces the session's conversation, held
+to the retention limits again here, and replaces its fingerprints with the
 response's `supplied_context`, or with nothing when the conversation is
 empty; a response carrying more than 64 fingerprints clears both. Every other
 response leaves both unchanged, so a turn that ended in a proposal changes
@@ -456,9 +482,10 @@ about context.
 
 `MariaSession.supplied_context -> frozenset[ContextFingerprint]`
 
-The fingerprints of every memory, note, and conversation summary supplied to
-the model since the conversation was last cleared, at most 64: source, id, and
-a SHA-256 digest of the exact text, a note's title and body together, never
+The fingerprints of every memory, note, conversation summary, task, and
+reminder supplied to the model since the conversation was last cleared, at
+most 64: source, id, and a SHA-256 digest of the exact text, a note's title
+and body together, and a task's or reminder's text and timing together, never
 the text. Empty for a new session and whenever the conversation is empty.
 
 `save conversation` and `summarize conversation` are ordinary submits: each
@@ -948,7 +975,8 @@ Summarize the conversation above so the owner can keep it. Use plain prose of at
 `core/context.py` holds Tier A and Tier B context: the provenance values, the
 selection rules, the search-term rule, the rendering a model receives, and the
 fixed owner-visible notices. It imports no Maria module, reads nothing, stores
-nothing, and logs nothing.
+nothing, and logs nothing. Since V1-22 Tier A also holds enabled open tasks
+and reminders after the memories; see "Task and reminder context" below.
 
 `CONTEXT_MAX_ITEMS = 16`, `CONTEXT_MAX_BYTES = 2048`, and
 `CONTEXT_QUERY_LIMIT = 17`
@@ -969,23 +997,30 @@ characters, 24 items and 4,096 fully rendered bytes across both tiers, and 64
 supplied records a conversation may carry.
 
 `ContextSource.MEMORY`, `ContextSource.NOTE`, `ContextSource.SUMMARY`,
-`ContextTier.A`, `ContextTier.B`,
-`ContextItem(source, record_id, text, title=None, tier=ContextTier.A)`, and
-`ContextFingerprint(source, record_id, digest)`
+`ContextSource.TASK`, `ContextSource.REMINDER`, `ContextTier.A`,
+`ContextTier.B`,
+`ContextItem(source, record_id, text, title=None, tier=ContextTier.A,
+timing=None)`, and `ContextFingerprint(source, record_id, digest)`
 
 A `ContextItem` is one stored record supplied to reasoning: an exact
 `ContextSource`, the positive `int` id Maria read, non-empty, encodable text of
-at most `CONTEXT_MAX_BYTES` — a memory's fact, a note's body, or a
-conversation summary's text — and a note's title under the same bound, with
-`title` None for any other source. Only a memory can be a Tier A item, and a
+at most `CONTEXT_MAX_BYTES` — a memory's fact, a note's body, a conversation
+summary's text, or a task's or reminder's text — and a note's title under the
+same bound, with `title` None for any other source. `timing` is a task's due
+date, `YYYY-MM-DD` or None, or a reminder's saved canonical time, printable
+ASCII of at most `CONTEXT_TIMING_MAX_CHARACTERS` (128), and None for every
+other source. Only a memory, task, or reminder can be a Tier A item, and a
 summary is always an untitled Tier B item. Anything else raises
 `ValueError(CONTEXT_ITEM_MESSAGE)`. `item.fingerprint` returns its
 `ContextFingerprint`, whose `digest` is the SHA-256 of the exact text, or for a
 note `note_digest(title, body)`: the SHA-256 of both as one compact JSON
-array; `summary_digest(body)` is a summary's, the SHA-256 of its exact text.
-Neither `repr()` shows text or digest. A later stage that makes another
-record type eligible adds a `ContextSource` member, as V1-20 added `SUMMARY`;
-a saved conversation is deliberately not a source.
+array; `summary_digest(body)` is a summary's, the SHA-256 of its exact text;
+`task_digest(text, due_date)` a task's, the SHA-256 of the compact JSON array
+`[text, due_date or ""]`; and `reminder_digest(text, remind_time)` a
+reminder's, of `[text, remind_time]`. Neither `repr()` shows text or digest.
+A later stage that makes another record type eligible adds a `ContextSource`
+member, as V1-20 added `SUMMARY` and V1-22 `TASK` and `REMINDER`; a saved
+conversation is deliberately not a source.
 
 `search_terms(request) -> tuple[str, ...]` and
 `memory_search_after(memories) -> int | None`
@@ -1023,6 +1058,30 @@ memory, whose text the bounded read never returned, is left out the same way.
 `ContextSelection` holds the `items` sent, the `omitted_ids` the read returned
 but the limits kept out, and `more_enabled` when the read found more than 16.
 
+**Task and reminder context.** `enabled_tasks(rows, limit)` and
+`enabled_reminders(rows, limit)` settle the memory layer's bounded reads into
+`(id, text, due)` and `(id, text, when)` triples, or raise
+`ValueError(ENABLED_TASKS_MESSAGE)` or `ValueError(ENABLED_REMINDERS_MESSAGE)`
+for anything but at most `limit` rows in strictly ascending id order with
+valid values. `select_agenda_context(memory_items, tasks, reminders,
+byte_budget) -> AgendaSelection` considers the first 16 rows of each read,
+tasks before reminders, each in ascending id order, after the memories Tier A
+already chose, and takes each whole only while Tier A as a whole stays within
+16 items, `CONTEXT_MAX_BYTES`, and `byte_budget`; one that does not fit is
+left out by `(source, id)` and the next is still considered, and memory
+selection never changes. `AgendaSelection` holds the `items`, the `omitted`
+pairs, and `more`, the sources whose read returned a seventeenth row.
+`agenda_supplied_notice(items)`, `agenda_selected_notice(items)`, and
+`agenda_omission_notice(selection)` are its owner-visible notices, built from
+sources and ids only, after the memory notice. With a task or reminder among
+the items, `context_instructions` returns `AGENDA_CONTEXT_INSTRUCTIONS`, or
+`AGENDA_SEARCH_CONTEXT_INSTRUCTIONS` once a Tier B item is present too, and
+the Tier A header is `AGENDA_DATA_HEADER`, `Owner memories, tasks, and
+reminders (reference data):`; each renders as
+`task <id>: {"text": ..., "due": ...}` or
+`reminder <id>: {"text": ..., "when": ...}`. Without one, every framing,
+header, and byte is exactly as before V1-22.
+
 `render_context_data(items) -> str`, `rendered_context_bytes(items) -> int`,
 and `context_content_bytes(context) -> int`
 
@@ -1057,11 +1116,14 @@ memory in both tiers; everything rendering within
 `COMBINED_CONTEXT_MAX_BYTES` — and returns its size, raising
 `ValueError(CONTEXT_MESSAGE)` otherwise.
 
-`supplied_still_current(supplied, memories, notes=(), summaries=()) -> bool`
+`supplied_still_current(supplied, memories, notes=(), summaries=(), tasks=(),
+reminders=()) -> bool`
 
 True when every supplied fingerprint names a record among the enabled rows a
-recheck by id returned, with exactly the text it had; a missing, oversized, or
-changed record is not current. Only supplied records are hashed.
+recheck by id returned, with exactly the text it had, and for a task or
+reminder exactly its timing too; a missing, oversized, or changed record is
+not current, and neither is a task or reminder no longer open, since the
+reads return open ones only. Only supplied records are hashed.
 
 `search_supplied_notice(items)`, `search_selected_notice(items)`,
 `search_omission_notice(selection)`, and `divergent_notices(items)`
@@ -1082,11 +1144,42 @@ stored text can start a new line or pose as Maria's own words.
 
 ## Planner
 
-`Planner.create_plan(user_input: str) -> Plan`
+`Planner.create_plan(user_input: str, *, timing: TimingContext | None = None)
+-> Plan`
 
 Returns a `Plan` containing zero or more `PlanStep` objects. The request text
-is the only input; no stored record, interaction history, or memory context is
-consulted, and any other argument raises `TypeError`.
+is the only positional input, and `timing`, the request's `TimingContext`
+passed by keyword only, is the only other; no stored record, interaction
+history, or memory context is consulted, and any other argument raises
+`TypeError`. Only the task and reminder commands read `timing`: a dated add,
+a date or time reschedule, and `due tasks` resolve against it, and
+`due reminders` takes its instant as `as_of`; without it they answer
+`TIMING_UNAVAILABLE_MESSAGE`, `Maria cannot resolve dates and times for this
+request.` A timing failure answers its fixed message followed by
+`Nothing was saved.` Every other command plans exactly as before.
+
+The task and reminder commands, matched ASCII case-insensitively, are `tasks`,
+`completed tasks`, `due tasks`, `add task <text>`,
+`add task due <date>: <text>`, `read`, `complete`, `reopen`, `delete`,
+`enable task context`, and `disable task context` with `<id>`,
+`edit task <id>: <new text>`, and `reschedule task <id>: <date or none>`, and
+for reminders `reminders`, `completed reminders`, `due reminders`,
+`add reminder <date> <time> [<offset>]: <text>`,
+`add reminder in <N> minutes|hours: <text>`, the same six id commands,
+`edit reminder <id>: <new text>`, and
+`reschedule reminder <id>: <timing>`. They plan `tasks.*` and `reminders.*`
+steps carrying canonical values only: `list` a `status`, `due` an `as_of`
+(local today, or the reference instant in UTC), `create` the text and a
+resolved `due` date or a canonical `when` with `repeat: "never"`, and
+`reschedule` a resolved date or `none`, or a canonical `when`. New text must
+pass `task_requests.is_creation_text` before anything is offered, refused
+otherwise with the shared text message. Malformed forms answer fixed usage
+lines (`ADD_TASK_USAGE`, `ADD_TASK_DUE_USAGE`, `ADD_REMINDER_USAGE`,
+`RESCHEDULE_TASK_USAGE`, `RESCHEDULE_REMINDER_USAGE`, and `Use: <command>
+<id>`), and an id the shared parser refuses answers `TASK_ID_USAGE_MESSAGE` or
+`REMINDER_ID_USAGE_MESSAGE`. `list tasks` and `list reminders` stay directory
+listings, and `remind me ...` and `add a task to ...` reach the generic
+fallback.
 
 `Plan` and `PlanStep` are immutable value objects, and both are hashable, so a
 plan can be compared, stored in a set, or used as a dictionary key. Step order
@@ -1235,10 +1328,10 @@ busy-timeout window. A failure while opening the connection itself is not
 covered by this fixed message and continues through that method's existing
 operation-specific static `RuntimeError` message. Every other SQLite failure
 likewise continues to raise that method's existing operation-specific
-`RuntimeError` message, unchanged. The audit-summary methods and the
-conversation-record methods classify contention themselves, wherever it
-arises; see "Audit Summaries" and "Saved Conversations and Conversation
-Summaries".
+`RuntimeError` message, unchanged. The audit-summary methods, the
+conversation-record methods, and the task and reminder methods classify
+contention themselves, wherever it arises; see "Audit Summaries", "Saved
+Conversations and Conversation Summaries", and "Tasks and Reminders".
 
 ### Schema
 
@@ -1828,6 +1921,108 @@ show`. No transcript, body, digest, or SQLite text is ever logged or raised.
 There is no search of saved conversations, no transcript edit, and no bulk
 deletion, retention, or pruning.
 
+### Tasks and Reminders
+
+The `tasks` and `reminders` tables, added in schema version 7 by the
+`create_tasks_and_reminders` migration, hold the owner's tasks and reminders;
+the tasks and reminders tools alone call the record methods below, and Brain's
+context reads call the four context methods.
+Every value is checked against `core/task_records.py` before it is written,
+before the database is opened, and settled into a validated `Task` or
+`Reminder` after it is read; a row Maria could not have written is refused
+privately and never repaired.
+
+`Memory.create_task(text, due_date=None) -> int` and
+`Memory.create_reminder(text, remind_time, remind_utc) -> int`
+
+Store one open record with consent off and return its id. `text` must be task
+text and `due_date` None or a calendar date; `remind_time` must be a canonical
+reminder time and `remind_utc` exactly the instant it encodes, or
+`ValueError(REMIND_TIME_MESSAGE)` is raised before any SQL.
+
+`Memory.list_tasks(status, limit=21) -> list[Task]`,
+`Memory.list_reminders(status, limit=21) -> list[Reminder]`,
+`Memory.due_tasks(as_of, limit=21) -> list[Task]`, and
+`Memory.due_reminders(as_of, limit=21) -> list[Reminder]`
+
+At most `limit` (1 to 21) records. Open tasks come by due date, undated last,
+then id; open reminders by `remind_utc`, then id; completed ones of either by
+latest completion first, then id, newest first. `due_tasks` returns open
+tasks whose due date is on or before the calendar date `as_of`, undated tasks
+never; `due_reminders` returns open reminders whose saved instant is at or
+before the UTC instant `as_of`. Neither reads a clock or zone data. A result
+holding any malformed row refuses as a whole.
+
+`Memory.get_task(task_id) -> Task | None` and
+`Memory.get_reminder(reminder_id) -> Reminder | None`
+
+One record, or None. An id beyond the largest SQLite integer is None without
+SQL; a non-id raises `ValueError(TASK_ID_MESSAGE)` or
+`ValueError(REMINDER_ID_MESSAGE)`.
+
+`Memory.complete_task(id)`, `Memory.reopen_task(id)`,
+`Memory.complete_reminder(id)`, and `Memory.reopen_reminder(id)` ->
+`StatusChange`
+
+Change the status alone: `CHANGED`, `UNCHANGED` when the record already has
+it, or `NOT_FOUND`. Completing stamps `completed_at` with the time of this
+completion; reopening clears it; neither changes the text, timing,
+`updated_at`, or consent.
+
+`Memory.edit_task(id, text)`, `Memory.reschedule_task(id, due_date)`,
+`Memory.edit_reminder(id, text)`, and
+`Memory.reschedule_reminder(id, remind_time, remind_utc)` -> `RecordUpdate`
+
+Replace the text or timing and stamp `updated_at`, turning consent off in the
+same transaction; `RecordUpdate(updated, context_consent_cleared)` says
+whether a row matched and whether consent had been on. `due_date` None clears
+a task's date.
+
+`Memory.delete_task(id) -> bool` and `Memory.delete_reminder(id) -> bool`
+
+Delete one row by id, touching no other record.
+
+`Memory.enable_task_context(id, expected_text_digest)`,
+`Memory.enable_reminder_context(id, expected_text_digest)` ->
+`ContextConsentOutcome`, and `Memory.disable_task_context(id)`,
+`Memory.disable_reminder_context(id)` -> `bool`
+
+Enabling is one `BEGIN IMMEDIATE` transaction that stores the pinned identity,
+`task_digest(text, due_date)` or `reminder_digest(text, remind_time)`, only
+while the record still holds exactly that text and timing: `ENABLED`,
+`NOT_FOUND`, or `TARGET_CHANGED`, which changes nothing, as does an identity
+of None. A malformed identity raises `ValueError(CONTEXT_DIGEST_MESSAGE)`.
+
+`Memory.list_context_tasks(limit, max_text_bytes)`,
+`Memory.list_context_reminders(limit, max_text_bytes)`,
+`Memory.context_tasks_by_id(ids, max_text_bytes)`, and
+`Memory.context_reminders_by_id(ids, max_text_bytes)`
+
+Tier A's reads and rechecks, by ascending id: rows of `id`, `text`, and `due`
+or `when`, returned only for an open record whose consent is on, whose text
+and timing are values Maria could have written, whose text is within the
+bound, whose text and timing are still exactly the approved ones, and whose
+stamps follow the record rules, with no completion stamp. Every check runs
+inside SQLite before a row is returned or counted toward `limit`. Before any
+value reaches the registered Python function, SQLite admits it only as text,
+or NULL where Maria could have written NULL, within its stored-byte bound in
+the file's own encoding, NUL characters included: the text within the
+caller's bound, the due date within 10 characters, the saved time within 91,
+the instant and both stamps within 20, and the consent identity within 64;
+an open record's completion stamp must be NULL. Only then does the function
+apply the canonical-format, timing-agreement, approved-identity, and record
+rules, and the rows are settled again afterwards, so a malformed or changed
+row is skipped, never refused and never counted. The one exception is a
+value whose stored bytes are not valid text in the file's encoding: it cannot
+be decoded for the check at all, so the read fails as a whole with its fixed
+error and no context is sent, as for every other record type's context read.
+
+Every failure raises a fixed `RuntimeError` after any handler has ended, with
+no cause and no context, and logs one fixed line naming the operation and a
+fixed reason; no text, date, time, zone, offset, instant, or digest is ever
+logged or raised. There is no search, bulk, wildcard, date-range, or automatic
+deletion, no recurrence, no linkage to any other record, and no delivery.
+
 ## Tool Execution Result
 
 `ToolExecutionResult(success: bool, message: str, data: Any = None, recorded_message: str | None = None)`
@@ -1840,11 +2035,13 @@ honored and persisted as an empty string rather than falling back to
 `message`. Brain applies this generically and never branches on a tool's name
 or action.
 
-In the current implementation, seven results supply a non-`None`
+In the current implementation, nineteen results supply a non-`None`
 `recorded_message`, each a fixed label with at most an id: a successful
 `history.read`, `audit.list`, `audit.read`, `conversations.list`,
 `conversations.read`, `conversation_summaries.list`, or
-`conversation_summaries.read` (see "History Tool", "Audit Tool",
+`conversation_summaries.read`, and a successful `create`, `list`, `due`,
+`read`, `edit`, or `reschedule` of `tasks` or `reminders` (see "History
+Tool", "Audit Tool", "Tasks Tool and Reminders Tool",
 "Conversations Tool", and "Conversation Summaries Tool"). Every other current
 tool result leaves the field as `None` and therefore retains the existing
 message-as-recorded behavior.
@@ -2123,12 +2320,57 @@ again. `list` and `read` record `Listed conversation summaries.` and
 other reply names at most an id. The factory is `build_tool(memory, **_)`; the
 tool contains no SQL.
 
+## Tasks Tool and Reminders Tool
+
+`TasksTool.execute(action, arguments) -> ToolExecutionResult`,
+`RemindersTool.execute(action, arguments) -> ToolExecutionResult`, and each
+tool's `confirmation_binding(action, arguments)`
+
+Each supports `create`, `list`, `due`, `read`, `complete`, `reopen`, `edit`,
+`reschedule`, `delete`, `enable_context`, and `disable_context`, reaching its
+records only through the shared `Memory` object, with no SQL, no clock, and
+no import of `zoneinfo`. `confirmation_binding` shows exactly what an approval
+covers before anything is stored: for `create`, with no read, the exact text
+and the resolved due date (`Due: Friday 2026-10-09, a calendar date with no
+time` or `Due: none`), or the resolved time
+(`Time: Monday 2026-10-05 at 09:00, Europe/Berlin (UTC+02:00), which is
+2026-10-05 07:00 UTC`) with `Repeats: never`; for `edit`, `reschedule`, and
+`delete`, one read showing the saved values beside any new ones; and for
+`enable_context`, one read showing the record and pinning `text_digest`, its
+`task_digest` or `reminder_digest`. Anything it cannot show adds nothing, and
+an enable without an identity can never turn consent on.
+
+`create` stores exactly the approved values, even when they are already due,
+and replies with the id, the text through `quoted_for_owner`, the described
+timing, and that consent is off; a reminder's reply adds that it does not
+repeat and that Maria will not notify the owner. A reminder's `repeat` must
+be `never`, or `REPEAT_MESSAGE` is the reply. `list` takes `status`, `open` or
+`completed`; `due` takes `as_of`, a calendar date for tasks and a UTC instant
+for reminders, and labels each row `(due today)`, `(overdue)`, or
+`(time reached)`. Listings show at most 20 rows and say when more exist.
+`complete` and `reopen` reply `Completed task <id>.` and the like, or that
+nothing changed. `edit` and `reschedule` reply with the new value and, when
+consent was on, that it was turned off. `create`, `list`, `due`, `read`,
+`edit`, and `reschedule` record a fixed line through `recorded_message`, such
+as `Added task <id>.`, `Listed open reminders.`, `Displayed task <id>.`, or
+`Rescheduled reminder <id>.`; every other reply names at most an id.
+
+The reminders tool shows every reminder from its saved values. Through
+`core/time_resolution.check_rules`, against the saved zone only, it adds
+`RULES_CHANGED_WARNING` when the zone's current rules no longer give the
+saved offset for the saved local time, and `RULES_UNCHECKED_NOTE` when the
+saved zone cannot be loaded; a listing marks such a row `[rules changed]` or
+`[rules unchecked]` and explains each marker once below it. Neither ever
+fails, refuses, or rewrites anything. Every failure is a fixed message, and
+the log names ids and fixed phrases only. The factories are
+`build_tool(memory, **_)`.
+
 ## Action Contracts
 
 `ActionContractRegistry.validate(tool_name, action, arguments) -> ContractViolation | None`
 
 `core/action_contracts.py` declares `BUILT_IN_ACTION_CONTRACTS`, the immutable
-positive allowlist of all 40 built-in tool actions and their arguments. The
+positive allowlist of all 62 built-in tool actions and their arguments. The
 table is written by hand and is independent of Tool Manager's runtime
 inventory, of `PermissionManager`, and of the planner; it is never generated
 from a tool's `actions` set, read from configuration, or persisted. Declaring
@@ -2154,10 +2396,30 @@ default: omitting it raises `TypeError`, and anything but an exact member,
 including a string equal to a member's value, raises `ValueError`. It records
 whether a reasoning model may ever propose the action and decides nothing
 else; `core/plan_compiler.py` compiles a proposal only when it and the
-compiler's own allowlist agree. Three actions are `MODEL_ELIGIBLE`:
-`calculator.calculate`, `filesystem.list`, and `system.current_time`. The
-other 37, the three audit actions and the eleven conversation-record actions
-included, are `NOT_MODEL_ELIGIBLE`.
+compiler's own allowlist agree. Five actions are `MODEL_ELIGIBLE`:
+`calculator.calculate`, `filesystem.list`, `system.current_time`,
+`tasks.create`, and `reminders.create`. The other 57, the three audit
+actions, the eleven conversation-record actions, and the other twenty task and
+reminder actions included, are `NOT_MODEL_ELIGIBLE`.
+
+A str field may also be closed. `ArgumentContract.allowed_values`, a tuple of
+exact texts or None, admits only those values, and
+`ArgumentContract.text_format`, a `TextFormat` member or None, admits only one
+closed format matched whole: `ISO_DATE`, `ISO_DATE_OR_NONE`,
+`ZONED_LOCAL_TIME`, or `UTC_INSTANT`. A closed field is required to be
+non-blank and declares no length bounds beyond its format, and a value outside
+it reports `OUT_OF_RANGE`. `matches_text_format(text_format, value) -> bool`
+is the check: syntax and calendar validity only, with a whole-minute offset
+from `-23:59` to `+23:59` written `+00:00` when zero and an IANA key of at
+most 64 characters, consulting no time zone's rules. The task and reminder
+contracts use them: `list.status` allows `open` and `completed`, `due.as_of`
+is `ISO_DATE` for tasks and `UTC_INSTANT` for reminders, `tasks.create.due` is
+an optional `ISO_DATE`, `tasks.reschedule.due` is `ISO_DATE_OR_NONE`,
+`reminders.create.when` and `reminders.reschedule.when` are
+`ZONED_LOCAL_TIME`, and `repeat` allows only `never`. Every task or reminder
+text declares `MAXIMUM_TASK_TEXT_LENGTH` (512) characters, the exact UTF-8
+rule being `core/task_records.py`'s, and each consent action's `text_digest`
+exactly 64 characters.
 
 `ArgumentContract` also accepts `session_input`, a `SessionInput` member
 (`CONVERSATION` or `CONVERSATION_SUMMARY_DRAFT`) or `None`, the default: the
@@ -2211,7 +2473,7 @@ all, are settled later by `FilesystemRoots` and `FilesystemTool`.
 
 ## Model-to-Plan Compilation
 
-`compile_proposal(request, response, contracts=BUILT_IN_ACTION_CONTRACTS, logger=None) -> Plan | ProposalRejection`
+`compile_proposal(request, response, contracts=BUILT_IN_ACTION_CONTRACTS, logger=None, *, timing=None) -> Plan | ProposalRejection`
 
 `core/plan_compiler.py` compiles one reasoning-model proposal into a
 `TRANSIENT` `Plan` of origin `MODEL`, of one step per proposed action and
@@ -2228,11 +2490,30 @@ non-empty text equal to its stripped form, `response` an exact
 anything else raises `ValueError` with a fixed message. `MODEL_ACTION_ALLOWLIST`
 is the closed allowlist, `MODEL_PROPOSAL_MAX_BYTES` the 4,096-byte cap on the
 whole reply, and `MODEL_PROPOSAL_MAX_NESTING` the eight-container nesting
-limit. `ProposalRejection` has thirteen members: `OVERSIZED`,
+limit. `ProposalRejection` has twenty-one members: `OVERSIZED`,
 `MALFORMED_OUTPUT`, `MALFORMED_PROPOSAL`, `MALFORMED_PLAN`, `UNKNOWN_TOOL`,
 `UNKNOWN_ACTION`, `NOT_MODEL_ELIGIBLE`, `MISSING_ARGUMENT`, `EXTRA_ARGUMENT`,
-`WRONG_TYPE`, `OUT_OF_RANGE`, `UNSAFE_TEXT`, and `UNSAFE_PATH`; each has a
-stable `code` and a fixed `message` that repeats nothing the model supplied.
+`WRONG_TYPE`, `OUT_OF_RANGE`, `UNSAFE_TEXT`, `UNSAFE_PATH`, and, from V1-22,
+`NOT_A_CREATION_REQUEST`, `CREATION_REQUEST_UNCLEAR`, `CREATION_MISMATCH`,
+`TIME_PAST`, `TIME_TOO_FAR`, `TIME_NONEXISTENT`, `TIME_AMBIGUOUS`, and
+`TIME_ZONE_UNAVAILABLE`; each has a stable `code` and a fixed `message` that
+repeats nothing the model supplied, the five timing messages being the timing
+failure's own sentence followed by `Nothing was added.`
+
+A proposal holding a `tasks.create` or `reminders.create` step (the
+`CREATION_ACTIONS`) compiles only through the creation gates, in order:
+allowlist and eligibility for every step; the raw checks of each creation
+step's arguments, a missing then an extra name, then type, size
+(`PROPOSAL_TEXT_MAX_BYTES`, 512 UTF-8 bytes of non-blank `text`;
+`PROPOSAL_PHRASE_MAX_LENGTH`, 64 characters of `when` or `due`), unsafe
+characters, and printable ASCII for a phrase, with `repeat` exactly `never`;
+`task_requests.parse_creation_request(request)`; the positional binding of one
+creation step per item; the resolution of each item's own phrase against
+`timing`, `TIME_ZONE_UNAVAILABLE` when it is None; the duplicate rule; and the
+ordinary step checks on the canonical arguments Maria builds from her own
+extraction: `{"text": body}` or `{"text": body, "due": "YYYY-MM-DD"}` for a
+task, and `{"text": body, "when": canonical, "repeat": "never"}` for a
+reminder. No model value enters the plan.
 `MALFORMED_PLAN` answers an object of exactly `steps` whose list is not two to
 five actions each shaped exactly as one: `The proposed plan did not have
 exactly a steps list of 2 to 5 actions, each with exactly a tool, an action,
@@ -2248,7 +2529,11 @@ Checks an already compiled plan again, exactly as it stands: every step, in
 order, against the closed allowlist, the model eligibility `contracts`
 declares now, the argument contract, and the text and path checks, in that
 order, the same gates that compiled it, returning the first refusal or
-`None`. Nothing is
+`None`. A plan holding a creation step is first checked against its own
+request again, with no clock: parsed once more, it must still hold one
+creation step per item, in order, each of the item's kind and body, a task
+carrying `due` exactly when its item is dated, and no two items alike; nothing
+is resolved again. Nothing is
 parsed, rebuilt, repaired, defaulted, or substituted, and no provider is asked
 anything. Brain asks it when it offers a compiled plan for approval and again
 just before the approved plan runs. A registry that is not exactly an
@@ -2267,9 +2552,11 @@ nothing, stores nothing, and logs nothing, and imports nothing from Maria but
 `AUDITED_ACTIONS`, `AUDIT_LIST_LIMIT = 20`, `AUDIT_QUERY_LIMIT = 21`, and
 `AUDIT_TIMESTAMP_FORMAT = "%Y-%m-%dT%H:%M:%SZ"`
 
-The actions a summary may name, `calculator.calculate`, `filesystem.list`, and
-`system.current_time`, which are exactly `MODEL_ACTION_ALLOWLIST` but declared
-again here rather than imported; the most summaries a listing shows, and the
+The actions a summary may name, `calculator.calculate`, `filesystem.list`,
+`system.current_time`, `tasks.create`, and `reminders.create`, which are
+exactly `MODEL_ACTION_ALLOWLIST` but declared again here rather than
+imported; both creation actions take the target `none`. Then the most
+summaries a listing shows, and the
 one more it reads to learn that more exist; and Maria's one timestamp form,
 UTC to the second with a literal `Z`, such as `2026-10-01T09:46:17Z`.
 `audit_timestamp()` returns the current time in that form.
@@ -2312,6 +2599,125 @@ fingerprint, private context, a root's name, a host path, a tool's result, or
 an exception's text. A summary records that the owner approved one
 model-proposed action and that Maria authorised that attempt for dispatch; by
 itself it does not prove the tool ran.
+
+## Time Resolution
+
+`core/time_resolution.py` is the one module that reads and resolves dates and
+times and the one production module that imports `zoneinfo`. It imports only
+the standard library, never `tzdata`, reads no clock, holds no SQL, and logs
+nothing.
+
+`TimingContext(reference, zone_key)`
+
+One request's UTC reference instant, whose time zone must be `timezone.utc`
+itself, and configured zone key or None; anything else, a zone that merely has
+no offset at that moment included, raises `ValueError`, and `repr()` shows
+neither. `DateSpec` and `ReminderTiming`, a phrase parsed but not resolved,
+show no date, time, offset, or span in `repr()` either.
+
+`parse_reminder_phrase(text)`, `parse_task_phrase(text)`,
+`parse_reminder_command(text)`, and `parse_task_command(text)`
+
+Parse, ASCII case-insensitively and whole, a request form's reminder timing
+(`today at T`, `tomorrow at T`, `on WEEKDAY at T`, `on YYYY-MM-DD at T`,
+`in N day(s) at T`, `in N minute(s)`, or `in N hour(s)`, where T is `H:MM` or
+`HH:MM` and an optional ` +HH:MM` or ` -HH:MM` offset) and task date (`today`,
+`tomorrow`, a weekday, or `YYYY-MM-DD`), and a command's reminder timing (a
+date and a time with no `on` or `at`, or an elapsed span) and task date (the
+same plus `in N day(s)`), into an unresolved `ReminderTiming` or `DateSpec`,
+or return None. Counts are ASCII digits with no leading zero, within
+`MAXIMUM_DAYS` (366), `MAXIMUM_MINUTES` (1,440), and `MAXIMUM_HOURS` (168).
+
+`resolve_task_date(spec, timing) -> date | TimingFailure` and
+`resolve_reminder_time(spec, timing) -> ResolvedTime | TimingFailure`
+
+Resolve at the context's instant, in its zone: `PAST`, `TOO_FAR` beyond
+`horizon(today)` (`TIMING_HORIZON_YEARS`, 10), `NONEXISTENT` for a skipped
+local time, `AMBIGUOUS` for a repeated one without a valid offset or any
+offset that is not valid, and `ZONE_UNAVAILABLE` when no zone is configured
+or its data cannot be loaded, or the resolved offset is not whole minutes.
+`ResolvedTime(local, offset, key)` gives `.canonical`,
+`YYYY-MM-DDTHH:MM:SS+HH:MM[Key]`, `.instant`, and `.instant_text`,
+`YYYY-MM-DDTHH:MM:SSZ`. Each `TimingFailure` has a fixed `.message`.
+
+`valid_offsets(local, zone)`, `check_rules(local, offset, key) -> RuleCheck`,
+`load_zone(key)`, `is_zone_key(value)`, and `local_today(timing)`
+
+`valid_offsets` returns the offsets at which a naive local time exists, none,
+one, or two, keeping each PEP 495 fold's offset only when it round-trips.
+`check_rules` loads the saved key, never the configured zone, and answers
+`AGREES` when the saved offset is among them, `CHANGED` otherwise, and
+`UNAVAILABLE` when the zone cannot be loaded. `load_zone` returns None for
+every failure alike. `is_zone_key` is the IANA key syntax of at most
+`ZONE_KEY_MAX_LENGTH` (64) characters. The canonical writers are
+`canonical_remind_time`, `offset_text`, `utc_instant_text`, `iso_date_text`,
+and `reference_instant_text`.
+
+## Task Requests
+
+`core/task_requests.py` parses the owner's cleaned request against the four
+request forms. It imports only `core/time_resolution.py` and the standard
+library, reads no clock, and logs nothing.
+
+`parse_creation_request(request) -> tuple[CreationItem, ...] | RequestRefusal`
+
+Returns one to `CREATION_REQUEST_MAX_ITEMS` (5) `CreationItem(kind, body,
+phrase, due, timing)` values, or `RequestRefusal.NOT_A_CREATION_REQUEST` (an
+unsafe character, a question, no form prefix) or `RequestRefusal.UNCLEAR` (a
+prefix that does not complete a form, vague or unsupported timing, a guarded
+body, a body over `CREATION_BODY_MAX_BYTES`, or more than five items).
+`body_is_guarded(body)` applies the closed guards (`GUARDED_CHARACTERS`,
+`SENTENCE_BREAK`, `GUARDED_PREFIXES`, `TIMING_WORDS`, timing tokens with
+`TIMING_UNITS`, and `GUARDED_PHRASES`); `canonical_phrase(value)` is the
+binding's canonical tokenization, which lowercases ASCII letters and joins the
+phrase's space-separated tokens by single spaces, keeping digits and every
+other character as written; and `is_creation_text(value)`
+is the stored-text rule the planner checks new text against, with
+`CREATION_TEXT_MESSAGE` its refusal. A `CreationItem`'s `repr()` shows its
+kind only.
+
+## Task Records
+
+`core/task_records.py` is the storage vocabulary of tasks and reminders. It
+imports only the standard library, holds no SQL, logs nothing, and reads a
+clock only in `task_timestamp()`, the memory layer's write stamp.
+
+`Task(task_id, text, due_date, status, created_at, updated_at, completed_at,
+context_enabled)` and `Reminder(reminder_id, text, remind_time, remind_utc,
+status, created_at, updated_at, completed_at, context_enabled)`
+
+Frozen value objects whose every field is validated: an exact positive id,
+task text, a calendar date or None, a canonical reminder time with exactly
+its instant, `open` or `completed` with `completed_at` set exactly while
+completed, valid UTC stamps, and an exact `bool`; anything else raises
+`ValueError(TASK_RECORD_MESSAGE)`, and `repr()` shows the id only.
+`StatusChange` (`CHANGED`, `UNCHANGED`, `NOT_FOUND`) and
+`RecordUpdate(updated, context_consent_cleared=False)` are the lifecycle
+results.
+
+`is_task_text`, `is_record_id`, `is_status`, `is_due_date`, `is_utc_instant`,
+`is_task_timestamp`, `is_lifecycle`, `parse_remind_time`, `is_remind_time`,
+`timing_agrees`, `is_context_digest`, `describe_due_date`, and
+`describe_remind_time`
+
+The validators and the owner-visible descriptions. Task text is 1 to
+`TASK_TEXT_MAX_BYTES` (512) UTF-8 bytes, equal to its stripped form, with no
+Cc, Cf, Cs, Zl, or Zp character. `timing_agrees(remind_time, remind_utc)` is
+the stored-timing rule, offset arithmetic with no zone data.
+`is_lifecycle(status, created_at, updated_at, completed_at)` is the record
+rule for a status and its stamps: both stamps valid, and `completed_at` a
+valid stamp exactly while completed and None while open; the value objects
+and Tier A's context reads both apply it. `DUE_DATE_LENGTH` (10),
+`UTC_INSTANT_LENGTH` (20), `REMIND_TIME_MAX_LENGTH` (91), and
+`CONTEXT_DIGEST_LENGTH` (64) are the longest canonical value of each form, in
+characters and so in UTF-8 bytes, by which the memory layer bounds a stored
+value before it reaches Python.
+`describe_due_date("2026-10-09")` is `due Friday 2026-10-09`, and
+`describe_remind_time` shows the saved local time, zone, offset, and UTC
+instant from the saved values alone. The fixed messages include
+`TASK_TEXT_MESSAGE`, `DUE_DATE_MESSAGE`, `REMIND_TIME_MESSAGE`,
+`RULES_CHANGED_WARNING`, and `RULES_UNCHECKED_NOTE`; none interpolates
+anything supplied at run time.
 
 ## Filesystem Roots
 
@@ -2566,27 +2972,31 @@ representation.
 `proposal_instruction_bytes(with_context: bool) -> int`, and
 `system_instructions(context, proposal_instructions) -> str | None`
 
-`PROPOSAL_INSTRUCTIONS` is Maria's fixed text, 1,327 ASCII bytes since V1-19,
-which added 312 to V1-18's 1,015, inviting the model to answer a request for
-allowed actions with one proposal: one bare JSON object of `tool`, `action`,
-and `arguments` for one action, or, for two to five actions run in order, one
-object of exactly `steps`, a list of such objects. It says that Maria stops if
-a step fails, an audit write fails, or the run is interrupted, and that every
-argument must be a complete literal value that cannot use an earlier step's
-result. It lists exactly the compiler's allowlist, calls earlier conversation
-and supplied memories or notes data rather than authorization, and asks for a
-conversational reply that does not start with `{` when no allowed action
-fits. It never contains
+`PROPOSAL_INSTRUCTIONS` is Maria's fixed text, 2,045 ASCII bytes in 24 lines
+since V1-22, which added 718 to V1-19's 1,327 (itself 312 more than V1-18's
+1,015), inviting the model to answer a request for allowed actions with one
+proposal: one bare JSON object of `tool`, `action`, and `arguments` for one
+action, or, for two to five actions run in order, one object of exactly
+`steps`, a list of such objects. It says that Maria stops if a step fails, an
+audit write fails, or the run is interrupted, and that every argument must be
+a complete literal value that cannot use an earlier step's result. It lists
+exactly the compiler's allowlist, the two creation actions with their text and
+phrase copied exactly; says to propose a task or reminder only when the whole
+request is one of the four forms, or two to five joined by "and", one action
+per item in order, and to reply conversationally otherwise; calls earlier
+conversation and supplied records data rather than authorization; and asks
+for a conversational reply that does not start with `{` when no allowed
+action fits. It never contains
 stored text, request text, or anything a model wrote. `system_instructions`
 returns the one system message a request carries: `None` with neither the
 flag nor context, the context instructions alone with context only,
 `PROPOSAL_INSTRUCTIONS` alone with the flag only, and with both,
 `PROPOSAL_INSTRUCTIONS`, `INSTRUCTION_SEPARATOR`, and the context
 instructions, in that order. `proposal_instruction_bytes` is what the
-instructions add to a request's size: 1,327 bytes, plus 2 for the separator
+instructions add to a request's size: 2,045 bytes, plus 2 for the separator
 when the request also carries context, whose framing is counted with the
 context. No budget grew with them: under the 8,192-byte conversation ceiling,
-a request with no context or earlier conversation may carry at most 6,865
+a request with no context or earlier conversation may carry at most 6,147
 prompt bytes in proposal mode, and one that does not fit is refused before the
 provider is asked anything.
 
@@ -2694,15 +3104,17 @@ whitespace, and Brain hands such a proposal attempt to the compiler; see
 `load_config(config_path=CONFIG_PATH, local_override_path=None) ->
 MariaConfig`
 
-`MariaConfig.reasoning` holds the settled `ReasoningSettings`. It is the last
-field and defaults to `DISABLED_REASONING`, so direct constructions that do
-not name it keep working.
+`MariaConfig.reasoning` holds the settled `ReasoningSettings` and defaults to
+`DISABLED_REASONING`, and `MariaConfig.time_zone`, the last field, holds the
+override's IANA zone key or None, its default, so direct constructions that do
+not name them keep working.
 
 The tracked file's `[reasoning]` table is optional. When absent, reasoning is
 disabled. When present, it must be a table containing exactly
 `enabled = false`: a tracked file that enables reasoning, or names any other
 key, raises `ValueError`. Active settings belong only in the untracked
-override.
+override. A tracked file that declares `[time]` at all raises
+`ValueError(TIME_TRACKED_MESSAGE)`.
 
 `local_override_path` is `None` by default, so an ordinary caller loads the
 tracked file alone and never reads the owner's private settings.
@@ -2718,12 +3130,19 @@ in full first. Then:
   is opened. Where the platform supports it, the open neither follows a link
   nor waits on a special file, and the opened descriptor must still be the
   same regular file.
-- The file must be at most 65,536 bytes of UTF-8 TOML containing exactly one
-  `[reasoning]` table and no other table or key.
-- That table replaces the tracked one completely: a disabled table must say
-  only `enabled = false`, and an enabled table must name all six active
-  fields. Nothing is merged and no missing field is borrowed. The override
-  can never affect permissions, roots, paths, logging, or any other section.
+- The file must be at most 65,536 bytes of UTF-8 TOML containing a
+  `[reasoning]` table, a `[time]` table, or both, and no other table or key;
+  anything else raises `ValueError(LOCAL_OVERRIDE_SECTIONS_MESSAGE)`.
+- A `[reasoning]` table replaces the tracked one completely: a disabled table
+  must say only `enabled = false`, and an enabled table must name all six
+  active fields. Nothing is merged and no missing field is borrowed.
+- A `[time]` table must be a table (`TIME_SECTION_TABLE_MESSAGE`) holding
+  exactly one key, `zone` (`TIME_SECTION_KEYS_MESSAGE`), whose value must be
+  IANA key syntax, `time_resolution.is_zone_key`: 1 to 64 characters of
+  slash-separated parts, each starting with an ASCII letter and holding only
+  ASCII letters, digits, `_`, `+`, and `-` (`TIME_ZONE_MESSAGE`). Whether data
+  for the key can be loaded is not checked here. The override can never
+  affect permissions, roots, paths, logging, or any other section.
 
 Unknown keys are refused inside `[reasoning]` only; the existing rule that
 unknown keys in `[app]`, `[paths]`, `[logging]`, and `[permissions]` are
@@ -2931,7 +3350,21 @@ it for passwords or other secrets. `conversation_summaries.enable_context`
 has one stating that the summary's entire text may be sent on a later
 conversational turn when a word of four or more characters from the request
 appears literally in it, within Maria's context limits, and that Maria does
-not check the summary for secrets.
+not check the summary for secrets. `reminders.create` has one stating that
+Maria will not notify the owner when the reminder is due and that it does not
+repeat, so `due reminders` shows the reminders whose time has come; and
+`tasks.enable_context` and `reminders.enable_context` each have one stating
+that the record's text and timing may be sent to the local reasoning model on
+a conversational turn while it is open, after the enabled memories and within
+Maria's memory context limits, so not always, and that Maria does not check it
+for secrets. There are eight notices in all.
+
+`PermissionManager.confirmation_notice(tool_name, action) -> str | None`
+
+Returns the fixed notice an approval of the action carries: its entry in
+`CONFIRMATION_NOTICES` when the action requires confirmation and is not
+denied, and None otherwise, without logging anything. `check()` appends the
+same notice to its reason, and Brain shows it before a model plan's approval.
 
 `load_config` requires a present `[permissions]` value to be a TOML table and
 validates `require_confirmation` and `deny` as arrays of lowercase
@@ -2948,8 +3381,10 @@ baseline: `audit.delete`, `conversations.delete`,
 `conversation_summaries.disable_context`, `filesystem.rename`,
 `filesystem.move`, `history.delete`, `notes.retitle`, `notes.edit`,
 `notes.delete`, `notes.enable_context`, `notes.disable_context`,
-`memory.update`, `memory.forget`, `memory.enable_context`, and
-`memory.disable_context` require confirmation, while `filesystem.delete` and
+`memory.update`, `memory.forget`, `memory.enable_context`,
+`memory.disable_context`, and `create`, `edit`, `reschedule`, `delete`,
+`enable_context`, and `disable_context` for both `tasks` and `reminders`,
+thirty-one actions, require confirmation, while `filesystem.delete` and
 `filesystem.write` are denied.
 Configuration can add restrictions but cannot remove this baseline.
 `PermissionManager` applies the same mandatory policy when constructed
@@ -2958,5 +3393,6 @@ directly, and denial wins if an action also requires confirmation.
 The one approval every model-originated plan needs is Brain's own requirement,
 not an entry here: `PermissionManager` decides `calculator.calculate`,
 `filesystem.list`, and `system.current_time` exactly as before, allowing them
-by default, and a configuration that denies one makes Brain refuse a proposal
-of it before any approval is offered.
+by default, and `tasks.create` and `reminders.create` as the mandatory
+confirmations they are, and a configuration that denies one makes Brain
+refuse a proposal of it before any approval is offered.

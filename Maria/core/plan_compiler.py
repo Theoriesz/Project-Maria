@@ -13,6 +13,19 @@ PermissionManager allows any action absent from its mandatory sets, so it
 cannot be the positive gate, and a compiled plan still has to pass it later,
 unchanged.
 
+A proposal to create a task or reminder, from V1-22, compiles only from the
+owner's own words. Its raw arguments are checked first; the owner's cleaned
+request must then be one to five items in the four supported forms that
+``core/task_requests.py`` parses; the proposal must hold exactly one creation
+step per item, in order, copying each item's body and timing phrase; and
+each item's own phrase is resolved at the request's one reference instant,
+through ``core/time_resolution.py``. Maria then builds every step from her
+own extraction, so the model's values are compared and never used: this is
+the one declared, deterministic exception to compiling arguments exactly as
+supplied, and it replaces only the timing value, with Maria's resolution of
+the owner's own phrase. A proposal with no creation step compiles exactly as
+it always has.
+
 The compiler executes nothing. It calls no tool, Tool Manager, permission
 check, memory layer, conversation, network, shell, or SQL, and it performs no
 filesystem operation. A model-supplied path is judged by its text alone, under
@@ -63,6 +76,21 @@ from core.planner import (
     is_model_plan,
 )
 from core.reasoning import ReasoningResponse
+from core.task_requests import (
+    CreationItem,
+    CreationKind,
+    RequestRefusal,
+    canonical_phrase,
+    parse_creation_request,
+)
+from core.time_resolution import (
+    ResolvedTime,
+    TimingContext,
+    TimingFailure,
+    iso_date_text,
+    resolve_reminder_time,
+    resolve_task_date,
+)
 
 
 # The closed positive allowlist. It is declared here by hand rather than read
@@ -74,8 +102,46 @@ MODEL_ACTION_ALLOWLIST = frozenset(
         "calculator.calculate",
         "filesystem.list",
         "system.current_time",
+        "tasks.create",
+        "reminders.create",
     }
 )
+
+# The two creation actions and the kind of requested item each one binds to.
+# A proposal holding either one compiles only through the creation gates.
+CREATION_ACTIONS = MappingProxyType(
+    {
+        "tasks.create": CreationKind.TASK,
+        "reminders.create": CreationKind.REMINDER,
+    }
+)
+
+# The closed proposal-input table for the creation actions: every argument
+# each one accepts, whether it is required, and its raw check, in the order
+# the checks run. A ``text`` is 1 to ``PROPOSAL_TEXT_MAX_BYTES`` UTF-8 bytes
+# and not blank; a timing phrase is 1 to ``PROPOSAL_PHRASE_MAX_LENGTH``
+# characters of printable ASCII; and ``repeat`` is exactly ``never``. These
+# run before anything else reads a value, so no model value is tokenized,
+# compared, or resolved before it has been checked.
+PROPOSAL_TEXT_MAX_BYTES = 512
+PROPOSAL_PHRASE_MAX_LENGTH = 64
+_TEXT_INPUT = "text"
+_PHRASE_INPUT = "phrase"
+_NEVER_INPUT = "never"
+_PROPOSAL_INPUTS = MappingProxyType(
+    {
+        "tasks.create": (
+            ("text", True, _TEXT_INPUT),
+            ("due", False, _PHRASE_INPUT),
+        ),
+        "reminders.create": (
+            ("text", True, _TEXT_INPUT),
+            ("when", True, _PHRASE_INPUT),
+            ("repeat", True, _NEVER_INPUT),
+        ),
+    }
+)
+_REPEAT_NEVER = "never"
 
 # The largest proposal considered at all, in UTF-8 bytes, measured before any
 # parsing. The cap covers the whole reply, however many actions it proposes:
@@ -141,6 +207,14 @@ class ProposalRejection(str, Enum):
     OUT_OF_RANGE = "out_of_range"
     UNSAFE_TEXT = "unsafe_text"
     UNSAFE_PATH = "unsafe_path"
+    NOT_A_CREATION_REQUEST = "not_a_creation_request"
+    CREATION_REQUEST_UNCLEAR = "creation_request_unclear"
+    CREATION_MISMATCH = "creation_mismatch"
+    TIME_PAST = "time_past"
+    TIME_TOO_FAR = "time_too_far"
+    TIME_NONEXISTENT = "time_nonexistent"
+    TIME_AMBIGUOUS = "time_ambiguous"
+    TIME_ZONE_UNAVAILABLE = "time_zone_unavailable"
 
     @property
     def code(self) -> str:
@@ -202,6 +276,57 @@ _REJECTION_MESSAGES = MappingProxyType(
             "The proposed action had a path that is not a plain relative path "
             "inside Maria's default filesystem root."
         ),
+        ProposalRejection.NOT_A_CREATION_REQUEST: (
+            "Maria adds a task or reminder from conversation only when your "
+            "whole request is a supported form, such as 'remind me tomorrow "
+            "at 09:00 to call mom' or 'add a task to pay rent by friday'. "
+            "Nothing was added."
+        ),
+        ProposalRejection.CREATION_REQUEST_UNCLEAR: (
+            "That request names a task or reminder, but its time or wording "
+            "is missing, vague, or not a supported form. Please say it again, "
+            "for example 'remind me tomorrow at 09:00 to call mom'. Nothing "
+            "was added."
+        ),
+        ProposalRejection.CREATION_MISMATCH: (
+            "The proposed tasks or reminders did not match your request: each "
+            "item must appear once, in order, with its text and time copied "
+            "exactly. Nothing was added."
+        ),
+        ProposalRejection.TIME_PAST: (
+            f"{TimingFailure.PAST.message} Nothing was added."
+        ),
+        ProposalRejection.TIME_TOO_FAR: (
+            f"{TimingFailure.TOO_FAR.message} Nothing was added."
+        ),
+        ProposalRejection.TIME_NONEXISTENT: (
+            f"{TimingFailure.NONEXISTENT.message} Nothing was added."
+        ),
+        ProposalRejection.TIME_AMBIGUOUS: (
+            f"{TimingFailure.AMBIGUOUS.message} Nothing was added."
+        ),
+        ProposalRejection.TIME_ZONE_UNAVAILABLE: (
+            f"{TimingFailure.ZONE_UNAVAILABLE.message} Nothing was added."
+        ),
+    }
+)
+
+_REQUEST_REJECTIONS = MappingProxyType(
+    {
+        RequestRefusal.NOT_A_CREATION_REQUEST: (
+            ProposalRejection.NOT_A_CREATION_REQUEST
+        ),
+        RequestRefusal.UNCLEAR: ProposalRejection.CREATION_REQUEST_UNCLEAR,
+    }
+)
+
+_TIMING_REJECTIONS = MappingProxyType(
+    {
+        TimingFailure.PAST: ProposalRejection.TIME_PAST,
+        TimingFailure.TOO_FAR: ProposalRejection.TIME_TOO_FAR,
+        TimingFailure.NONEXISTENT: ProposalRejection.TIME_NONEXISTENT,
+        TimingFailure.AMBIGUOUS: ProposalRejection.TIME_AMBIGUOUS,
+        TimingFailure.ZONE_UNAVAILABLE: ProposalRejection.TIME_ZONE_UNAVAILABLE,
     }
 )
 
@@ -233,6 +358,9 @@ COMPILER_CONTRACTS_MESSAGE = (
 COMPILER_PLAN_MESSAGE = (
     "Only a well-formed model-originated plan can be checked again."
 )
+COMPILER_TIMING_MESSAGE = (
+    "A model proposal's timing must be a TimingContext or None."
+)
 
 
 class _StrictJsonError(ValueError):
@@ -244,6 +372,8 @@ def compile_proposal(
     response: ReasoningResponse,
     contracts: ActionContractRegistry = BUILT_IN_ACTION_CONTRACTS,
     logger: Logger | None = None,
+    *,
+    timing: TimingContext | None = None,
 ) -> Plan | ProposalRejection:
     """Compile one model proposal into a plan of 1 to 5 steps, or refuse it.
 
@@ -251,6 +381,9 @@ def compile_proposal(
     ``original_request``; no model text ever does. ``response`` is the
     model's reply, read again here rather than trusted from construction.
     ``contracts`` is the registry the eventual dispatch would use.
+    ``timing`` is the request's one reference instant and configured zone,
+    which only a creation step's timing ever uses; without it, any timing
+    is refused as unavailable.
 
     The gates run in a fixed order and the first failure decides the
     rejection: the byte cap, strict parsing, the proposal's shape, which is
@@ -266,10 +399,18 @@ def compile_proposal(
     defaulted, or substituted, and a reference-like value such as ``$1`` is
     only literal text.
 
+    A proposal holding a creation step goes through the creation gates
+    instead, in this order: allowlist and eligibility for every step; the
+    raw checks of every creation step's arguments; the parse of the owner's
+    request and the positional binding of steps to its items; the
+    resolution of each item's own timing phrase at the shared instant and
+    the duplicate rule; and the step checks above on the canonical steps
+    Maria builds from her own extraction. No model value enters that plan.
+
     A caller passing anything but cleaned request text, an exact
-    ``ReasoningResponse``, or an exact registry receives ``ValueError`` with
-    a fixed message. The log records only whether a proposal compiled and,
-    when it did not, the rejection code.
+    ``ReasoningResponse``, an exact registry, or a timing context or None
+    receives ``ValueError`` with a fixed message. The log records only
+    whether a proposal compiled and, when it did not, the rejection code.
     """
     if type(contracts) is not ActionContractRegistry:
         raise ValueError(COMPILER_CONTRACTS_MESSAGE)
@@ -277,9 +418,11 @@ def compile_proposal(
         raise ValueError(COMPILER_REQUEST_MESSAGE)
     if type(response) is not ReasoningResponse:
         raise ValueError(COMPILER_RESPONSE_MESSAGE)
+    if timing is not None and type(timing) is not TimingContext:
+        raise ValueError(COMPILER_TIMING_MESSAGE)
 
     log = logger or get_logger(__name__)
-    outcome = _compile(request, getattr(response, "text", None), contracts)
+    outcome = _compile(request, getattr(response, "text", None), contracts, timing)
     if type(outcome) is ProposalRejection:
         log.warning("Refused a model proposal: code=%s", outcome.code)
     else:
@@ -297,12 +440,20 @@ def recheck_model_plan(
     Brain asks this when it offers a compiled plan for approval and again
     just before the approved plan runs, because an approval authorises a
     plan rather than freezing the registry that was current when the plan
-    was shown. Nothing is parsed, rebuilt, repaired, defaulted, or
-    substituted, and no provider is asked anything: every step of the plan
-    is checked, in order, as it is, against the closed allowlist, the model
-    eligibility ``contracts`` declares now, the argument contract, and the
-    text and path checks, in that order, and the first failure is returned,
-    or None when every step still passes every gate.
+    was shown. No proposal is parsed again, nothing is rebuilt, repaired,
+    defaulted, or substituted, and no provider is asked anything: every step
+    of the plan is checked, in order, as it is, against the closed allowlist,
+    the model eligibility ``contracts`` declares now, the argument contract,
+    and the text and path checks, in that order, and the first failure is
+    returned, or None when every step still passes every gate.
+
+    A plan holding a creation step is first checked against the owner's
+    request again, with no clock: the request is parsed once more, and the
+    plan must still hold exactly one creation step per requested item, in
+    order, each carrying that item's body and, for a task, a due date
+    exactly when the item names one, with no two items alike. Each step's
+    canonical timing is then checked by its contract's format. Nothing is
+    resolved again.
 
     A value that is not a well-formed model-originated plan, including one
     holding more steps than ``PLAN_MAX_STEPS``, or a registry that is not
@@ -314,7 +465,49 @@ def recheck_model_plan(
     if not is_model_plan(plan):
         raise ValueError(COMPILER_PLAN_MESSAGE)
 
-    for step in plan.steps:
+    outcome = _recheck(plan, contracts)
+    if outcome is not None:
+        (logger or get_logger(__name__)).warning(
+            "Refused a compiled model plan: code=%s",
+            outcome.code,
+        )
+    return outcome
+
+
+def _recheck(
+    plan: Plan,
+    contracts: ActionContractRegistry,
+) -> ProposalRejection | None:
+    """Return the first gate a compiled plan no longer passes, or None."""
+    steps = plan.steps
+    if any(
+        f"{step.tool_name}.{step.action}" in CREATION_ACTIONS for step in steps
+    ):
+        for step in steps:
+            contract = _eligible_contract(step.tool_name, step.action, contracts)
+            if type(contract) is ProposalRejection:
+                return contract
+        items = parse_creation_request(plan.original_request)
+        if type(items) is RequestRefusal:
+            return _REQUEST_REJECTIONS[items]
+        if len(items) != len(steps):
+            return ProposalRejection.CREATION_MISMATCH
+        values: list[object] = []
+        for step, item in zip(steps, items):
+            kind = CREATION_ACTIONS.get(f"{step.tool_name}.{step.action}")
+            arguments = step.arguments
+            if kind is not item.kind or arguments.get("text") != item.body:
+                return ProposalRejection.CREATION_MISMATCH
+            if item.kind is CreationKind.TASK:
+                if ("due" in arguments) != (item.phrase is not None):
+                    return ProposalRejection.CREATION_MISMATCH
+                values.append(arguments.get("due"))
+            else:
+                values.append(arguments.get("when"))
+        if _has_duplicates(items, values):
+            return ProposalRejection.CREATION_REQUEST_UNCLEAR
+
+    for step in steps:
         outcome = _checked_step(
             step.tool_name,
             step.action,
@@ -322,10 +515,6 @@ def recheck_model_plan(
             contracts,
         )
         if type(outcome) is ProposalRejection:
-            (logger or get_logger(__name__)).warning(
-                "Refused a compiled model plan: code=%s",
-                outcome.code,
-            )
             return outcome
     return None
 
@@ -334,6 +523,7 @@ def _compile(
     request: str,
     text: object,
     contracts: ActionContractRegistry,
+    timing: TimingContext | None = None,
 ) -> Plan | ProposalRejection:
     """Apply every gate in order and build the plan only after all pass."""
     size = _utf8_size(text)
@@ -353,6 +543,12 @@ def _compile(
         actions = [proposal]
     else:
         return ProposalRejection.MALFORMED_PROPOSAL
+
+    if any(
+        f"{action['tool']}.{action['action']}" in CREATION_ACTIONS
+        for action in actions
+    ):
+        return _compile_creation(request, actions, contracts, timing)
 
     # Every action passes every gate before any step is built, so a refusal
     # anywhere leaves nothing behind.
@@ -412,6 +608,198 @@ def _checked_step(
             return ProposalRejection.UNSAFE_PATH
 
     return contract
+
+
+def _compile_creation(
+    request: str,
+    actions: list[dict[str, object]],
+    contracts: ActionContractRegistry,
+    timing: TimingContext | None,
+) -> Plan | ProposalRejection:
+    """Compile a proposal holding a creation step, from the owner's own words.
+
+    The gates run in order, each over every step before the next begins,
+    and the first failure decides the refusal: allowlist and eligibility;
+    the raw checks of each creation step's arguments; the parse of the
+    owner's request, then the positional binding; the resolution of each
+    item's own timing phrase, then the duplicate rule; and finally the
+    ordinary step checks on the canonical steps Maria builds. Every step of
+    the plan comes from Maria's extraction of the request; the model's
+    values are only compared with it.
+    """
+    eligible: list[tuple[ActionContract, dict[str, object]]] = []
+    for action in actions:
+        contract = _eligible_contract(action["tool"], action["action"], contracts)
+        if type(contract) is ProposalRejection:
+            return contract
+        eligible.append((contract, action["arguments"]))
+
+    for contract, arguments in eligible:
+        inputs = _PROPOSAL_INPUTS.get(contract.identifier)
+        if inputs is None:
+            continue
+        rejection = _raw_rejection(inputs, arguments)
+        if rejection is not None:
+            return rejection
+
+    items = parse_creation_request(request)
+    if type(items) is RequestRefusal:
+        return _REQUEST_REJECTIONS[items]
+    rejection = _binding_rejection(items, eligible)
+    if rejection is not None:
+        return rejection
+
+    values: list[str | None] = []
+    for item in items:
+        value = _resolved_value(item, timing)
+        if type(value) is ProposalRejection:
+            return value
+        values.append(value)
+    if _has_duplicates(items, values):
+        return ProposalRejection.CREATION_REQUEST_UNCLEAR
+
+    steps: list[PlanStep] = []
+    for (contract, _), item, value in zip(eligible, items, values):
+        arguments = _canonical_arguments(item, value)
+        checked = _checked_step(
+            contract.tool_name,
+            contract.action,
+            arguments,
+            contracts,
+        )
+        if type(checked) is ProposalRejection:
+            return checked
+        steps.append(PlanStep(checked.tool_name, checked.action, arguments))
+
+    return Plan(
+        original_request=request,
+        steps=tuple(steps),
+        recording=RecordingPolicy.TRANSIENT,
+        origin=PlanOrigin.MODEL,
+    )
+
+
+def _raw_rejection(
+    inputs: tuple[tuple[str, bool, str], ...],
+    arguments: dict[str, object],
+) -> ProposalRejection | None:
+    """Return the first raw check one creation step's arguments fail, or None.
+
+    A missing required argument is found first, in the table's order, then
+    an argument the table does not name, then each argument's own checks in
+    the table's order: type, size, unsafe characters, and, for a timing
+    phrase, printable ASCII. The unsafe check runs before the ASCII check,
+    so both refusals are reachable.
+    """
+    for name, required, _ in inputs:
+        if required and name not in arguments:
+            return ProposalRejection.MISSING_ARGUMENT
+    declared = {name for name, _, _ in inputs}
+    if any(name not in declared for name in arguments):
+        return ProposalRejection.EXTRA_ARGUMENT
+    for name, _, check in inputs:
+        if name not in arguments:
+            continue
+        value = arguments[name]
+        if type(value) is not str:
+            return ProposalRejection.WRONG_TYPE
+        if check == _NEVER_INPUT:
+            if value != _REPEAT_NEVER:
+                return ProposalRejection.OUT_OF_RANGE
+            continue
+        if check == _TEXT_INPUT:
+            size = len(value.encode("utf-8", "surrogatepass"))
+            if not 0 < size <= PROPOSAL_TEXT_MAX_BYTES or not value.strip():
+                return ProposalRejection.OUT_OF_RANGE
+            if _has_unsafe_character(value):
+                return ProposalRejection.UNSAFE_TEXT
+            continue
+        if not 0 < len(value) <= PROPOSAL_PHRASE_MAX_LENGTH or (
+            len(value.encode("utf-8", "surrogatepass"))
+            > PROPOSAL_PHRASE_MAX_LENGTH
+        ):
+            return ProposalRejection.OUT_OF_RANGE
+        if _has_unsafe_character(value):
+            return ProposalRejection.UNSAFE_TEXT
+        if not all(" " <= character <= "~" for character in value):
+            return ProposalRejection.OUT_OF_RANGE
+    return None
+
+
+def _binding_rejection(
+    items: tuple[CreationItem, ...],
+    eligible: list[tuple[ActionContract, dict[str, object]]],
+) -> ProposalRejection | None:
+    """Refuse a proposal that is not exactly the requested items, in order.
+
+    There must be one creation step per item, of the item's kind, whose
+    ``text`` equals the item's body exactly and whose timing phrase equals
+    the item's own after canonical tokenization, ``canonical_phrase``: ASCII
+    letters lowercased and tokens joined by single spaces, digits as
+    written. A task carries ``due`` exactly when its item names a date.
+    Anything else, an extra, missing, reordered, or non-creation step
+    included, is a mismatch.
+    """
+    if len(items) != len(eligible):
+        return ProposalRejection.CREATION_MISMATCH
+    for (contract, arguments), item in zip(eligible, items):
+        if CREATION_ACTIONS.get(contract.identifier) is not item.kind:
+            return ProposalRejection.CREATION_MISMATCH
+        if arguments["text"] != item.body:
+            return ProposalRejection.CREATION_MISMATCH
+        phrase = arguments.get("due" if item.kind is CreationKind.TASK else "when")
+        if (phrase is None) != (item.phrase is None):
+            return ProposalRejection.CREATION_MISMATCH
+        if phrase is not None and (
+            canonical_phrase(phrase) != canonical_phrase(item.phrase)
+        ):
+            return ProposalRejection.CREATION_MISMATCH
+    return None
+
+
+def _resolved_value(
+    item: CreationItem,
+    timing: TimingContext | None,
+) -> str | None | ProposalRejection:
+    """Return one item's canonical timing, None when it has none, or a refusal.
+
+    The item's own parsed phrase is resolved at the shared reference
+    instant; an undated task needs no timing at all, and so no zone.
+    """
+    if item.kind is CreationKind.TASK and item.due is None:
+        return None
+    if timing is None:
+        return ProposalRejection.TIME_ZONE_UNAVAILABLE
+    if item.kind is CreationKind.TASK:
+        resolved = resolve_task_date(item.due, timing)
+        if type(resolved) is TimingFailure:
+            return _TIMING_REJECTIONS[resolved]
+        return iso_date_text(resolved)
+    resolved = resolve_reminder_time(item.timing, timing)
+    if type(resolved) is not ResolvedTime:
+        return _TIMING_REJECTIONS[resolved]
+    return resolved.canonical
+
+
+def _has_duplicates(
+    items: tuple[CreationItem, ...],
+    values: list[object],
+) -> bool:
+    """Return whether two items share a kind, a body, and a resolved timing.
+
+    Two undated tasks with the same body are duplicates too.
+    """
+    keys = [(item.kind, item.body, value) for item, value in zip(items, values)]
+    return len(set(keys)) != len(keys)
+
+
+def _canonical_arguments(item: CreationItem, value: str | None) -> dict[str, str]:
+    """Return the arguments Maria builds for one item from her extraction."""
+    if item.kind is CreationKind.TASK:
+        if value is None:
+            return {"text": item.body}
+        return {"text": item.body, "due": value}
+    return {"text": item.body, "when": value, "repeat": _REPEAT_NEVER}
 
 
 def _utf8_size(text: object) -> int | None:

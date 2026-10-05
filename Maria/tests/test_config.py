@@ -27,6 +27,10 @@ from core.config import (
     REASONING_SECTION_TABLE_MESSAGE,
     REASONING_TRACKED_ENABLED_MESSAGE,
     REASONING_UNKNOWN_KEY_MESSAGE,
+    TIME_SECTION_KEYS_MESSAGE,
+    TIME_SECTION_TABLE_MESSAGE,
+    TIME_TRACKED_MESSAGE,
+    TIME_ZONE_MESSAGE,
 )
 from core.config import (
     FILESYSTEM_DEFAULT_ROOT_TEXT_MESSAGE,
@@ -1240,8 +1244,8 @@ class LocalOverrideTests(unittest.TestCase):
 
         with patch.object(
             config_module,
-            "_local_override_reasoning",
-            wraps=config_module._local_override_reasoning,
+            "_local_override",
+            wraps=config_module._local_override,
         ) as reader:
             config = load_config(self.config_path)
 
@@ -1552,10 +1556,119 @@ class LocalOverrideTests(unittest.TestCase):
             LOCAL_OVERRIDE_SECTIONS_MESSAGE,
         )
 
-    def test_an_override_without_a_reasoning_section_is_refused(self) -> None:
+    def test_an_override_without_a_reasoning_or_time_section_is_refused(
+        self,
+    ) -> None:
         for content in ("", "# nothing here\n", "[permissions]\ndeny = []\n"):
             with self.subTest(content=content[:12]):
                 self._assert_refused(content, LOCAL_OVERRIDE_SECTIONS_MESSAGE)
+
+    # The [time] section (V1-22).
+
+    def test_no_time_zone_is_configured_without_a_time_section(self) -> None:
+        self.assertIsNone(load_config(self.config_path).time_zone)
+        self._write_override(reasoning_block())
+
+        self.assertIsNone(self._load().time_zone)
+
+    def test_a_time_section_alone_sets_only_the_zone(self) -> None:
+        tracked = load_config(self.config_path)
+        self._write_override('[time]\nzone = "Area/City"\n')
+
+        config = self._load()
+
+        self.assertEqual(config.time_zone, "Area/City")
+        self.assertEqual(replace(config, time_zone=None), tracked)
+
+    def test_time_and_reasoning_sections_together(self) -> None:
+        self._write_override(reasoning_block() + '[time]\nzone = "Etc/GMT+5"\n')
+
+        config = self._load()
+
+        self.assertEqual(config.time_zone, "Etc/GMT+5")
+        self.assertTrue(config.reasoning.enabled)
+
+    def test_only_the_keys_syntax_is_checked_at_startup(self) -> None:
+        # Whether data for the key can be loaded is settled only when timing
+        # is resolved, so startup never consults zoneinfo.
+        self._write_override('[time]\nzone = "Maria/NoSuchZone"\n')
+
+        with patch("zoneinfo.ZoneInfo", side_effect=AssertionError("not loaded")):
+            config = self._load()
+
+        self.assertEqual(config.time_zone, "Maria/NoSuchZone")
+
+    def test_a_malformed_time_section_refuses_startup(self) -> None:
+        for content, message in (
+            ("time = 1\n", TIME_SECTION_TABLE_MESSAGE),
+            ('time = "Area/City"\n', TIME_SECTION_TABLE_MESSAGE),
+            ("[time]\n", TIME_SECTION_KEYS_MESSAGE),
+            ('[time]\nZone = "Area/City"\n', TIME_SECTION_KEYS_MESSAGE),
+            (
+                '[time]\nzone = "Area/City"\nfallback = "UTC"\n',
+                TIME_SECTION_KEYS_MESSAGE,
+            ),
+            (
+                '[time]\nzone = "Area/City"\n[time.extra]\nvalue = 1\n',
+                TIME_SECTION_KEYS_MESSAGE,
+            ),
+        ):
+            with self.subTest(content=content):
+                self._assert_refused(content, message)
+
+    def test_a_zone_that_is_not_an_iana_key_refuses_startup(self) -> None:
+        for value in (
+            "1",
+            "true",
+            '""',
+            '["Area/City"]',
+            '"Area/City "',
+            '" Area/City"',
+            '"Area City"',
+            '"Area/../City"',
+            '"../Area/City"',
+            '"/etc/localtime"',
+            '"Area\\\\City"',
+            '"Area//City"',
+            '"Area/"',
+            '"1Area/City"',
+            '"' + "A" * 65 + '"',
+            '"Area/C' + chr(0x00EF) + 'ty"',
+        ):
+            with self.subTest(value=value):
+                refused = self._assert_refused(
+                    f"[time]\nzone = {value}\n",
+                    TIME_ZONE_MESSAGE,
+                )
+                self.assertIsNone(refused.__cause__)
+        self._write_override('[time]\nzone = "' + "A" * 64 + '"\n')
+        self.assertEqual(self._load().time_zone, "A" * 64)
+
+    def test_a_refused_zone_repeats_nothing_from_the_file(self) -> None:
+        refused = self._assert_refused(
+            f'[time]\nzone = "{OVERRIDE_TEXT_SENTINEL}/.."\n',
+            TIME_ZONE_MESSAGE,
+        )
+
+        self._assert_carries_nothing(refused, OVERRIDE_TEXT_SENTINEL)
+
+    def test_the_tracked_configuration_may_not_hold_a_time_section(self) -> None:
+        self.config_path.write_text(
+            "[reasoning]\nenabled = false\n"
+            + VALID_FILESYSTEM_SECTION
+            + '[time]\nzone = "Area/City"\n',
+            encoding="utf-8",
+        )
+
+        with self.assertRaises(ValueError) as caught:
+            load_config(self.config_path)
+
+        self.assertEqual(str(caught.exception), TIME_TRACKED_MESSAGE)
+
+    def test_the_shipped_configuration_holds_no_time_section(self) -> None:
+        shipped = tomllib.loads(CONFIG_PATH.read_text(encoding="utf-8"))
+
+        self.assertNotIn("time", shipped)
 
     # The private file itself.
 

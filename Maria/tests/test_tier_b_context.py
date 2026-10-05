@@ -1684,18 +1684,27 @@ class TierCExclusionTests(unittest.TestCase):
     the request literally contains, so a search that could reach it would.
     """
 
-    def test_the_automatic_sources_are_exactly_the_approved_two(self) -> None:
-        """Memory and note alone; a new source must change this test on purpose.
+    def test_the_automatic_sources_are_exactly_the_approved_ones(self) -> None:
+        """The approved sources alone; a new one must change this test on purpose.
 
         Rejecting a list of forbidden names would let any unlisted source in,
         so the registered sources are compared with the approved set itself.
         V1-20 changed it on purpose: conversation summaries the owner enabled
         for context are a third source, Tier B only and untitled, while a
-        saved conversation is not a source at all.
+        saved conversation is not a source at all. V1-22 changed it on purpose
+        again: open tasks and reminders the owner enabled for context are a
+        fourth and fifth source, Tier A only, untitled, and carrying their
+        timing.
         """
         self.assertEqual(
             [(source.name, source.value) for source in ContextSource],
-            [("MEMORY", "memory"), ("NOTE", "note"), ("SUMMARY", "summary")],
+            [
+                ("MEMORY", "memory"),
+                ("NOTE", "note"),
+                ("SUMMARY", "summary"),
+                ("TASK", "task"),
+                ("REMINDER", "reminder"),
+            ],
         )
         self.assertEqual(
             {
@@ -1705,6 +1714,15 @@ class TierCExclusionTests(unittest.TestCase):
                     _memory(2, "b", ContextTier.B),
                     _note_item(3, "t", "b"),
                     ContextItem(ContextSource.SUMMARY, 4, "s", None, ContextTier.B),
+                    ContextItem(ContextSource.TASK, 5, "t", None, ContextTier.A),
+                    ContextItem(
+                        ContextSource.REMINDER,
+                        6,
+                        "r",
+                        None,
+                        ContextTier.A,
+                        "2027-01-01T09:00:00+01:00[Area/City]",
+                    ),
                 )
             },
             {
@@ -1712,8 +1730,33 @@ class TierCExclusionTests(unittest.TestCase):
                 (ContextSource.MEMORY, ContextTier.B),
                 (ContextSource.NOTE, ContextTier.B),
                 (ContextSource.SUMMARY, ContextTier.B),
+                (ContextSource.TASK, ContextTier.A),
+                (ContextSource.REMINDER, ContextTier.A),
             },
         )
+        for label, item in (
+            ("a Tier B task", (ContextSource.TASK, 7, "t", None, ContextTier.B)),
+            (
+                "a Tier B reminder",
+                (
+                    ContextSource.REMINDER,
+                    8,
+                    "r",
+                    None,
+                    ContextTier.B,
+                    "2027-01-01T09:00:00+01:00[Area/City]",
+                ),
+            ),
+            ("a reminder with no time", (ContextSource.REMINDER, 9, "r")),
+            ("a titled task", (ContextSource.TASK, 10, "t", "title")),
+            (
+                "a timed memory",
+                (ContextSource.MEMORY, 11, "m", None, ContextTier.A, "2027-01-01"),
+            ),
+        ):
+            with self.subTest(case=label):
+                with self.assertRaises(ValueError):
+                    ContextItem(*item)
         for label, value in (
             ("a text source", "interaction"),
             ("a saved-conversation stand-in", "saved_conversation"),

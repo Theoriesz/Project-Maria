@@ -6,7 +6,7 @@ import inspect
 import logging
 import unittest
 from typing import Any
-from unittest.mock import Mock, call
+from unittest.mock import ANY, Mock, call
 
 import core.brain as brain_module
 from core.brain import BrainResponse, MariaBrain
@@ -75,7 +75,7 @@ class MariaBrainTests(unittest.TestCase):
         response = self.brain.process("  calculate 2 + 2 \n")
 
         self.assertEqual(response.text, "4")
-        self.planner.create_plan.assert_called_once_with("calculate 2 + 2")
+        self.planner.create_plan.assert_called_once_with("calculate 2 + 2", timing=ANY)
         self.memory.record_interaction.assert_called_once_with(
             "calculate 2 + 2",
             "4",
@@ -91,7 +91,7 @@ class MariaBrainTests(unittest.TestCase):
         response = self.brain.process("help")
 
         self.assertEqual(response.text, "available commands")
-        self.planner.create_plan.assert_called_once_with("help")
+        self.planner.create_plan.assert_called_once_with("help", timing=ANY)
         for method in (
             "get_recent_interactions",
             "get_interaction",
@@ -554,9 +554,39 @@ class MariaBrainTests(unittest.TestCase):
             "get_memory",
             "search_memories",
             "list_memories",
+            # V1-22: Brain reads task and reminder context, never a record
+            # command; those reach the memory layer only through the tools.
+            *(
+                f"{verb}_{noun}"
+                for noun in ("task", "reminder")
+                for verb in (
+                    "create",
+                    "get",
+                    "complete",
+                    "reopen",
+                    "edit",
+                    "reschedule",
+                    "delete",
+                )
+            ),
+            *(
+                f"{verb}_{noun}s"
+                for noun in ("task", "reminder")
+                for verb in ("list", "due")
+            ),
+            *(
+                f"{verb}_{noun}_context"
+                for noun in ("task", "reminder")
+                for verb in ("enable", "disable")
+            ),
         ):
             with self.subTest(method_name=method_name):
                 self.assertNotIn(method_name, source)
+        self.assertNotRegex(
+            source,
+            r"(?:tool_name|step\.tool_name|identifier)\s*==\s*"
+            r"['\"](?:tasks|reminders)(?:\.\w+)?['\"]",
+        )
         self.assertNotRegex(
             source,
             r"(?:tool_name|step\.tool_name)\s*==\s*['\"]memory['\"]",

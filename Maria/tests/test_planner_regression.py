@@ -4,8 +4,11 @@ from __future__ import annotations
 
 import logging
 import unittest
+from datetime import datetime, timezone
 
 from core.planner import Plan, Planner, PlanStep
+from core.time_resolution import TimingContext
+from tests.zone_fixtures import CENTRAL_RULES, SYNTHETIC_KEY, SyntheticZones
 
 
 UNSUPPORTED_RESPONSE = (
@@ -21,6 +24,14 @@ SAVED_CONVERSATION_ID_RESPONSE = (
     "Saved conversation id must be a positive whole number."
 )
 SUMMARY_ID_RESPONSE = "Conversation summary id must be a positive whole number."
+TASK_ID_RESPONSE = "Task id must be a positive whole number."
+REMINDER_ID_RESPONSE = "Reminder id must be a positive whole number."
+
+# V1-22's reschedule commands resolve their timing at the request's reference
+# instant: Saturday 2027-10-30, 10:03:27 local at +02:00 under the synthetic
+# central rules, so "in 2 hours" is 12:03 that day.
+TIMING_REFERENCE = datetime(2027, 10, 30, 8, 3, 27, tzinfo=timezone.utc)
+RESCHEDULED_WHEN = f"2027-10-30T12:03:00+02:00[{SYNTHETIC_KEY}]"
 
 # The largest id any record can have, because every id is a SQLite integer.
 LARGEST_ID = 2**63 - 1
@@ -28,11 +39,11 @@ LARGEST_ID = 2**63 - 1
 # an operand padded with them raises ValueError if int() is handed it whole.
 LONG_ZEROES = "0" * 5000
 
-# The twenty ID-only planner commands, which share one id parser: each
+# The thirty-six ID-only planner commands, which share one id parser: each
 # one's request template, the tool, action, and other arguments of the step
 # it plans, and the response it gives an id it cannot use. The command
 # "read note <id or exact title>" is not among them; it uses its separate,
-# unchanged lookup path.
+# unchanged lookup path. V1-22 added the last sixteen.
 ID_COMMANDS: tuple[tuple[str, str, str, dict[str, str], str], ...] = (
     (
         "update memory {}: New fact",
@@ -95,6 +106,52 @@ ID_COMMANDS: tuple[tuple[str, str, str, dict[str, str], str], ...] = (
         "disable_context",
         {},
         SUMMARY_ID_RESPONSE,
+    ),
+    ("read task {}", "tasks", "read", {}, TASK_ID_RESPONSE),
+    ("complete task {}", "tasks", "complete", {}, TASK_ID_RESPONSE),
+    ("reopen task {}", "tasks", "reopen", {}, TASK_ID_RESPONSE),
+    ("edit task {}: New text", "tasks", "edit", {"text": "New text"}, TASK_ID_RESPONSE),
+    (
+        "reschedule task {}: none",
+        "tasks",
+        "reschedule",
+        {"due": "none"},
+        TASK_ID_RESPONSE,
+    ),
+    ("delete task {}", "tasks", "delete", {}, TASK_ID_RESPONSE),
+    ("enable task context {}", "tasks", "enable_context", {}, TASK_ID_RESPONSE),
+    ("disable task context {}", "tasks", "disable_context", {}, TASK_ID_RESPONSE),
+    ("read reminder {}", "reminders", "read", {}, REMINDER_ID_RESPONSE),
+    ("complete reminder {}", "reminders", "complete", {}, REMINDER_ID_RESPONSE),
+    ("reopen reminder {}", "reminders", "reopen", {}, REMINDER_ID_RESPONSE),
+    (
+        "edit reminder {}: New text",
+        "reminders",
+        "edit",
+        {"text": "New text"},
+        REMINDER_ID_RESPONSE,
+    ),
+    (
+        "reschedule reminder {}: in 2 hours",
+        "reminders",
+        "reschedule",
+        {"when": RESCHEDULED_WHEN, "repeat": "never"},
+        REMINDER_ID_RESPONSE,
+    ),
+    ("delete reminder {}", "reminders", "delete", {}, REMINDER_ID_RESPONSE),
+    (
+        "enable reminder context {}",
+        "reminders",
+        "enable_context",
+        {},
+        REMINDER_ID_RESPONSE,
+    ),
+    (
+        "disable reminder context {}",
+        "reminders",
+        "disable_context",
+        {},
+        REMINDER_ID_RESPONSE,
     ),
 )
 
@@ -1015,20 +1072,26 @@ class PlannerRegressionTests(unittest.TestCase):
 
 
 class SharedIdGrammarTests(unittest.TestCase):
-    """Verify the shared id parser of the thirteen ID-only planner commands.
+    """Verify the shared id parser of the thirty-six ID-only planner commands.
 
     It strips leading zeroes however many there are and refuses more than
     19 significant digits before any conversion, then converts at most 19
     digits and compares the result with 9223372036854775807, the largest
     integer SQLite stores, which no record's id can exceed. It therefore
     reads an operand of any length safely, and no operand reaches Python's
-    limit on converting long digit strings.
+    limit on converting long digit strings. Every request is planned with
+    one timing context, which only V1-22's reminder reschedule uses.
     """
 
     def setUp(self) -> None:
         logger = logging.Logger("tests.planner_regression.shared_id")
         logger.addHandler(logging.NullHandler())
         self.planner = Planner(logger=logger)
+        SyntheticZones(self, {SYNTHETIC_KEY: CENTRAL_RULES})
+        self.timing = TimingContext(TIMING_REFERENCE, SYNTHETIC_KEY)
+
+    def plan(self, request: str) -> Plan:
+        return self.planner.create_plan(request, timing=self.timing)
 
     def test_the_long_operands_here_exceed_pythons_conversion_limit(self) -> None:
         # The limit stays in force, so each operand below would raise if it
@@ -1051,7 +1114,7 @@ class SharedIdGrammarTests(unittest.TestCase):
                 step = PlanStep(tool, action, {"id": record_id, **other_arguments})
                 with self.subTest(request=_shown(request)):
                     self.assertEqual(
-                        self.planner.create_plan(request),
+                        self.plan(request),
                         Plan(original_request=request, steps=(step,)),
                     )
 
@@ -1068,7 +1131,7 @@ class SharedIdGrammarTests(unittest.TestCase):
                 request = template.format(operand)
                 with self.subTest(request=_shown(request)):
                     self.assertEqual(
-                        self.planner.create_plan(request),
+                        self.plan(request),
                         Plan(
                             original_request=request,
                             steps=(),

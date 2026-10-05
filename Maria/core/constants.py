@@ -19,9 +19,10 @@ CONFIG_PATH = PROJECT_ROOT / "config" / "config.toml"
 
 # The owner's optional, untracked local configuration override. Maria never
 # creates this file. Startup reads it, only when it is present, as the one
-# place machine-specific reasoning settings may live; it can hold a
-# [reasoning] table and nothing else. The permanent-exclusion boundary names
-# it too, so no filesystem capability can ever read it.
+# place machine-specific reasoning settings and the owner's time zone may
+# live; it can hold a [reasoning] table, a [time] table, or both, and nothing
+# else. The permanent-exclusion boundary names it too, so no filesystem
+# capability can ever read it.
 LOCAL_CONFIG_PATH = PROJECT_ROOT / "config" / "config.local.toml"
 
 DATABASE_DIR = PROJECT_ROOT / "database"
@@ -52,6 +53,7 @@ DEFAULT_DATABASE_BUSY_TIMEOUT_SECONDS = 5.0
 # per-memory ``context_enabled`` consent column; 4 adds the per-note
 # ``context_digest`` consent column; 5 adds the ``audit_summaries`` and
 # ``audit_outcomes`` tables; 6 adds the ``saved_conversations`` and
-# ``conversation_summaries`` tables and is the current schema. A new version
-# is added by appending one migration, never by editing this value's meaning.
-DATABASE_SCHEMA_VERSION = 6
+# ``conversation_summaries`` tables; 7 adds the ``tasks`` and ``reminders``
+# tables and is the current schema. A new version is added by appending one
+# migration, never by editing this value's meaning.
+DATABASE_SCHEMA_VERSION = 7

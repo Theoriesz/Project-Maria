@@ -5,7 +5,7 @@ Tools are small modules that expose controlled capabilities to Maria.
 ## Declared Argument Contracts
 
 Every built-in tool action is declared once in `core/action_contracts.py`,
-which is the positive allowlist of the 40 supported tool actions and of the
+which is the positive allowlist of the 62 supported tool actions and of the
 arguments each one accepts. A tool's `actions` set answers only whether an
 action is registered; the contract answers which arguments it takes, whether
 each is required, its exact type, any numeric bound, and, for a path field, the
@@ -42,6 +42,16 @@ canonical resolution, safe-root containment, symlink handling, and collisions.
 longer the acceptance policy: it sits below the Brain, Tool Manager, and tool
 gates as defence in depth and is unchanged.
 
+Some text fields are closed. A task or reminder listing's `status` allows only
+`open` and `completed`, and a reminder's `repeat` only `never`. A task's due
+date is `ISO_DATE`, or `ISO_DATE_OR_NONE` for a reschedule; a reminder's
+`when` is `ZONED_LOCAL_TIME`, a canonical
+`YYYY-MM-DDTHH:MM:00+HH:MM[Area/City]`; and a due query's `as_of` is
+`ISO_DATE` for tasks and `UTC_INSTANT` for reminders. Each is matched whole,
+with calendar validity, and consults no time zone's rules. Task and reminder
+text declares a 512-character ceiling, its exact rule being
+`core/task_records.py`'s.
+
 Two text fields are session inputs, declared as such on their contracts:
 `conversations.save.transcript` and `conversation_summaries.create.text`.
 Maria supplies their text herself, from the owner's session, before the
@@ -50,10 +60,13 @@ that already carries it is refused, and a contract that declares one can
 never be model-eligible.
 
 Every contract also states, with no default, whether a reasoning model may
-ever propose its action. Only three of the 40 actions are model-eligible:
-`calculator.calculate`, `filesystem.list`, and `system.current_time`. The
-other 37, including all three audit actions and all eleven saved-conversation
-and conversation-summary actions, are closed to the model. The
+ever propose its action. Only five of the 62 actions are model-eligible:
+`calculator.calculate`, `filesystem.list`, `system.current_time`,
+`tasks.create`, and `reminders.create`, the last two only for a request in one
+of the four natural-language forms Maria reads herself. The other 57,
+including all three audit actions, all eleven saved-conversation and
+conversation-summary actions, and the other twenty task and reminder actions,
+are closed to the model. The
 classification is independent of permission and approves nothing by itself:
 `core/plan_compiler.py` keeps its own closed allowlist and compiles a proposal
 only when the two agree and every argument satisfies the action's contract.
@@ -80,7 +93,12 @@ allows its action outright; see "Model-to-Plan Compilation Gate" and
 - `memory`: store, search, list, update, and forget explicit SQLite-backed
   memories
 - `notes`: create, list, read, retitle, edit, and delete SQLite-backed notes
+- `reminders`: add, list, query, read, complete, reopen, edit, reschedule, and
+  delete reminders, and turn one reminder's context consent on or off; it
+  never delivers or notifies
 - `system`: read-only OS, CPU, RAM, disk, and time information
+- `tasks`: add, list, query, read, complete, reopen, edit, reschedule, and
+  delete tasks, and turn one task's context consent on or off
 
 ## Calculator Tool
 
@@ -849,6 +867,69 @@ by default; `create`, `edit`, `delete`, `enable_context`, and
 These are conversation summaries, never the content-free audit summaries of
 the audit tool.
 
+## Tasks Tool
+
+The tasks tool, `tools/tasks.py`, supports `create`, `list`, `due`, `read`,
+`complete`, `reopen`, `edit`, `reschedule`, `delete`, `enable_context`, and
+`disable_context`, reaching tasks only through the shared `Memory` object. A
+task is one line of text, 1 to 512 UTF-8 bytes, with an optional calendar due
+date. Every date it stores was resolved before the plan was built, against
+the request's own reference instant, so the tool reads no clock and needs no
+time zone data.
+
+`create`, `edit`, `reschedule`, `delete`, and both consent actions always
+require confirmation, and the confirmation shows exactly what is covered
+before anything is stored:
+
+```text
+add task due friday: File the tax return
+Confirmation required: tasks.create requires explicit confirmation.
+This approval adds a task, shown quoted:
+Text: "File the tax return"
+Due: Friday 2026-10-09, a calendar date with no time
+```
+
+An edit or reschedule shows the saved value beside the new one, a deletion
+shows the saved task, and enabling consent shows it and pins the identity of
+exactly that text and due date. `list`, `due`, `read`, `complete`, and
+`reopen` are allowed. Listings show at most 20 tasks and say when more exist,
+open ones by due date with undated ones last; `due` lists open tasks due on or
+before the plan's local date, each labelled `(due today)` or `(overdue)`.
+Completing stamps the time of that completion and reopening clears it,
+changing nothing else. Replies that would show a task's text or date record
+only fixed lines such as `Added task 4.`, `Listed open tasks.`, or
+`Displayed task 4.`; the log names ids and fixed phrases only.
+
+## Reminders Tool
+
+The reminders tool, `tools/reminders.py`, supports the same eleven actions
+for reminders, through the shared `Memory` object. A reminder is one line of
+text with one moment: the canonical local time, offset, and IANA zone the
+owner approved, and the UTC instant they encode, which alone orders reminders
+and selects due ones. A reminder never repeats, and the tool never delivers,
+notifies, schedules, or polls anything: `due` lists the open reminders whose
+saved instant is at or before the plan's reference instant, each labelled
+`(time reached)`, only when the owner asks.
+
+Its confirmations work as the tasks tool's do, and an add shows the resolved
+time in full:
+
+```text
+Time: Monday 2026-10-05 at 09:00, Europe/Berlin (UTC+02:00), which is 2026-10-05 07:00 UTC
+Repeats: never
+```
+
+Every reminder is shown from its saved values, which need no time zone data.
+When the saved zone's current rules no longer give the saved offset for the
+saved local time, the tool adds `Time zone rules for this reminder's zone have
+changed since it was set. It stays at its saved instant; reschedule it to use
+the current rules.`, and when the saved zone cannot be loaded, `Maria cannot
+check this time against current time zone rules.`; a listing marks such a
+row `[rules changed]` or `[rules unchecked]` and explains the marker once
+below. A correctly chosen time in a repeated hour agrees with the rules it was
+resolved under and shows no warning. Neither ever refuses, rewrites, or moves
+a reminder.
+
 ## System Tool
 
 The system tool supports exactly two actions:
@@ -915,7 +996,11 @@ same way and always requires explicit confirmation before a summary and its
 outcome are removed. Saved-conversation deletion (`conversations.delete`) and
 every conversation-summary change (`conversation_summaries.create`, `edit`,
 `delete`, `enable_context`, and `disable_context`) are checked the same way
-and always require explicit confirmation. An action a reasoning model proposes needs exactly one
+and always require explicit confirmation, and so are adding, editing,
+rescheduling, deleting, and both consent actions for tasks and reminders,
+while completing and reopening one changes its status alone and is allowed.
+Neither the tasks nor the reminders tool starts a thread, a timer, or any
+background work. An action a reasoning model proposes needs exactly one
 approval from the owner before it runs, even when `permissions.py` allows it
 outright; a denied one is refused before any approval is offered, and an
 approved one does not run at all unless its audit summary is committed first.

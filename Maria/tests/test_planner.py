@@ -4,9 +4,25 @@ from __future__ import annotations
 
 import logging
 import unittest
+from datetime import datetime, timezone
 from typing import Any
 
-from core.planner import Plan, Planner, PlanStep
+from core.planner import (
+    ADD_REMINDER_USAGE,
+    ADD_TASK_DUE_USAGE,
+    ADD_TASK_USAGE,
+    REMINDER_ID_USAGE_MESSAGE,
+    RESCHEDULE_REMINDER_USAGE,
+    RESCHEDULE_TASK_USAGE,
+    TASK_ID_USAGE_MESSAGE,
+    TIMING_UNAVAILABLE_MESSAGE,
+    Plan,
+    Planner,
+    PlanStep,
+)
+from core.task_records import TASK_TEXT_MESSAGE
+from core.time_resolution import TimingContext, TimingFailure
+from tests.zone_fixtures import CENTRAL_RULES, SYNTHETIC_KEY, SyntheticZones
 
 
 UNSUPPORTED_RESPONSE = (
@@ -212,6 +228,34 @@ class PlannerMemoryTests(unittest.TestCase):
             "- delete summary <id>",
             "- enable summary context <id>",
             "- disable summary context <id>",
+            # V1-22's twenty-six task and reminder commands.
+            "- add task <text>",
+            "- add task due <date>: <text>",
+            "- tasks",
+            "- completed tasks",
+            "- due tasks",
+            "- read task <id>",
+            "- complete task <id>",
+            "- reopen task <id>",
+            "- edit task <id>: <new text>",
+            "- reschedule task <id>: <date or none>",
+            "- delete task <id>",
+            "- enable task context <id>",
+            "- disable task context <id>",
+            "- add reminder <date> <time> [<offset>]: <text>",
+            "- add reminder in <N> minutes|hours: <text>",
+            "- reminders",
+            "- completed reminders",
+            "- due reminders",
+            "- read reminder <id>",
+            "- complete reminder <id>",
+            "- reopen reminder <id>",
+            "- edit reminder <id>: <new text>",
+            "- reschedule reminder <id>: <date> <time> [<offset>] or in <N> "
+            "minutes|hours",
+            "- delete reminder <id>",
+            "- enable reminder context <id>",
+            "- disable reminder context <id>",
             "- system",
             "- time",
             "- history",
@@ -572,6 +616,447 @@ class ConversationRecordCommandTests(unittest.TestCase):
                 plan = self.planner.create_plan(request)
                 self.assertEqual(plan.steps, ())
                 self.assertEqual(plan.response_if_no_action, usage)
+
+
+# V1-22's reference: Saturday 2027-10-30, 10:03:27 local at +02:00 in the
+# synthetic central rules, the day before the local hour from 02:00 repeats.
+TIMING_REFERENCE = datetime(2027, 10, 30, 8, 3, 27, tzinfo=timezone.utc)
+ZONE = f"[{SYNTHETIC_KEY}]"
+NOTHING_SAVED = " Nothing was saved."
+
+
+class TaskAndReminderCommandTests(unittest.TestCase):
+    """Verify V1-22's twenty-six commands and the grammar they leave alone.
+
+    Each timing command resolves its phrase once, against the request's own
+    reference instant and configured zone, so the plan carries canonical
+    values; a synthetic zone keeps every expectation exact.
+    """
+
+    def setUp(self) -> None:
+        self.planner = Planner(logger=_quiet_logger())
+        SyntheticZones(self, {SYNTHETIC_KEY: CENTRAL_RULES})
+        self.timing = TimingContext(TIMING_REFERENCE, SYNTHETIC_KEY)
+
+    def plan(self, request: str, timing: object = None) -> Plan:
+        return self.planner.create_plan(
+            request,
+            timing=self.timing if timing is None else timing,
+        )
+
+    def assertNoAction(self, request: str, response: str, **kwargs: Any) -> None:
+        plan = self.plan(request, **kwargs)
+        self.assertEqual(plan.steps, ())
+        self.assertEqual(plan.response_if_no_action, response)
+
+    def test_each_command_maps_to_one_step_of_its_own_action(self) -> None:
+        for request, tool_name, action, arguments in (
+            ("tasks", "tasks", "list", {"status": "open"}),
+            ("completed tasks", "tasks", "list", {"status": "completed"}),
+            ("due tasks", "tasks", "due", {"as_of": "2027-10-30"}),
+            ("add task buy milk", "tasks", "create", {"text": "buy milk"}),
+            (
+                "add task due tomorrow: buy milk",
+                "tasks",
+                "create",
+                {"text": "buy milk", "due": "2027-10-31"},
+            ),
+            (
+                "add task due friday: file taxes",
+                "tasks",
+                "create",
+                {"text": "file taxes", "due": "2027-11-05"},
+            ),
+            (
+                "add task due in 3 days: call the bank",
+                "tasks",
+                "create",
+                {"text": "call the bank", "due": "2027-11-02"},
+            ),
+            (
+                "add task due today: water the plants",
+                "tasks",
+                "create",
+                {"text": "water the plants", "due": "2027-10-30"},
+            ),
+            ("read task 3", "tasks", "read", {"id": 3}),
+            ("complete task 3", "tasks", "complete", {"id": 3}),
+            ("reopen task 3", "tasks", "reopen", {"id": 3}),
+            (
+                "edit task 3: buy oat milk",
+                "tasks",
+                "edit",
+                {"id": 3, "text": "buy oat milk"},
+            ),
+            (
+                "reschedule task 3: 2027-12-31",
+                "tasks",
+                "reschedule",
+                {"id": 3, "due": "2027-12-31"},
+            ),
+            (
+                "reschedule task 3: none",
+                "tasks",
+                "reschedule",
+                {"id": 3, "due": "none"},
+            ),
+            ("delete task 3", "tasks", "delete", {"id": 3}),
+            ("enable task context 3", "tasks", "enable_context", {"id": 3}),
+            ("disable task context 3", "tasks", "disable_context", {"id": 3}),
+            ("reminders", "reminders", "list", {"status": "open"}),
+            ("completed reminders", "reminders", "list", {"status": "completed"}),
+            (
+                "due reminders",
+                "reminders",
+                "due",
+                {"as_of": "2027-10-30T08:03:27Z"},
+            ),
+            (
+                "add reminder tomorrow 9:00: call mom",
+                "reminders",
+                "create",
+                {
+                    "text": "call mom",
+                    "when": f"2027-10-31T09:00:00+01:00{ZONE}",
+                    "repeat": "never",
+                },
+            ),
+            (
+                "add reminder tomorrow 02:30 +02:00: check the clocks",
+                "reminders",
+                "create",
+                {
+                    "text": "check the clocks",
+                    "when": f"2027-10-31T02:30:00+02:00{ZONE}",
+                    "repeat": "never",
+                },
+            ),
+            (
+                "add reminder in 20 minutes: stretch",
+                "reminders",
+                "create",
+                {
+                    "text": "stretch",
+                    "when": f"2027-10-30T10:23:00+02:00{ZONE}",
+                    "repeat": "never",
+                },
+            ),
+            (
+                "add reminder 2027-11-02 18:30: call: dad",
+                "reminders",
+                "create",
+                {
+                    "text": "call: dad",
+                    "when": f"2027-11-02T18:30:00+01:00{ZONE}",
+                    "repeat": "never",
+                },
+            ),
+            ("read reminder 4", "reminders", "read", {"id": 4}),
+            ("complete reminder 4", "reminders", "complete", {"id": 4}),
+            ("reopen reminder 4", "reminders", "reopen", {"id": 4}),
+            (
+                "edit reminder 4: call mom back",
+                "reminders",
+                "edit",
+                {"id": 4, "text": "call mom back"},
+            ),
+            (
+                "reschedule reminder 4: monday 08:00",
+                "reminders",
+                "reschedule",
+                {
+                    "id": 4,
+                    "when": f"2027-11-01T08:00:00+01:00{ZONE}",
+                    "repeat": "never",
+                },
+            ),
+            (
+                "reschedule reminder 4: in 2 hours",
+                "reminders",
+                "reschedule",
+                {
+                    "id": 4,
+                    "when": f"2027-10-30T12:03:00+02:00{ZONE}",
+                    "repeat": "never",
+                },
+            ),
+            ("delete reminder 4", "reminders", "delete", {"id": 4}),
+            ("enable reminder context 4", "reminders", "enable_context", {"id": 4}),
+            ("disable reminder context 4", "reminders", "disable_context", {"id": 4}),
+        ):
+            with self.subTest(request=request):
+                self.assertEqual(
+                    self.plan(request),
+                    Plan(
+                        original_request=request,
+                        steps=(PlanStep(tool_name, action, arguments),),
+                    ),
+                )
+
+    def test_keywords_match_in_any_case_and_text_keeps_its_own(self) -> None:
+        for request, action, arguments in (
+            ("TASKS", "list", {"status": "open"}),
+            ("Due Tasks", "due", {"as_of": "2027-10-30"}),
+            ("Add Task Buy Milk", "create", {"text": "Buy Milk"}),
+            (
+                "ADD TASK DUE Tomorrow: Buy Milk",
+                "create",
+                {"text": "Buy Milk", "due": "2027-10-31"},
+            ),
+            (
+                "Add Reminder Tomorrow 9:00: Call Mom",
+                "create",
+                {
+                    "text": "Call Mom",
+                    "when": f"2027-10-31T09:00:00+01:00{ZONE}",
+                    "repeat": "never",
+                },
+            ),
+            ("Reschedule Task 3: NONE", "reschedule", {"id": 3, "due": "none"}),
+            ("READ REMINDER 007", "read", {"id": 7}),
+        ):
+            with self.subTest(request=request):
+                (step,) = self.plan(request).steps
+                self.assertEqual(
+                    (step.action, dict(step.arguments)),
+                    (action, arguments),
+                )
+
+    def test_listings_and_filesystem_verbs_are_unchanged(self) -> None:
+        for request, action, arguments in (
+            ("list tasks", "list", {"path": "tasks"}),
+            ("ls reminders", "list", {"path": "reminders"}),
+            ("list todo", "list", {"path": "todo"}),
+            (
+                "move task 3 to tomorrow",
+                "move",
+                {"source": "task 3", "destination": "tomorrow"},
+            ),
+        ):
+            with self.subTest(request=request):
+                self.assertEqual(
+                    self.plan(request),
+                    Plan(
+                        original_request=request,
+                        steps=(PlanStep("filesystem", action, arguments),),
+                    ),
+                )
+
+    def test_the_request_forms_reach_the_generic_fallback(self) -> None:
+        for request in (
+            "remind me tomorrow at 09:00 to call mom",
+            "Remind me in 20 minutes to stretch",
+            "remind me to call mom tomorrow at 9:00",
+            "add a task to buy milk",
+            "add a task to file taxes by friday",
+            "remind me",
+            "add a task to",
+            "task",
+            "reminder",
+            "todo",
+            "add todo buy milk",
+            "please add task buy milk",
+            "show tasks",
+            "tasks due",
+        ):
+            with self.subTest(request=request):
+                self.assertNoAction(request, UNSUPPORTED_RESPONSE)
+
+    def test_bare_and_malformed_forms_answer_with_their_usage(self) -> None:
+        for request, usage in (
+            ("add task", ADD_TASK_USAGE),
+            ("add task due tomorrow:", ADD_TASK_DUE_USAGE),
+            ("add task due someday: buy milk", ADD_TASK_DUE_USAGE),
+            ("add task due 2027-02-30: buy milk", ADD_TASK_DUE_USAGE),
+            ("add task due tomorrow 9:00: buy milk", ADD_TASK_DUE_USAGE),
+            ("read task", "Use: read task <id>"),
+            ("complete task", "Use: complete task <id>"),
+            ("reopen task", "Use: reopen task <id>"),
+            ("delete task", "Use: delete task <id>"),
+            ("enable task context", "Use: enable task context <id>"),
+            ("disable task context", "Use: disable task context <id>"),
+            ("edit task", "Use: edit task <id>: <new text>"),
+            ("edit task 3", "Use: edit task <id>: <new text>"),
+            ("edit task 3:", "Use: edit task <id>: <new text>"),
+            ("reschedule task", RESCHEDULE_TASK_USAGE),
+            ("reschedule task 3:", RESCHEDULE_TASK_USAGE),
+            ("reschedule task 3: someday", RESCHEDULE_TASK_USAGE),
+            ("add reminder", ADD_REMINDER_USAGE),
+            ("add reminder tomorrow: call mom", ADD_REMINDER_USAGE),
+            ("add reminder tomorrow 9:00", ADD_REMINDER_USAGE),
+            ("add reminder tomorrow 9:00:", ADD_REMINDER_USAGE),
+            ("add reminder tomorrow at 9:00: call mom", ADD_REMINDER_USAGE),
+            ("add reminder tomorrow 9am: call mom", ADD_REMINDER_USAGE),
+            ("add reminder in 1441 minutes: stretch", ADD_REMINDER_USAGE),
+            ("add reminder tomorrow 9:00 CET: call mom", ADD_REMINDER_USAGE),
+            ("read reminder", "Use: read reminder <id>"),
+            ("complete reminder", "Use: complete reminder <id>"),
+            ("reopen reminder", "Use: reopen reminder <id>"),
+            ("delete reminder", "Use: delete reminder <id>"),
+            ("enable reminder context", "Use: enable reminder context <id>"),
+            ("disable reminder context", "Use: disable reminder context <id>"),
+            ("edit reminder", "Use: edit reminder <id>: <new text>"),
+            ("edit reminder 4", "Use: edit reminder <id>: <new text>"),
+            ("reschedule reminder", RESCHEDULE_REMINDER_USAGE),
+            ("reschedule reminder 4: tomorrow", RESCHEDULE_REMINDER_USAGE),
+            ("reschedule reminder 4: none", RESCHEDULE_REMINDER_USAGE),
+        ):
+            with self.subTest(request=request):
+                self.assertNoAction(request, usage)
+
+    def test_usage_and_timing_replies_are_exactly_this_text(self) -> None:
+        # Owner-visible fixed text, pinned word for word.
+        for constant, text in (
+            (ADD_TASK_USAGE, "Use: add task <text> or add task due <date>: <text>"),
+            (
+                ADD_TASK_DUE_USAGE,
+                "Use: add task due <date>: <text>, where <date> is today, "
+                "tomorrow, a weekday, YYYY-MM-DD, or in <N> days",
+            ),
+            (
+                ADD_REMINDER_USAGE,
+                "Use: add reminder <date> <time> [<offset>]: <text> or add "
+                "reminder in <N> minutes|hours: <text>, where <date> is today, "
+                "tomorrow, a weekday, YYYY-MM-DD, or in <N> days and <time> is "
+                "HH:MM",
+            ),
+            (
+                RESCHEDULE_TASK_USAGE,
+                "Use: reschedule task <id>: <date or none>, where <date> is "
+                "today, tomorrow, a weekday, YYYY-MM-DD, or in <N> days",
+            ),
+            (
+                RESCHEDULE_REMINDER_USAGE,
+                "Use: reschedule reminder <id>: <date> <time> [<offset>] or in "
+                "<N> minutes|hours",
+            ),
+            (TASK_ID_USAGE_MESSAGE, "Task id must be a positive whole number."),
+            (
+                REMINDER_ID_USAGE_MESSAGE,
+                "Reminder id must be a positive whole number.",
+            ),
+            (
+                TIMING_UNAVAILABLE_MESSAGE,
+                "Maria cannot resolve dates and times for this request.",
+            ),
+        ):
+            with self.subTest(text=text[:30]):
+                self.assertEqual(constant, text)
+
+    def test_ids_are_positive_ascii_whole_numbers(self) -> None:
+        for operand in ("0", "-1", "abc", "1.5", chr(0x0661), "1 2"):
+            for words in ("read", "complete", "reopen", "delete"):
+                with self.subTest(command=f"{words} task {operand}"):
+                    self.assertNoAction(
+                        f"{words} task {operand}",
+                        TASK_ID_USAGE_MESSAGE,
+                    )
+                with self.subTest(command=f"{words} reminder {operand}"):
+                    self.assertNoAction(
+                        f"{words} reminder {operand}",
+                        REMINDER_ID_USAGE_MESSAGE,
+                    )
+        self.assertNoAction("edit task x: buy milk", TASK_ID_USAGE_MESSAGE)
+        self.assertNoAction("reschedule task 0: none", TASK_ID_USAGE_MESSAGE)
+        self.assertNoAction("edit reminder x: call", REMINDER_ID_USAGE_MESSAGE)
+        self.assertNoAction(
+            "reschedule reminder -4: tomorrow 9:00",
+            REMINDER_ID_USAGE_MESSAGE,
+        )
+
+    def test_text_must_be_storable_before_anything_is_offered(self) -> None:
+        too_long = "a" * 513
+        hidden = f"buy{chr(0x200B)}milk"
+        for request in (
+            f"add task {too_long}",
+            f"add task {hidden}",
+            f"add task due tomorrow: {too_long}",
+            f"edit task 3: {hidden}",
+            f"add reminder tomorrow 9:00: {too_long}",
+            f"edit reminder 4: {too_long}",
+        ):
+            with self.subTest(request=request[:40]):
+                self.assertNoAction(request, TASK_TEXT_MESSAGE)
+
+    def test_timing_commands_need_the_requests_timing(self) -> None:
+        for request in (
+            "due tasks",
+            "due reminders",
+            "add task due tomorrow: buy milk",
+            "reschedule task 3: tomorrow",
+            "add reminder tomorrow 9:00: call mom",
+            "reschedule reminder 4: in 2 hours",
+        ):
+            with self.subTest(request=request):
+                plan = self.planner.create_plan(request)
+                self.assertEqual(plan.steps, ())
+                self.assertEqual(plan.response_if_no_action, TIMING_UNAVAILABLE_MESSAGE)
+        for request, action in (
+            ("add task buy milk", "create"),
+            ("reschedule task 3: none", "reschedule"),
+            ("tasks", "list"),
+            ("read reminder 4", "read"),
+            ("complete task 3", "complete"),
+        ):
+            with self.subTest(request=request):
+                (step,) = self.planner.create_plan(request).steps
+                self.assertEqual(step.action, action)
+
+    def test_without_a_zone_only_new_dates_and_times_are_refused(self) -> None:
+        unzoned = TimingContext(TIMING_REFERENCE, None)
+        refusal = TimingFailure.ZONE_UNAVAILABLE.message
+        self.assertNoAction("due tasks", refusal, timing=unzoned)
+        for request in (
+            "add task due tomorrow: buy milk",
+            "reschedule task 3: friday",
+            "add reminder tomorrow 9:00: call mom",
+            "add reminder in 5 minutes: stretch",
+            "reschedule reminder 4: in 2 hours",
+        ):
+            with self.subTest(request=request):
+                self.assertNoAction(request, refusal + NOTHING_SAVED, timing=unzoned)
+        # The due-reminder query compares saved instants with the reference
+        # instant alone, so it needs no zone.
+        self.assertEqual(
+            self.plan("due reminders", unzoned).steps,
+            (PlanStep("reminders", "due", {"as_of": "2027-10-30T08:03:27Z"}),),
+        )
+        self.assertEqual(
+            self.plan("add task buy milk", unzoned).steps,
+            (PlanStep("tasks", "create", {"text": "buy milk"}),),
+        )
+
+    def test_past_far_skipped_and_repeated_times_are_refused(self) -> None:
+        for request, failure in (
+            ("add task due 2027-10-29: buy milk", TimingFailure.PAST),
+            ("reschedule task 3: 2027-10-29", TimingFailure.PAST),
+            ("add reminder today 10:03: call mom", TimingFailure.PAST),
+            ("add task due 2037-10-31: buy milk", TimingFailure.TOO_FAR),
+            ("add reminder 2028-03-26 02:30: call mom", TimingFailure.NONEXISTENT),
+            ("add reminder tomorrow 02:30: check the clocks", TimingFailure.AMBIGUOUS),
+            (
+                "add reminder tomorrow 02:30 +03:00: check the clocks",
+                TimingFailure.AMBIGUOUS,
+            ),
+            ("add reminder tomorrow 09:00 +02:00: call mom", TimingFailure.AMBIGUOUS),
+        ):
+            with self.subTest(request=request):
+                self.assertNoAction(request, failure.message + NOTHING_SAVED)
+        for request, argument in (
+            ("add reminder today 10:04: call mom", f"2027-10-30T10:04:00+02:00{ZONE}"),
+            ("add task due 2037-10-30: buy milk", "2037-10-30"),
+            (
+                "add reminder tomorrow 02:30 +01:00: check the clocks",
+                f"2027-10-31T02:30:00+01:00{ZONE}",
+            ),
+        ):
+            with self.subTest(request=request):
+                (step,) = self.plan(request).steps
+                self.assertIn(argument, step.arguments.values())
+
+    def test_timing_is_passed_by_keyword_only(self) -> None:
+        with self.assertRaises(TypeError):
+            self.planner.create_plan("due tasks", self.timing)
 
 
 def _quiet_logger() -> logging.Logger:

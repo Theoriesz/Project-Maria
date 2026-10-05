@@ -27,7 +27,7 @@ from datetime import datetime, timedelta, timezone
 from enum import Enum
 from pathlib import Path
 from types import MappingProxyType, SimpleNamespace
-from unittest.mock import Mock, call, patch
+from unittest.mock import ANY, Mock, call, patch
 
 import core.audit as audit_module
 import core.memory as memory_module
@@ -77,7 +77,13 @@ from tools.calculator import CalculatorTool
 # not pass by agreeing with itself.
 
 EXPECTED_AUDITED_ACTIONS = frozenset(
-    {"calculator.calculate", "filesystem.list", "system.current_time"}
+    {
+        "calculator.calculate",
+        "filesystem.list",
+        "system.current_time",
+        "tasks.create",
+        "reminders.create",
+    }
 )
 
 # Every registered action whose contract declares a path argument.
@@ -115,6 +121,8 @@ RECORD_TABLES = (
     "audit_outcomes",
     "saved_conversations",
     "conversation_summaries",
+    "tasks",
+    "reminders",
 )
 ZERO_ROWS = {table: 0 for table in RECORD_TABLES}
 
@@ -547,7 +555,7 @@ def _contract(tool: str, action: str) -> ActionContract:
 class AuditVocabularyTests(unittest.TestCase):
     """Pin every word an audit summary may use, against hand-written values."""
 
-    def test_audited_actions_are_exactly_the_three_proposable_actions(self) -> None:
+    def test_audited_actions_are_exactly_the_proposable_actions(self) -> None:
         self.assertIs(type(AUDITED_ACTIONS), frozenset)
         self.assertEqual(AUDITED_ACTIONS, EXPECTED_AUDITED_ACTIONS)
 
@@ -869,7 +877,7 @@ class AuditTargetTests(unittest.TestCase):
 
     def test_every_registered_contract_has_its_target(self) -> None:
         contracts = BUILT_IN_ACTION_CONTRACTS.contracts
-        self.assertEqual(len(contracts), 40)
+        self.assertEqual(len(contracts), 62)
         for contract in contracts:
             with self.subTest(action=contract.identifier):
                 expected = (
@@ -1113,7 +1121,9 @@ class RecordAuditSummaryTests(_AuditDatabaseTestCase):
             [
                 (1, "calculator.calculate", "owner_approved", "none"),
                 (2, "filesystem.list", "owner_approved", "named_filesystem_root"),
-                (3, "system.current_time", "owner_approved", "none"),
+                (3, "reminders.create", "owner_approved", "none"),
+                (4, "system.current_time", "owner_approved", "none"),
+                (5, "tasks.create", "owner_approved", "none"),
             ],
         )
 
@@ -2255,7 +2265,7 @@ class ApprovedProposalAuditTests(unittest.TestCase):
         harness.validate_action.assert_called_once()
         self.assertIs(harness.validate_action.call_args.args[2], approved_arguments)
         harness.prepare_confirmation.assert_not_called()
-        harness.create_plan.assert_called_once_with(UNRECOGNISED_REQUEST)
+        harness.create_plan.assert_called_once_with(UNRECOGNISED_REQUEST, timing=ANY)
         self.assertEqual(
             harness.check.call_args_list,
             [call("calculator", "calculate")] * 2,

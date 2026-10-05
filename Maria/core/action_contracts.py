@@ -23,12 +23,20 @@ supplies from the owner's current session when Brain receives a planner's
 plan, and that no request, planner, or model ever supplies. The declaration
 is the whole of the mechanism's knowledge of which actions take one, so Brain
 needs no tool-specific branch to fill it.
+
+From V1-22 a text argument may also declare a closed text format, such as a
+calendar date or a canonical reminder time, or a closed tuple of allowed
+values, such as a status. Both are checked on the exact value, with ``re``
+and ``datetime`` alone: syntax and calendar validity, never a time zone's
+rules, which ``core/time_resolution.py`` settles when timing is resolved.
 """
 
 from __future__ import annotations
 
+import re
 from collections.abc import Iterable, Mapping
 from dataclasses import dataclass, field
+from datetime import date, datetime
 from enum import Enum
 from types import MappingProxyType
 from typing import Any
@@ -61,6 +69,35 @@ FACT_DIGEST_LENGTH = 64
 # which a test holds these to.
 MAXIMUM_SUMMARY_LENGTH = 2 * 1024
 MAXIMUM_TRANSCRIPT_LENGTH = 64 * 1024
+
+# The longest task or reminder text, in characters, a coarse ceiling as
+# above; the exact UTF-8 and character rules belong to
+# ``core.task_records``, which a test holds this to.
+MAXIMUM_TASK_TEXT_LENGTH = 512
+
+# The statuses a task or reminder listing names, and the one repeat a
+# reminder has.
+TASK_STATUSES = ("open", "completed")
+REPEAT_VALUES = ("never",)
+
+# The value a task reschedule carries to clear its due date.
+NO_DUE_DATE = "none"
+
+# The exact shapes of the closed text formats. Each is matched whole, and a
+# date or time must also name a real calendar day. A canonical reminder time
+# has zero seconds, an offset of whole minutes written ``+00:00`` when zero,
+# and an IANA key of at most 64 characters; a test holds these to
+# ``core.task_records``, which validates stored values the same way.
+_ISO_DATE_PATTERN = re.compile(r"[0-9]{4}-[0-9]{2}-[0-9]{2}")
+_UTC_INSTANT_PATTERN = re.compile(
+    r"[0-9]{4}-[0-9]{2}-[0-9]{2}T[0-9]{2}:[0-9]{2}:[0-9]{2}Z"
+)
+_ZONED_LOCAL_TIME_PATTERN = re.compile(
+    r"([0-9]{4}-[0-9]{2}-[0-9]{2})T([0-9]{2}):([0-9]{2}):00"
+    r"([+-])([0-9]{2}):([0-9]{2})"
+    r"\[([A-Za-z][A-Za-z0-9_+-]*(?:/[A-Za-z][A-Za-z0-9_+-]*)*)\]"
+)
+_MAXIMUM_ZONE_KEY_LENGTH = 64
 
 
 # The longest metadata name Maria will repeat back. Every declared tool,
@@ -156,6 +193,21 @@ class SessionInput(str, Enum):
 
     CONVERSATION = "conversation"
     CONVERSATION_SUMMARY_DRAFT = "conversation_summary_draft"
+
+
+class TextFormat(str, Enum):
+    """A closed shape one text argument's exact value must have.
+
+    ``ISO_DATE`` is ``YYYY-MM-DD`` naming a real date, and
+    ``ISO_DATE_OR_NONE`` is that or exactly ``none``. ``ZONED_LOCAL_TIME`` is
+    a canonical reminder time, ``YYYY-MM-DDTHH:MM:00+HH:MM[Area/City]``, and
+    ``UTC_INSTANT`` is ``YYYY-MM-DDTHH:MM:SSZ`` naming a real second.
+    """
+
+    ISO_DATE = "iso_date"
+    ISO_DATE_OR_NONE = "iso_date_or_none"
+    ZONED_LOCAL_TIME = "zoned_local_time"
+    UTC_INSTANT = "utc_instant"
 
 
 class ContractFailure(str, Enum):
@@ -294,6 +346,11 @@ class ArgumentContract:
     ``session_input`` names the session text Maria supplies to this
     argument, or None for an argument the request supplies. Only a required,
     non-blank, bounded text argument with no root class may declare one.
+
+    ``text_format`` names a closed shape the exact value must have, and
+    ``allowed_values`` a closed tuple of exact values it must be one of. At
+    most one of the two may be declared, only on a text argument with no
+    root class and no session input.
     """
 
     name: str
@@ -306,6 +363,8 @@ class ArgumentContract:
     allow_blank: bool | None = None
     root_class: RootClass | None = None
     session_input: SessionInput | None = None
+    text_format: TextFormat | None = None
+    allowed_values: tuple[str, ...] | None = None
 
     def __post_init__(self) -> None:
         """Reject a declaration the validator could not honour."""
@@ -316,6 +375,38 @@ class ArgumentContract:
         else:
             self._validate_numeric_declaration()
         self._validate_session_input()
+        self._validate_closed_text()
+
+    def _validate_closed_text(self) -> None:
+        """Reject a text format or allowed values the validator cannot apply."""
+        if self.text_format is None and self.allowed_values is None:
+            return
+        if (
+            self.value_type is not str
+            or self.root_class is not None
+            or self.session_input is not None
+            or (self.text_format is not None and self.allowed_values is not None)
+        ):
+            raise ValueError(
+                "A text format or allowed values may be declared only, and only "
+                f"one of them, on a plain text argument: {self.name!r}."
+            )
+        if self.text_format is not None and type(self.text_format) is not TextFormat:
+            raise ValueError(
+                f"text_format must be a TextFormat member: {self.name!r}."
+            )
+        if self.allowed_values is not None and not (
+            type(self.allowed_values) is tuple
+            and self.allowed_values
+            and all(
+                type(value) is str and value for value in self.allowed_values
+            )
+            and len(set(self.allowed_values)) == len(self.allowed_values)
+        ):
+            raise ValueError(
+                "allowed_values must be a tuple of distinct non-empty strings: "
+                f"{self.name!r}."
+            )
 
     def _validate_session_input(self) -> None:
         """Reject a session input on anything but bounded, required text."""
@@ -445,7 +536,9 @@ class ArgumentContract:
         measured on its stripped form, which is how every tool establishes
         blankness and exactly how CalculatorTool measures its expression
         ceiling. That stripped text is used for the comparison only and is
-        never written back, so the caller keeps the value it supplied.
+        never written back, so the caller keeps the value it supplied. A
+        declared allowed tuple or text format is then checked on the exact
+        value, unstripped.
         """
         if type(value) is not self.value_type:
             return ContractFailure.WRONG_TYPE
@@ -462,6 +555,13 @@ class ArgumentContract:
             if (
                 self.maximum_length is not None
                 and len(measured) > self.maximum_length
+            ):
+                return ContractFailure.OUT_OF_RANGE
+            if self.allowed_values is not None and value not in self.allowed_values:
+                return ContractFailure.OUT_OF_RANGE
+            if self.text_format is not None and not matches_text_format(
+                self.text_format,
+                value,
             ):
                 return ContractFailure.OUT_OF_RANGE
             return None
@@ -770,8 +870,54 @@ class ActionContractRegistry:
         return contract.validate(arguments)
 
 
+def matches_text_format(text_format: TextFormat, value: str) -> bool:
+    """Return whether an exact text value has one closed format.
+
+    Only syntax and calendar validity are checked: a date must exist, a time
+    must be a real minute with zero seconds, an offset must be whole minutes
+    from -23:59 to +23:59 with zero written ``+00:00``, and a zone key must
+    have IANA key syntax. No time zone's rules are consulted.
+    """
+    if text_format is TextFormat.ISO_DATE_OR_NONE:
+        return value == NO_DUE_DATE or _is_iso_date(value)
+    if text_format is TextFormat.ISO_DATE:
+        return _is_iso_date(value)
+    if text_format is TextFormat.UTC_INSTANT:
+        if _UTC_INSTANT_PATTERN.fullmatch(value) is None:
+            return False
+        try:
+            datetime.strptime(value, "%Y-%m-%dT%H:%M:%SZ")
+        except ValueError:
+            return False
+        return True
+    match = _ZONED_LOCAL_TIME_PATTERN.fullmatch(value)
+    if match is None:
+        return False
+    day, hours, minutes, sign, offset_hours, offset_minutes, key = match.groups()
+    return (
+        _is_iso_date(day)
+        and int(hours) <= 23
+        and int(minutes) <= 59
+        and int(offset_hours) <= 23
+        and int(offset_minutes) <= 59
+        and not (sign == "-" and offset_hours == offset_minutes == "00")
+        and len(key) <= _MAXIMUM_ZONE_KEY_LENGTH
+    )
+
+
+def _is_iso_date(value: str) -> bool:
+    """Return whether text is exactly ``YYYY-MM-DD`` naming a real date."""
+    if _ISO_DATE_PATTERN.fullmatch(value) is None:
+        return False
+    try:
+        date.fromisoformat(value)
+    except ValueError:
+        return False
+    return True
+
+
 def _identifier(required: bool = True) -> ArgumentContract:
-    """Declare the positive row identifier shared by twenty actions.
+    """Declare the positive row identifier shared by thirty-six actions.
 
     Every tool that takes an ``id`` rejects a bool, a non-int, and anything
     below 1, and none imposes a ceiling.
@@ -861,6 +1007,40 @@ def _text_digest() -> ArgumentContract:
     )
 
 
+def _task_text() -> ArgumentContract:
+    """Declare a task's or reminder's required text, within its ceiling."""
+    return _text(
+        "text",
+        required=True,
+        allow_blank=False,
+        minimum_length=None,
+        maximum_length=MAXIMUM_TASK_TEXT_LENGTH,
+    )
+
+
+def _closed_text(
+    name: str,
+    *,
+    required: bool,
+    text_format: TextFormat | None = None,
+    allowed_values: tuple[str, ...] | None = None,
+) -> ArgumentContract:
+    """Declare one text field whose exact value has a closed shape or set.
+
+    The shape or set bounds the value, so no separate length is declared.
+    """
+    return ArgumentContract(
+        name,
+        str,
+        required=required,
+        allow_blank=False,
+        minimum_length=None,
+        maximum_length=None,
+        text_format=text_format,
+        allowed_values=allowed_values,
+    )
+
+
 def _named_root_path(name: str, required: bool = True) -> ArgumentContract:
     """Declare a path argument governed by Maria's named filesystem roots.
 
@@ -884,11 +1064,13 @@ def _named_root_path(name: str, required: bool = True) -> ArgumentContract:
 
 
 # Model eligibility is stated on every declaration below and decided
-# independently of permission. Only three actions are open to a reasoning
-# model: arithmetic, listing a directory beneath the default named root, and
-# reading the clock. Everything that changes state, widens consent, or reads a
-# stored record, interaction history, an audit summary, a file's contents, or
-# a host profile is closed to it.
+# independently of permission. Only five actions are open to a reasoning
+# model: arithmetic, listing a directory beneath the default named root,
+# reading the clock, and creating a task or a reminder, which compile only
+# from the owner's own supported request, with Maria's own extraction of its
+# text and timing. Everything else that changes state, widens consent, or
+# reads a stored record, interaction history, an audit summary, a file's
+# contents, or a host profile is closed to it.
 BUILT_IN_ACTION_CONTRACTS = ActionContractRegistry(
     (
         ActionContract(
@@ -1256,6 +1438,116 @@ BUILT_IN_ACTION_CONTRACTS = ActionContractRegistry(
             model_eligibility=ModelEligibility.NOT_MODEL_ELIGIBLE,
         ),
         ActionContract(
+            "reminders",
+            "create",
+            (
+                _task_text(),
+                # The canonical local time, offset, and zone Maria resolved,
+                # never a phrase: a model's phrase is compared, then replaced.
+                _closed_text(
+                    "when",
+                    required=True,
+                    text_format=TextFormat.ZONED_LOCAL_TIME,
+                ),
+                _closed_text(
+                    "repeat",
+                    required=True,
+                    allowed_values=REPEAT_VALUES,
+                ),
+            ),
+            model_eligibility=ModelEligibility.MODEL_ELIGIBLE,
+        ),
+        ActionContract(
+            "reminders",
+            "list",
+            (
+                _closed_text(
+                    "status",
+                    required=True,
+                    allowed_values=TASK_STATUSES,
+                ),
+            ),
+            model_eligibility=ModelEligibility.NOT_MODEL_ELIGIBLE,
+        ),
+        ActionContract(
+            "reminders",
+            "due",
+            (
+                # The request's reference instant, in UTC, from the plan.
+                _closed_text(
+                    "as_of",
+                    required=True,
+                    text_format=TextFormat.UTC_INSTANT,
+                ),
+            ),
+            model_eligibility=ModelEligibility.NOT_MODEL_ELIGIBLE,
+        ),
+        ActionContract(
+            "reminders",
+            "read",
+            (_identifier(),),
+            model_eligibility=ModelEligibility.NOT_MODEL_ELIGIBLE,
+        ),
+        ActionContract(
+            "reminders",
+            "complete",
+            (_identifier(),),
+            model_eligibility=ModelEligibility.NOT_MODEL_ELIGIBLE,
+        ),
+        ActionContract(
+            "reminders",
+            "reopen",
+            (_identifier(),),
+            model_eligibility=ModelEligibility.NOT_MODEL_ELIGIBLE,
+        ),
+        ActionContract(
+            "reminders",
+            "edit",
+            (_identifier(), _task_text()),
+            model_eligibility=ModelEligibility.NOT_MODEL_ELIGIBLE,
+        ),
+        ActionContract(
+            "reminders",
+            "reschedule",
+            (
+                _identifier(),
+                _closed_text(
+                    "when",
+                    required=True,
+                    text_format=TextFormat.ZONED_LOCAL_TIME,
+                ),
+                _closed_text(
+                    "repeat",
+                    required=True,
+                    allowed_values=REPEAT_VALUES,
+                ),
+            ),
+            model_eligibility=ModelEligibility.NOT_MODEL_ELIGIBLE,
+        ),
+        ActionContract(
+            "reminders",
+            "delete",
+            (_identifier(),),
+            model_eligibility=ModelEligibility.NOT_MODEL_ELIGIBLE,
+        ),
+        ActionContract(
+            "reminders",
+            "enable_context",
+            (
+                _identifier(),
+                # Absent from the planner's plan; pinned when confirmation is
+                # offered, so the approved plan names the exact text and time.
+                _text_digest(),
+            ),
+            model_eligibility=ModelEligibility.NOT_MODEL_ELIGIBLE,
+        ),
+        ActionContract(
+            "reminders",
+            "disable_context",
+            (_identifier(),),
+            model_eligibility=ModelEligibility.NOT_MODEL_ELIGIBLE,
+        ),
+        ActionContract(
             "system",
             "overview",
             model_eligibility=ModelEligibility.NOT_MODEL_ELIGIBLE,
@@ -1264,6 +1556,108 @@ BUILT_IN_ACTION_CONTRACTS = ActionContractRegistry(
             "system",
             "current_time",
             model_eligibility=ModelEligibility.MODEL_ELIGIBLE,
+        ),
+        ActionContract(
+            "tasks",
+            "create",
+            (
+                _task_text(),
+                # The resolved calendar date, never a phrase; absent for a
+                # task with no due date.
+                _closed_text(
+                    "due",
+                    required=False,
+                    text_format=TextFormat.ISO_DATE,
+                ),
+            ),
+            model_eligibility=ModelEligibility.MODEL_ELIGIBLE,
+        ),
+        ActionContract(
+            "tasks",
+            "list",
+            (
+                _closed_text(
+                    "status",
+                    required=True,
+                    allowed_values=TASK_STATUSES,
+                ),
+            ),
+            model_eligibility=ModelEligibility.NOT_MODEL_ELIGIBLE,
+        ),
+        ActionContract(
+            "tasks",
+            "due",
+            (
+                # Local today at the request's reference instant, from the
+                # plan.
+                _closed_text(
+                    "as_of",
+                    required=True,
+                    text_format=TextFormat.ISO_DATE,
+                ),
+            ),
+            model_eligibility=ModelEligibility.NOT_MODEL_ELIGIBLE,
+        ),
+        ActionContract(
+            "tasks",
+            "read",
+            (_identifier(),),
+            model_eligibility=ModelEligibility.NOT_MODEL_ELIGIBLE,
+        ),
+        ActionContract(
+            "tasks",
+            "complete",
+            (_identifier(),),
+            model_eligibility=ModelEligibility.NOT_MODEL_ELIGIBLE,
+        ),
+        ActionContract(
+            "tasks",
+            "reopen",
+            (_identifier(),),
+            model_eligibility=ModelEligibility.NOT_MODEL_ELIGIBLE,
+        ),
+        ActionContract(
+            "tasks",
+            "edit",
+            (_identifier(), _task_text()),
+            model_eligibility=ModelEligibility.NOT_MODEL_ELIGIBLE,
+        ),
+        ActionContract(
+            "tasks",
+            "reschedule",
+            (
+                _identifier(),
+                # A resolved calendar date, or ``none`` to clear it.
+                _closed_text(
+                    "due",
+                    required=True,
+                    text_format=TextFormat.ISO_DATE_OR_NONE,
+                ),
+            ),
+            model_eligibility=ModelEligibility.NOT_MODEL_ELIGIBLE,
+        ),
+        ActionContract(
+            "tasks",
+            "delete",
+            (_identifier(),),
+            model_eligibility=ModelEligibility.NOT_MODEL_ELIGIBLE,
+        ),
+        ActionContract(
+            "tasks",
+            "enable_context",
+            (
+                _identifier(),
+                # Absent from the planner's plan; pinned when confirmation is
+                # offered, so the approved plan names the exact text and date.
+                _text_digest(),
+            ),
+            model_eligibility=ModelEligibility.NOT_MODEL_ELIGIBLE,
+        ),
+        ActionContract(
+            "tasks",
+            "disable_context",
+            (_identifier(),),
+            model_eligibility=ModelEligibility.NOT_MODEL_ELIGIBLE,
         ),
     )
 )

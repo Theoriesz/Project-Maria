@@ -5,7 +5,7 @@ from __future__ import annotations
 import inspect
 import logging
 import unittest
-from unittest.mock import Mock, call, patch
+from unittest.mock import ANY, Mock, call, patch
 
 import core.session as session_module
 from core.action_contracts import BUILT_IN_ACTION_CONTRACTS
@@ -131,7 +131,7 @@ class PlanBindingTests(SessionTestCase):
 
         self.assertEqual(confirmed.text, "Renamed old.txt to new.txt")
         self.assertFalse(confirmed.needs_confirmation)
-        self.planner.create_plan.assert_called_once_with(RENAME_REQUEST)
+        self.planner.create_plan.assert_called_once_with(RENAME_REQUEST, timing=ANY)
         self.assertIs(confirmed.plan, plan)
 
     def test_no_interaction_history_is_read_for_an_approved_request(
