@@ -78,8 +78,9 @@ ENABLE_SUMMARY_CONTEXT_NOTICE = (
 )
 # V1-22's reminder and task notices, pinned the same way.
 CREATE_REMINDER_NOTICE = (
-    "Maria will not notify you when this reminder is due, and it does not "
-    "repeat: type due reminders to see the reminders whose time has come."
+    "Maria shows a reminder at most once when it is due, and only while "
+    "reminder delivery is turned on and able to run; it does not repeat. "
+    "Type due reminders to see the reminders whose time has come."
 )
 ENABLE_TASK_CONTEXT_NOTICE = (
     "Once enabled, this task's text and due date may be sent to your local "
@@ -94,6 +95,24 @@ ENABLE_REMINDER_CONTEXT_NOTICE = (
     "your enabled memories and within Maria's memory context limits, so it is "
     "not always sent. Maria does not check the reminder for passwords or "
     "other secrets, and enabling it does not mean it contains none."
+)
+# V1-23-R1's two reminder-delivery notices, pinned the same way.
+ENABLE_REMINDER_DELIVERY_NOTICE = (
+    "Once enabled, Maria shows each due reminder at most once: in the desktop "
+    "window or the command line while you use them, and, while Maria is "
+    "closed, as a Windows message box if you have installed the "
+    "MariaReminderDelivery task, which Maria cannot see or install. It can "
+    "show a reminder again only after you move it to a different time, even "
+    "back to an earlier one. A message box shows the reminder's text to anyone "
+    "at your unlocked screen. Open reminders whose time has passed and that "
+    "were not shown since they were created or last moved are shown too, five "
+    "at a time, and marked overdue when more than fifteen minutes late."
+)
+DISABLE_REMINDER_DELIVERY_NOTICE = (
+    "Turning reminder delivery off stops Maria from starting any new reminder "
+    "notice from the moment it is saved. A notice Maria has already started "
+    "may still appear and be recorded, and a message box already on screen "
+    "stays until you close it."
 )
 
 
@@ -426,10 +445,14 @@ class PermissionManagerTests(unittest.TestCase):
                     "reminders.delete",
                     "reminders.enable_context",
                     "reminders.disable_context",
+                    # V1-23-R1: turning reminder delivery on or off is
+                    # confirmed, each with its fixed notice.
+                    "reminders.enable_delivery",
+                    "reminders.disable_delivery",
                 }
             ),
         )
-        self.assertEqual(len(MANDATORY_CONFIRMATION_ACTIONS), 31)
+        self.assertEqual(len(MANDATORY_CONFIRMATION_ACTIONS), 33)
         self.assertEqual(
             MANDATORY_DENIED_ACTIONS,
             frozenset({"filesystem.delete", "filesystem.write"}),
@@ -623,6 +646,10 @@ class PermissionManagerTests(unittest.TestCase):
                         reason = f"{reason} {ENABLE_TASK_CONTEXT_NOTICE}"
                     if action_id == "reminders.enable_context":
                         reason = f"{reason} {ENABLE_REMINDER_CONTEXT_NOTICE}"
+                    if action_id == "reminders.enable_delivery":
+                        reason = f"{reason} {ENABLE_REMINDER_DELIVERY_NOTICE}"
+                    if action_id == "reminders.disable_delivery":
+                        reason = f"{reason} {DISABLE_REMINDER_DELIVERY_NOTICE}"
                     with self.subTest(action_id=action_id):
                         self.assertEqual(
                             manager.check(tool_name, action),
@@ -645,6 +672,8 @@ class PermissionManagerTests(unittest.TestCase):
             "reminders.create": CREATE_REMINDER_NOTICE,
             "tasks.enable_context": ENABLE_TASK_CONTEXT_NOTICE,
             "reminders.enable_context": ENABLE_REMINDER_CONTEXT_NOTICE,
+            "reminders.enable_delivery": ENABLE_REMINDER_DELIVERY_NOTICE,
+            "reminders.disable_delivery": DISABLE_REMINDER_DELIVERY_NOTICE,
         }
 
         self.assertEqual(set(expected), set(CONFIRMATION_NOTICES))

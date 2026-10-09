@@ -8,12 +8,19 @@ The command line runs by default. ``--gui`` opens the desktop window instead,
 over a Brain built the same way and the same session contract. The GUI
 package, and Qt with it, is imported only then, so the command line never
 needs Qt.
+
+Each interface's session also gets the reminder-delivery seam (V1-23-R1),
+built from the started Brain's memory, so due reminders surface in session:
+the command line checks before each prompt and prints what it claimed. The
+closed-app pass has its own entry point, ``deliver_reminders.py``, and this
+module's argument handling is unchanged.
 """
 
 from __future__ import annotations
 
 import sys
 from collections.abc import Callable, Sequence
+from datetime import datetime, timezone
 from functools import partial
 
 from core.brain import BrainResponse, MariaBrain
@@ -22,7 +29,14 @@ from core.failures import TypedFailureError
 from core.logger import get_logger
 from core.ollama_adapter import OllamaReasoningProvider
 from core.reasoning import ReasoningProvider, ReasoningSettings
+from core.reminder_delivery import ReminderDeliverySeam
 from core.session import MariaSession
+from core.task_records import DELIVERY_CHANNEL_CLI, DELIVERY_CHANNEL_GUI
+
+
+# Builds an interface's reminder-delivery seam from its started Brain, or
+# returns None for a session without one.
+DeliveryFactory = Callable[[MariaBrain], ReminderDeliverySeam | None]
 
 
 EXIT_COMMANDS = {"exit", "quit", "q"}
@@ -88,15 +102,45 @@ def build_runtime_brain() -> MariaBrain:
     return MariaBrain.from_defaults(reasoning_factory=build_reasoning_provider)
 
 
+def utc_now() -> datetime:
+    """Return the current instant, aware, in UTC: one reminder check's clock."""
+    return datetime.now(timezone.utc)
+
+
+def build_runtime_delivery(brain: MariaBrain, channel: str) -> ReminderDeliverySeam:
+    """Return the reminder-delivery seam over the runtime Brain's memory.
+
+    The seam always exists at run time, because delivery can be turned on
+    at any time; with it off, a check reads the setting and returns.
+    """
+    return ReminderDeliverySeam(brain.memory, channel, utc_now)
+
+
 def run_cli(
     brain_factory: Callable[[], MariaBrain] | None = None,
+    delivery_factory: DeliveryFactory | None = None,
 ) -> int:
-    """Run Maria's minimal command line interface."""
+    """Run Maria's minimal command line interface.
+
+    Before each prompt, the session's reminder check runs inside the
+    prompt's own handling of EOF and Ctrl+C, so an interrupt during the
+    check, or while its notice prints, ends Maria exactly as one at the
+    prompt does. A caller that injects a Brain factory gets no delivery seam
+    unless it also injects a delivery factory.
+    """
     started = _start_brain(brain_factory)
     if isinstance(started, int):
         return started
 
-    session = MariaSession(started)
+    session = MariaSession(
+        started,
+        delivery=_start_delivery(
+            started,
+            brain_factory,
+            delivery_factory,
+            DELIVERY_CHANNEL_CLI,
+        ),
+    )
 
     try:
         print(f"{APP_NAME} v{APP_VERSION}")
@@ -104,6 +148,7 @@ def run_cli(
 
         while True:
             try:
+                show_due_reminders(session)
                 user_input = input("You: ").strip()
             except (EOFError, KeyboardInterrupt):
                 print(f"\n{APP_NAME}: Goodbye.")
@@ -137,8 +182,31 @@ def run_cli(
     return _EXIT_SUCCESS
 
 
+def show_due_reminders(session: MariaSession) -> None:
+    """Print the due reminders this check claimed, and record how it went.
+
+    Nothing happens without a delivery seam, or when nothing was claimed. A
+    notice that prints is recorded as displayed; one whose printing raises
+    an ``Exception`` is recorded as not displayed, and the command line goes
+    on to its prompt. Anything that is not an ``Exception`` propagates to
+    the prompt's own handling.
+    """
+    if not session.delivers_reminders:
+        return
+    notice = session.claim_due_reminders()
+    if notice is None:
+        return
+    try:
+        print(f"{APP_NAME}: {notice.text}")
+    except Exception:  # noqa: BLE001 - recorded as not displayed.
+        session.record_reminder_notice(notice, displayed=False)
+        return
+    session.record_reminder_notice(notice, displayed=True)
+
+
 def run_gui(
     brain_factory: Callable[[], MariaBrain] | None = None,
+    delivery_factory: DeliveryFactory | None = None,
 ) -> int:
     """Run Maria's desktop window over the same Brain and session contract.
 
@@ -167,8 +235,14 @@ def run_gui(
     if isinstance(started, int):
         return started
 
+    delivery = _start_delivery(
+        started,
+        brain_factory,
+        delivery_factory,
+        DELIVERY_CHANNEL_GUI,
+    )
     try:
-        status = run_window(partial(MariaSession, started))
+        status = run_window(partial(MariaSession, started, delivery=delivery))
     except KeyboardInterrupt:
         print(_STARTUP_INTERRUPTED_MESSAGE, file=sys.stderr)
         return _EXIT_STARTUP_INTERRUPTED
@@ -196,6 +270,25 @@ def main(arguments: Sequence[str] | None = None) -> int:
     if GUI_OPTION in selected:
         return run_gui()
     return run_cli()
+
+
+def _start_delivery(
+    brain: MariaBrain,
+    brain_factory: Callable[[], MariaBrain] | None,
+    delivery_factory: DeliveryFactory | None,
+    channel: str,
+) -> ReminderDeliverySeam | None:
+    """Return an interface's delivery seam, or None for a session without one.
+
+    An injected delivery factory decides. Otherwise the runtime default
+    applies only to the runtime Brain: a caller that injected a Brain factory
+    gets no seam.
+    """
+    if delivery_factory is not None:
+        return delivery_factory(brain)
+    if brain_factory is not None:
+        return None
+    return build_runtime_delivery(brain, channel)
 
 
 def _start_brain(

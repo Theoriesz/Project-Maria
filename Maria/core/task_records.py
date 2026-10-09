@@ -23,6 +23,14 @@ a record invalid.
 This module stores nothing, logs nothing, and reads no time zone data. Its
 one clock read is ``task_timestamp``, the stamp a record write takes, which
 never decides any timing. No value object here shows its text in a ``repr``.
+
+It also holds reminder delivery's vocabulary (V1-23-R1): the three channels
+a reminder can be shown through, the two outcomes a display can have, the
+scheduling revision that names one claim with the reminder's id, the one-row
+delivery setting, and the value objects and fixed messages of each. A claim
+is one committed write that reserves one display of one reminder for its
+current scheduling revision; every surface commits it before displaying
+anything, so a reminder is shown at most once per revision.
 """
 
 from __future__ import annotations
@@ -134,6 +142,51 @@ RULES_UNCHECKED_NOTE = (
     "Maria cannot check this time against current time zone rules."
 )
 
+# The surfaces a reminder can be shown through: the closed-app message box,
+# the command line, and the desktop window.
+DELIVERY_CHANNEL_DESKTOP = "desktop"
+DELIVERY_CHANNEL_CLI = "cli"
+DELIVERY_CHANNEL_GUI = "gui"
+DELIVERY_CHANNELS = (
+    DELIVERY_CHANNEL_DESKTOP,
+    DELIVERY_CHANNEL_CLI,
+    DELIVERY_CHANNEL_GUI,
+)
+
+# What one claimed display came to. A claim with no outcome is unconfirmed:
+# Maria cannot say whether it was displayed.
+DELIVERY_OUTCOME_DISPLAYED = "displayed"
+DELIVERY_OUTCOME_FAILED = "failed"
+DELIVERY_OUTCOMES = (DELIVERY_OUTCOME_DISPLAYED, DELIVERY_OUTCOME_FAILED)
+
+# A scheduling revision starts at 1 and only ever rises, by one, when an
+# approved reschedule stores a different saved instant. It is an identity,
+# not a history: no earlier time, text, or claim is kept with it. The largest
+# is the largest INTEGER SQLite can store.
+SCHEDULE_REVISION_FIRST = 1
+SCHEDULE_REVISION_MAX = 2**63 - 1
+
+# The longest stored channel and outcome, in characters. Both are ASCII, so
+# these are also their UTF-8 sizes, and the memory layer bounds a stored
+# value by them before it can reach Python.
+DELIVERY_CHANNEL_MAX_LENGTH = max(len(channel) for channel in DELIVERY_CHANNELS)
+DELIVERY_OUTCOME_MAX_LENGTH = max(len(outcome) for outcome in DELIVERY_OUTCOMES)
+
+# Fixed delivery messages. None interpolates anything supplied at run time.
+DELIVERY_RECORD_MESSAGE = (
+    "A reminder's delivery state may hold only values Maria can show."
+)
+DELIVERY_CHANNEL_MESSAGE = (
+    "A reminder delivery channel must be desktop, cli, or gui."
+)
+DELIVERY_OUTCOME_MESSAGE = (
+    "A reminder delivery outcome must be displayed or failed."
+)
+DELIVERY_SETTING_MESSAGE = (
+    "The reminder delivery setting may hold only values Maria can show."
+)
+DELIVERY_STORAGE_MESSAGE = "Unable to read or write reminder delivery."
+
 
 class StatusChange(str, Enum):
     """What one complete or reopen did.
@@ -223,6 +276,30 @@ class Task:
         return f"Task(id={self.task_id}, <redacted>)"
 
 
+@dataclass(frozen=True)
+class ReminderDeliveryState:
+    """One reminder's claim for its current scheduling revision.
+
+    ``claimed_at`` is when the claim was committed, a UTC instant to the
+    second; ``channel`` is the surface that claimed it; and ``outcome`` is
+    ``displayed``, ``failed`` (not displayed), or None while unconfirmed.
+    It holds no text, so its ``repr`` shows nothing private.
+    """
+
+    claimed_at: str
+    channel: str
+    outcome: str | None = None
+
+    def __post_init__(self) -> None:
+        """Refuse any claim Maria could not have written."""
+        if not (
+            is_utc_instant(self.claimed_at)
+            and is_delivery_channel(self.channel)
+            and (self.outcome is None or is_delivery_outcome(self.outcome))
+        ):
+            raise ValueError(DELIVERY_RECORD_MESSAGE)
+
+
 @dataclass(frozen=True, repr=False)
 class Reminder:
     """One reminder, every field validated.
@@ -230,7 +307,9 @@ class Reminder:
     ``remind_utc`` is exactly the instant ``remind_time`` encodes.
     ``completed_at`` is set only while the reminder is completed, and
     ``context_enabled`` is True only while the owner's consent covers
-    exactly this text and saved time.
+    exactly this text and saved time. ``schedule_revision`` is the
+    reminder's current scheduling revision, and ``delivery`` its claim for
+    that revision, or None when it has none (V1-23-R1).
     """
 
     reminder_id: int
@@ -242,6 +321,8 @@ class Reminder:
     updated_at: str
     completed_at: str | None
     context_enabled: bool
+    schedule_revision: int = SCHEDULE_REVISION_FIRST
+    delivery: ReminderDeliveryState | None = None
 
     def __post_init__(self) -> None:
         """Refuse any field Maria could not have written."""
@@ -256,12 +337,172 @@ class Reminder:
                 self.completed_at,
             )
             and type(self.context_enabled) is bool
+            and is_schedule_revision(self.schedule_revision)
+            and (
+                self.delivery is None
+                or type(self.delivery) is ReminderDeliveryState
+            )
         ):
             raise ValueError(TASK_RECORD_MESSAGE)
 
     def __repr__(self) -> str:
         """Name the type and id without showing the text or the time."""
         return f"Reminder(id={self.reminder_id}, <redacted>)"
+
+
+@dataclass(frozen=True, repr=False)
+class DeliveryCandidate:
+    """One due reminder with no claim for its revision, as a claim reads it.
+
+    It carries only what a notice shows and what a claim compares: the id,
+    the text, the saved time and instant, and the scheduling revision, every
+    one validated. Its ``repr`` shows the id alone.
+    """
+
+    reminder_id: int
+    text: str
+    remind_time: str
+    remind_utc: str
+    schedule_revision: int
+
+    def __post_init__(self) -> None:
+        """Refuse any field Maria could not have written."""
+        if not (
+            is_record_id(self.reminder_id)
+            and is_task_text(self.text)
+            and timing_agrees(self.remind_time, self.remind_utc)
+            and is_schedule_revision(self.schedule_revision)
+        ):
+            raise ValueError(TASK_RECORD_MESSAGE)
+
+    def __repr__(self) -> str:
+        """Name the type and id without showing the text or the time."""
+        return f"DeliveryCandidate(id={self.reminder_id}, <redacted>)"
+
+
+@dataclass(frozen=True)
+class DeliveryClaim:
+    """The identity of one committed claim: a reminder and its revision.
+
+    A reminder's id is never reused and its revision only rises, so this
+    pair names at most one claim, ever. Every outcome is written for exactly
+    this pair, never for a timestamp.
+    """
+
+    reminder_id: int
+    schedule_revision: int
+
+    def __post_init__(self) -> None:
+        """Refuse an identity no claim can have."""
+        if not (
+            is_record_id(self.reminder_id)
+            and is_schedule_revision(self.schedule_revision)
+        ):
+            raise ValueError(DELIVERY_RECORD_MESSAGE)
+
+
+class ClaimOutcome(str, Enum):
+    """What one claim attempt did.
+
+    ``CLAIMED`` committed the claim. ``CHANGED`` wrote nothing because the
+    reminder no longer qualified when the claim ran. ``DISABLED`` wrote
+    nothing because delivery was not enabled then, which stops the batch.
+    """
+
+    CLAIMED = "claimed"
+    CHANGED = "changed"
+    DISABLED = "disabled"
+
+
+@dataclass(frozen=True)
+class ClaimResult:
+    """One claim attempt's outcome, and the claim it committed, if any."""
+
+    outcome: ClaimOutcome
+    claim: DeliveryClaim | None = None
+
+    def __post_init__(self) -> None:
+        """Require a claim exactly when one was committed."""
+        if type(self.outcome) is not ClaimOutcome:
+            raise ValueError(DELIVERY_RECORD_MESSAGE)
+        if self.outcome is ClaimOutcome.CLAIMED:
+            valid = type(self.claim) is DeliveryClaim
+        else:
+            valid = self.claim is None
+        if not valid:
+            raise ValueError(DELIVERY_RECORD_MESSAGE)
+
+
+class DeliverySettingState(str, Enum):
+    """What the one-row delivery setting says.
+
+    ``NEVER_SET`` means there is no row, so delivery is off. ``ENABLED`` and
+    ``DISABLED`` are a well-formed row. ``UNREADABLE`` is any row Maria could
+    not have written, which leaves delivery off.
+    """
+
+    NEVER_SET = "never_set"
+    ENABLED = "enabled"
+    DISABLED = "disabled"
+    UNREADABLE = "unreadable"
+
+
+@dataclass(frozen=True)
+class DeliverySetting:
+    """The delivery setting as one read found it.
+
+    ``changed_at`` is the UTC instant the setting last changed, exactly
+    while it is ``ENABLED`` or ``DISABLED``, and None otherwise.
+    """
+
+    state: DeliverySettingState
+    changed_at: str | None = None
+
+    def __post_init__(self) -> None:
+        """Refuse a setting value no read can produce."""
+        if type(self.state) is not DeliverySettingState:
+            raise ValueError(DELIVERY_SETTING_MESSAGE)
+        if self.state in (
+            DeliverySettingState.ENABLED,
+            DeliverySettingState.DISABLED,
+        ):
+            valid = is_utc_instant(self.changed_at)
+        else:
+            valid = self.changed_at is None
+        if not valid:
+            raise ValueError(DELIVERY_SETTING_MESSAGE)
+
+    @property
+    def enabled(self) -> bool:
+        """Return whether delivery may claim now."""
+        return self.state is DeliverySettingState.ENABLED
+
+
+@dataclass(frozen=True)
+class DeliveryCounts:
+    """How many reminders' current claims came to each outcome."""
+
+    displayed: int
+    unconfirmed: int
+    failed: int
+
+    def __post_init__(self) -> None:
+        """Refuse a count that is not a whole number of at least zero."""
+        if not all(
+            type(count) is int and count >= 0
+            for count in (self.displayed, self.unconfirmed, self.failed)
+        ):
+            raise ValueError(DELIVERY_RECORD_MESSAGE)
+
+
+class DeliveryStorageError(RuntimeError):
+    """Reminder delivery state or its setting could not be read or written.
+
+    The memory layer raises it, with a fixed message and no cause, for a
+    busy, missing, unreadable, or not-current database, so the delivery
+    subsystem can tell a storage failure from any other. Nothing SQLite
+    reported and nothing a row held ever joins it.
+    """
 
 
 def is_task_text(value: object) -> bool:
@@ -448,3 +689,79 @@ def is_lifecycle(
     if status == STATUS_OPEN:
         return completed_at is None
     return is_task_timestamp(completed_at)
+
+
+def is_schedule_revision(value: object) -> bool:
+    """Return whether a value is an exact int scheduling revision, never a bool."""
+    return (
+        type(value) is int
+        and SCHEDULE_REVISION_FIRST <= value <= SCHEDULE_REVISION_MAX
+    )
+
+
+def is_delivery_channel(value: object) -> bool:
+    """Return whether a value is exactly one of the three delivery channels."""
+    return type(value) is str and value in DELIVERY_CHANNELS
+
+
+def is_delivery_outcome(value: object) -> bool:
+    """Return whether a value is exactly one of the two delivery outcomes."""
+    return type(value) is str and value in DELIVERY_OUTCOMES
+
+
+def settle_delivery_state(
+    claimed_at: object,
+    channel: object,
+    outcome: object,
+) -> ReminderDeliveryState | None:
+    """Return a reminder's stored claim columns as its delivery state.
+
+    All three NULL means no claim for the current revision, which is None.
+    Otherwise they must be a valid claim stamp, a known channel, and a known
+    outcome or NULL; an outcome without a claim, a channel without a stamp,
+    or any other mix raises ``ValueError`` with a fixed message.
+    """
+    if claimed_at is None and channel is None and outcome is None:
+        return None
+    return ReminderDeliveryState(claimed_at, channel, outcome)
+
+
+def settle_delivery_setting(
+    row_count: object,
+    enabled: object,
+    changed_at: object,
+) -> DeliverySetting:
+    """Return what one bounded read of the setting table says.
+
+    No row means the setting was never set. Exactly one row whose enabled
+    value is the integer 0 or 1 and whose changed_at is a canonical instant
+    is the setting it states. Anything else, from a second row to a value of
+    the wrong type, is unreadable, which leaves delivery off.
+    """
+    if type(row_count) is int and row_count == 0:
+        return DeliverySetting(DeliverySettingState.NEVER_SET)
+    if (
+        type(row_count) is int
+        and row_count == 1
+        and type(enabled) is int
+        and enabled in (0, 1)
+        and is_utc_instant(changed_at)
+    ):
+        return DeliverySetting(
+            DeliverySettingState.ENABLED
+            if enabled == 1
+            else DeliverySettingState.DISABLED,
+            changed_at,
+        )
+    return DeliverySetting(DeliverySettingState.UNREADABLE)
+
+
+def describe_utc_instant(instant: str) -> str:
+    """Return a UTC instant as the owner reads it, to the minute.
+
+    ``2026-10-05T07:00:00Z`` reads ``2026-10-05 07:00 UTC``. Only a valid
+    instant may be described.
+    """
+    if not is_utc_instant(instant):
+        raise ValueError(AS_OF_INSTANT_MESSAGE)
+    return f"{instant[:10]} {instant[11:16]} UTC"

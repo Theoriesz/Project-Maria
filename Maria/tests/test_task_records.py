@@ -5,7 +5,7 @@ reminder layers share is pinned here, together with the agreements other
 modules keep with it: the request forms' text rule, the contracts' closed
 text formats, the planner's literal values, the compiler's limits, and the
 timing leaf's canonical output, which must always be a value this module
-accepts.
+accepts. Reminder delivery's vocabulary (V1-23-R1) is pinned here as well.
 """
 
 from __future__ import annotations
@@ -22,6 +22,12 @@ from core.action_contracts import TextFormat, matches_text_format
 from core.context import CONTEXT_TIMING_MAX_CHARACTERS, reminder_digest, task_digest
 from core.task_records import (
     CONTEXT_DIGEST_LENGTH,
+    DELIVERY_CHANNEL_MAX_LENGTH,
+    DELIVERY_CHANNELS,
+    DELIVERY_OUTCOME_MAX_LENGTH,
+    DELIVERY_OUTCOMES,
+    DELIVERY_RECORD_MESSAGE,
+    DELIVERY_SETTING_MESSAGE,
     DUE_DATE_LENGTH,
     NO_DUE_DATE,
     RECORD_STATUSES,
@@ -30,6 +36,8 @@ from core.task_records import (
     REPEAT_NEVER,
     RULES_CHANGED_WARNING,
     RULES_UNCHECKED_NOTE,
+    SCHEDULE_REVISION_FIRST,
+    SCHEDULE_REVISION_MAX,
     STATUS_COMPLETED,
     STATUS_OPEN,
     TASK_LIST_LIMIT,
@@ -40,22 +48,36 @@ from core.task_records import (
     TASK_TEXT_MESSAGE,
     DUE_DATE_MESSAGE,
     UTC_INSTANT_LENGTH,
+    ClaimOutcome,
+    ClaimResult,
+    DeliveryCandidate,
+    DeliveryClaim,
+    DeliveryCounts,
+    DeliverySetting,
+    DeliverySettingState,
     RecordUpdate,
     Reminder,
+    ReminderDeliveryState,
     StatusChange,
     Task,
     ZonedTime,
     describe_due_date,
     describe_remind_time,
+    describe_utc_instant,
     is_context_digest,
+    is_delivery_channel,
+    is_delivery_outcome,
     is_due_date,
     is_record_id,
     is_remind_time,
+    is_schedule_revision,
     is_status,
     is_task_text,
     is_task_timestamp,
     is_utc_instant,
     parse_remind_time,
+    settle_delivery_setting,
+    settle_delivery_state,
     task_timestamp,
     timing_agrees,
 )
@@ -720,6 +742,202 @@ class CanonicalOutputTests(unittest.TestCase):
             ),
             "2027-01-01T09:00:59Z",
         )
+
+
+class DeliveryVocabularyTests(unittest.TestCase):
+    """Pin reminder delivery's vocabulary: its values, rules, and reprs."""
+
+    def test_channels_outcomes_and_revision_bounds(self) -> None:
+        self.assertEqual(DELIVERY_CHANNELS, ("desktop", "cli", "gui"))
+        self.assertEqual(DELIVERY_OUTCOMES, ("displayed", "failed"))
+        self.assertEqual(
+            (DELIVERY_CHANNEL_MAX_LENGTH, DELIVERY_OUTCOME_MAX_LENGTH),
+            (7, 9),
+        )
+        self.assertEqual(
+            (SCHEDULE_REVISION_FIRST, SCHEDULE_REVISION_MAX),
+            (1, 2**63 - 1),
+        )
+
+    def test_only_exact_known_values_pass_the_checks(self) -> None:
+        for channel in DELIVERY_CHANNELS:
+            self.assertTrue(is_delivery_channel(channel))
+        for outcome in DELIVERY_OUTCOMES:
+            self.assertTrue(is_delivery_outcome(outcome))
+        for revision in (1, 2, 2**63 - 1):
+            self.assertTrue(is_schedule_revision(revision))
+        for value in ("Desktop", "cli ", "window", "", None, b"cli", 1):
+            with self.subTest(channel=value):
+                self.assertFalse(is_delivery_channel(value))
+        for value in ("Displayed", "unconfirmed", "", None, b"failed", 0):
+            with self.subTest(outcome=value):
+                self.assertFalse(is_delivery_outcome(value))
+        for value in (0, -1, 2**63, True, 1.0, "1", None):
+            with self.subTest(revision=value):
+                self.assertFalse(is_schedule_revision(value))
+
+    def test_a_delivery_state_holds_only_a_claim_maria_could_write(self) -> None:
+        self.assertIsNone(ReminderDeliveryState(STAMP, "cli").outcome)
+        self.assertEqual(
+            ReminderDeliveryState(STAMP, "gui", "failed").outcome,
+            "failed",
+        )
+        for fields in (
+            ("2026-10-04 05:59:35", "cli", None),
+            (None, "cli", "displayed"),
+            (STAMP, "window", None),
+            (STAMP, None, None),
+            (STAMP, "cli", "unconfirmed"),
+        ):
+            with self.subTest(fields=fields):
+                with self.assertRaises(ValueError) as raised:
+                    ReminderDeliveryState(*fields)
+                self.assertEqual(str(raised.exception), DELIVERY_RECORD_MESSAGE)
+
+    def test_stored_claim_columns_settle_to_a_state_or_none(self) -> None:
+        self.assertIsNone(settle_delivery_state(None, None, None))
+        self.assertEqual(
+            settle_delivery_state(STAMP, "desktop", "displayed"),
+            ReminderDeliveryState(STAMP, "desktop", "displayed"),
+        )
+        for columns in (
+            (None, None, "displayed"),
+            (None, "cli", None),
+            (STAMP, None, None),
+            (STAMP, "cli", 1),
+        ):
+            with self.subTest(columns=columns):
+                with self.assertRaises(ValueError) as raised:
+                    settle_delivery_state(*columns)
+                self.assertEqual(str(raised.exception), DELIVERY_RECORD_MESSAGE)
+
+    def test_a_reminder_carries_its_revision_and_at_most_its_claim(self) -> None:
+        reminder = _reminder()
+        self.assertEqual((reminder.schedule_revision, reminder.delivery), (1, None))
+        claimed = _reminder(
+            schedule_revision=3,
+            delivery=ReminderDeliveryState(STAMP, "cli"),
+        )
+        self.assertEqual(claimed.delivery, ReminderDeliveryState(STAMP, "cli"))
+        self.assertEqual(repr(claimed), "Reminder(id=1, <redacted>)")
+        for changes in (
+            {"schedule_revision": 0},
+            {"schedule_revision": True},
+            {"schedule_revision": 2**63},
+            {"delivery": (STAMP, "cli", None)},
+        ):
+            with self.subTest(changes=changes):
+                with self.assertRaises(ValueError) as raised:
+                    _reminder(**changes)
+                self.assertEqual(str(raised.exception), TASK_RECORD_MESSAGE)
+
+    def test_a_candidate_is_validated_and_shows_only_its_id(self) -> None:
+        candidate = DeliveryCandidate(4, "call mom", BERLIN_TIME, BERLIN_INSTANT, 2)
+        self.assertEqual(repr(candidate), "DeliveryCandidate(id=4, <redacted>)")
+        for shown in (repr(candidate), str(candidate)):
+            for secret in ("mom", "2026", "Berlin"):
+                self.assertNotIn(secret, shown)
+        for fields in (
+            (0, "call mom", BERLIN_TIME, BERLIN_INSTANT, 1),
+            (4, " call mom", BERLIN_TIME, BERLIN_INSTANT, 1),
+            (4, "call mom", BERLIN_TIME, "2026-10-05T08:00:00Z", 1),
+            (4, "call mom", "2026-10-05T09:00:00+02:00", BERLIN_INSTANT, 1),
+            (4, "call mom", BERLIN_TIME, BERLIN_INSTANT, 0),
+            (4, "call mom", BERLIN_TIME, BERLIN_INSTANT, True),
+        ):
+            with self.subTest(fields=fields):
+                with self.assertRaises(ValueError) as raised:
+                    DeliveryCandidate(*fields)
+                self.assertEqual(str(raised.exception), TASK_RECORD_MESSAGE)
+
+    def test_a_claim_result_holds_a_claim_exactly_when_claimed(self) -> None:
+        claim = DeliveryClaim(4, 2)
+        self.assertIs(ClaimResult(ClaimOutcome.CLAIMED, claim).claim, claim)
+        self.assertIsNone(ClaimResult(ClaimOutcome.CHANGED).claim)
+        self.assertIsNone(ClaimResult(ClaimOutcome.DISABLED).claim)
+        self.assertEqual(
+            [outcome.value for outcome in ClaimOutcome],
+            ["claimed", "changed", "disabled"],
+        )
+        for outcome, given in (
+            (ClaimOutcome.CLAIMED, None),
+            (ClaimOutcome.CLAIMED, (4, 2)),
+            (ClaimOutcome.CHANGED, claim),
+            (ClaimOutcome.DISABLED, claim),
+            ("claimed", claim),
+        ):
+            with self.subTest(outcome=outcome, claim=given):
+                with self.assertRaises(ValueError) as raised:
+                    ClaimResult(outcome, given)  # type: ignore[arg-type]
+                self.assertEqual(str(raised.exception), DELIVERY_RECORD_MESSAGE)
+        for identity in ((0, 1), (True, 1), (4, 0), (4, 2**63)):
+            with self.subTest(identity=identity):
+                with self.assertRaises(ValueError) as raised:
+                    DeliveryClaim(*identity)
+                self.assertEqual(str(raised.exception), DELIVERY_RECORD_MESSAGE)
+
+    def test_a_setting_has_a_stamp_exactly_while_it_was_set(self) -> None:
+        for state in (DeliverySettingState.ENABLED, DeliverySettingState.DISABLED):
+            with self.subTest(state=state):
+                self.assertEqual(
+                    DeliverySetting(state, STAMP).enabled,
+                    state is DeliverySettingState.ENABLED,
+                )
+                with self.assertRaises(ValueError) as raised:
+                    DeliverySetting(state)
+                self.assertEqual(str(raised.exception), DELIVERY_SETTING_MESSAGE)
+        for state in (DeliverySettingState.NEVER_SET, DeliverySettingState.UNREADABLE):
+            with self.subTest(state=state):
+                self.assertIs(DeliverySetting(state).enabled, False)
+                with self.assertRaises(ValueError):
+                    DeliverySetting(state, STAMP)
+        with self.assertRaises(ValueError):
+            DeliverySetting("enabled", STAMP)  # type: ignore[arg-type]
+
+    def test_a_setting_read_is_off_unless_one_well_formed_row(self) -> None:
+        self.assertEqual(
+            settle_delivery_setting(0, None, None),
+            DeliverySetting(DeliverySettingState.NEVER_SET),
+        )
+        self.assertEqual(
+            settle_delivery_setting(1, 1, STAMP),
+            DeliverySetting(DeliverySettingState.ENABLED, STAMP),
+        )
+        self.assertEqual(
+            settle_delivery_setting(1, 0, STAMP),
+            DeliverySetting(DeliverySettingState.DISABLED, STAMP),
+        )
+        for row in (
+            (2, 1, STAMP),
+            (False, None, None),
+            (None, None, None),
+            (1, 2, STAMP),
+            (1, True, STAMP),
+            (1, "1", STAMP),
+            (1, 1.0, STAMP),
+            (1, 1, None),
+            (1, 1, "2026-10-04 05:59:35"),
+        ):
+            with self.subTest(row=row):
+                self.assertEqual(
+                    settle_delivery_setting(*row),
+                    DeliverySetting(DeliverySettingState.UNREADABLE),
+                )
+
+    def test_counts_are_whole_numbers_of_at_least_zero(self) -> None:
+        self.assertEqual(DeliveryCounts(1, 0, 2), DeliveryCounts(1, 0, 2))
+        for counts in ((-1, 0, 0), (0, True, 0), (0, 0, 1.0)):
+            with self.subTest(counts=counts):
+                with self.assertRaises(ValueError) as raised:
+                    DeliveryCounts(*counts)
+                self.assertEqual(str(raised.exception), DELIVERY_RECORD_MESSAGE)
+
+    def test_a_utc_instant_is_described_to_the_minute(self) -> None:
+        self.assertEqual(describe_utc_instant(BERLIN_INSTANT), "2026-10-05 07:00 UTC")
+        for value in ("2026-10-05 07:00", "2026-10-05T07:00:00+00:00", None):
+            with self.subTest(value=value):
+                with self.assertRaises(ValueError):
+                    describe_utc_instant(value)  # type: ignore[arg-type]
 
 
 class ModuleBoundaryTests(unittest.TestCase):

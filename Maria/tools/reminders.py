@@ -5,9 +5,14 @@ and deletes the owner's reminders, and turns one reminder's context consent
 on or off, through the memory layer. A reminder is one line of the owner's
 text and one moment: the canonical local time, offset, and time zone the
 owner approved, and the saved UTC instant they encode, which alone orders
-reminders and selects due ones. A reminder never repeats, and Maria never
-delivers, notifies, schedules, or polls anything: ``due reminders`` is a
-query the owner asks.
+reminders and selects due ones. A reminder never repeats, and this tool
+itself delivers, notifies, schedules, and polls nothing: ``due reminders`` is
+a query the owner asks. Under V1-23-R1 the reminder-delivery subsystem shows
+due reminders, at most once per scheduling revision, while delivery is on;
+this tool only shows that one setting, with counts of what became of the
+current claims, and turns it on or off, each change confirmed. ``read
+reminder`` adds one delivery line when the reminder has a claim for its
+current revision.
 
 Adding, editing, rescheduling, deleting, and both consent changes are
 confirmation-required, and this tool's binding shows the owner exactly what
@@ -40,6 +45,11 @@ from core.logger import get_logger
 from core.memory import Memory
 from core.task_records import (
     AS_OF_INSTANT_MESSAGE,
+    DELIVERY_CHANNEL_CLI,
+    DELIVERY_CHANNEL_DESKTOP,
+    DELIVERY_CHANNEL_GUI,
+    DELIVERY_OUTCOME_DISPLAYED,
+    DELIVERY_OUTCOME_FAILED,
     REMIND_TIME_MESSAGE,
     REMINDER_ID_MESSAGE,
     REPEAT_NEVER,
@@ -51,10 +61,15 @@ from core.task_records import (
     TASK_QUERY_LIMIT,
     TASK_STATUS_MESSAGE,
     TASK_TEXT_MESSAGE,
+    DeliveryCounts,
+    DeliverySetting,
+    DeliverySettingState,
     RecordUpdate,
     Reminder,
+    ReminderDeliveryState,
     StatusChange,
     describe_remind_time,
+    describe_utc_instant,
     is_record_id,
     is_status,
     is_task_text,
@@ -84,6 +99,30 @@ DUE_LISTED_RECORD = "Listed due reminders."
 MORE_REMINDERS_MESSAGE = (
     f"Showing the first {TASK_LIST_LIMIT} reminders. More reminders exist."
 )
+
+# Reminder delivery (V1-23-R1, decision D8-A): the three actions' fixed
+# replies and failures, none of which shows a reminder's text or time.
+DELIVERY_STATUS_FAILED_MESSAGE = "Unable to read reminder delivery."
+DELIVERY_CHANGE_FAILED_MESSAGE = "Unable to change reminder delivery."
+DELIVERY_ENABLED_MESSAGE = (
+    "Reminder delivery is on. Maria cannot see whether the Windows task is "
+    "installed; type reminder delivery to see the status."
+)
+DELIVERY_DISABLED_MESSAGE = (
+    "Reminder delivery is off. Maria starts no new reminder notices; one "
+    "already started may still appear."
+)
+DELIVERY_UNREADABLE_SENTENCE = (
+    "Maria could not read the reminder delivery setting, so delivery is off."
+)
+DELIVERY_TASK_SENTENCE = "Maria cannot see whether the Windows task is installed."
+
+# How ``read reminder`` names the surface that claimed a reminder.
+_CHANNEL_PHRASES = {
+    DELIVERY_CHANNEL_DESKTOP: "as a desktop notice",
+    DELIVERY_CHANNEL_CLI: "in the command line",
+    DELIVERY_CHANNEL_GUI: "in the desktop window",
+}
 
 # The compact markers a listing adds to one reminder, each explained once
 # below the listing in the fixed sentence it stands for.
@@ -152,7 +191,56 @@ def reminder_block(reminder: Reminder) -> str:
     sentence = rules_sentence(reminder.remind_time)
     if sentence is not None:
         lines.append(sentence)
+    if reminder.delivery is not None:
+        lines.append(delivery_line(reminder.delivery))
     return "\n".join(lines)
+
+
+def delivery_line(state: ReminderDeliveryState) -> str:
+    """Render a reminder's claim for its current revision as one line.
+
+    It says when the claim was started and through which surface, and
+    whether it was displayed, could not be displayed, or is unconfirmed.
+    The time is the claim's; no separate display time is recorded.
+    """
+    started = (
+        f"Delivery: started at {describe_utc_instant(state.claimed_at)} "
+        f"{_CHANNEL_PHRASES[state.channel]}"
+    )
+    if state.outcome == DELIVERY_OUTCOME_DISPLAYED:
+        return f"{started}, and displayed. Maria cannot tell whether you read it."
+    if state.outcome == DELIVERY_OUTCOME_FAILED:
+        return (
+            f"{started}, but it could not be displayed. Maria will not try "
+            "again unless you move it to a different time."
+        )
+    return (
+        f"{started}. Maria cannot confirm that it was displayed, and will not "
+        "show it again unless you move it to a different time."
+    )
+
+
+def delivery_status_text(setting: DeliverySetting, counts: DeliveryCounts) -> str:
+    """Render the delivery setting and the current claims' counts."""
+    if setting.state is DeliverySettingState.ENABLED:
+        first = (
+            "Reminder delivery is on, since "
+            f"{describe_utc_instant(setting.changed_at)}."
+        )
+    elif setting.state is DeliverySettingState.DISABLED:
+        first = (
+            "Reminder delivery is off, since "
+            f"{describe_utc_instant(setting.changed_at)}."
+        )
+    elif setting.state is DeliverySettingState.NEVER_SET:
+        first = "Reminder delivery is off."
+    else:
+        first = DELIVERY_UNREADABLE_SENTENCE
+    return (
+        f"{first} For your reminders' current saved times: "
+        f"{counts.displayed} displayed, {counts.unconfirmed} unconfirmed, "
+        f"{counts.failed} not displayed. {DELIVERY_TASK_SENTENCE}"
+    )
 
 
 class RemindersTool:
@@ -161,8 +249,9 @@ class RemindersTool:
     name = "reminders"
     description = (
         "Adds, lists, reads, completes, reopens, edits, reschedules, and "
-        "deletes reminders, answers which reminders are due, and turns one "
-        "reminder's context consent on or off. It never delivers or notifies."
+        "deletes reminders, answers which reminders are due, turns one "
+        "reminder's context consent on or off, and shows or changes the "
+        "reminder delivery setting. It never delivers or notifies."
     )
     actions = frozenset(
         {
@@ -177,6 +266,9 @@ class RemindersTool:
             "delete",
             "enable_context",
             "disable_context",
+            "delivery_status",
+            "enable_delivery",
+            "disable_delivery",
         }
     )
 
@@ -324,6 +416,12 @@ class RemindersTool:
             return self._set_context(arguments, enabled=True)
         if action == "disable_context":
             return self._set_context(arguments, enabled=False)
+        if action == "delivery_status":
+            return self._delivery_status()
+        if action == "enable_delivery":
+            return self._set_delivery(enabled=True)
+        if action == "disable_delivery":
+            return self._set_delivery(enabled=False)
         return ToolExecutionResult(False, UNSUPPORTED_ACTION_MESSAGE)
 
     def _create(self, arguments: Mapping[str, Any]) -> ToolExecutionResult:
@@ -352,8 +450,8 @@ class RemindersTool:
             (
                 f"Added reminder {reminder_id}: {quoted_for_owner(text)}, "
                 f"{describe_remind_time(when, parts.instant_text)}. It does not "
-                "repeat, Maria will not notify you when it is due, and its "
-                "context consent is off."
+                "repeat, Maria shows it at most once and only while reminder "
+                "delivery is on, and its context consent is off."
             ),
             {"id": reminder_id},
             recorded_message=f"Added reminder {reminder_id}.",
@@ -631,6 +729,53 @@ class RemindersTool:
             True,
             f"{verb} context for reminder {reminder_id}.",
             {"id": reminder_id, "context_enabled": enabled},
+        )
+
+    def _delivery_status(self) -> ToolExecutionResult:
+        """Show the delivery setting and what became of the current claims.
+
+        The reply is content-free: the setting, its time, and three counts.
+        Maria cannot see the Windows task, and says so.
+        """
+        try:
+            setting = self.memory.reminder_delivery_setting()
+            counts = self.memory.reminder_delivery_counts()
+        except (RuntimeError, ValueError):
+            self.logger.warning("Reminder delivery status failed.")
+            return ToolExecutionResult(False, DELIVERY_STATUS_FAILED_MESSAGE)
+        if type(setting) is not DeliverySetting or type(counts) is not DeliveryCounts:
+            self.logger.warning("Reminder delivery status failed.")
+            return ToolExecutionResult(False, DELIVERY_STATUS_FAILED_MESSAGE)
+        self.logger.info("Showed reminder delivery through reminders tool.")
+        return ToolExecutionResult(
+            True,
+            delivery_status_text(setting, counts),
+            {"delivery": setting.state.value},
+        )
+
+    def _set_delivery(self, *, enabled: bool) -> ToolExecutionResult:
+        """Turn reminder delivery on or off, as the owner just confirmed.
+
+        Every claim reads the setting under its own write lock, so the
+        change governs every claim that commits after it. Turning it off
+        cancels nothing already claimed.
+        """
+        try:
+            setting = self.memory.set_reminder_delivery(enabled)
+        except (RuntimeError, ValueError):
+            self.logger.warning("Reminder delivery change failed.")
+            return ToolExecutionResult(False, DELIVERY_CHANGE_FAILED_MESSAGE)
+        if type(setting) is not DeliverySetting or setting.enabled is not enabled:
+            self.logger.warning("Reminder delivery change failed.")
+            return ToolExecutionResult(False, DELIVERY_CHANGE_FAILED_MESSAGE)
+        self.logger.info(
+            "Turned reminder delivery %s through reminders tool.",
+            "on" if enabled else "off",
+        )
+        return ToolExecutionResult(
+            True,
+            DELIVERY_ENABLED_MESSAGE if enabled else DELIVERY_DISABLED_MESSAGE,
+            {"delivery": setting.state.value},
         )
 
 

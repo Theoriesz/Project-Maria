@@ -113,7 +113,7 @@ class _StorageCase(unittest.TestCase):
         self.memory = Memory(self.database_path, logger=self.logger)
         self.memory.initialize()
         self.assertEqual(_database_encoding(self.database_path), self.encoding)
-        self.assertEqual(self.memory.schema_version(), 7)
+        self.assertEqual(self.memory.schema_version(), 8)
         self.zones = SyntheticZones(self, {SYNTHETIC_KEY: CENTRAL_RULES})
 
     def raw(self, statement: str, parameters: tuple[object, ...] = ()) -> int:
@@ -268,7 +268,9 @@ class SqlGuaranteeTests(_StorageCase):
                 "('tasks', 'reminders') AND type != 'table'"
             ).fetchall()
         self.assertEqual(statements["tasks"].count("CHECK"), 4)
-        self.assertEqual(statements["reminders"].count("CHECK"), 4)
+        # Schema 8 adds one CHECK on each of the four delivery columns
+        # (V1-23-R1), whether created fresh or added by the migration.
+        self.assertEqual(statements["reminders"].count("CHECK"), 8)
         self.assertEqual(others, [])
 
 

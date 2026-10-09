@@ -30,6 +30,13 @@ finishes normally first.
 What the window shows is presentation only. The controller keeps no
 transcript, never hands displayed text back to the session, saves nothing,
 and reads no stored record.
+
+Under V1-23-R1 the worker may also send due reminders the session claimed.
+The controller adds such a notice to the conversation, as plain text, in any
+state but closed, changes nothing else, and only then acknowledges it to the
+worker, which records it as displayed. A notice whose rendering fails is
+never acknowledged, so it stays unconfirmed, and the window's existing
+shield closes the window as a failure.
 """
 
 from __future__ import annotations
@@ -40,6 +47,7 @@ from typing import Protocol
 from core.constants import APP_NAME, APP_VERSION
 from gui.session_worker import (
     ApprovalOffer,
+    DueReminderNotice,
     Reply,
     SessionEnded,
     WorkerEvent,
@@ -114,6 +122,9 @@ class SessionCommands(Protocol):
 
     def cancel(self) -> None:
         """Dismiss the pending approval."""
+
+    def acknowledge_reminder_notice(self, serial: int) -> None:
+        """Say that the window showed the notice named by ``serial``."""
 
     def close(self) -> None:
         """End the session once earlier operations finish."""
@@ -259,6 +270,13 @@ class GuiController:
             return
         if isinstance(event, SessionEnded):
             self._end(event)
+            return
+        if isinstance(event, DueReminderNotice):
+            # Shown first and acknowledged only then, so a notice whose
+            # rendering raised is never recorded as displayed. Nothing else
+            # changes: not the state, the offer shown, or the approval area.
+            self._view.append(f"{APP_NAME}: {event.text}")
+            self._worker.acknowledge_reminder_notice(event.serial)
             return
         if isinstance(event, ApprovalOffer):
             self._offer(event)

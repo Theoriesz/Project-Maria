@@ -4,18 +4,32 @@ Stage V1-21 admits exactly one thread for the GUI, under the owner's
 amendment V1-21-R1: this worker. It creates the window's session, performs
 each operation the owner asks for, one at a time and in the order asked, and
 ends the session, so a single owner holds the session for its whole life and
-the GUI thread never touches it. It schedules nothing, starts nothing on its
-own initiative, and stops for good once the session has ended. This is the
-only production module that imports ``threading``.
+the GUI thread never touches it. It schedules nothing, starts no work of its
+own beyond the V1-23-R1 reminder check and acknowledgment described below,
+and stops for good once the session has ended. This is the only production
+module that imports ``threading``.
 
-Every result goes back as one event through ``deliver``, which the window
-supplies and which must hand the event to the GUI thread; the worker never
-touches a widget. When a request leaves an approval pending, the worker keeps
+Every result of an owner's operation goes back as one event through
+``deliver``, which the window supplies and which must hand the event to the
+GUI thread; the worker never touches a widget. When a request leaves an approval pending, the worker keeps
 the exact ``PendingApproval`` object the session holds, and confirms only
 while that object is still the session's pending approval, through the
 session's own ``confirm()``. Dismissing uses the session's own ``cancel()``,
 and ending uses ``end()``, which discards any approval still pending, so an
 approval that arrives as the window closes is never confirmed.
+
+Under V1-23-R1 the worker also runs the session's due-reminder check, when
+the session delivers reminders: once after creating the session, and once
+after each operation whose event is a ``Reply``, after that reply has been
+handed to the window. It never checks after an approval offer, never on a
+timer, and never once ``close()`` was called, not even the first time. A
+claimed notice goes to the window as one ``DueReminderNotice`` under a
+notice serial of its own, and the worker keeps it until the window
+acknowledges that it showed it; the acknowledgment is one more queued
+operation, taken in order with the owner's, which records the notice as
+displayed, delivers no event, and starts no check. A notice the window never
+acknowledges stays unconfirmed, and the kept notices go with the session
+when it ends.
 
 An event carries only text Maria shows the owner, and its ``repr`` shows none
 of it. Every failure, whatever its kind, is contained in the worker's thread:
@@ -43,6 +57,7 @@ from core.session import (
     CONFIRMATION_REFUSED_MESSAGE,
     MariaSession,
     PendingApproval,
+    ReminderNotice,
 )
 
 
@@ -85,11 +100,25 @@ class SessionEnded:
     failed: bool = False
 
 
-WorkerEvent = Reply | ApprovalOffer | SessionEnded
+@dataclass(frozen=True)
+class DueReminderNotice:
+    """Due reminders the session claimed, for the window to show (V1-23-R1).
+
+    ``serial`` names this notice among the notices the worker has handed
+    off, counted apart from offer serials, so the window's acknowledgment
+    names exactly it and can never name an offer.
+    """
+
+    serial: int
+    text: str = field(repr=False)
+
+
+WorkerEvent = Reply | ApprovalOffer | SessionEnded | DueReminderNotice
 
 # One queued operation: it runs on the worker thread with the session and
-# returns the event to deliver. ``None`` in the queue asks for the end.
-_Operation = Callable[[MariaSession], WorkerEvent]
+# returns the event to deliver, or None for an operation that delivers none.
+# ``None`` in the queue itself asks for the end.
+_Operation = Callable[[MariaSession], WorkerEvent | None]
 
 
 class SessionWorker:
@@ -117,6 +146,14 @@ class SessionWorker:
         # written only on the worker thread.
         self._offer: tuple[int, PendingApproval] | None = None
         self._serial = 0
+        # Set by ``close()`` before it queues the end, on the window's
+        # thread, and read here before every reminder check, so no check
+        # runs once the window has asked to close.
+        self._closing = threading.Event()
+        # The notices handed to the window and not yet acknowledged, by
+        # their own serial. Both are touched only on the worker thread.
+        self._notices: dict[int, ReminderNotice] = {}
+        self._notice_serial = 0
 
     def start(self) -> None:
         """Start the worker, which first creates the window's session."""
@@ -134,8 +171,23 @@ class SessionWorker:
         """Ask for the pending approval to be dismissed."""
         self._operations.put(self._cancel)
 
+    def acknowledge_reminder_notice(self, serial: int) -> None:
+        """Say that the window showed the notice named by ``serial``.
+
+        Like every command, this only queues work and never raises. The
+        acknowledgment runs in order with the owner's operations, and one
+        queued after the close never runs.
+        """
+        self._operations.put(
+            lambda session: self._acknowledge(session, serial)
+        )
+
     def close(self) -> None:
-        """Ask for the session to end once every earlier operation finishes."""
+        """Ask for the session to end once every earlier operation finishes.
+
+        No reminder check runs once this was called, not even the first.
+        """
+        self._closing.set()
         self._operations.put(None)
 
     def join(self, timeout: float | None = None) -> bool:
@@ -167,8 +219,14 @@ class SessionWorker:
         try:
             session = self._session_factory()
             self.logger.info("GUI session started.")
+            self._check(session)
             while (operation := self._operations.get()) is not None:
-                self._send(operation(session))
+                event = operation(session)
+                if event is None:
+                    continue
+                self._send(event)
+                if isinstance(event, Reply):
+                    self._check(session)
             reached_close = True
         except BaseException as error:  # noqa: BLE001 - thread boundary.
             self.logger.error(
@@ -176,6 +234,7 @@ class SessionWorker:
                 type(error).__name__,
             )
         self._offer = None
+        self._notices.clear()
         ended = session is None or self._end(session)
         self._send(SessionEnded(failed=not (reached_close and ended)))
 
@@ -229,6 +288,36 @@ class SessionWorker:
         self._offer = None
         session.cancel()
         return Reply(ACTION_CANCELLED_MESSAGE)
+
+    def _check(self, session: MariaSession) -> None:
+        """Hand the window the due reminders the session claims now, if any.
+
+        Nothing runs once the window has asked to close, or for a session
+        without a delivery seam. A claimed notice is kept under its own
+        serial until the window acknowledges it. The retained offer and the
+        session's pending approval are never touched.
+        """
+        if self._closing.is_set() or not session.delivers_reminders:
+            return
+        notice = session.claim_due_reminders()
+        if notice is None:
+            return
+        self._notice_serial += 1
+        self._notices[self._notice_serial] = notice
+        self._send(DueReminderNotice(self._notice_serial, notice.text))
+
+    def _acknowledge(self, session: MariaSession, serial: int) -> None:
+        """Record a notice the window showed as displayed; deliver nothing.
+
+        Only a notice still kept under ``serial`` is recorded, once; a
+        repeated or unknown serial changes nothing. No check follows, and
+        neither the retained offer nor the pending approval changes.
+        """
+        notice = self._notices.pop(serial, None)
+        if notice is None:
+            return None
+        session.record_reminder_notice(notice, displayed=True)
+        return None
 
     def _send(self, event: WorkerEvent) -> None:
         """Hand one event to the window; one already gone stops nothing.

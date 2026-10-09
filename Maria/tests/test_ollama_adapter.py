@@ -2006,15 +2006,21 @@ GUARDED_CORE_MODULES = (
     "core.tool_manager",
     "core.memory",
     "core.config",
+    # The reminder-delivery subsystem of V1-23-R1, its entry point included.
+    "core.runtime_paths",
+    "core.reminder_delivery",
+    "core.desktop_notice",
+    "deliver_reminders",
 )
 
 # The importable production roots Maria recognises. Every importable root but
 # the test package is scanned as production whatever its name, so a new one is
 # checked as soon as it exists; the root-inventory test separately fails until
 # a stage adds it here. This is the V1-10 discovery policy in test_memory.py.
-# V1-21 added the desktop GUI package.
+# V1-21 added the desktop GUI package, and V1-23 the closed-app reminder
+# pass's entry point.
 PRODUCTION_PACKAGES = ("core", "tools", "gui")
-PRODUCTION_ENTRY_POINTS = ("main.py",)
+PRODUCTION_ENTRY_POINTS = ("main.py", "deliver_reminders.py")
 TEST_PACKAGE = "tests"
 
 # The functions that import a module named by a string, and the standard

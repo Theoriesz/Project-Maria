@@ -37,6 +37,8 @@ MANDATORY_CONFIRMATION_ACTIONS = frozenset(
         "reminders.delete",
         "reminders.enable_context",
         "reminders.disable_context",
+        "reminders.enable_delivery",
+        "reminders.disable_delivery",
         "tasks.create",
         "tasks.edit",
         "tasks.reschedule",
@@ -85,9 +87,16 @@ CONFIRMATION_NOTICES = MappingProxyType(
             "secrets, and enabling it does not mean it contains none."
         ),
         "reminders.create": (
-            "Maria will not notify you when this reminder is due, and it does "
-            "not repeat: type due reminders to see the reminders whose time "
+            "Maria shows a reminder at most once when it is due, and only "
+            "while reminder delivery is turned on and able to run; it does "
+            "not repeat. Type due reminders to see the reminders whose time "
             "has come."
+        ),
+        "reminders.disable_delivery": (
+            "Turning reminder delivery off stops Maria from starting any new "
+            "reminder notice from the moment it is saved. A notice Maria has "
+            "already started may still appear and be recorded, and a message "
+            "box already on screen stays until you close it."
         ),
         "reminders.enable_context": (
             "Once enabled, this reminder's text and saved time may be sent to "
@@ -96,6 +105,18 @@ CONFIRMATION_NOTICES = MappingProxyType(
             "context limits, so it is not always sent. Maria does not check "
             "the reminder for passwords or other secrets, and enabling it does "
             "not mean it contains none."
+        ),
+        "reminders.enable_delivery": (
+            "Once enabled, Maria shows each due reminder at most once: in the "
+            "desktop window or the command line while you use them, and, "
+            "while Maria is closed, as a Windows message box if you have "
+            "installed the MariaReminderDelivery task, which Maria cannot see "
+            "or install. It can show a reminder again only after you move it "
+            "to a different time, even back to an earlier one. A message box "
+            "shows the reminder's text to anyone at your unlocked screen. Open "
+            "reminders whose time has passed and that were not shown since "
+            "they were created or last moved are shown too, five at a time, "
+            "and marked overdue when more than fifteen minutes late."
         ),
         "tasks.enable_context": (
             "Once enabled, this task's text and due date may be sent to your "

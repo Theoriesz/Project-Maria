@@ -51,8 +51,9 @@ NOTICE = "No memory context supplied."
 AGENDA_TABLES = ("tasks", "reminders", "audit_summaries", "audit_outcomes")
 # The fixed notice a reminder's approval carries, written out by hand.
 REMINDER_NOTICE = (
-    "Maria will not notify you when this reminder is due, and it does not "
-    "repeat: type due reminders to see the reminders whose time has come."
+    "Maria shows a reminder at most once when it is due, and only while "
+    "reminder delivery is turned on and able to run; it does not repeat. "
+    "Type due reminders to see the reminders whose time has come."
 )
 
 
@@ -896,9 +897,10 @@ class DeterministicApprovalTests(_ModelPathCase):
         self.assertEqual(
             reminder_offer.text,
             "Confirmation required: reminders.create requires explicit "
-            "confirmation. Maria will not notify you when this reminder is due, "
-            "and it does not repeat: type due reminders to see the reminders whose "
-            "time has come.\n"
+            "confirmation. Maria shows a reminder at most once when it is due, "
+            "and only while reminder delivery is turned on and able to run; it "
+            "does not repeat. Type due reminders to see the reminders whose time "
+            "has come.\n"
             "This approval adds a reminder, shown quoted:\n"
             'Text: "call mom"\n'
             f"Time: Sunday 2027-10-31 at 09:00, {SYNTHETIC_KEY} (UTC+01:00), "
@@ -934,7 +936,7 @@ class ModelApprovalNoticeTests(_ModelPathCase):
     Owner decision A: before a model plan is approved, each confirmation-
     required step's fixed permission notice is shown once, in plan order,
     after the exact compiled steps, so a reminder made from the owner's own
-    words says that Maria will not notify. Nothing else about the offer, the
+    words says when Maria shows it. Nothing else about the offer, the
     plan, its approval, or what is kept changes.
     """
 
@@ -1326,11 +1328,14 @@ class LogPrivacyTests(_ModelPathCase):
         ):
             with self.subTest(value=value):
                 self.assertNotIn(value, logged)
+        # The consent digest's position in each table: last for tasks, and
+        # before the four delivery columns schema 8 added for reminders.
+        consent_column = {"tasks": 7, "reminders": 8}
         digests = [
-            row[-1]
+            row[consent_column[table]]
             for table in ("tasks", "reminders")
             for row in self.rows(table)
-            if row[-1]
+            if row[consent_column[table]]
         ]
         # Task 1 and reminder 2 hold consent, so both kinds are checked.
         self.assertEqual(len(digests), 2)
@@ -1340,7 +1345,11 @@ class LogPrivacyTests(_ModelPathCase):
 
 
 class NoDeliveryTests(_ModelPathCase):
-    """Prove nothing is delivered: no thread, timer, or unasked output."""
+    """Prove a session without a delivery seam delivers nothing.
+
+    No thread, timer, or unasked output: due reminders appear only when
+    asked. Delivery through a session's seam is V1-23-R1's, tested apart.
+    """
 
     def test_a_due_reminder_is_shown_only_when_asked(self) -> None:
         threads = threading.active_count()

@@ -94,6 +94,7 @@ if not UNAVAILABLE:
     from gui.session_worker import (
         THREAD_NAME,
         ApprovalOffer,
+        DueReminderNotice,
         Reply,
         SessionEnded,
         SessionWorker,
@@ -808,6 +809,129 @@ class FailedWindowTests(unittest.TestCase):
         self.assertEqual(self.session.calls, ["end"])
         self.assertEqual(self.commands, ["close"])
         self.assertEqual(self.messages, [])
+
+
+class _StandInNotice:
+    """What the worker reads of a claimed reminder notice: its text."""
+
+    def __init__(self, text: str) -> None:
+        self.text = text
+
+
+@unittest.skipIf(UNAVAILABLE, UNAVAILABLE)
+class ReminderNoticeWindowTests(unittest.TestCase):
+    """A due-reminder notice in the real window (V1-23-R1, decision D12-A).
+
+    As in ``FailedWindowTests``, the window is real but offscreen, with a
+    real controller and worker over a stand-in session whose first check
+    claims one notice. Events are handed to the window's production slot by
+    direct calls, and the one failure is injected by replacing a window
+    method, so it never passes through Qt's own dispatch.
+    """
+
+    NOTICE_TEXT = 'Reminder 1 is due: "<b>call</b> mom &amp; dad"'
+
+    def setUp(self) -> None:
+        self.application = application()
+        self.application.setQuitOnLastWindowClosed(False)
+        self.addCleanup(self.application.setQuitOnLastWindowClosed, True)
+        _quiet_maria_logger(self)
+        self.logger, self.messages = capturing_logger("tests.gui.notice")
+        patcher = patch.object(
+            window_module,
+            "get_logger",
+            lambda name: self.logger,
+        )
+        patcher.start()
+        self.addCleanup(patcher.stop)
+        self.notice = _StandInNotice(self.NOTICE_TEXT)
+        self.events: queue.SimpleQueue[WorkerEvent] = queue.SimpleQueue()
+        self.session = FakeSession(delivers_reminders=True, notices=(self.notice,))
+        self.worker = SessionWorker(lambda: self.session, self.events.put)
+        self.commands: list[str] = []
+        for name in ("submit", "confirm", "cancel", "acknowledge_reminder_notice"):
+            self._record(name)
+        self._record("close")
+        self.window = MariaWindow()
+        self.controller = GuiController(self.window, self.worker)
+        self.window.bind(self.controller)
+        self.addCleanup(self._shut_down)
+        self.controller.start()
+        self.window.show()
+
+    def _record(self, name: str) -> None:
+        """Record each ``name`` asked of the worker, then pass it on."""
+        passed_on = getattr(self.worker, name)
+
+        def recorded(*arguments: object) -> None:
+            self.commands.append(name)
+            passed_on(*arguments)
+
+        setattr(self.worker, name, recorded)
+
+    def _shut_down(self) -> None:
+        """End the worker and discard the window, whatever a test left."""
+        self.worker.close()
+        self.assertTrue(self.worker.join(2 * WAIT_SECONDS))
+        self.window.hide()
+        self.window.deleteLater()
+        QApplication.processEvents()
+
+    def deliver(self) -> WorkerEvent:
+        """Hand the worker's next event to the window's production slot."""
+        event = self.events.get(timeout=WAIT_SECONDS)
+        self.window._receive(event)
+        return event
+
+    def test_a_notice_is_shown_as_plain_text_and_recorded_once_shown(self) -> None:
+        self.assertEqual(self.deliver(), DueReminderNotice(1, self.NOTICE_TEXT))
+
+        self.assertTrue(
+            self.window.conversation.toPlainText().endswith(
+                f"Maria: {self.NOTICE_TEXT}"
+            )
+        )
+        self.assertEqual(self.commands, ["acknowledge_reminder_notice"])
+        self.assertIs(self.controller.state, ControllerState.READY)
+        self.window._shielded(self.controller.request_close)
+        self.assertTrue(self.worker.join(WAIT_SECONDS))
+        self.assertIsInstance(self.deliver(), SessionEnded)
+
+        self.assertEqual(self.session.recorded, [(self.notice, True)])
+        self.assertEqual(self.controller.exit_status, 0)
+        self.assertFalse(self.window.failed)
+        self.assertEqual(self.messages, [])
+
+    def test_a_notice_whose_rendering_fails_closes_the_window_unrecorded(
+        self,
+    ) -> None:
+        shown = self.window.append
+
+        def failing(line: str) -> None:
+            if line.startswith("Maria: Reminder"):
+                raise RuntimeError(FAILURE_TEXT)
+            shown(line)
+
+        self.window.append = failing  # type: ignore[method-assign]
+
+        self.assertIsInstance(self.deliver(), DueReminderNotice)
+
+        # The shield logged the failure by type and closed the window as a
+        # failure; no acknowledgment was sent, so nothing was recorded.
+        self.assertTrue(self.window.failed)
+        self.assertEqual(self.commands, ["close"])
+        self.assertTrue(self.worker.join(WAIT_SECONDS))
+        self.assertIsInstance(self.deliver(), SessionEnded)
+        self.assertIs(self.controller.state, ControllerState.CLOSED)
+        self.assertEqual(self.controller.exit_status, 1)
+        self.assertFalse(self.window.isVisible())
+        self.assertEqual(self.session.calls, ["claim_due_reminders", "end"])
+        self.assertEqual(self.session.recorded, [])
+        self.assertEqual(
+            self.messages,
+            ["A desktop window callback failed: RuntimeError."],
+        )
+        self.assertNotIn(FAILURE_TEXT, self.window.conversation.toPlainText())
 
 
 @unittest.skipIf(UNAVAILABLE, UNAVAILABLE)

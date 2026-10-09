@@ -877,7 +877,7 @@ class AuditTargetTests(unittest.TestCase):
 
     def test_every_registered_contract_has_its_target(self) -> None:
         contracts = BUILT_IN_ACTION_CONTRACTS.contracts
-        self.assertEqual(len(contracts), 62)
+        self.assertEqual(len(contracts), 65)
         for contract in contracts:
             with self.subTest(action=contract.identifier):
                 expected = (

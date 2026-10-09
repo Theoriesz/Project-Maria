@@ -54,6 +54,18 @@ DEFAULT_DATABASE_BUSY_TIMEOUT_SECONDS = 5.0
 # ``context_digest`` consent column; 5 adds the ``audit_summaries`` and
 # ``audit_outcomes`` tables; 6 adds the ``saved_conversations`` and
 # ``conversation_summaries`` tables; 7 adds the ``tasks`` and ``reminders``
-# tables and is the current schema. A new version is added by appending one
+# tables; 8 adds each reminder's delivery state and the one-row delivery
+# setting, and is the current schema. A new version is added by appending one
 # migration, never by editing this value's meaning.
-DATABASE_SCHEMA_VERSION = 7
+DATABASE_SCHEMA_VERSION = 8
+
+# The closed-app reminder pass's own log file, beside ``maria.log`` in the
+# configured log directory (V1-23-R1). Only that pass writes it, and Maria
+# never reads it back.
+DELIVERY_LOG_FILE_NAME = "delivery.log"
+
+# Reminder delivery's bounds (V1-23-R1, decision D7-A): one notice lists at
+# most this many reminders, oldest first, and a reminder shown more than this
+# many seconds after its saved instant is labelled overdue.
+REMINDER_NOTICE_LIMIT = 5
+REMINDER_OVERDUE_AFTER_SECONDS = 15 * 60

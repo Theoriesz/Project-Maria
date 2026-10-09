@@ -243,8 +243,9 @@ TIER_A_HEADER = "Owner memories (reference data):"
 # Owner-visible wording, written out so it is pinned rather than agreed with.
 NO_CONTEXT_NOTICE = "No memory context supplied."
 REMINDER_NOTICE = (
-    "Maria will not notify you when this reminder is due, and it does not "
-    "repeat: type due reminders to see the reminders whose time has come."
+    "Maria shows a reminder at most once when it is due, and only while "
+    "reminder delivery is turned on and able to run; it does not repeat. "
+    "Type due reminders to see the reminders whose time has come."
 )
 OVER_BUDGET_TEXT = (
     "The request is too large for the local reasoning model.\n"

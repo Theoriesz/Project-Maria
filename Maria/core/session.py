@@ -38,6 +38,16 @@ fingerprint with the approval, and hands that very snapshot to Brain only if
 it still holds exactly the field objects that were fingerprinted. No steps
 container is read again after the comparison: Brain re-checks the very
 snapshot, whose steps are a tuple.
+
+A session may also hold a reminder-delivery seam (V1-23-R1), which its
+interface uses to show due reminders: ``claim_due_reminders`` claims them
+through the delivery subsystem and returns one ``ReminderNotice``, and
+``record_reminder_notice`` records whether the interface displayed it. Both
+contain every ``Exception``, logging only its type; neither calls Brain, a
+plan, a tool, Tool Manager, permissions, or a provider, and neither touches
+a pending approval, the conversation, or the supplied-context fingerprints.
+A notice is never recorded as an interaction, kept in the conversation, or
+sent to a model.
 """
 
 from __future__ import annotations
@@ -60,6 +70,10 @@ from core.planner import (
     plan_snapshot,
 )
 from core.reasoning import ReasoningExchange
+# ``ReminderNotice`` is imported here also so that the desktop window's
+# worker, which may import no core module but this one, ``core.constants``,
+# and ``core.logger``, can name the notice type.
+from core.reminder_delivery import ReminderDeliverySeam, ReminderNotice
 
 
 CONFIRMATION_REFUSED_MESSAGE = (
@@ -112,17 +126,74 @@ class PendingApproval:
 class MariaSession:
     """Bind an owner's approval to one exact plan, for any interface."""
 
-    def __init__(self, brain: MariaBrain, logger: Logger | None = None) -> None:
+    def __init__(
+        self,
+        brain: MariaBrain,
+        logger: Logger | None = None,
+        *,
+        delivery: ReminderDeliverySeam | None = None,
+    ) -> None:
         self.brain = brain
         self.logger = logger or get_logger(__name__)
         self._pending: PendingApproval | None = None
         self._conversation: tuple[ReasoningExchange, ...] = ()
         self._supplied_context: frozenset[ContextFingerprint] = frozenset()
+        self._delivery = delivery
 
     @property
     def pending_approval(self) -> PendingApproval | None:
         """Return the plan awaiting approval, or None when none is pending."""
         return self._pending
+
+    @property
+    def delivers_reminders(self) -> bool:
+        """Return whether this session was given a reminder-delivery seam."""
+        return self._delivery is not None
+
+    def claim_due_reminders(self) -> ReminderNotice | None:
+        """Claim the due reminders this check may show, as one notice.
+
+        With no seam, or with delivery off, this returns None having claimed
+        nothing; with delivery off it reads only the setting. Otherwise it
+        returns the notice holding exactly the claims this call retained, or
+        None. An ``Exception`` from the delivery subsystem is logged by its
+        type alone and returns None; a failure that is not an
+        ``Exception`` propagates. Brain, the conversation, the
+        supplied-context fingerprints, and any pending approval are never
+        touched.
+        """
+        if self._delivery is None:
+            return None
+        try:
+            return self._delivery.claim().notice
+        except Exception as error:  # noqa: BLE001 - the seam's boundary.
+            self.logger.error(
+                "The reminder check failed: %s.",
+                type(error).__name__,
+            )
+            return None
+
+    def record_reminder_notice(
+        self,
+        notice: ReminderNotice,
+        displayed: bool,
+    ) -> None:
+        """Record whether this session's interface displayed one notice.
+
+        ``displayed`` True records every claim of the notice as displayed,
+        and False as not displayed. An ``Exception`` is logged by its type
+        alone; a failure that is not an ``Exception`` propagates. Nothing
+        else the session holds changes.
+        """
+        if self._delivery is None:
+            return
+        try:
+            self._delivery.record(notice, displayed)
+        except Exception as error:  # noqa: BLE001 - the seam's boundary.
+            self.logger.error(
+                "Recording a reminder notice failed: %s.",
+                type(error).__name__,
+            )
 
     @property
     def conversation(self) -> tuple[ReasoningExchange, ...]:

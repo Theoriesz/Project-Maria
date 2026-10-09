@@ -96,8 +96,10 @@ nothing; it cannot stop something that is already running. Approve and Cancel
 never take keyboard focus, so only a deliberate click answers an approval.
 
 The window stays responsive while Maria works, because one worker thread runs
-your requests one at a time, in the foreground and only when you ask. Closing
-the window while Maria is busy says that closing waits for the current
+your requests one at a time, in the foreground and only when you ask. With
+reminder delivery on, the same worker also checks for due reminders when the
+window opens and after each reply, never on a timer; see "Reminder Delivery".
+Closing the window while Maria is busy says that closing waits for the current
 request; it never approves anything that request produces, and the window
 closes once the session has ended. Closing waits for the current operation and
 has no general GUI-wide deadline. Provider deadlines apply where configured,
@@ -184,6 +186,9 @@ reschedule reminder 1: monday 08:30
 delete reminder 1
 enable reminder context 1
 disable reminder context 1
+reminder delivery
+enable reminder delivery
+disable reminder delivery
 system
 time
 history
@@ -206,9 +211,10 @@ the two memory context consent commands `enable memory context <id>` and
 summary lifecycle commands `edit summary <id>: <new text>` and
 `delete summary <id>`, the two summary context consent commands
 `enable summary context <id>` and `disable summary context <id>`, `add task`,
-`add reminder`, and for tasks and reminders alike the `edit`, `reschedule`,
-`delete`, `enable ... context`, and `disable ... context` commands require
-explicit confirmation. `delete interaction <id>` targets at most one
+`add reminder`, for tasks and reminders alike the `edit`, `reschedule`,
+`delete`, `enable ... context`, and `disable ... context` commands, and
+`enable reminder delivery` and `disable reminder delivery` require explicit
+confirmation. `delete interaction <id>` targets at most one
 interaction row by ID and removes it when found; it never cascades to notes or
 memories. Each note
 lifecycle command likewise targets at most one note by positive whole-number ID
@@ -245,10 +251,11 @@ offset, and time zone you approved, and the UTC instant they name. Both are
 `open` or `completed`. Every task and reminder command works without a
 language model.
 
-Maria never delivers, notifies, schedules, repeats, or polls anything. A
-reminder is never shown to you unasked: `due reminders` lists the open
-reminders whose moment has come, and `due tasks` the open tasks due today or
-earlier, only when you type them. A reminder does not repeat.
+`due reminders` lists the open reminders whose moment has come, and
+`due tasks` the open tasks due today or earlier, whenever you type them. A
+reminder does not repeat, and a task is never delivered. Maria shows a due
+reminder without being asked only while reminder delivery is on, which it is
+not until you turn it on, and then at most once; see "Reminder Delivery".
 
 ### Your time zone
 
@@ -306,7 +313,7 @@ anything is:
 
 ```text
 add reminder tomorrow 09:00: Call the dentist
-Confirmation required: reminders.create requires explicit confirmation. Maria will not notify you when this reminder is due, and it does not repeat: type due reminders to see the reminders whose time has come.
+Confirmation required: reminders.create requires explicit confirmation. Maria shows a reminder at most once when it is due, and only while reminder delivery is turned on and able to run; it does not repeat. Type due reminders to see the reminders whose time has come.
 This approval adds a reminder, shown quoted:
 Text: "Call the dentist"
 Time: Monday 2026-10-05 at 09:00, Europe/Berlin (UTC+02:00), which is 2026-10-05 07:00 UTC
@@ -343,6 +350,210 @@ Editing or rescheduling turns consent off and says so, and completing,
 deleting, or disabling one that was sent clears the session's earlier
 conversation, as for a memory. Reopening makes it eligible again. Maria does
 not check a task or reminder for secrets.
+
+## Reminder Delivery
+
+Maria can show you a due reminder on her own: in the command line or the
+desktop window while you use them and, while both are closed, as a Windows
+message box, if you install the task described below. Reminder delivery is off
+until you turn it on:
+
+```text
+reminder delivery
+enable reminder delivery
+disable reminder delivery
+```
+
+`reminder delivery` says whether delivery is on, since when, and how many of
+your reminders' current saved times were displayed, are unconfirmed, or could
+not be displayed; it also says that Maria cannot see whether the Windows task
+is installed, because she cannot. `enable reminder delivery` and
+`disable reminder delivery` each ask for confirmation and show a fixed notice
+of what they do. Your local model can never select any of the three.
+
+### What you are shown
+
+A notice lists at most five reminders, oldest first. Each reads
+`Reminder <id> is due:`, or `Reminder <id> is overdue:` when it is shown more
+than fifteen minutes after its saved time, followed by its quoted text and its
+saved time, described as `read reminder` describes it. When more are due, the
+notice ends with `More reminders are due. Type due reminders in Maria to see
+them.`, and the rest follow at the next check. Open reminders whose time has
+passed and that were not shown since they were created or last moved are shown
+too, including ones that fell due before you turned delivery on or while it
+was off.
+
+### At most once
+
+Before anything is shown, Maria claims the reminder in its own committed write
+to the database, and every surface claims the same way, so each reminder is
+shown at most once until you move it to a different time, whichever surfaces or
+passes run, and across restarts and upgrades. Moving it to a different time
+lets it be shown once more, at the new time, even when you move it back to a
+time it was already shown at; rescheduling it to the same moment, editing it,
+completing or reopening it, changing its consent, and turning delivery off or
+on do not.
+Nothing is ever retried. A message box or command-line notice that could not be
+shown is recorded as not displayed. When Maria cannot confirm what became of a
+claimed reminder, because the window could not show it, the process ended, the
+window closed first, or recording the outcome failed, it stays unconfirmed.
+Either way it is not shown again; `read reminder <id>` says so in one Delivery
+line, as it says when a reminder was displayed, and `reminder delivery` counts
+it. Displayed means shown, not read.
+
+### In the command line and the window
+
+With delivery on, the command line checks before every prompt and prints what
+it claims as one `Maria:` message. The desktop window checks once when it opens
+and after each request or answer that ends with a reply, never while an
+approval waits and never once you have asked it to close; it adds the notice to
+its conversation as plain text and records it as displayed only once it has
+shown it. A reminder that falls due while an interface sits idle appears there
+after your next action: neither interface uses a timer.
+
+### While Maria is closed: the Windows task
+
+Closed-app delivery is Windows only. It needs one per-user Task Scheduler task,
+`MariaReminderDelivery`, which you install and remove yourself; Maria never
+registers, changes, runs, or deletes it, and cannot see it. The task runs only
+while you are signed in, with your ordinary rights, once a minute without end,
+with no battery restriction and no time limit. It never wakes the computer, and
+never starts a second scheduled run while one is still running. Each run starts
+`pythonw` on `deliver_reminders.py`, which makes one short pass and exits.
+
+To install it:
+
+1. Check that no task of that name exists:
+   `schtasks /query /tn MariaReminderDelivery` must report
+   `ERROR: The system cannot find the file specified.` If it reports anything
+   else, stop; never replace an existing task.
+2. Copy `docs/reminder-delivery-task.xml` to a folder outside the repository.
+   In the copy, replace `PYTHONW_EXE` with the full path of the `pythonw.exe`
+   you run Maria with, and both `MARIA_DIR` placeholders with the full path of
+   this `Maria` directory. Keep the copy plain text with no byte-order mark, as
+   the template is; the tracked template itself holds placeholders only.
+3. Register the copy from a normal Command Prompt, not one run as
+   administrator:
+   `schtasks /create /tn MariaReminderDelivery /xml "<path to the copy>"`.
+   Never add `/f`, which would replace an existing task, and if schtasks asks
+   whether to replace a task, answer `N` and stop.
+4. Inspect it: `schtasks /query /tn MariaReminderDelivery /v /fo LIST` shows
+   `Logon Mode: Interactive only`, and Task Scheduler lists the same task.
+5. Turn delivery on with `enable reminder delivery`.
+
+Registering it needs no administrator rights and stores no password. That was
+checked on an administrator account running without elevation; a standard
+account was not tested.
+
+To remove it:
+
+1. Check that the stored task is this installation's. Run
+   `schtasks /query /tn MariaReminderDelivery /xml` and read its `Actions`
+   element. It must hold exactly one action, an `Exec`, whose `Command`,
+   `Arguments`, and `WorkingDirectory` equal the three values in your copy
+   of the template: the full path of your `pythonw.exe`, the quoted path of
+   this directory's `deliver_reminders.py`, and the full path of this `Maria`
+   directory. Compare those three fields only, not the whole file: Task
+   Scheduler stores the definition in its own form, adding and dropping
+   elements, so the whole file does not match your copy. If the query fails,
+   if there is any other action, or if any of the three fields differs or is
+   missing, stop: do not end, change, or delete the task.
+2. Run `schtasks /end /tn MariaReminderDelivery`.
+3. Check the stored task again, as in step 1, then run
+   `schtasks /delete /tn MariaReminderDelivery /f`.
+4. Check with `schtasks /query /tn MariaReminderDelivery` that it no longer
+   exists: the query reports
+   `ERROR: The system cannot find the file specified.`
+
+Ending the task stops only a run the task itself started, and deleting it
+stops none. Removing the task stops closed-app delivery, and
+`disable reminder delivery` stops new deliveries everywhere. The delivery
+setting and each reminder's delivery state stay in the database after the
+task is removed.
+
+Changing or deleting the task may need a Command Prompt run as administrator.
+On the account Maria was tested on, a normal prompt could end the task, but
+changing or deleting it was refused with `ERROR: Access is denied.` If that
+happens, stop there. Open a Command Prompt with Run as administrator
+yourself, check the stored task in it again as in step 1, and only if it
+still matches, run the same command there. Use that prompt for nothing
+else. Maria itself, and the passes the task starts, run without
+administrator rights.
+
+### One pass
+
+A pass reads only the `[paths]` of the tracked `config/config.toml`, never the
+private override. It asks Windows whether notifications may be shown now, and
+opens the existing database only when it is already at the current schema,
+never creating or upgrading it. When delivery is on, it claims the due
+reminders and shows them in one message box, with an OK button and the
+information icon, titled `Maria reminder` or `Maria reminders`,
+and records what became of them. It builds no Brain and never calls the model,
+plans, runs a tool, or reads any other record.
+
+A pass claims only while Windows reports that notifications are accepted; for
+any other report it claims nothing and leaves the reminders for a later pass.
+Microsoft documents other reports for a locked screen or a running screen
+saver, a full-screen program, presentation settings, quiet time, and a running
+Store app, but what Windows actually reports in each of those situations has
+not been verified, so a box may still appear during them. Its exit status,
+which Task Scheduler shows as the task's last result, is 0 when it finished
+(nothing due, delivery off, waiting for Windows, or everything shown and
+recorded), 1 when the tracked configuration could not be read, 2 when message
+boxes are unavailable here or Windows' answer could not be read or was not one
+Maria knows, 3 when the database was missing, busy, or not at the current
+schema, or a storage failure stopped a claim or the recording of an outcome, 4
+when the box could not be shown, and 5 for anything unexpected; when several
+apply, the highest wins.
+After an upgrade, closed-app delivery resumes once the command line or the
+window has started and upgraded the database; until then each pass exits
+with 3.
+
+### Limits
+
+Delivery is not promised while the computer is powered off, asleep, or
+hibernated, while you are signed out, or after a restart before you sign in.
+The computer is never woken. A reminder missed that way is shown by a later
+pass once you are signed in and the computer is awake, labelled overdue only
+when it is shown more than fifteen minutes after its saved time, and due
+otherwise. That is not always the first pass: Windows may defer
+notifications, a box still open from earlier holds back every later pass, and
+a notice lists at most five reminders, oldest first, leaving the rest for
+later passes. A box appears up to about a minute after its reminder's time,
+later after waking or while Windows defers notifications, and stays until
+someone closes it. While it waits, the task starts no later pass, so an
+unanswered box delays every later desktop notice for as long as it stays open;
+the command line and the window still show theirs. A run you start yourself,
+with `schtasks /run` or Run in Task Scheduler, has no time limit either, and
+the task's rule against overlapping runs keeps apart only its own scheduled
+runs: a pass you start by hand, or one a leftover second task starts, is kept
+from showing a reminder twice by the claim alone.
+
+Windows is asked before a box is shown, not while it shows, so a box can appear
+just after you lock the screen or start a presentation. The box asks Windows to
+keep it on top, but on the computer Maria was tested on, each box opened behind
+the window in use and was not kept on top. Listen for its sound, and look for
+its icon on the taskbar, or use Alt+Tab. A box hidden this way can go
+unanswered, and while it stays open it delays every later desktop notice. If
+Windows gives a box keyboard focus, a stray key can close it unread, and it
+still counts as displayed. Turning delivery off stops new
+claims at once but cancels nothing: a box already on screen stays until you
+close it, and a notice already claimed may still appear. A wrong system clock
+gives wrong delivery times. Each pass is short, but there are about 1,440 a day
+while you are signed in.
+
+### Privacy
+
+A message box shows the reminder's text to anyone at your unlocked screen and
+to any screen-capture, screen-sharing, or accessibility software. Maria copies
+nothing to the clipboard, but Windows may let a person copy a box's text, which
+then follows your clipboard history and sync settings. Reminder text is never
+written to `maria.log` or to the pass's own `logs/delivery.log`, which names
+only reminder ids, the surface, outcomes, and fixed phrases, and a notice is
+never recorded as interaction history, kept in a conversation, or sent to the
+model. `delivery.log` is best effort: passes running at the same time can
+interleave or lose lines in it, and the database stays the record of what was
+delivered.
 
 ## Filesystem Access
 
@@ -930,7 +1141,7 @@ Tool: reminders
 Action: create
 Arguments: {"repeat": "never", "text": "call mom", "when": "2026-10-05T09:00:00+02:00[Europe/Berlin]"}
 
-Maria will not notify you when this reminder is due, and it does not repeat: type due reminders to see the reminders whose time has come.
+Maria shows a reminder at most once when it is due, and only while reminder delivery is turned on and able to run; it does not repeat. Type due reminders to see the reminders whose time has come.
 No memory context supplied.
 ```
 
@@ -1214,6 +1425,19 @@ Maria promises no secure erasure. Tasks and reminders are never linked to each
 other or to any other record. The operational log names a task or reminder
 only by its ID, never its text, date, time, zone, or consent identity.
 
+A reminder also keeps its delivery state, part of its own row: a scheduling
+revision number, which keeps no earlier time, and, once it has been claimed
+for its current saved time, when, through which surface, and whether it was
+displayed. The one delivery setting row holds only on or off and when it last
+changed. Both stay until the reminder is deleted or the database is removed,
+with no reset command, and neither is ever read for context or sent to the
+model. `reminder delivery` is recorded as the command and its reply, which
+holds only the setting and three counts; turning delivery on or off records
+its fixed reply. A notice itself is never recorded. The closed-app pass keeps
+its own operational log, `logs/delivery.log` by default, bounded like
+`maria.log` and holding ids, outcomes, and fixed phrases only; Maria never
+reads it.
+
 Maria's shipped runtime has no cloud integration and does not itself transmit
 this history. Its only network-capable code is the local Ollama adapter
 described under "Local Ollama Adapter": it can reach only `127.0.0.1:11434` on
@@ -1248,12 +1472,13 @@ go through the same session and Brain. What the window displays is only
 displayed: it is held in the window while it is open, never saved by the
 window, never sent back to Maria as conversation, and gone when the window
 closes, and a new window starts empty apart from its banner. Display history
-is never populated automatically from stored records. Explicit record-reading
-commands still display their results. The window title never shows a request
-or a reply, the window keeps no recent-item list, and Maria shows no crash
-dialog. Anything you copy elsewhere, or an operating system's own clipboard
-history, is outside Maria's control; Maria itself never writes to the
-clipboard.
+is never populated automatically from stored records, except that due-reminder
+notices appear as plain text while reminder delivery is on. Explicit
+record-reading commands still display their results. The window title never
+shows a request or a reply, the window keeps no recent-item list, and Maria
+shows no crash dialog. Anything you copy elsewhere, or an operating system's
+own clipboard history, is outside Maria's control; Maria itself never writes
+to the clipboard.
 
 ## Tests
 
@@ -1293,13 +1518,22 @@ that need real IANA data skip, each with its reason, when no data source
 provides it; run the suite with the pinned `tzdata` installed as well to
 include them.
 
+Reminder delivery's tests replace the Windows notice functions with fakes, so
+no test shows a real message box, and none registers, runs, ends, or deletes a
+Task Scheduler task. Every clock the delivery code reads in them is injected,
+and none of them sleeps. Passing tests are not a check of the real box or the real task.
+
 ## Project Layout
 
 - `core/`: application coordination, planning, memory, permissions, logging,
   configuration, constants, the local reasoning interface and adapter, the
   compiler that checks model proposals, the audit-summary, conversation-record,
-  and task vocabularies, the four task and reminder request forms, and date and
-  time resolution
+  and task vocabularies, the four task and reminder request forms, date and
+  time resolution, and reminder delivery's claim protocol, Windows message box,
+  and runtime paths
+- `main.py`: the entry point for the command line and the desktop window
+- `deliver_reminders.py`: the closed-app reminder pass, started only by the
+  Windows task you install
 - `tools/`: built-in tools
 - `gui/`: the optional desktop window, its Qt-free controller, and its one
   session worker
@@ -1310,8 +1544,9 @@ include them.
 - `config/`: TOML configuration, including the named filesystem roots and the
   disabled reasoning template
 - `prompts/`: starter prompt text
-- `logs/`: runtime logs
-- `docs/`: architecture and development documentation
+- `logs/`: runtime logs, `maria.log` and the closed-app pass's `delivery.log`
+- `docs/`: architecture and development documentation, and the Windows task
+  template `reminder-delivery-task.xml`
 
 ## Scope
 

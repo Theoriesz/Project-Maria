@@ -126,9 +126,30 @@ whose own `ValueError` refuses settings it cannot honour.
 `build_runtime_brain()` is the default startup of both interfaces and calls
 `MariaBrain.from_defaults(reasoning_factory=build_reasoning_provider)`.
 
+`main.utc_now() -> datetime` and
+`main.build_runtime_delivery(brain: MariaBrain, channel: str) ->
+ReminderDeliverySeam`
+
+The runtime reminder-delivery seam (V1-23-R1): `ReminderDeliverySeam(
+brain.memory, channel, utc_now)`, where `utc_now()` returns the current aware
+UTC instant, read once per check. It always exists at run time, because
+delivery can be turned on at any moment; with delivery off, a check reads the
+setting and returns.
+
 `main.main(arguments: Sequence[str] | None = None) -> int`,
-`main.run_cli(brain_factory=None) -> int`, and
-`main.run_gui(brain_factory=None) -> int`
+`main.run_cli(brain_factory=None, delivery_factory=None) -> int`, and
+`main.run_gui(brain_factory=None, delivery_factory=None) -> int`
+
+`delivery_factory`, when given, builds the interface's seam from the started
+Brain and may return None. Without one, the runtime default
+`build_runtime_delivery(brain, channel)` applies only when Brain came from the
+runtime default too, so a caller that injects a Brain factory gets no seam
+unless it also injects a delivery factory. The CLI passes `cli` and the GUI
+`gui`. `main.show_due_reminders(session) -> None` is the CLI's check: nothing
+without a seam or when nothing was claimed; otherwise it prints the notice as
+`Maria: <text>` and records it displayed, or not displayed when printing
+raises an `Exception`. `run_cli()` calls it before every prompt, inside the
+prompt's own handling of `EOFError` and `KeyboardInterrupt`.
 
 `main()` runs the desktop GUI when `--gui` (`main.GUI_OPTION`) is among the
 arguments, `sys.argv[1:]` by default, and the CLI otherwise; every other
@@ -440,7 +461,8 @@ argument, a report, or a result, and
 
 ## Session
 
-`MariaSession(brain: MariaBrain, logger: Logger | None = None)`
+`MariaSession(brain: MariaBrain, logger: Logger | None = None, *, delivery:
+ReminderDeliverySeam | None = None)`
 
 The interface-agnostic confirmation boundary. It needs no standard input,
 standard output, or terminal, so the CLI and the desktop GUI share one
@@ -448,6 +470,23 @@ contract. It holds at most one pending approval and owns the whole policy for
 invalidation, replay prevention, and refusal. A session is used from one
 thread at a time: the CLI's own thread, or the GUI's one worker thread, which
 creates, uses, and ends that session; see "GUI".
+
+`MariaSession.delivers_reminders -> bool`,
+`MariaSession.claim_due_reminders() -> ReminderNotice | None`, and
+`MariaSession.record_reminder_notice(notice, displayed: bool) -> None`
+
+The session's reminder-delivery seam (V1-23-R1). `delivers_reminders` says
+whether the session was given a seam. `claim_due_reminders()` returns None
+without one; otherwise it runs one check through the seam and returns the
+notice holding exactly the claims that check retained, or None.
+`record_reminder_notice` does nothing without a seam, and otherwise records
+every claim of the notice as displayed, or as not displayed when `displayed`
+is False. Both contain every `Exception`, logging only `The reminder check
+failed: <exception type>.` or `Recording a reminder notice failed:
+<exception type>.`, and let anything else propagate. Neither calls Brain, a
+plan, a tool, Tool Manager, permissions, or a provider, and neither touches the
+pending approval, the conversation, or the supplied-context fingerprints. A
+notice is never recorded, kept in the conversation, or sent to a model.
 
 `MariaSession.submit(user_input: str) -> BrainResponse`
 
@@ -635,10 +674,11 @@ production use of `threading`. `start()` starts the thread, which first calls
 str)`, `confirm(serial: int)`, `cancel()`, and `close()` only queue work, and
 return at once; `join(timeout=None) -> bool` waits for the thread, never stops
 it, and returns whether it has ended, which is immediate for a worker never
-started. Each operation that finishes delivers exactly one event through
+started. Each owner operation that finishes delivers exactly one event through
 `deliver`, called on the worker thread, which the window turns into a queued Qt
 signal; an operation that raises delivers none of its own and ends the session
-instead:
+instead. Under V1-23-R1 an acknowledgment delivers no event, and a
+due-reminder check may deliver one notice of its own:
 
 - `Reply(text)`: what a finished operation said.
 - `ApprovalOffer(serial, text)`: a request left an approval pending, and `text`
@@ -648,6 +688,21 @@ instead:
   `failed` is set unless the end came from `close()` and the session's `end()`
   then succeeded, so anything raised by creating the session, by an operation,
   or by `end()`, whatever its kind, counts as failed.
+- `DueReminderNotice(serial, text)`: due reminders the session claimed, for
+  the window to show (V1-23-R1). `serial` is a notice serial of the worker's
+  own, counted apart from offer serials, and `text` is the notice's text.
+
+When the session delivers reminders, the worker runs its check once after
+creating the session and once after each operation whose event is a `Reply`,
+after handing that reply over; never after an `ApprovalOffer` or an
+acknowledgment, never on a timer, and never once `close()` was called, not
+even the first time, because `close()` sets a flag before it queues the end.
+`acknowledge_reminder_notice(serial: int)` only queues work, in order with the
+owner's operations: when it runs, the notice kept under `serial` is recorded as
+displayed through `record_reminder_notice`, once; a repeated or unknown serial
+changes nothing, and nothing is delivered and no check follows. One queued
+after the close never runs, so its notice stays unconfirmed, and the kept
+notices go with the session when it ends.
 
 `confirm(serial)` calls the session's own `confirm()` only when `serial` names
 the last offer and the object that offer kept is still
@@ -690,7 +745,11 @@ method is called on the GUI thread.
   `False`.
 - `receive(event)` shows a `Reply` as `Maria: <text>` and returns to `READY`,
   and shows an `ApprovalOffer` as `Maria: <text>` and in the approval area,
-  except while closing, when an offer is never shown. `SessionEnded` settles
+  except while closing, when an offer is never shown. A `DueReminderNotice` is
+  shown as `Maria: <text>` in any state but closed, changing neither the state,
+  the offer shown, nor the approval area, and only then acknowledged to the
+  worker through `acknowledge_reminder_notice(serial)`, so a notice whose
+  rendering raises is never acknowledged. `SessionEnded` settles
   the outcome, then clears the window and asks it to close; the close is
   attempted even when clearing fails, and that failure is raised afterwards.
 - `request_close() -> bool` starts closing once, asking the worker to end the
@@ -762,8 +821,9 @@ delivered. Until it closes, the window may show a stale state, such as a
 status line that no longer changes, but nothing it shows can still be
 approved. What the window shows is presentation state, never saved
 automatically or replayed into the session. Display history is never
-populated automatically from stored records. Explicit record-reading commands
-still display their results.
+populated automatically from stored records, except due-reminder notices from
+the session's delivery seam, shown as plain text. Explicit record-reading
+commands still display their results.
 
 ## Conversation
 
@@ -1329,9 +1389,17 @@ covered by this fixed message and continues through that method's existing
 operation-specific static `RuntimeError` message. Every other SQLite failure
 likewise continues to raise that method's existing operation-specific
 `RuntimeError` message, unchanged. The audit-summary methods, the
-conversation-record methods, and the task and reminder methods classify
-contention themselves, wherever it arises; see "Audit Summaries", "Saved
-Conversations and Conversation Summaries", and "Tasks and Reminders".
+conversation-record methods, the task and reminder methods, and the
+reminder-delivery methods classify contention themselves, wherever it arises;
+see "Audit Summaries", "Saved Conversations and Conversation Summaries",
+"Tasks and Reminders", and "Reminder Delivery State".
+
+`Memory(database_path, logger=None, *, existing_only=False)`
+
+`existing_only` is for the closed-app reminder pass (V1-23-R1): every
+connection is then opened read-write through a `mode=rw` URI, which never
+creates the file, so a missing database stays missing. The interfaces leave
+it False.
 
 ### Schema
 
@@ -1976,7 +2044,10 @@ completion; reopening clears it; neither changes the text, timing,
 Replace the text or timing and stamp `updated_at`, turning consent off in the
 same transaction; `RecordUpdate(updated, context_consent_cleared)` says
 whether a row matched and whether consent had been on. `due_date` None clears
-a task's date.
+a task's date. A reminder reschedule that stores a different saved instant
+also raises the scheduling revision by one and clears the claim, in the same
+statement; the same instant, even written as another local time and offset,
+keeps both (V1-23-R1).
 
 `Memory.delete_task(id) -> bool` and `Memory.delete_reminder(id) -> bool`
 
@@ -2021,7 +2092,66 @@ Every failure raises a fixed `RuntimeError` after any handler has ended, with
 no cause and no context, and logs one fixed line naming the operation and a
 fixed reason; no text, date, time, zone, offset, instant, or digest is ever
 logged or raised. There is no search, bulk, wildcard, date-range, or automatic
-deletion, no recurrence, no linkage to any other record, and no delivery.
+deletion, no recurrence, and no linkage to any other record. Every reminder
+read also settles the four delivery columns of schema version 8 into
+`Reminder.schedule_revision` and `Reminder.delivery`, refusing a row whose
+delivery state Maria could not have written.
+
+### Reminder Delivery State
+
+The reminder-delivery subsystem's storage (V1-23-R1).
+`core/reminder_delivery.py` receives the memory layer as its store, and a
+claim and an outcome are its only writes; `docs/database.md` describes the
+rules.
+
+`Memory.delivery_state() -> DeliverySetting`
+
+The closed-app pass's read-only readiness check: the database must be stamped
+exactly `DATABASE_SCHEMA_VERSION` and match its frozen structure; nothing is
+created, migrated, or written. It then returns the setting.
+
+`Memory.reminder_delivery_setting() -> DeliverySetting` and
+`Memory.set_reminder_delivery(enabled: bool) -> DeliverySetting`
+
+The setting, from one bounded read: `NEVER_SET` without a row, `ENABLED` or
+`DISABLED` since its stamp for one well-formed row, and `UNREADABLE`
+otherwise; only `ENABLED` lets anything be claimed. `set_reminder_delivery`
+reads the setting under `BEGIN IMMEDIATE` and writes the one row only when it
+does not already say exactly this; anything but a `bool` raises
+`ValueError(DELIVERY_SETTING_MESSAGE)` before any SQL.
+
+`Memory.reminder_delivery_candidates(as_of, limit=6) -> list[DeliveryCandidate]`
+
+Open reminders saved at or before the UTC instant `as_of` with no claim for
+their current revision, by saved instant and then id, at most `limit` (1 to
+6). The id must be positive, and every value the registered check receives
+is typed and bounded inside SQLite first; these gates apply before the limit,
+and a row that fails is skipped. Only the id, text, saved time and instant,
+and revision come back. Every claim re-reads its row through the same gates.
+
+`Memory.claim_reminder_delivery(candidate, channel, claimed_at, as_of) ->
+ClaimResult`
+
+One write transaction under `BEGIN IMMEDIATE`: `DISABLED` when the setting is
+not on, `CHANGED` when the reminder no longer qualifies or differs from the
+candidate in text, saved time, saved instant, or revision, or is no longer due
+at `as_of`, each writing nothing, and otherwise `CLAIMED` with the claim's
+`DeliveryClaim(reminder_id, schedule_revision)`, committed before it returns.
+
+`Memory.record_reminder_delivery(claim, outcome) -> bool`
+
+Writes `displayed` or `failed` for exactly that claim, only while it has no
+outcome; False when the claim no longer exists, and nothing else is touched.
+
+`Memory.reminder_delivery_counts() -> DeliveryCounts`
+
+How many reminders' current claims were displayed, are unconfirmed, and were
+not displayed; a claim Maria could not have written is not counted.
+
+Every storage failure of these methods raises `DeliveryStorageError`, a
+`RuntimeError`, with the shared busy message for contention and
+`DELIVERY_STORAGE_MESSAGE` otherwise, after its handler has ended, with no
+cause or context; a malformed argument raises `ValueError` before any SQL.
 
 ## Tool Execution Result
 
@@ -2343,7 +2473,8 @@ an enable without an identity can never turn consent on.
 `create` stores exactly the approved values, even when they are already due,
 and replies with the id, the text through `quoted_for_owner`, the described
 timing, and that consent is off; a reminder's reply adds that it does not
-repeat and that Maria will not notify the owner. A reminder's `repeat` must
+repeat and that Maria shows it at most once and only while reminder delivery
+is on. A reminder's `repeat` must
 be `never`, or `REPEAT_MESSAGE` is the reply. `list` takes `status`, `open` or
 `completed`; `due` takes `as_of`, a calendar date for tasks and a UTC instant
 for reminders, and labels each row `(due today)`, `(overdue)`, or
@@ -2365,12 +2496,33 @@ fails, refuses, or rewrites anything. Every failure is a fixed message, and
 the log names ids and fixed phrases only. The factories are
 `build_tool(memory, **_)`.
 
+Under V1-23-R1 the reminders tool also has `delivery_status`,
+`enable_delivery`, and `disable_delivery`, none taking an argument and none
+setting `recorded_message`. `delivery_status` replies `Reminder delivery is
+on, since <time> UTC.`, `Reminder delivery is off, since <time> UTC.`,
+`Reminder delivery is off.` when it was never set, or `Maria could not read
+the reminder delivery setting, so delivery is off.`, followed by `For your
+reminders' current saved times: <n> displayed, <n> unconfirmed, <n> not
+displayed. Maria cannot see whether the Windows task is installed.` The two
+changes call `Memory.set_reminder_delivery` and reply
+`DELIVERY_ENABLED_MESSAGE` or `DELIVERY_DISABLED_MESSAGE`; a storage failure
+replies `Unable to read reminder delivery.` or `Unable to change reminder
+delivery.`. `read` adds one line for a reminder with a claim for its current
+revision: `Delivery: started at <time> UTC <channel>, and displayed. Maria
+cannot tell whether you read it.`, `Delivery: started at <time> UTC
+<channel>. Maria cannot confirm that it was displayed, and will not show it
+again unless you move it to a different time.`, or `Delivery: started at
+<time> UTC <channel>, but it could not be displayed. Maria will not try again
+unless you move it to a different time.`, the channel reading `as a desktop
+notice`, `in the command line`, or `in the desktop window`. The tool itself
+still delivers, notifies, schedules, and polls nothing.
+
 ## Action Contracts
 
 `ActionContractRegistry.validate(tool_name, action, arguments) -> ContractViolation | None`
 
 `core/action_contracts.py` declares `BUILT_IN_ACTION_CONTRACTS`, the immutable
-positive allowlist of all 62 built-in tool actions and their arguments. The
+positive allowlist of all 65 built-in tool actions and their arguments. The
 table is written by hand and is independent of Tool Manager's runtime
 inventory, of `PermissionManager`, and of the planner; it is never generated
 from a tool's `actions` set, read from configuration, or persisted. Declaring
@@ -2398,9 +2550,10 @@ whether a reasoning model may ever propose the action and decides nothing
 else; `core/plan_compiler.py` compiles a proposal only when it and the
 compiler's own allowlist agree. Five actions are `MODEL_ELIGIBLE`:
 `calculator.calculate`, `filesystem.list`, `system.current_time`,
-`tasks.create`, and `reminders.create`. The other 57, the three audit
-actions, the eleven conversation-record actions, and the other twenty task and
-reminder actions included, are `NOT_MODEL_ELIGIBLE`.
+`tasks.create`, and `reminders.create`. The other 60, the three audit
+actions, the eleven conversation-record actions, the other twenty task and
+reminder actions, and the three argument-free reminder-delivery actions of
+V1-23-R1 included, are `NOT_MODEL_ELIGIBLE`.
 
 A str field may also be closed. `ArgumentContract.allowed_values`, a tuple of
 exact texts or None, admits only those values, and
@@ -2718,6 +2871,152 @@ instant from the saved values alone. The fixed messages include
 `TASK_TEXT_MESSAGE`, `DUE_DATE_MESSAGE`, `REMIND_TIME_MESSAGE`,
 `RULES_CHANGED_WARNING`, and `RULES_UNCHECKED_NOTE`; none interpolates
 anything supplied at run time.
+
+Under V1-23-R1 it also holds reminder delivery's vocabulary. The channels are
+`DELIVERY_CHANNEL_DESKTOP`, `DELIVERY_CHANNEL_CLI`, and `DELIVERY_CHANNEL_GUI`
+(`desktop`, `cli`, `gui`) and the outcomes `DELIVERY_OUTCOME_DISPLAYED` and
+`DELIVERY_OUTCOME_FAILED` (`displayed`, `failed`); a scheduling revision is an
+exact `int` from `SCHEDULE_REVISION_FIRST` (1) to `SCHEDULE_REVISION_MAX`
+(2**63 - 1). `Reminder` gains `schedule_revision` and `delivery`, a
+`ReminderDeliveryState(claimed_at, channel, outcome=None)` or None.
+`DeliveryCandidate(reminder_id, text, remind_time, remind_utc,
+schedule_revision)` is one due reminder as a claim reads it, its `repr()`
+showing the id only; `DeliveryClaim(reminder_id, schedule_revision)` is one
+claim's identity; `ClaimResult(outcome, claim=None)` holds a `ClaimOutcome`
+(`CLAIMED`, `CHANGED`, `DISABLED`) and the claim exactly when one was made;
+`DeliverySetting(state, changed_at=None)` holds a `DeliverySettingState`
+(`NEVER_SET`, `ENABLED`, `DISABLED`, `UNREADABLE`), with `enabled` True only
+for `ENABLED`; and `DeliveryCounts(displayed, unconfirmed, failed)`.
+`settle_delivery_state(claimed_at, channel, outcome)` returns None for three
+NULLs and otherwise a valid state or raises `ValueError`, and
+`settle_delivery_setting(row_count, enabled, changed_at)` returns what one
+bounded read says. `describe_utc_instant("2026-10-05T07:00:00Z")` is
+`2026-10-05 07:00 UTC`. `DeliveryStorageError`, a `RuntimeError`, is the
+memory layer's delivery failure. The fixed delivery messages include
+`DELIVERY_RECORD_MESSAGE`, `DELIVERY_CHANNEL_MESSAGE`,
+`DELIVERY_OUTCOME_MESSAGE`, `DELIVERY_SETTING_MESSAGE`, and
+`DELIVERY_STORAGE_MESSAGE`.
+
+## Reminder Delivery
+
+`core/reminder_delivery.py` is the one claim protocol every surface uses
+(V1-23-R1). It runs no SQL, calls no Windows function, starts no thread, and
+reads no clock of its own: the seam calls the clock it is given once per
+check. It logs only ids, counts, channels, fixed phrases, and exception types.
+
+`claim_notice(store, now: datetime, channel: str) -> ClaimBatch`
+
+One check. An unknown channel or a naive `now` raises `ValueError` before
+anything is read. The setting is read first, and with delivery not on nothing
+else is read and `ClaimBatch()` returns. Otherwise at most
+`CANDIDATE_READ_LIMIT` (6) candidates are read at `now`, the first
+`REMINDER_NOTICE_LIMIT` (5) are rendered by `notice_entry` before any claim,
+and those are claimed one at a time with `now` as both the claim stamp and the
+instant. A `CHANGED` claim is skipped. The notice's `more_due` is set when a
+sixth candidate was read, when a candidate was skipped as `CHANGED`, or when
+the batch stopped early; with no claim retained there is no notice, whatever
+`more_due` would have said. A `DISABLED` claim stops the batch as
+`ClaimStop.DISABLED`, a `DeliveryStorageError` as `ClaimStop.STORAGE`, and any
+other `Exception`, or a result that is not a `ClaimResult`, as
+`ClaimStop.UNEXPECTED`, each logged by type alone; a `BaseException` that is
+not an `Exception` propagates. `ClaimBatch(notice=None, stopped=None,
+failure=None)` holds the `ReminderNotice` of exactly the retained claims, or
+None, why the batch stopped, and the exception type's name. The setting read,
+the candidate read, rendering, and packaging catch nothing.
+
+`record_notice(store, notice, displayed: bool) -> RecordFailures`
+
+Writes each claim's outcome in its own write, `displayed` or `failed`, and
+returns `RecordFailures(storage, unexpected)`: how many writes raised a
+`DeliveryStorageError`, and how many raised any other `Exception`. Each
+failure is logged by type and leaves its own claim unconfirmed.
+
+`ReminderNotice(entries, more_due, claims)`, `notice_entry(candidate, as_of)`,
+and `instant_text(moment)`
+
+A notice pairs each rendered entry with one `DeliveryClaim`. `title` is
+`Maria reminder` or `Maria reminders`, `text` joins the entries with a blank
+line and adds `MORE_DUE_LINE`, `More reminders are due. Type due reminders in
+Maria to see them.`, when `more_due`, and `reminder_ids` lists the claimed
+ids; its `repr()` is `ReminderNotice(<redacted>)`. `notice_entry` renders
+`Reminder <id> is due: "<text>"`, or `is overdue:` when the check's instant is
+more than `REMINDER_OVERDUE_AFTER_SECONDS` (900) after the saved instant,
+followed by a line describing the saved time. `instant_text` writes an aware
+instant in Maria's UTC form, truncated to the second.
+
+`ReminderDeliverySeam(store, channel, clock)`
+
+The session's seam: `claim()` reads `clock()` once and runs `claim_notice`,
+and `record(notice, displayed)` runs `record_notice` and returns its
+`RecordFailures`. Its `repr()` names only the channel.
+
+## Desktop Notice
+
+`core/desktop_notice.py` is the only module that calls a Windows notice
+function, through standard-library `ctypes`; tests replace its `_library`.
+
+`available() -> bool`, `notification_state() -> NotificationState`, and
+`show(title: str, text: str) -> bool`
+
+`available()` is True only on Windows with both `MessageBoxW` and
+`SHQueryUserNotificationState` present. `notification_state()` asks Windows
+once: `ACCEPTS` only for `S_OK` with `QUNS_ACCEPTS_NOTIFICATIONS` (5),
+`DEFERS` for `S_OK` with any other known state (1 to 4, 6, 7), and `UNKNOWN`
+for a failing HRESULT, a raised call, or an unknown value. `show()` calls
+`MessageBoxW` with no owner window and exactly `MB_OK`, `MB_ICONINFORMATION`,
+and `MB_TOPMOST`, waits until the box is closed, and returns True when it
+returned a button and False when it returned 0; a raised call propagates. The
+module names no foreground or clipboard function and logs nothing.
+
+## Runtime Paths
+
+`core.runtime_paths.read_runtime_paths(config_path=CONFIG_PATH) ->
+RuntimePaths` and `resolve_project_path(value) -> Path`
+
+Read only the tracked configuration's `[paths]` table, never the private
+override, with the defaults `database/maria.db` and `logs`, and return
+`RuntimePaths(database_path, log_dir)`. `resolve_project_path` keeps an
+absolute path and resolves any other against the application directory, the
+one rule `core/config.py` also applies. A file that cannot be read or parsed,
+or a `[paths]` that is not a table, raises
+`ValueError(PATHS_UNREADABLE_MESSAGE)` with no cause.
+
+## Closed-App Reminder Pass
+
+`deliver_reminders.run_pass(*, clock=utc_now, config_path=CONFIG_PATH,
+notices=desktop_notice, memory_factory=None,
+configure_log=configure_delivery_logging) -> int` and
+`deliver_reminders.main() -> int`
+
+`run_pass` performs one pass, in order: it reads the clock once; reads the
+tracked `[paths]`, or returns 1; returns 2 when `notices.available()` is
+False; asks `notices.notification_state()` once, returning 0 for `DEFERS` and
+2 for `UNKNOWN`; opens the database through `memory_factory`, by default
+`Memory(path, existing_only=True)`, and calls `delivery_state()`, returning 3
+for a `DeliveryStorageError`; returns 0 when delivery is not on; calls
+`configure_log(log_dir)`, returning 5 if it raises; claims through
+`claim_notice` with the `desktop` channel, a batch that a storage failure
+stopped making the status at least 3 and one an unexpected failure stopped at
+least 5, and returns that status when no claim was retained; shows the notice,
+if any, through `notices.show`, a box that returns False or raises making the
+status at least 4; and records it with `record_notice`, a storage failure there
+making the status at least 3 and any other failure at least 5. The statuses are
+`EXIT_DONE` (0), `EXIT_CONFIGURATION_UNREADABLE` (1),
+`EXIT_NOTICES_UNAVAILABLE` (2), `EXIT_STORAGE` (3), `EXIT_DISPLAY_FAILED` (4),
+and `EXIT_UNEXPECTED` (5); when more than one applies, 5 outranks 4, which
+outranks 3, which outranks 0. `main()` runs one pass behind the entry
+boundary, which turns an `Exception` into status 5, logged only as `The
+reminder pass failed: <exception type>.`, and catches nothing else; the script
+exits with that status.
+
+`core.logger.configure_delivery_logging(log_dir=LOG_DIR) -> Logger`
+
+Configures the pass's own log, `delivery.log` (`DELIVERY_LOG_FILE_NAME`) in
+`log_dir`, which it creates when missing, rotating with `LOG_MAX_BYTES` and
+`LOG_BACKUP_COUNT` like the managed log. The handler opens its file only when
+the first line is written, and no start-up line is written. It replaces only
+the handlers `core.logger` made, as `configure_logging` does, and is meant only
+for the pass's process; a failed write is handled inside logging.
 
 ## Filesystem Roots
 
@@ -3351,13 +3650,22 @@ has one stating that the summary's entire text may be sent on a later
 conversational turn when a word of four or more characters from the request
 appears literally in it, within Maria's context limits, and that Maria does
 not check the summary for secrets. `reminders.create` has one stating that
-Maria will not notify the owner when the reminder is due and that it does not
-repeat, so `due reminders` shows the reminders whose time has come; and
+Maria shows a reminder at most once when it is due, and only while reminder
+delivery is turned on and able to run, that it does not repeat, and that
+`due reminders` shows the reminders whose time has come; and
 `tasks.enable_context` and `reminders.enable_context` each have one stating
 that the record's text and timing may be sent to the local reasoning model on
 a conversational turn while it is open, after the enabled memories and within
 Maria's memory context limits, so not always, and that Maria does not check it
-for secrets. There are eight notices in all.
+for secrets. Under V1-23-R1, `reminders.enable_delivery` has one stating how
+and where Maria then shows each due reminder at most once, that only moving a
+reminder to a different time lets it be shown again, that a message box shows
+the text to anyone at the unlocked screen, and that missed reminders are shown
+too, five at a time, and marked overdue when more than fifteen minutes late;
+and `reminders.disable_delivery` has one stating that turning delivery off
+stops every new notice from the moment it is saved, while one already started
+may still appear and be recorded and a box already on screen stays until it is
+closed. There are ten notices in all.
 
 `PermissionManager.confirmation_notice(tool_name, action) -> str | None`
 
@@ -3382,9 +3690,10 @@ baseline: `audit.delete`, `conversations.delete`,
 `filesystem.move`, `history.delete`, `notes.retitle`, `notes.edit`,
 `notes.delete`, `notes.enable_context`, `notes.disable_context`,
 `memory.update`, `memory.forget`, `memory.enable_context`,
-`memory.disable_context`, and `create`, `edit`, `reschedule`, `delete`,
-`enable_context`, and `disable_context` for both `tasks` and `reminders`,
-thirty-one actions, require confirmation, while `filesystem.delete` and
+`memory.disable_context`, `create`, `edit`, `reschedule`, `delete`,
+`enable_context`, and `disable_context` for both `tasks` and `reminders`, and
+`reminders.enable_delivery` and `reminders.disable_delivery`, thirty-three
+actions, require confirmation, while `filesystem.delete` and
 `filesystem.write` are denied.
 Configuration can add restrictions but cannot remove this baseline.
 `PermissionManager` applies the same mandatory policy when constructed

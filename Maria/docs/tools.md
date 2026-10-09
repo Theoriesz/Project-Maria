@@ -5,7 +5,7 @@ Tools are small modules that expose controlled capabilities to Maria.
 ## Declared Argument Contracts
 
 Every built-in tool action is declared once in `core/action_contracts.py`,
-which is the positive allowlist of the 62 supported tool actions and of the
+which is the positive allowlist of the 65 supported tool actions and of the
 arguments each one accepts. A tool's `actions` set answers only whether an
 action is registered; the contract answers which arguments it takes, whether
 each is required, its exact type, any numeric bound, and, for a path field, the
@@ -60,13 +60,13 @@ that already carries it is refused, and a contract that declares one can
 never be model-eligible.
 
 Every contract also states, with no default, whether a reasoning model may
-ever propose its action. Only five of the 62 actions are model-eligible:
+ever propose its action. Only five of the 65 actions are model-eligible:
 `calculator.calculate`, `filesystem.list`, `system.current_time`,
 `tasks.create`, and `reminders.create`, the last two only for a request in one
-of the four natural-language forms Maria reads herself. The other 57,
+of the four natural-language forms Maria reads herself. The other 60,
 including all three audit actions, all eleven saved-conversation and
-conversation-summary actions, and the other twenty task and reminder actions,
-are closed to the model. The
+conversation-summary actions, the other twenty task and reminder actions, and
+the three reminder-delivery actions, are closed to the model. The
 classification is independent of permission and approves nothing by itself:
 `core/plan_compiler.py` keeps its own closed allowlist and compiles a proposal
 only when the two agree and every argument satisfies the action's contract.
@@ -94,8 +94,8 @@ allows its action outright; see "Model-to-Plan Compilation Gate" and
   memories
 - `notes`: create, list, read, retitle, edit, and delete SQLite-backed notes
 - `reminders`: add, list, query, read, complete, reopen, edit, reschedule, and
-  delete reminders, and turn one reminder's context consent on or off; it
-  never delivers or notifies
+  delete reminders, turn one reminder's context consent on or off, and show or
+  change the reminder delivery setting; it never delivers or notifies
 - `system`: read-only OS, CPU, RAM, disk, and time information
 - `tasks`: add, list, query, read, complete, reopen, edit, reschedule, and
   delete tasks, and turn one task's context consent on or off
@@ -903,13 +903,32 @@ only fixed lines such as `Added task 4.`, `Listed open tasks.`, or
 ## Reminders Tool
 
 The reminders tool, `tools/reminders.py`, supports the same eleven actions
-for reminders, through the shared `Memory` object. A reminder is one line of
-text with one moment: the canonical local time, offset, and IANA zone the
-owner approved, and the UTC instant they encode, which alone orders reminders
-and selects due ones. A reminder never repeats, and the tool never delivers,
-notifies, schedules, or polls anything: `due` lists the open reminders whose
-saved instant is at or before the plan's reference instant, each labelled
-`(time reached)`, only when the owner asks.
+for reminders, through the shared `Memory` object, and, under V1-23-R1, three
+more: `delivery_status`, `enable_delivery`, and `disable_delivery`. A reminder
+is one line of text with one moment: the canonical local time, offset, and
+IANA zone the owner approved, and the UTC instant they encode, which alone
+orders reminders and selects due ones. A reminder never repeats, and the tool
+itself never delivers, notifies, schedules, or polls anything: `due` lists the
+open reminders whose saved instant is at or before the plan's reference
+instant, each labelled `(time reached)`, only when the owner asks. Showing due
+reminders unasked is the reminder-delivery subsystem's alone; see "Reminder
+Delivery" in `docs/architecture.md`.
+
+The three delivery actions take no argument and are never open to a model.
+`delivery_status` (`reminder delivery`) is allowed and replies with the
+setting, the time it last changed, and how many reminders' current saved
+times were displayed, are unconfirmed, and were not displayed, adding that
+Maria cannot see whether the Windows task is installed. `enable_delivery`
+(`enable reminder delivery`) and `disable_delivery`
+(`disable reminder delivery`) are mandatory confirmations, each showing its
+own fixed notice, and write the one delivery setting row; turning delivery on
+twice keeps the first time. None of the three sets `recorded_message`: each
+records its ordinary reply, which holds no reminder's text or time. `read`
+adds one Delivery line when the reminder has a claim for its current saved
+time, saying when the claim was started, through which surface, and whether
+it was displayed, could not be displayed, or is unconfirmed; a listing never
+shows it. A reminder added now says that Maria shows it at most once and only
+while reminder delivery is on.
 
 Its confirmations work as the tasks tool's do, and an add shows the resolved
 time in full:
@@ -998,7 +1017,8 @@ every conversation-summary change (`conversation_summaries.create`, `edit`,
 `delete`, `enable_context`, and `disable_context`) are checked the same way
 and always require explicit confirmation, and so are adding, editing,
 rescheduling, deleting, and both consent actions for tasks and reminders,
-while completing and reopening one changes its status alone and is allowed.
+and turning reminder delivery on or off, while completing and reopening one
+changes its status alone and is allowed, as is showing the delivery status.
 Neither the tasks nor the reminders tool starts a thread, a timer, or any
 background work. An action a reasoning model proposes needs exactly one
 approval from the owner before it runs, even when `permissions.py` allows it

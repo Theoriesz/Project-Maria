@@ -55,7 +55,7 @@ TESTS_DIR = PROJECT_ROOT / "tests"
 # the test instead of agreed with: the stamp the v0.2.0 baseline receives when
 # it is classified, and the current schema every database ends at.
 BASELINE_SCHEMA_VERSION = 2
-EXPECTED_SCHEMA_VERSION = 7
+EXPECTED_SCHEMA_VERSION = 8
 # V1-15's memory consent step, pinned by its own number now that V1-16's
 # note consent step follows it and the current version has moved on.
 MEMORY_CONTEXT_CONSENT_VERSION = 3
@@ -63,10 +63,10 @@ UNVERSIONED = 0
 PRE_MEMORIES_VERSION = 1
 
 # The frozen v0.2.0 fixture's tables. Version 5 adds V1-18's two audit tables
-# beside them, version 6 V1-20's two conversation-record tables, and version 7
-# V1-22's two task tables, so every database Maria creates or migrates now
-# ends with exactly the current set, while the fixture itself still holds only
-# these.
+# beside them, version 6 V1-20's two conversation-record tables, version 7
+# V1-22's two task tables, and version 8 V1-23-R1's delivery setting table, so
+# every database Maria creates or migrates now ends with exactly the current
+# set, while the fixture itself still holds only these.
 BASELINE_TABLES = frozenset({"interactions", "notes", "memories"})
 CURRENT_TABLES = BASELINE_TABLES | frozenset(
     {
@@ -76,6 +76,7 @@ CURRENT_TABLES = BASELINE_TABLES | frozenset(
         "conversation_summaries",
         "tasks",
         "reminders",
+        "reminder_delivery_settings",
     }
 )
 
@@ -351,6 +352,7 @@ class BaselineClassificationTests(_TemporaryDatabaseTestCase):
                 "create_audit_summaries",
                 "create_conversation_records",
                 "create_tasks_and_reminders",
+                "add_reminder_delivery_state",
             ],
         )
 
@@ -931,6 +933,7 @@ class MigrationRunnerTests(_TemporaryDatabaseTestCase):
                 "create_audit_summaries",
                 "create_conversation_records",
                 "create_tasks_and_reminders",
+                "add_reminder_delivery_state",
             ],
         )
         for identifier, request, response, created_at in BASELINE_INTERACTIONS:
@@ -2325,6 +2328,57 @@ V7_REMINDERS_TABLE = """
     """
 V7_SCHEMA = V6_SCHEMA + (V7_TASKS_TABLE, V7_REMINDERS_TABLE)
 
+# The version 8 delivery state, pinned the same way: version 7 with V1-23-R1's
+# four delivery columns added to the reminders table, and its one-row
+# delivery setting table. Nothing else changes.
+V8_REMINDERS_TABLE = """
+    CREATE TABLE reminders (
+        id INTEGER PRIMARY KEY AUTOINCREMENT,
+        text TEXT NOT NULL CHECK (length(CAST(text AS BLOB)) > 0),
+        remind_time TEXT NOT NULL,
+        remind_utc TEXT NOT NULL CHECK (
+            remind_utc GLOB
+                '[0-9][0-9][0-9][0-9]-[0-9][0-9]-[0-9][0-9]T[0-9][0-9]:[0-9][0-9]:[0-9][0-9]Z'
+        ),
+        status TEXT NOT NULL CHECK (status IN ('open', 'completed')),
+        created_at TEXT NOT NULL,
+        updated_at TEXT NOT NULL,
+        completed_at TEXT,
+        context_digest TEXT
+            CHECK (context_digest IS NULL OR length(context_digest) = 64),
+        schedule_revision INTEGER NOT NULL DEFAULT 1
+            CHECK (typeof(schedule_revision) = 'integer' AND schedule_revision >= 1),
+        delivery_claimed_at TEXT CHECK (
+            delivery_claimed_at IS NULL
+            OR delivery_claimed_at GLOB
+                '[0-9][0-9][0-9][0-9]-[0-9][0-9]-[0-9][0-9]T[0-9][0-9]:[0-9][0-9]:[0-9][0-9]Z'
+        ),
+        delivery_channel TEXT CHECK (
+            delivery_channel IS NULL
+            OR delivery_channel IN ('desktop', 'cli', 'gui')
+        ),
+        delivery_outcome TEXT CHECK (
+            delivery_outcome IS NULL
+            OR delivery_outcome IN ('displayed', 'failed')
+        )
+    )
+    """
+V8_REMINDER_DELIVERY_SETTINGS_TABLE = """
+    CREATE TABLE reminder_delivery_settings (
+        id INTEGER PRIMARY KEY CHECK (id = 1),
+        enabled INTEGER NOT NULL CHECK (enabled IN (0, 1)),
+        changed_at TEXT NOT NULL CHECK (
+            changed_at GLOB
+                '[0-9][0-9][0-9][0-9]-[0-9][0-9]-[0-9][0-9]T[0-9][0-9]:[0-9][0-9]:[0-9][0-9]Z'
+        )
+    )
+    """
+V8_SCHEMA = V6_SCHEMA + (
+    V7_TASKS_TABLE,
+    V8_REMINDERS_TABLE,
+    V8_REMINDER_DELIVERY_SETTINGS_TABLE,
+)
+
 
 class MemoryContextConsentMigrationTests(_TemporaryDatabaseTestCase):
     """Verify V1-15's consent column arrives through the V1-09 runner.
@@ -2386,7 +2440,7 @@ class MemoryContextConsentMigrationTests(_TemporaryDatabaseTestCase):
         self.memory.initialize()
 
         self.assertEqual(read_schema_version(self.database_path), EXPECTED_SCHEMA_VERSION)
-        self.assertEqual(self.describe(), memory_module._reference_schema(V7_SCHEMA))
+        self.assertEqual(self.describe(), memory_module._reference_schema(V8_SCHEMA))
         self.assertEqual(
             self._raw_memories(),
             [(*row, 0) for row in BASELINE_MEMORIES],
@@ -2438,6 +2492,7 @@ class MemoryContextConsentMigrationTests(_TemporaryDatabaseTestCase):
                 "create_audit_summaries",
                 "create_conversation_records",
                 "create_tasks_and_reminders",
+                "add_reminder_delivery_state",
             ],
         )
         self.assertEqual(read_schema_version(self.database_path), EXPECTED_SCHEMA_VERSION)
@@ -2515,6 +2570,7 @@ class MemoryContextConsentMigrationTests(_TemporaryDatabaseTestCase):
                 "create_audit_summaries",
                 "create_conversation_records",
                 "create_tasks_and_reminders",
+                "add_reminder_delivery_state",
             ],
         )
         self.assertEqual(
@@ -2638,11 +2694,12 @@ class NoteContextConsentMigrationTests(_TemporaryDatabaseTestCase):
                 memory_module._frozen_schema(self.NOTE_CONTEXT_CONSENT_VERSION)
             ),
         )
-        # V1-18's audit step, V1-20's conversation-record step, and V1-22's
-        # task step now follow this one, so the current schema is the pinned
-        # version 7 shape: this one with the two audit tables, the two
-        # conversation-record tables, and the two task tables.
-        current = memory_module._reference_schema(V7_SCHEMA)
+        # V1-18's audit step, V1-20's conversation-record step, V1-22's task
+        # step, and V1-23-R1's delivery step now follow this one, so the
+        # current schema is the pinned version 8 shape: this one with the two
+        # audit tables, the two conversation-record tables, the two task
+        # tables, the reminders' delivery columns, and the delivery setting.
+        current = memory_module._reference_schema(V8_SCHEMA)
         self.assertEqual(
             current,
             memory_module._reference_schema(
@@ -2652,6 +2709,11 @@ class NoteContextConsentMigrationTests(_TemporaryDatabaseTestCase):
         self.assertEqual(
             current,
             memory_module._reference_schema(memory_module._CURRENT_SCHEMA_STATEMENTS),
+        )
+        # Version 7 is frozen history now, and stays exactly V1-22's shape.
+        self.assertEqual(
+            memory_module._reference_schema(V7_SCHEMA),
+            memory_module._reference_schema(memory_module._frozen_schema(7)),
         )
         (note_step,) = [
             migration
@@ -2671,7 +2733,7 @@ class NoteContextConsentMigrationTests(_TemporaryDatabaseTestCase):
         note_id = self.memory.create_note("Fresh", "body")
 
         self.assertEqual(read_schema_version(self.database_path), EXPECTED_SCHEMA_VERSION)
-        self.assertEqual(self.describe(), memory_module._reference_schema(V7_SCHEMA))
+        self.assertEqual(self.describe(), memory_module._reference_schema(V8_SCHEMA))
         self.assertIsNone(self._raw_notes()[0][-1])
         self.assertEqual(self._raw_notes()[0][0], note_id)
 
@@ -2687,13 +2749,13 @@ class NoteContextConsentMigrationTests(_TemporaryDatabaseTestCase):
 
         self.assertEqual(read_schema_version(self.database_path), EXPECTED_SCHEMA_VERSION)
         # The note step still leaves exactly version 4, and the audit,
-        # conversation-record, and task steps then carry the database on to
-        # the current shape.
+        # conversation-record, task, and delivery steps then carry the
+        # database on to the current shape.
         self.assertEqual(
             committed[self.NOTE_CONTEXT_CONSENT_VERSION],
             memory_module._reference_schema(V4_SCHEMA),
         )
-        self.assertEqual(self.describe(), memory_module._reference_schema(V7_SCHEMA))
+        self.assertEqual(self.describe(), memory_module._reference_schema(V8_SCHEMA))
         self.assertEqual(
             self._applied(recording_logger),
             [
@@ -2702,6 +2764,7 @@ class NoteContextConsentMigrationTests(_TemporaryDatabaseTestCase):
                 "create_audit_summaries",
                 "create_conversation_records",
                 "create_tasks_and_reminders",
+                "add_reminder_delivery_state",
             ],
         )
         self.assertEqual(
@@ -2734,6 +2797,7 @@ class NoteContextConsentMigrationTests(_TemporaryDatabaseTestCase):
                     "create_audit_summaries",
                     "create_conversation_records",
                     "create_tasks_and_reminders",
+                    "add_reminder_delivery_state",
                 ],
             ),
             BASELINE_SCHEMA_VERSION: (
@@ -2744,6 +2808,7 @@ class NoteContextConsentMigrationTests(_TemporaryDatabaseTestCase):
                     "create_audit_summaries",
                     "create_conversation_records",
                     "create_tasks_and_reminders",
+                    "add_reminder_delivery_state",
                 ],
             ),
             MEMORY_CONTEXT_CONSENT_VERSION: (
@@ -2758,6 +2823,7 @@ class NoteContextConsentMigrationTests(_TemporaryDatabaseTestCase):
                     "create_audit_summaries",
                     "create_conversation_records",
                     "create_tasks_and_reminders",
+                    "add_reminder_delivery_state",
                 ],
             ),
         }
@@ -2835,6 +2901,7 @@ class NoteContextConsentMigrationTests(_TemporaryDatabaseTestCase):
                 "create_audit_summaries",
                 "create_conversation_records",
                 "create_tasks_and_reminders",
+                "add_reminder_delivery_state",
             ],
         )
         self.assertEqual(
