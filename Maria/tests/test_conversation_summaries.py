@@ -1553,7 +1553,7 @@ class NulBodyTests(unittest.TestCase):
         )
         self.memory.initialize()
         self.assertEqual(_database_encoding(self.database_path), self.encoding)
-        self.assertEqual(self.memory.schema_version(), 7)
+        self.assertEqual(self.memory.schema_version(), 8)
 
     def raw(self, statement: str, parameters: tuple = ()) -> None:
         """Run one statement through a second, raw connection."""

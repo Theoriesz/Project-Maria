@@ -2,6 +2,60 @@
 
 ## Unreleased
 
+- Maria can now show due reminders on her own (V1-23, amendment V1-23-R1),
+  each at most once, while reminder delivery is on, which it is not until the
+  owner turns it on. Three new commands, `reminder delivery`,
+  `enable reminder delivery`, and `disable reminder delivery`, show the
+  setting with counts of what became of the current deliveries and turn it on
+  or off, each change confirmed with its own fixed notice; a model can select
+  none of them. In a session, the command line checks before every prompt and
+  the desktop window once after it opens and after each reply, never on a
+  timer, never after an approval offer, and never once closing has begun; the
+  window records a notice as displayed only once it has shown it and its
+  acknowledgment reaches the session in order. While both interfaces are
+  closed, an owner-installed per-user Windows Task Scheduler task,
+  `MariaReminderDelivery`, registered from the tracked template
+  `docs/reminder-delivery-task.xml`, starts the new entry point
+  `deliver_reminders.py` with pythonw once a minute while the owner is signed
+  in, with least privilege, never waking the computer and never starting a
+  second scheduled instance of itself. Each run is one pass that shows what it
+  claimed in one standard Windows message box, with an OK button and the
+  information icon, and exits with a fixed status from 0 to 5;
+  it claims only when Windows reports that notifications are accepted, and
+  otherwise waits for the next minute. Maria never registers, changes, runs,
+  or deletes the task. The box asks Windows to keep it on top, but on the
+  computer Maria was tested on it opened behind the window in use and was not
+  kept on top, a known limitation: a box hidden that way can go unanswered,
+  and while it stays open it delays every later desktop notice. Delivery is
+  not promised while the computer is off,
+  asleep, or hibernated, or while the owner is signed out: a reminder missed
+  that way, or while delivery was off, is shown at the next chance, oldest
+  first, five at a time, and labelled overdue when more than fifteen minutes
+  late. Every surface claims a reminder in its own committed write before
+  showing it, so each is shown at most once per scheduling revision, which
+  rises only when an approved reschedule stores a different saved instant;
+  nothing is retried, a claim whose display cannot be confirmed stays
+  unconfirmed, and `read reminder` and `reminder delivery` report displayed,
+  unconfirmed, and not-displayed deliveries. Disabling stops new claims at
+  once and cancels none already made. The pass reads only the tracked
+  configuration's `[paths]`, never the private override, opens only an
+  existing database already at the current schema, builds no Brain, and never
+  calls the model, plans, runs a tool, or reads any other record; its own
+  bounded `delivery.log` beside `maria.log` names ids, channels, outcomes, and
+  fixed codes only. Reminder text is displayed, never logged, recorded as
+  interaction history, kept in a conversation, or sent to a model. Schema
+  version 8 adds a scheduling revision and three claim columns to `reminders`
+  and the one-row `reminder_delivery_settings` table through one appended
+  migration that rewrites no row; every existing reminder starts at revision
+  1 with no claim, and an older build refuses a version 8 database. The
+  reminder confirmation notice and the creation reply, which said that Maria
+  will not notify, now say that she shows a reminder at most once and only
+  while reminder delivery is on. The session gains an optional delivery seam,
+  the GUI worker one event and one acknowledgment, the actions grow from 62 to
+  65 with the five model-eligible ones unchanged, the mandatory confirmations
+  from 31 to 33, and the confirmation notices from eight to ten.
+  `requirements.txt`, the shipped configuration, and the version stay
+  unchanged.
 - Maria now keeps structured tasks and reminders (V1-22, amendment V1-22-R1),
   with twenty-six commands that work in both interfaces with no model present.
   A task is one line of text with an optional calendar due date; a reminder is
@@ -13,8 +67,9 @@
   `reminders`, `completed tasks`, `completed reminders`, `due tasks`,
   `due reminders`, `read`, `complete`, and `reopen` run without asking.
   Completing stamps the time of that completion and reopening clears it.
-  Nothing is ever delivered, notified, scheduled, polled, or repeated: due and
-  overdue items are shown only when the owner asks. Dates and times use one
+  V1-22 itself delivers, notifies, schedules, polls, and repeats nothing: its
+  due and overdue items are shown only when the owner asks, and reminder
+  delivery is described in the V1-23 entry above. Dates and times use one
   IANA zone set in the private override's new `[time]` section, resolved by
   standard-library `zoneinfo` from the system's time zone files or the
   optional, pinned, data-only `tzdata` in the new `requirements-time.txt`,
@@ -37,8 +92,9 @@
   hedges, and vague or invented times are refused with nothing added. Before
   any model plan is approved, its approval shows, after the exact steps, the
   fixed notice of each step that carries one, once, so a reminder from the
-  owner's own words says, as a typed `add reminder` does, that Maria will not
-  notify; the notice is kept nowhere. The model-eligible actions grow from
+  owner's own words carries the same notice as a typed `add reminder`, which
+  in V1-22 said that Maria will not notify and is reworded in the V1-23 entry
+  above; the notice is kept nowhere. The model-eligible actions grow from
   three to five, the mandatory confirmations from 19 to 31, the compiler's
   refusal kinds from 13 to 21, and the proposal instructions to 2,045 bytes.
   Open tasks and reminders reach the model only

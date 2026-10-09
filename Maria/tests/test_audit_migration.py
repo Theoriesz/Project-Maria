@@ -101,7 +101,8 @@ NOTE_CONTEXT_CONSENT_VERSION = 4
 AUDIT_SUMMARIES_VERSION = 5
 CONVERSATION_RECORDS_VERSION = 6
 TASKS_AND_REMINDERS_VERSION = 7
-NEWER_SCHEMA_VERSION = 8
+REMINDER_DELIVERY_VERSION = 8
+NEWER_SCHEMA_VERSION = 9
 
 # The whole forward ladder, in the order it runs.
 LADDER_NAMES = (
@@ -111,13 +112,21 @@ LADDER_NAMES = (
     "create_audit_summaries",
     "create_conversation_records",
     "create_tasks_and_reminders",
+    "add_reminder_delivery_state",
 )
 
 RECORD_TABLES = ("interactions", "notes", "memories")
 AUDIT_TABLES = ("audit_summaries", "audit_outcomes")
 CONVERSATION_TABLES = ("saved_conversations", "conversation_summaries")
 TASK_TABLES = ("tasks", "reminders")
-ALL_TABLES = (*RECORD_TABLES, *AUDIT_TABLES, *CONVERSATION_TABLES, *TASK_TABLES)
+DELIVERY_TABLES = ("reminder_delivery_settings",)
+ALL_TABLES = (
+    *RECORD_TABLES,
+    *AUDIT_TABLES,
+    *CONVERSATION_TABLES,
+    *TASK_TABLES,
+    *DELIVERY_TABLES,
+)
 CURRENT_TABLES = frozenset(ALL_TABLES)
 
 # A busy timeout short enough that real contention fails at once.
@@ -160,9 +169,12 @@ APPLIED_STEP_LINES = {
     "create_tasks_and_reminders": (
         "Applied migration create_tasks_and_reminders; schema version is now 7."
     ),
+    "add_reminder_delivery_state": (
+        "Applied migration add_reminder_delivery_state; schema version is now 8."
+    ),
 }
-READY_LINE = "Database ready at schema version 7."
-CREATED_LINE = "Created a new database at schema version 7."
+READY_LINE = "Database ready at schema version 8."
+CREATED_LINE = "Created a new database at schema version 8."
 FAILED_AUDIT_STEP_LINE = (
     "Migration create_audit_summaries to schema version 5 failed and was "
     "rolled back; the database remains at version 4."
@@ -176,7 +188,7 @@ DRIFTED_VERSION_FIVE_LINE = (
     "the frozen schema for that version."
 )
 TOO_NEW_LINE = (
-    "Refused a database stamped at schema version 8; this build expects 7."
+    "Refused a database stamped at schema version 9; this build expects 8."
 )
 UNRECOGNISED_UNVERSIONED_LINE = (
     "Refused an unversioned database whose structure matches no schema "
@@ -342,6 +354,81 @@ FROZEN_REMINDERS_TABLE = """
     )
 """
 
+# Version 8's statements (V1-23-R1): the reminders table with its delivery
+# state, the one-row delivery setting table, and the four columns the step
+# adds, one statement each.
+
+FROZEN_REMINDERS_TABLE_WITH_DELIVERY_STATE = """
+    CREATE TABLE reminders (
+        id INTEGER PRIMARY KEY AUTOINCREMENT,
+        text TEXT NOT NULL CHECK (length(CAST(text AS BLOB)) > 0),
+        remind_time TEXT NOT NULL,
+        remind_utc TEXT NOT NULL CHECK (
+            remind_utc GLOB
+                '[0-9][0-9][0-9][0-9]-[0-9][0-9]-[0-9][0-9]T[0-9][0-9]:[0-9][0-9]:[0-9][0-9]Z'
+        ),
+        status TEXT NOT NULL CHECK (status IN ('open', 'completed')),
+        created_at TEXT NOT NULL,
+        updated_at TEXT NOT NULL,
+        completed_at TEXT,
+        context_digest TEXT
+            CHECK (context_digest IS NULL OR length(context_digest) = 64),
+        schedule_revision INTEGER NOT NULL DEFAULT 1
+            CHECK (typeof(schedule_revision) = 'integer' AND schedule_revision >= 1),
+        delivery_claimed_at TEXT CHECK (
+            delivery_claimed_at IS NULL
+            OR delivery_claimed_at GLOB
+                '[0-9][0-9][0-9][0-9]-[0-9][0-9]-[0-9][0-9]T[0-9][0-9]:[0-9][0-9]:[0-9][0-9]Z'
+        ),
+        delivery_channel TEXT CHECK (
+            delivery_channel IS NULL
+            OR delivery_channel IN ('desktop', 'cli', 'gui')
+        ),
+        delivery_outcome TEXT CHECK (
+            delivery_outcome IS NULL
+            OR delivery_outcome IN ('displayed', 'failed')
+        )
+    )
+"""
+
+FROZEN_REMINDER_DELIVERY_SETTINGS_TABLE = """
+    CREATE TABLE reminder_delivery_settings (
+        id INTEGER PRIMARY KEY CHECK (id = 1),
+        enabled INTEGER NOT NULL CHECK (enabled IN (0, 1)),
+        changed_at TEXT NOT NULL CHECK (
+            changed_at GLOB
+                '[0-9][0-9][0-9][0-9]-[0-9][0-9]-[0-9][0-9]T[0-9][0-9]:[0-9][0-9]:[0-9][0-9]Z'
+        )
+    )
+"""
+
+FROZEN_ADD_REMINDER_SCHEDULE_REVISION_COLUMN = """
+    ALTER TABLE reminders ADD COLUMN schedule_revision INTEGER NOT NULL DEFAULT 1
+            CHECK (typeof(schedule_revision) = 'integer' AND schedule_revision >= 1)
+"""
+
+FROZEN_ADD_REMINDER_DELIVERY_CLAIMED_AT_COLUMN = """
+    ALTER TABLE reminders ADD COLUMN delivery_claimed_at TEXT CHECK (
+            delivery_claimed_at IS NULL
+            OR delivery_claimed_at GLOB
+                '[0-9][0-9][0-9][0-9]-[0-9][0-9]-[0-9][0-9]T[0-9][0-9]:[0-9][0-9]:[0-9][0-9]Z'
+        )
+"""
+
+FROZEN_ADD_REMINDER_DELIVERY_CHANNEL_COLUMN = """
+    ALTER TABLE reminders ADD COLUMN delivery_channel TEXT CHECK (
+            delivery_channel IS NULL
+            OR delivery_channel IN ('desktop', 'cli', 'gui')
+        )
+"""
+
+FROZEN_ADD_REMINDER_DELIVERY_OUTCOME_COLUMN = """
+    ALTER TABLE reminders ADD COLUMN delivery_outcome TEXT CHECK (
+            delivery_outcome IS NULL
+            OR delivery_outcome IN ('displayed', 'failed')
+        )
+"""
+
 # Every version's complete frozen schema, statement for statement.
 EXPECTED_FROZEN_SCHEMAS: dict[int, tuple[str, ...]] = {
     PRE_MEMORIES_VERSION: (
@@ -404,6 +491,20 @@ EXPECTED_FROZEN_SCHEMAS: dict[int, tuple[str, ...]] = {
         FROZEN_INTERACTIONS_INDEX,
         FROZEN_NOTES_INDEX,
     ),
+    REMINDER_DELIVERY_VERSION: (
+        FROZEN_INTERACTIONS_TABLE,
+        FROZEN_NOTES_TABLE_WITH_CONTEXT_CONSENT,
+        FROZEN_MEMORIES_TABLE_WITH_CONTEXT_CONSENT,
+        FROZEN_AUDIT_SUMMARIES_TABLE,
+        FROZEN_AUDIT_OUTCOMES_TABLE,
+        FROZEN_SAVED_CONVERSATIONS_TABLE,
+        FROZEN_CONVERSATION_SUMMARIES_TABLE,
+        FROZEN_TASKS_TABLE,
+        FROZEN_REMINDERS_TABLE_WITH_DELIVERY_STATE,
+        FROZEN_REMINDER_DELIVERY_SETTINGS_TABLE,
+        FROZEN_INTERACTIONS_INDEX,
+        FROZEN_NOTES_INDEX,
+    ),
 }
 
 # Every forward step: its version, its name, and exactly what it runs.
@@ -434,6 +535,17 @@ EXPECTED_LADDER: tuple[tuple[int, str, tuple[str, ...]], ...] = (
         "create_tasks_and_reminders",
         (FROZEN_TASKS_TABLE, FROZEN_REMINDERS_TABLE),
     ),
+    (
+        REMINDER_DELIVERY_VERSION,
+        "add_reminder_delivery_state",
+        (
+            FROZEN_ADD_REMINDER_SCHEDULE_REVISION_COLUMN,
+            FROZEN_ADD_REMINDER_DELIVERY_CLAIMED_AT_COLUMN,
+            FROZEN_ADD_REMINDER_DELIVERY_CHANNEL_COLUMN,
+            FROZEN_ADD_REMINDER_DELIVERY_OUTCOME_COLUMN,
+            FROZEN_REMINDER_DELIVERY_SETTINGS_TABLE,
+        ),
+    ),
 )
 # The audit step's own entry, found by name rather than by position.
 (AUDIT_STEP,) = [
@@ -460,10 +572,15 @@ V6_SCHEMA = V5_SCHEMA + (
     FROZEN_CONVERSATION_SUMMARIES_TABLE,
 )
 V7_SCHEMA = V6_SCHEMA + (FROZEN_TASKS_TABLE, FROZEN_REMINDERS_TABLE)
+V8_SCHEMA = V6_SCHEMA + (
+    FROZEN_TASKS_TABLE,
+    FROZEN_REMINDERS_TABLE_WITH_DELIVERY_STATE,
+    FROZEN_REMINDER_DELIVERY_SETTINGS_TABLE,
+)
 
 # The version and the schema this build creates, and every climb ends at.
-CURRENT_SCHEMA_VERSION = TASKS_AND_REMINDERS_VERSION
-CURRENT_SCHEMA = V7_SCHEMA
+CURRENT_SCHEMA_VERSION = REMINDER_DELIVERY_VERSION
+CURRENT_SCHEMA = V8_SCHEMA
 
 # The owner rows every migration must keep, as they read once at version 5
 # and every version after it: each note's consent off (NULL) and each
@@ -481,6 +598,7 @@ BASELINE_COUNTS = {
     "conversation_summaries": 0,
     "tasks": 0,
     "reminders": 0,
+    "reminder_delivery_settings": 0,
 }
 
 # Owner-visible texts for the end-to-end audit flows, written out by hand.
@@ -798,6 +916,7 @@ START_BASELINE = _Start(
         "create_audit_summaries",
         "create_conversation_records",
         "create_tasks_and_reminders",
+        "add_reminder_delivery_state",
     ),
     MIGRATED_MEMORIES,
 )
@@ -819,6 +938,7 @@ START_V2 = _Start(
         "create_audit_summaries",
         "create_conversation_records",
         "create_tasks_and_reminders",
+        "add_reminder_delivery_state",
     ),
     MIGRATED_MEMORIES,
 )
@@ -831,6 +951,7 @@ START_V3 = _Start(
         "create_audit_summaries",
         "create_conversation_records",
         "create_tasks_and_reminders",
+        "add_reminder_delivery_state",
     ),
     MIGRATED_MEMORIES,
 )
@@ -842,6 +963,7 @@ START_V4 = _Start(
         "create_audit_summaries",
         "create_conversation_records",
         "create_tasks_and_reminders",
+        "add_reminder_delivery_state",
     ),
     MIGRATED_MEMORIES,
 )
@@ -1241,7 +1363,9 @@ class AuditSchemaPinTests(unittest.TestCase):
         )
         self.assertEqual(APP_VERSION, "0.2.0")
 
-    def test_the_ladder_is_exactly_six_steps_with_the_audit_step_fourth(self) -> None:
+    def test_the_ladder_is_exactly_seven_steps_with_the_audit_step_fourth(
+        self,
+    ) -> None:
         ladder = memory_module._MIGRATIONS
 
         self.assertEqual(tuple(step.name for step in ladder), LADDER_NAMES)
@@ -1254,6 +1378,7 @@ class AuditSchemaPinTests(unittest.TestCase):
                 AUDIT_SUMMARIES_VERSION,
                 CONVERSATION_RECORDS_VERSION,
                 TASKS_AND_REMINDERS_VERSION,
+                REMINDER_DELIVERY_VERSION,
             ),
         )
         self.assertEqual(ladder[3].name, "create_audit_summaries")
@@ -1298,7 +1423,7 @@ class AuditSchemaPinTests(unittest.TestCase):
     def test_the_frozen_version_five_entry_is_pinned_word_for_word(self) -> None:
         versions = [version for version, _ in memory_module._FROZEN_SCHEMAS]
 
-        self.assertEqual(sorted(versions), [1, 2, 3, 4, 5, 6, 7])
+        self.assertEqual(sorted(versions), [1, 2, 3, 4, 5, 6, 7, 8])
         self.assertEqual(len(versions), len(set(versions)))
         self.assertEqual(
             dict(memory_module._FROZEN_SCHEMAS)[AUDIT_SUMMARIES_VERSION],
@@ -1463,13 +1588,14 @@ class AuditMigrationUpgradeTests(_TemporaryDatabaseTestCase):
             ],
         )
         # The audit step is applied, followed only by the conversation-record
-        # step, V1-22's task step, and the ready line.
+        # step, V1-22's task step, V1-23-R1's delivery step, and the ready line.
         self.assertEqual(
-            messages[-4:],
+            messages[-5:],
             [
                 APPLIED_AUDIT_STEP_LINE,
                 APPLIED_STEP_LINES["create_conversation_records"],
                 APPLIED_STEP_LINES["create_tasks_and_reminders"],
+                APPLIED_STEP_LINES["add_reminder_delivery_state"],
                 READY_LINE,
             ],
         )
@@ -1637,7 +1763,7 @@ class FreshDatabaseTests(_TemporaryDatabaseTestCase):
     """Verify a database Maria creates itself starts at the current version."""
 
     def _assert_created_directly(self, database_path: Path, recording: Mock) -> None:
-        """Assert one creation went straight to version 7 with no ladder."""
+        """Assert one creation went straight to the current version, no ladder."""
         self.assertEqual(_messages(recording), [CREATED_LINE, READY_LINE])
         self.assertEqual(_applied(recording), [])
         self.assertEqual(
@@ -1819,6 +1945,7 @@ class AuditStepAtomicityTests(_TemporaryDatabaseTestCase):
                 "create_audit_summaries",
                 "create_conversation_records",
                 "create_tasks_and_reminders",
+                "add_reminder_delivery_state",
             ],
         )
         self.assertEqual(_messages(recording).count(APPLIED_AUDIT_STEP_LINE), 1)
@@ -1887,6 +2014,7 @@ class AuditStepAtomicityTests(_TemporaryDatabaseTestCase):
                         "create_audit_summaries",
                         "create_conversation_records",
                         "create_tasks_and_reminders",
+                        "add_reminder_delivery_state",
                     ],
                 )
                 self.assert_at_current_version(database_path, START_BASELINE)
@@ -1953,6 +2081,7 @@ class AuditStepContentionTests(_TemporaryDatabaseTestCase):
                 "create_audit_summaries",
                 "create_conversation_records",
                 "create_tasks_and_reminders",
+                "add_reminder_delivery_state",
             ],
         )
         self.assert_at_current_version(database_path, START_V4)
@@ -2069,6 +2198,7 @@ class AuditStepContentionTests(_TemporaryDatabaseTestCase):
                 "create_audit_summaries",
                 "create_conversation_records",
                 "create_tasks_and_reminders",
+                "add_reminder_delivery_state",
             ],
         )
         self.assert_at_current_version(database_path, START_BASELINE)
@@ -2099,14 +2229,14 @@ class VersionFiveDriftTests(_TemporaryDatabaseTestCase):
                     [DRIFTED_VERSION_FIVE_LINE],
                 )
 
-    def test_the_exact_version_five_schema_is_accepted_and_climbs_two_steps(
+    def test_the_exact_version_five_schema_is_accepted_and_climbs_three_steps(
         self,
     ) -> None:
-        """Version 5 is frozen now, so an exact one climbs two steps and stops.
+        """Version 5 is frozen now, so an exact one climbs three steps and stops.
 
-        Only the conversation-record and task steps run, every owner row is
-        kept, and the database it leaves is current and then accepted without
-        a write.
+        Only the conversation-record, task, and delivery steps run, every owner
+        row is kept, and the database it leaves is current and then accepted
+        without a write.
         """
         database_path = self.database("exact")
         _build_schema(database_path, V5_SCHEMA, AUDIT_SUMMARIES_VERSION)
@@ -2118,13 +2248,18 @@ class VersionFiveDriftTests(_TemporaryDatabaseTestCase):
 
         self.assertEqual(
             _applied(recording),
-            ["create_conversation_records", "create_tasks_and_reminders"],
+            [
+                "create_conversation_records",
+                "create_tasks_and_reminders",
+                "add_reminder_delivery_state",
+            ],
         )
         self.assertEqual(
             _messages(recording),
             [
                 APPLIED_STEP_LINES["create_conversation_records"],
                 APPLIED_STEP_LINES["create_tasks_and_reminders"],
+                APPLIED_STEP_LINES["add_reminder_delivery_state"],
                 READY_LINE,
             ],
         )
@@ -2440,9 +2575,9 @@ class AuditMigrationLoggingTests(unittest.TestCase):
 
         self.assertIn(f"| INFO | maria.memory | {APPLIED_AUDIT_STEP_LINE}", logged)
         self.assertEqual(logged.count(APPLIED_AUDIT_STEP_LINE), 1)
-        # The conversation-record step and V1-22's task step follow it, each
-        # with its own one line.
-        self.assertEqual(logged.count("Applied migration"), 3)
+        # The conversation-record step, V1-22's task step, and V1-23-R1's
+        # delivery step follow it, each with its own one line.
+        self.assertEqual(logged.count("Applied migration"), 4)
         self.assertIn(f"| INFO | maria.memory | {READY_LINE}", logged)
         self.assertEqual(
             self._entries(),
@@ -2458,6 +2593,11 @@ class AuditMigrationLoggingTests(unittest.TestCase):
                     "INFO",
                     "maria.memory",
                     APPLIED_STEP_LINES["create_tasks_and_reminders"],
+                ),
+                (
+                    "INFO",
+                    "maria.memory",
+                    APPLIED_STEP_LINES["add_reminder_delivery_state"],
                 ),
                 ("INFO", "maria.memory", READY_LINE),
             ],
@@ -2505,6 +2645,12 @@ class AuditMigrationLoggingTests(unittest.TestCase):
                     "maria.memory",
                     "Applied migration create_tasks_and_reminders; schema "
                     "version is now 7.",
+                ),
+                (
+                    "INFO",
+                    "maria.memory",
+                    "Applied migration add_reminder_delivery_state; schema "
+                    "version is now 8.",
                 ),
                 ("INFO", "maria.memory", READY_LINE),
             ],

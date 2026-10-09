@@ -124,6 +124,9 @@ HELP_TEXT = (
     "- delete reminder <id>\n"
     "- enable reminder context <id>\n"
     "- disable reminder context <id>\n"
+    "- reminder delivery\n"
+    "- enable reminder delivery\n"
+    "- disable reminder delivery\n"
     "- system\n"
     "- time\n"
     "- history\n"
@@ -529,6 +532,27 @@ COMMAND_CORPUS: tuple[CorpusEntry, ...] = (
         CONFIRM,
     ),
     _records("delete reminder 2", "Deleted reminder 2.", CONFIRM),
+    # V1-23-R1's delivery commands record their content-free replies. The
+    # status is read before delivery was ever set, so it names no time.
+    _records(
+        "reminder delivery",
+        "Reminder delivery is off. For your reminders' current saved times: 0 "
+        "displayed, 0 unconfirmed, 0 not displayed. Maria cannot see whether "
+        "the Windows task is installed.",
+    ),
+    _records_nothing("enable reminder delivery", CANCEL),
+    _records(
+        "enable reminder delivery",
+        "Reminder delivery is on. Maria cannot see whether the Windows task is "
+        "installed; type reminder delivery to see the status.",
+        CONFIRM,
+    ),
+    _records(
+        "disable reminder delivery",
+        "Reminder delivery is off. Maria starts no new reminder notices; one "
+        "already started may still appear.",
+        CONFIRM,
+    ),
     _records("add a task to buy milk", UNSUPPORTED_RESPONSE),
     _records("remind me tomorrow at 09:00 to call mom", UNSUPPORTED_RESPONSE),
     _records_nothing("   ", RUN),

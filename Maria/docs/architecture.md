@@ -211,11 +211,14 @@ summary text, task or reminder text, date, or time reaches interaction
 history that way. Every other
 current tool result, including `history.delete`, `notes.retitle`,
 `notes.edit`, `notes.delete`, `audit.delete`, `conversations.save`,
-`conversations.delete`, every conversation-summary mutation, and the task and
-reminder `complete`, `reopen`, `delete`, and consent actions, leaves the
-field as `None` and therefore retains the existing message-as-recorded
-behavior; those displayed messages are already short, content-free
-summaries naming at most an id and a count, so no override is needed.
+`conversations.delete`, every conversation-summary mutation, the task and
+reminder `complete`, `reopen`, `delete`, and consent actions, and V1-23-R1's
+three reminder-delivery actions, leaves the field as `None` and therefore
+retains the existing message-as-recorded behavior; those displayed messages
+are already short, content-free summaries naming at most an id, a setting,
+and counts, so no override is needed. A due-reminder notice is never recorded
+at all: it reaches an interface through the session's delivery seam, never
+through Brain; see "Reminder Delivery".
 `read file`, `read note`, and `recall` are unmodified and still record their
 full displayed content.
 
@@ -361,6 +364,23 @@ plan, or re-sends the original request after approval. Every way out of the
 main loop, including an exception it lets propagate, ends the session, which
 discards the session's conversation and any pending approval.
 
+Before every prompt, the loop calls `show_due_reminders(session)` inside the
+prompt's own `try` (V1-23-R1). It returns at once for a session without a
+delivery seam, and otherwise prints the notice the session's
+`claim_due_reminders()` returns as one `Maria:` message and records it as
+displayed, or as not displayed when printing raises an `Exception`, after
+which the prompt follows. Because the check sits inside the prompt's handler
+of `EOFError` and `KeyboardInterrupt`, Ctrl+C during the check or while its
+notice prints says `Goodbye.` and ends with status 0, exactly as at the
+prompt, leaving a claim not yet recorded unconfirmed; a `SystemExit` raised
+there is not caught by that handler, propagates, and still ends the session,
+and an interrupt during a request propagates as before. `run_cli()` and
+`run_gui()` build the session's seam through an injectable delivery factory;
+by default, `build_runtime_delivery()` builds it over the runtime Brain's
+memory with the interface's channel and an aware UTC clock, and a caller that
+injects a Brain factory gets no seam unless it also injects a delivery
+factory.
+
 `main.py` is also the runtime composition point. Its default startup is
 `build_runtime_brain()`, which calls `MariaBrain.from_defaults()` with
 `build_reasoning_provider` as the reasoning factory. That factory constructs
@@ -403,8 +423,11 @@ The package has three modules with separate jobs:
 - `gui/session_worker.py` runs the window's one worker thread, the narrow
   concurrency exception V1-21-R1 grants. That thread creates the session,
   performs each operation one at a time in the order asked, and ends the
-  session; nothing else touches the session. It is the only production module
-  that imports `threading`. Every failure in that thread, of any kind, is
+  session; nothing else touches the session. Under V1-23-R1 it also runs the
+  session's due-reminder check and the acknowledgment of each notice it
+  handed to the window, and for these two alone the amendment supersedes "in
+  the order asked"; see below. It is the only production module that imports
+  `threading`. Every failure in that thread, of any kind, is
   caught at its boundary and logged as fixed text naming at most its
   exception type, so nothing reaches Python's thread exception hook. A
   failure to create the session or of an operation stops the queue at once;
@@ -416,10 +439,34 @@ The package has three modules with separate jobs:
   production module that imports PyQt6, and it touches widgets only on the GUI
   thread; the worker's events reach it through a queued Qt signal.
 
-Brain and the session API are unchanged. Brain is built on the main thread,
-exactly as for the CLI, and is safe to hand to the worker because it holds no
-thread-bound resource: the memory layer opens and closes one SQLite connection
-per operation, and the local adapter opens one socket per request.
+Brain is unchanged, and the session API gains only V1-23-R1's delivery seam.
+Brain is built on the main thread, exactly as for the CLI, and is safe to hand
+to the worker because it holds no thread-bound resource: the memory layer
+opens and closes one SQLite connection per operation, and the local adapter
+opens one socket per request.
+
+When the session delivers reminders, the worker checks for due ones once after
+creating the session and once after each operation whose event is a `Reply`,
+after that reply has been handed to the window. It never checks after an
+approval offer or an acknowledgment, never on a timer, and never once
+`close()` was called, not even the first time: `close()` sets a flag before it
+queues the end, and every check reads it first. A claimed notice goes to the
+window as one `DueReminderNotice` under a notice serial of the worker's own,
+counted apart from offer serials, and the worker keeps the notice until the
+window acknowledges that serial. The controller adds the notice's text to the
+conversation as `Maria: <text>`, in any state but closed, without changing
+its state, the offer it shows, or the approval area, and only then sends the
+acknowledgment, which the worker queues in order with the owner's operations.
+When it reaches the worker, the notice is recorded as displayed, once; a
+repeated or unknown serial changes nothing, and no event or check follows. A
+notice the window never acknowledges stays unconfirmed: one whose handoff
+failed and was only logged, one whose acknowledgment queues behind the close
+and so never runs, and one shown just before a session that then ended. A
+rendering that raises reaches the window's shield, which closes the window as
+a failure, and no acknowledgment is sent, so nothing records it either way. A
+failure that is not an `Exception`, raised in the session's claim or record
+call, and an `Exception` in the worker's own new lines end the session as a
+failed operation does.
 
 The window shows a read-only conversation area, a one-line input with Send, a
 short status line, and, while an approval is pending, the complete approval
@@ -486,7 +533,9 @@ saw, with no failed callback.
 What the window shows is presentation state: it is never replayed into the
 session's conversation or saved automatically, and a new window starts with
 only the banner. Display history is never populated automatically from stored
-records. Explicit record-reading commands still display their results. The GUI
+records, except due-reminder notices from the session's delivery seam, shown
+as plain text (V1-23-R1). Explicit record-reading commands still display their
+results. The GUI
 never configures logging. Its worker logs fixed lines through the same `maria`
 logger, so running both interfaces in one process keeps exactly one managed
 log handler throughout.
@@ -601,6 +650,20 @@ recheck finds a supplied record changed clears the conversation and its
 fingerprints, as a conversational turn would. Once a session has ended there
 is nothing left to save.
 
+A session may also hold a reminder-delivery seam (V1-23-R1), given as the
+optional `delivery` keyword argument; `delivers_reminders` says whether it
+has one. `claim_due_reminders()` claims, through the seam, the due reminders
+one check may show and returns them as one `ReminderNotice`, or `None`, and
+`record_reminder_notice(notice, displayed)` records whether the interface
+displayed it. Both contain every `Exception` from the delivery subsystem,
+logging only its type, and let anything else propagate. Neither calls Brain,
+a plan, a tool, Tool Manager, permissions, or a provider, and neither touches
+the pending approval, the conversation, or the supplied-context fingerprints,
+so a check between an offer and its answer leaves the offer exactly as it
+was. With delivery off, a check reads the setting and nothing else. A notice
+is never recorded as an interaction, kept in the conversation, or sent to a
+model.
+
 ## Permission Policy
 
 All planned actions pass through `PermissionManager`.
@@ -612,16 +675,17 @@ malformed present arrays stop configuration loading instead of weakening it.
 When an action is both denied and confirmation-required, denial wins.
 
 In the current implementation, the mandatory confirmation baseline is
-thirty-one actions: `audit.delete`, `conversations.delete`,
+thirty-three actions: `audit.delete`, `conversations.delete`,
 `conversation_summaries.create`, `conversation_summaries.edit`,
 `conversation_summaries.delete`, `conversation_summaries.enable_context`,
 `conversation_summaries.disable_context`, `filesystem.rename`,
 `filesystem.move`, `history.delete`, `notes.retitle`, `notes.edit`,
 `notes.delete`, `notes.enable_context`, `notes.disable_context`,
 `memory.update`, `memory.forget`, `memory.enable_context`,
-`memory.disable_context`, and, from V1-22, `create`, `edit`, `reschedule`,
+`memory.disable_context`, from V1-22, `create`, `edit`, `reschedule`,
 `delete`, `enable_context`, and `disable_context` for both `tasks` and
-`reminders`. The confirmation for `memory.enable_context` also
+`reminders`, and, from V1-23-R1, `reminders.enable_delivery` and
+`reminders.disable_delivery`. The confirmation for `memory.enable_context` also
 carries a fixed notice, from `CONFIRMATION_NOTICES` in `core/permissions.py`,
 that an enabled memory may be sent to the local reasoning model on any
 conversational turn within Maria's memory context limits, and that Maria does
@@ -639,19 +703,31 @@ including text from memories or notes it was given, that its context consent
 starts off, and that Maria does not check it for passwords or other secrets;
 the confirmation for `conversation_summaries.enable_context` carries the
 note notice's counterpart for one summary's entire text. The confirmation for
-`reminders.create` carries one that Maria will not notify the owner when the
-reminder is due and that it does not repeat, so `due reminders` is how to see
-it, and the confirmations for `tasks.enable_context` and
+`reminders.create` carries one that Maria shows a reminder at most once when
+it is due, and only while reminder delivery is turned on and able to run, that
+it does not repeat, and that `due reminders` shows the reminders whose time has
+come, and the confirmations for `tasks.enable_context` and
 `reminders.enable_context` carry one that the record's text and timing may be
 sent to the local model on a conversational turn while it is open, after the
 enabled memories and within the memory context limits, and that Maria does not
-check it for secrets: eight notices in all. A deterministic plan's
-confirmation request shows each notice as part of its step's permission
+check it for secrets. Under V1-23-R1 the confirmation for
+`reminders.enable_delivery` carries one that Maria then shows each due reminder
+at most once, in the window or the command line and, while she is closed, as a
+Windows message box if the owner installed the task she cannot see or install;
+that only moving a reminder to a different time lets it be shown again; that a
+box shows the text to anyone at the unlocked screen; and that missed reminders
+are shown too, five at a time, and marked overdue when more than fifteen
+minutes late. The confirmation for `reminders.disable_delivery` carries one
+that turning delivery off stops every new notice from the moment it is saved,
+while a notice already started may still appear and be recorded and a box
+already on screen stays until closed: ten notices in all. A deterministic
+plan's confirmation request shows each notice as part of its step's permission
 reason. A model plan's approval shows, after the exact compiled steps and
 before the turn's context notices, the notice of every step PermissionManager
 resolved as requiring confirmation, each distinct notice once, in plan order
 (owner decision A on V1-22-R1), so a reminder created from the owner's own
-words says, before it is approved, that Maria will not notify the owner.
+words says, before it is approved, that Maria shows it at most once and only
+while reminder delivery is turned on and able to run.
 Brain asks `PermissionManager.confirmation_notice()` for each such step
 generically and names no tool or action. The notices are display only: the
 plan, its arguments, its fingerprint, the one approval for the whole plan,
@@ -663,15 +739,19 @@ before.
 `conversations.read`, `conversation_summaries.list`,
 `conversation_summaries.read`, `history.list`, `history.search`,
 `history.read`, `notes.create`, `notes.list`, `notes.read`, `memory.store`,
-`memory.search`, `memory.list`, and `list`, `due`, `read`, `complete`, and
-`reopen` for both `tasks` and `reminders` are allowed by default. The V1-22
-ten each carry a written risk note: a listing, a due query, or a reading
-only shows the owner's own records and records a content-free line, and
-completing or reopening changes the status alone, never the text, timing, or
-consent, reversibly and without deleting anything. These entries live
-in `MANDATORY_CONFIRMATION_ACTIONS` in `core/permissions.py` rather than in
-`config/config.toml`, so configuration can add restrictions on top of them but
-can never remove them.
+`memory.search`, `memory.list`, `list`, `due`, `read`, `complete`, and
+`reopen` for both `tasks` and `reminders`, and `reminders.delivery_status` are
+allowed by default. The V1-22 ten each carry a written risk note: a listing, a
+due query, or a reading only shows the owner's own records and records a
+content-free line, and completing or reopening changes the status alone, never
+the text, timing, or consent, reversibly and without deleting anything.
+`reminders.delivery_status` shows only the setting and three counts, never a
+reminder's text or time. None of the three delivery actions is model-eligible.
+A reminder-delivery claim or outcome write is not a tool action at all and
+passes through no permission decision; see "Reminder Delivery". These
+entries live in `MANDATORY_CONFIRMATION_ACTIONS` in `core/permissions.py`
+rather than in `config/config.toml`, so configuration can add restrictions on
+top of them but can never remove them.
 
 A model-originated plan meets one further requirement, which belongs to Brain
 rather than to `PermissionManager`: it always needs exactly one approval from
@@ -1005,11 +1085,13 @@ unversioned database structurally against the shapes Maria actually shipped,
 runs any missing forward migrations in order, and refuses a database stamped
 newer than the running build before writing anything.
 `docs/database.md` describes the rules; the eight record types below are
-unchanged by them. The current schema is version 7, whose one appended
-migration, `create_tasks_and_reminders`, creates the two empty tables `tasks`
-and `reminders` and changes no existing table or row; version 6's
-`create_conversation_records` created the two conversation-record tables,
-and version 5's `create_audit_summaries` the two audit tables, the same way.
+unchanged by them. The current schema is version 8, whose one appended
+migration, `add_reminder_delivery_state` (V1-23-R1), adds each reminder's
+delivery state and creates the empty one-row delivery setting table, and
+rewrites no row; version 7's `create_tasks_and_reminders` created the two
+empty tables `tasks` and `reminders`, version 6's
+`create_conversation_records` the two conversation-record tables, and
+version 5's `create_audit_summaries` the two audit tables, the same way.
 
 Maria keeps eight kinds of persistent data separate:
 
@@ -1091,10 +1173,13 @@ Maria keeps eight kinds of persistent data separate:
   exactly its approved text and timing. They are added, edited, rescheduled,
   deleted, and given or denied consent only through confirmation-gated
   commands, one row by id, while listing, due queries, reading, completing,
-  and reopening are allowed; nothing recurs, nothing is delivered, and ids are
-  never reused. Tasks and reminders are independent of each other and of
-  every other record type, with no link and no cascade; see "Tasks and
-  Reminders" below.
+  and reopening are allowed; nothing recurs, no task is ever delivered, and
+  ids are never reused. Tasks and reminders are independent of each other and
+  of every other record type, with no link and no cascade; see "Tasks and
+  Reminders" below. A reminder also keeps its delivery state, a scheduling
+  revision and its current revision's one claim, in its own row; that state
+  is not a record type of its own, and neither is the one-row delivery
+  setting. See "Reminder Delivery".
 
 On the completed paths described above, memory commands and their responses
 also appear in interaction history when recording succeeds. A stored fact can
@@ -1986,9 +2071,10 @@ notice says.
 
 V1-22 adds tasks and reminders as two independent record types (amendment
 V1-22-R1, decisions D1 to D9 with D1a and D7a), with twenty-six commands, all
-usable with no model present, and two request forms of the model path. Maria
-delivers, notifies, schedules, polls, repeats, and generates nothing: due-now
-and overdue are queries the owner types.
+usable with no model present, and two request forms of the model path. V1-22
+itself delivers, notifies, schedules, polls, repeats, and generates nothing:
+due-now and overdue are queries the owner types. Showing due reminders
+unasked is V1-23-R1's narrow subsystem; see "Reminder Delivery".
 
 **The time zone (D1, D1a).** Dates and times are resolved in one IANA zone,
 the private override's `[time] zone`, which `core/config.py` checks by syntax
@@ -2079,6 +2165,121 @@ then binds the proposal to those items and builds every step from Maria's own
 extraction, as "Model-to-Plan Compilation Gate" describes, and a casual
 mention never produces an approval.
 
+## Reminder Delivery
+
+V1-23 (amendment V1-23-R1, decisions D1 to D13 with a verification-timing
+amendment) lets Maria show due reminders unasked, through one claim protocol
+shared by three surfaces: the closed-app pass, the command line, and the
+desktop window. Delivery is off until the owner turns it on, and no task is
+ever delivered.
+
+**The subsystem.** It is four modules. `deliver_reminders.py` is the
+closed-app entry point and composition point; it is not an interface, accepts
+no command, builds no Brain, and imports neither `main.py`, the GUI,
+`core/config.py`, reasoning, nor the adapter. `core/runtime_paths.py` is the
+leaf that reads the tracked `config.toml`'s `[paths]` with the one path rule
+`core/config.py` also uses, and nothing else, never the private override.
+`core/reminder_delivery.py` holds `claim_notice` and `record_notice`, the
+`ReminderNotice` value, the notice text, and the session's seam; it runs no
+SQL, calls no Windows function, starts no thread, and reads no clock of its
+own: `claim_notice` receives the store, the instant, and the channel, and the
+seam calls the clock it is given once per check. `core/desktop_notice.py`
+is the only module that calls a Windows notice function, through
+standard-library `ctypes`: `SHQueryUserNotificationState` and `MessageBoxW`,
+the latter with exactly `MB_OK`, `MB_ICONINFORMATION`, and `MB_TOPMOST`, and
+it names no foreground or clipboard function. These are operating-system
+notification primitives, not a GUI toolkit. The subsystem's callers are
+`core/session.py`, `main.py`, and `gui/session_worker.py`.
+
+**One claim protocol.** A check reads the setting first, and with delivery
+not on reads nothing else. Otherwise it reads at most six due reminders with no
+claim for their current scheduling revision, oldest first, renders the first
+five notice entries before any claim, and claims those five one at a time,
+each in its own write transaction that re-reads the setting and the row under
+the write lock and commits before anything is displayed. The read and every
+claim use the same gates, a positive id among them, and the read applies
+them before its limit, so a row Maria could not have written never takes a
+place among the six. A reminder that no longer qualifies is skipped, as a due
+reminder left unclaimed. A claim that finds delivery off, or that raises,
+stops the batch; every claim whose call returned is retained and displayed,
+and the notice ends with the more-due line whenever a due reminder was left
+unclaimed: a sixth candidate, a skipped one, or any the batch stopped before
+claiming. A claim whose commit succeeded but whose call raised, the retained
+claims when packaging them into one notice fails, and every claim of a process
+that dies before its display stay unconfirmed and undisplayed, and none is
+retried. Each outcome is written for its own claim only, identified by the
+reminder id and revision, never by a timestamp, and an outcome whose claim no
+longer exists is dropped. The memory layer's methods are described in
+`docs/database.md`, under "Reminder Delivery State".
+
+**The guarantee.** A scheduling revision begins when a reminder is created,
+and a new one begins exactly when an approved reschedule stores a different
+saved instant, which also clears the claim; for each reminder and revision at
+most one claim is ever committed, so no crash, restart, upgrade, or second
+process shows a reminder twice in one revision. A reschedule to the same
+instant, an edit, completion, reopening, consent changes, and turning delivery
+on or off keep both. A fresh request to move a reminder to a time that has
+passed is refused at planning, as in V1-22, so only a late approval can restore
+an earlier time, and a reminder already shown at that time may then be shown
+once more. A claim judges the row as it is when the claim commits: a change
+made and undone before then is not detected. The per-reminder claim is the
+single-instance guard: Task Scheduler's IgnoreNew only keeps the task's own
+scheduled runs from overlapping.
+
+**The closed-app pass.** The owner registers one per-user Task Scheduler task,
+`MariaReminderDelivery`, from the template `docs/reminder-delivery-task.xml`,
+which is documentation: placeholders only, no absolute path, never loaded by
+Maria. While the owner is signed in, it starts pythonw on
+`deliver_reminders.py` once a minute, with the interactive token and least
+privilege, never waking the computer, never overlapping its own scheduled
+runs, and with no execution time limit. Maria never registers, changes,
+runs, or deletes the task, never calls schtasks, and starts no process. One
+pass reads the clock once; reads the tracked `[paths]`, or exits 1; exits 2
+when the Windows notice functions are unavailable; asks Windows for the
+notification state once, claiming only on `S_OK` with
+`QUNS_ACCEPTS_NOTIFICATIONS`, deferring every other known state with status 0
+and a failed query, a raised call, or an unknown value with status 2; opens
+the existing database read-write without creating it and runs the interfaces'
+read-only structure check, exiting 3 unless it is exactly the current schema;
+exits 0 when delivery is not on; configures its own log, which opens no file
+until a line is written, or exits 5 having claimed nothing; claims; shows one
+message box for exactly the retained claims; records each outcome, displayed
+when the box returned a button and not displayed when it returned 0 or raised;
+and exits with a fixed status, 5 outranking 4, which outranks 3, which outranks
+0. Before its first claim it writes nothing except, at most, the log
+directory. Its entry boundary catches `Exception` only, logging the type; a
+`KeyboardInterrupt` or `SystemExit` keeps Python's default handling.
+
+**In session.** The command line checks before every prompt and the window's
+worker after it creates the session and after each reply, as "CLI Boundary"
+and "GUI Boundary" describe, both through the session's seam, which
+"Session Boundary" describes. In-session delivery does not consult the
+notification state.
+
+**Logging and live files.** The pass writes its own bounded `delivery.log`
+beside `maria.log`, with the same size and backup bounds, because Python does
+not support several processes logging to one file; it is configured before the
+first claim and opened only when the first line is written, so an idle,
+disabled, or deferred pass writes nothing. Lines name ids, channels, outcomes,
+counts, and fixed phrases only, and reminder text is displayed, never logged.
+`delivery.log` is best effort: passes started by hand or by another task can
+write it at the same time as a scheduled one, so lines can interleave or be
+lost, and a refused rotation can lose older backups; no claim, display,
+outcome, or exit status depends on it, and Maria never reads it. It and its
+backups are live runtime files.
+
+**What is not promised.** Delivery is not promised while the computer is
+powered off, asleep, or hibernated, or while the owner is signed out, and the
+computer is never woken. A reminder due then is shown by a later pass once the
+owner is signed in and the computer is awake: the first that Windows does not
+defer, that no box still open holds back, and whose notice has room among its
+five, oldest first. It is labelled overdue when shown more than fifteen
+minutes after its saved time, and due otherwise. Presence is checked before a
+box is shown, not during it. A box waits until someone closes it, and while it
+waits no later pass of the task starts, so an unanswered box delays later
+desktop notices without limit; in-session delivery is unaffected. Displayed
+never means read.
+
 ## Boundaries
 
 The brain does not run SQL or perform tool work directly. The planner does not
@@ -2135,6 +2336,27 @@ modules; `gui/session_worker.py` is the only one besides the adapter that
 imports anything from the guarded network and threading set, and imports
 `threading` alone, under the owner's amendment V1-21-R1. `main.py` imports the
 GUI only inside `run_gui()`, so the CLI never loads Qt.
+The reminder-delivery subsystem of V1-23-R1 reaches, at any depth, only
+`core/runtime_paths.py`, `core/reminder_delivery.py`, `core/desktop_notice.py`,
+the memory layer and the leaves it imports, the constants, and the logger:
+never configuration, reasoning or the adapter, permissions, the planner, the
+compiler, the task-request parser, Tool Manager, a tool, the conversation, the
+session, a GUI module, or `main.py`, and no Maria module it reaches imports a
+network, threading, process, or asynchronous module. Static guards compute that
+reach over Maria's own modules only, treating the standard library as leaves;
+`logging.handlers`, which every Maria process loads, imports socket and
+threading itself, so a behavioral guard runs full cycles with socket creation,
+network connections, thread starts, and new processes patched to fail and
+proves that the delivery code uses none of them. A SQL trace proves that the
+delivery code reads only catalogue metadata, the setting, and the five
+reminder fields a notice shows and a claim compares, and writes only claim
+columns, and a file-access guard that a pass opens only the tracked
+configuration, its database, and its log. `core/desktop_notice.py` and the
+system tool are the only production modules that import `ctypes`. The
+subsystem is the one exception to the Planner, PermissionManager, Tool Manager
+pipeline, out of session and, for its claim and outcome writes, in session: it
+is limited to its fixed reminder operations through the memory layer's narrow
+delivery methods and never uses Tool Manager or model planning.
 
 The brain has no memory-specific dispatch branch. `MemoryTool` contains no SQL;
 it receives the shared `Memory` object and calls its public persistence methods.
@@ -2150,13 +2372,19 @@ task or reminder tool, action, or argument: timing reaches the planner and
 the compiler as one opaque context, and task and reminder context through the
 memory layer's and `core/context.py`'s generic reads. Neither tool reads a
 clock, and nothing in V1-22 starts a thread, a timer, or any background or
-scheduled work.
+scheduled work. Under V1-23-R1, nothing in Maria starts a timer or background
+work either: the only scheduled work is the owner-installed task's one-minute
+pass, which Task Scheduler starts and which ends after one pass, and the
+in-session checks run only at the moments "CLI Boundary" and "GUI Boundary"
+name.
 
 ## Scope
 
 This foundation intentionally excludes autonomous agents, voice, browser
 automation, internet search, and user interfaces beyond the command line and
-the optional desktop GUI of Stage V1-21. Future
+the optional desktop GUI of Stage V1-21; the closed-app reminder message box
+of V1-23-R1 is the one owner-facing surface beyond them, and it accepts no
+command. Future
 versions can add richer capabilities by extending the planner, tool manager, and
 tool set without rewriting the foundation.
 

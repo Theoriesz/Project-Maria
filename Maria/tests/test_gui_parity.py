@@ -13,7 +13,8 @@ same approvals for the same resolved plans, confirmed the same plans, refused
 the same tampered fingerprint, asked the model the same things, dispatched
 the same tool calls, and left the same records, audit summaries included.
 Cancelling is compared the same way, so the GUI records exactly what the CLI
-records.
+records. A due reminder reaches both through the session's delivery seam,
+each on its own channel, and is compared the same way (V1-23-R1).
 
 Nothing here imports Qt, contacts a model, or reads Maria's live database,
 live log, or private override.
@@ -27,6 +28,7 @@ import sqlite3
 import unittest
 from contextlib import closing, redirect_stderr, redirect_stdout
 from dataclasses import dataclass
+from datetime import datetime, timezone
 from io import StringIO
 from unittest.mock import patch
 
@@ -35,7 +37,9 @@ from core import memory as memory_module
 from core.brain import BrainResponse
 from core.planner import Plan
 from core.reasoning import ReasoningRequest
+from core.reminder_delivery import ReminderDeliverySeam
 from core.session import CONFIRMATION_REFUSED_MESSAGE, MariaSession
+from core.task_records import DELIVERY_CHANNEL_CLI, DELIVERY_CHANNEL_GUI
 from core.time_resolution import TimingFailure
 from tests.gui_fakes import RunningGui
 from tests.test_brain_recording_policy import _controlled_environment
@@ -59,7 +63,14 @@ RECORD_TABLES = (
     "conversation_summaries",
     "tasks",
     "reminders",
+    "reminder_delivery_settings",
 )
+# V1-23-R1: one reminder five minutes past its time when each session's seam
+# checks, at the controlled clock's own moment.
+DUE_TEXT = "water the ferns"
+DUE_TIME = f"2031-02-02T21:00:00+01:00[{SYNTHETIC_KEY}]"
+DUE_INSTANT = "2031-02-02T20:00:00Z"
+DELIVERY_CHECK = datetime(2031, 2, 2, 20, 5, 6, tzinfo=timezone.utc)
 
 # A request the model answers with a plan of three steps, whose approval
 # text is the longest the core produces.
@@ -130,8 +141,9 @@ REMINDER_PROPOSAL = json.dumps(
     }
 )
 REMINDER_NOTICE = (
-    "Maria will not notify you when this reminder is due, and it does not "
-    "repeat: type due reminders to see the reminders whose time has come."
+    "Maria shows a reminder at most once when it is due, and only while "
+    "reminder delivery is turned on and able to run; it does not repeat. "
+    "Type due reminders to see the reminders whose time has come."
 )
 
 # One script step: ("send", text), ("approve",), ("cancel",), or
@@ -248,7 +260,11 @@ class _World:
 
 
 def _records(database_path) -> dict[str, list[tuple[object, ...]]]:
-    """Read every record table, leaving out the clock columns."""
+    """Read every record table, leaving out the clock columns.
+
+    A reminder's delivery channel is left out too: it names the interface
+    that claimed it, the one value the two runs must not share.
+    """
     tables: dict[str, list[tuple[object, ...]]] = {}
     with closing(sqlite3.connect(database_path)) as connection:
         for table in RECORD_TABLES:
@@ -256,12 +272,31 @@ def _records(database_path) -> dict[str, list[tuple[object, ...]]]:
             kept = [
                 index
                 for index, column in enumerate(cursor.description)
-                if not column[0].endswith("_at")
+                if not column[0].endswith("_at") and column[0] != "delivery_channel"
             ]
             tables[table] = [
                 tuple(row[index] for index in kept) for row in cursor.fetchall()
             ]
     return tables
+
+
+def _delivering(world: _World, channel: str) -> ReminderDeliverySeam:
+    """Turn delivery on, store one due reminder, and return a session seam."""
+    world.harness.memory.set_reminder_delivery(True)
+    world.harness.memory.create_reminder(DUE_TEXT, DUE_TIME, DUE_INSTANT)
+    return ReminderDeliverySeam(world.harness.memory, channel, lambda: DELIVERY_CHECK)
+
+
+def _delivery_channels(database_path) -> list[object]:
+    """Return the channel of every claimed reminder, by id."""
+    with closing(sqlite3.connect(database_path)) as connection:
+        return [
+            row[0]
+            for row in connection.execute(
+                "SELECT delivery_channel FROM reminders "
+                "WHERE delivery_channel IS NOT NULL ORDER BY id"
+            )
+        ]
 
 
 def run_through_cli(
@@ -270,9 +305,15 @@ def run_through_cli(
     *,
     reasoning: bool,
     time_zone: str | None = SYNTHETIC_KEY,
+    due_reminder: bool = False,
 ) -> Outcome:
-    """Run the script through ``main.run_cli`` with scripted terminal input."""
+    """Run the script through ``main.run_cli`` with scripted terminal input.
+
+    With ``due_reminder``, the session gets a delivery seam on the command
+    line's channel, over a world where delivery is on and one reminder is due.
+    """
     world = _World(test, reasoning=reasoning, time_zone=time_zone)
+    seam = _delivering(world, DELIVERY_CHANNEL_CLI) if due_reminder else None
     sessions: list[MariaSession] = []
 
     class RecordingSession(MariaSession):
@@ -303,11 +344,19 @@ def run_through_cli(
         redirect_stdout(stdout),
         redirect_stderr(stderr),
     ):
-        status = main_module.run_cli(lambda: world.brain)
+        status = main_module.run_cli(
+            lambda: world.brain,
+            None if seam is None else lambda _brain: seam,
+        )
 
     test.assertEqual(status, 0)
     test.assertEqual(stderr.getvalue(), "")
     test.assertEqual(steps, [])
+    if due_reminder:
+        test.assertEqual(
+            _delivery_channels(world.harness.database_path),
+            [DELIVERY_CHANNEL_CLI],
+        )
     shown = stdout.getvalue()
     test.assertTrue(shown.endswith("Maria: Goodbye.\n"))
     return world.outcome(shown.removesuffix("Maria: Goodbye.\n"))
@@ -319,13 +368,19 @@ def run_through_gui(
     *,
     reasoning: bool,
     time_zone: str | None = SYNTHETIC_KEY,
+    due_reminder: bool = False,
 ) -> Outcome:
-    """Run the script through the GUI controller and its real worker."""
+    """Run the script through the GUI controller and its real worker.
+
+    With ``due_reminder``, the session gets a delivery seam on the window's
+    channel, over a world where delivery is on and one reminder is due.
+    """
     world = _World(test, reasoning=reasoning, time_zone=time_zone)
+    seam = _delivering(world, DELIVERY_CHANNEL_GUI) if due_reminder else None
     sessions: list[MariaSession] = []
 
     def session_factory() -> MariaSession:
-        session = MariaSession(world.brain)
+        session = MariaSession(world.brain, delivery=seam)
         sessions.append(session)
         return session
 
@@ -345,6 +400,11 @@ def run_through_gui(
 
     test.assertFalse(pending_at_close)
     test.assertEqual(gui.controller.exit_status, 0)
+    if due_reminder:
+        test.assertEqual(
+            _delivery_channels(world.harness.database_path),
+            [DELIVERY_CHANNEL_GUI],
+        )
     shown = "".join(
         f"{line}\n" for line in gui.view.lines if not line.startswith("You: ")
     )
@@ -360,6 +420,7 @@ class InterfaceParityTests(unittest.TestCase):
         *,
         reasoning: bool = False,
         time_zone: str | None = SYNTHETIC_KEY,
+        due_reminder: bool = False,
     ) -> Outcome:
         """Run the script through both interfaces and return the CLI's run."""
         through_cli = run_through_cli(
@@ -367,12 +428,14 @@ class InterfaceParityTests(unittest.TestCase):
             script,
             reasoning=reasoning,
             time_zone=time_zone,
+            due_reminder=due_reminder,
         )
         through_gui = run_through_gui(
             self,
             script,
             reasoning=reasoning,
             time_zone=time_zone,
+            due_reminder=due_reminder,
         )
 
         self.assertEqual(through_gui.shown, through_cli.shown)
@@ -664,6 +727,67 @@ class InterfaceParityTests(unittest.TestCase):
             ],
         )
         self.assertEqual(outcome.records["audit_summaries"], [])
+
+    def test_the_reminder_delivery_commands_match_without_reasoning(self) -> None:
+        # V1-23-R1: the three delivery commands, with no seam in either
+        # session, so only the commands themselves are compared.
+        outcome = self.assert_same_through_both(
+            [
+                ("send", "reminder delivery"),
+                ("send", "enable reminder delivery"),
+                ("cancel",),
+                ("send", "enable reminder delivery"),
+                ("approve",),
+                ("send", "reminder delivery"),
+                ("send", "disable reminder delivery"),
+                ("approve",),
+                ("send", "reminder delivery"),
+            ]
+        )
+
+        # Positive controls: the script really did what it says.
+        self.assertEqual(outcome.prompts, ())
+        self.assertEqual(outcome.shown.count("Maria: Action cancelled.\n"), 1)
+        self.assertEqual(len(outcome.confirmed), 2)
+        self.assertIn("Maria: Reminder delivery is off. For your", outcome.shown)
+        self.assertIn("Maria: Reminder delivery is on, since", outcome.shown)
+        self.assertIn("Maria: Reminder delivery is off, since", outcome.shown)
+        self.assertEqual(outcome.records["reminder_delivery_settings"], [(1, 0)])
+
+    def test_a_due_reminder_reaches_both_interfaces_alike(self) -> None:
+        # V1-23-R1: each session gets a seam on its own channel, over a world
+        # where delivery is on and one reminder is due. The command line
+        # checks before each prompt; the window once it starts and after
+        # each reply.
+        outcome = self.assert_same_through_both(
+            [
+                ("send", "reminders"),
+                ("send", "reminder delivery"),
+                ("send", "disable reminder delivery"),
+                ("approve",),
+                ("send", "reminder delivery"),
+            ],
+            due_reminder=True,
+        )
+
+        # Positive controls: shown once, before any reply, and recorded as
+        # displayed before the next request in both.
+        self.assertEqual(outcome.shown.count("Reminder 1 is due:"), 1)
+        self.assertIn(f'Maria: Reminder 1 is due: "{DUE_TEXT}"\n', outcome.shown)
+        self.assertLess(
+            outcome.shown.index("Reminder 1 is due:"),
+            outcome.shown.index("Maria: Reminder delivery is on, since"),
+        )
+        self.assertEqual(
+            outcome.shown.count("1 displayed, 0 unconfirmed, 0 not displayed."),
+            2,
+        )
+        self.assertEqual(
+            [row[-2:] for row in outcome.records["reminders"]],
+            [(1, "displayed")],
+        )
+        self.assertEqual(outcome.records["reminder_delivery_settings"], [(1, 0)])
+        self.assertEqual(outcome.prompts, ())
 
     def test_task_and_reminder_commands_match_without_a_zone(self) -> None:
         unavailable = TimingFailure.ZONE_UNAVAILABLE.message

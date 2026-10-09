@@ -1064,6 +1064,13 @@ _REMINDER_ID_COMMANDS = (
     ("disable reminder context", "disable_context"),
 )
 
+# The reminder-delivery commands, matched exactly, and their actions.
+_REMINDER_DELIVERY_COMMANDS = {
+    "reminder delivery": "delivery_status",
+    "enable reminder delivery": "enable_delivery",
+    "disable reminder delivery": "disable_delivery",
+}
+
 
 def _task_plan(
     text: str,
@@ -1232,6 +1239,17 @@ def _reminder_plan(
             "reminders",
             "create",
             {"text": reminder_text, "when": when, "repeat": _REPEAT_NEVER},
+        )
+
+    # Reminder delivery (V1-23-R1): three exact commands, none taking an
+    # argument. Turning delivery on or off is confirmed like any other change
+    # the owner makes.
+    if lowered in _REMINDER_DELIVERY_COMMANDS:
+        return Planner._single_step(
+            text,
+            "reminders",
+            _REMINDER_DELIVERY_COMMANDS[lowered],
+            {},
         )
 
     identified = _id_command(text, lowered, "reminders", _REMINDER_ID_COMMANDS)
@@ -1482,6 +1500,9 @@ def _help_text() -> str:
         "- delete reminder <id>\n"
         "- enable reminder context <id>\n"
         "- disable reminder context <id>\n"
+        "- reminder delivery\n"
+        "- enable reminder delivery\n"
+        "- disable reminder delivery\n"
         "- system\n"
         "- time\n"
         "- history\n"

@@ -181,6 +181,9 @@ PERMITTED_BUT_CLOSED = frozenset(
         "reminders.read",
         "reminders.complete",
         "reminders.reopen",
+        # V1-23-R1: showing the delivery status is allowed and closed to the
+        # model; turning delivery on or off always requires confirmation.
+        "reminders.delivery_status",
     }
 )
 
@@ -287,6 +290,9 @@ VALID_ARGUMENTS: dict[str, dict[str, Any]] = {
     "reminders.delete": {"id": 1},
     "reminders.enable_context": {"id": 1, "text_digest": DIGEST},
     "reminders.disable_context": {"id": 1},
+    "reminders.delivery_status": {},
+    "reminders.enable_delivery": {},
+    "reminders.disable_delivery": {},
 }
 
 # What the compiler must do with each V1-12 category. The out-of-range

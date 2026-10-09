@@ -1547,6 +1547,24 @@ BUILT_IN_ACTION_CONTRACTS = ActionContractRegistry(
             (_identifier(),),
             model_eligibility=ModelEligibility.NOT_MODEL_ELIGIBLE,
         ),
+        # Reminder delivery (V1-23-R1): the status and the two confirmed
+        # changes of the one delivery setting. None takes an argument, and
+        # none is ever a model's to select.
+        ActionContract(
+            "reminders",
+            "delivery_status",
+            model_eligibility=ModelEligibility.NOT_MODEL_ELIGIBLE,
+        ),
+        ActionContract(
+            "reminders",
+            "enable_delivery",
+            model_eligibility=ModelEligibility.NOT_MODEL_ELIGIBLE,
+        ),
+        ActionContract(
+            "reminders",
+            "disable_delivery",
+            model_eligibility=ModelEligibility.NOT_MODEL_ELIGIBLE,
+        ),
         ActionContract(
             "system",
             "overview",

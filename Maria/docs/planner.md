@@ -658,6 +658,8 @@ creates one step, carrying canonical values only:
 | `edit reminder <id>: <new text>` | `reminders.edit` | `{"id": id, "text": new_text}` |
 | `reschedule reminder <id>: <timing>` | `reminders.reschedule` | `{"id": id, "when": canonical, "repeat": "never"}` |
 | `enable` / `disable reminder context <id>` | `reminders.enable_context` / `.disable_context` | `{"id": id}` |
+| `reminder delivery` | `reminders.delivery_status` | `{}` |
+| `enable reminder delivery` / `disable reminder delivery` | `reminders.enable_delivery` / `.disable_delivery` | `{}` |
 
 `<date>` is `today`, `tomorrow`, a weekday name, `YYYY-MM-DD`, or
 `in <N> day(s)`, and a reminder's `<timing>` is a `<date>`, one space, and
@@ -689,10 +691,19 @@ request. `list tasks` and `list reminders` keep their meaning as
 no command begins with `remind me` or `add a task to`: those natural-language
 forms reach the generic fallback, and the reasoning model when it is enabled.
 
-`add task`, `add reminder`, and the edit, reschedule, delete, and consent
-commands always require confirmation; listing, the due queries, reading,
-completing, and reopening run without asking. `help` lists the twenty-six
-commands after the conversation-record commands and before `system`:
+The three reminder-delivery commands of V1-23-R1, `reminder delivery`,
+`enable reminder delivery`, and `disable reminder delivery`, each match only
+the whole request, in any letter case and with outer whitespace ignored, and
+plan one step with no arguments; anything more, such as
+`enable reminder delivery now`, plans no delivery step. None is open to the
+reasoning model.
+
+`add task`, `add reminder`, the edit, reschedule, delete, and consent
+commands, and `enable reminder delivery` and `disable reminder delivery`
+always require confirmation; listing, the due queries, reading, completing,
+reopening, and `reminder delivery` run without asking. `help` lists the
+twenty-nine commands after the conversation-record commands and before
+`system`:
 
 ```text
 - add task <text>
@@ -721,6 +732,9 @@ commands after the conversation-record commands and before `system`:
 - delete reminder <id>
 - enable reminder context <id>
 - disable reminder context <id>
+- reminder delivery
+- enable reminder delivery
+- disable reminder delivery
 ```
 
 Only `tasks.create` and `reminders.create` are model-eligible, and only for a

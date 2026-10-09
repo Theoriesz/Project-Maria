@@ -2,16 +2,19 @@
 
 from __future__ import annotations
 
+import io
 import logging
 import tempfile
 import unittest
+from contextlib import redirect_stderr
 from logging.handlers import RotatingFileHandler
 from pathlib import Path
 from unittest.mock import patch
 
 import core.logger as logger_module
 import tests.log_assertions as log_assertions
-from core.logger import configure_logging, get_logger
+from core.constants import DELIVERY_LOG_FILE_NAME
+from core.logger import configure_delivery_logging, configure_logging, get_logger
 from tests.log_assertions import assert_log_omits
 
 
@@ -356,6 +359,93 @@ class LoggerTests(unittest.TestCase):
         self.assertIsNone(handler.stream)
         log_text = (self.log_dir / "maria.log").read_text(encoding="utf-8")
         self.assertIn("cleanup-marker", log_text)
+
+
+class DeliveryLoggingTests(unittest.TestCase):
+    """Verify the closed-app pass's own log (V1-23-R1), in temporary folders."""
+
+    def setUp(self) -> None:
+        self.temporary_directory = tempfile.TemporaryDirectory()
+        self.addCleanup(self.temporary_directory.cleanup)
+        self.log_dir = Path(self.temporary_directory.name) / "nested" / "logs"
+        self.delivery_log = self.log_dir / DELIVERY_LOG_FILE_NAME
+
+        self.maria_logger = logging.getLogger("maria")
+        original_handlers = tuple(self.maria_logger.handlers)
+        original_state = (
+            self.maria_logger.level,
+            self.maria_logger.propagate,
+            self.maria_logger.disabled,
+        )
+        for handler in original_handlers:
+            self.maria_logger.removeHandler(handler)
+
+        def restore() -> None:
+            _remove_and_close_handlers(self.maria_logger)
+            for handler in original_handlers:
+                self.maria_logger.addHandler(handler)
+            (
+                self.maria_logger.level,
+                self.maria_logger.propagate,
+                self.maria_logger.disabled,
+            ) = original_state
+
+        self.addCleanup(restore)
+
+    def test_no_file_is_opened_until_the_first_line(self) -> None:
+        logger = configure_delivery_logging(self.log_dir)
+
+        # The directory exists, but a pass with nothing to say writes nothing,
+        # not even a start-up line.
+        self.assertTrue(self.log_dir.is_dir())
+        self.assertFalse(self.delivery_log.exists())
+        self.assertEqual(list(self.log_dir.iterdir()), [])
+
+        get_logger("delivery").info("first-line-marker")
+        _flush_handlers(logger)
+
+        lines = self.delivery_log.read_text(encoding="utf-8").splitlines()
+        self.assertEqual(len(lines), 1)
+        self.assertTrue(
+            lines[0].endswith(" | INFO | maria.delivery | first-line-marker")
+        )
+        self.assertFalse((self.log_dir / "maria.log").exists())
+
+    def test_it_rotates_within_the_managed_logs_bounds(self) -> None:
+        logger = configure_delivery_logging(self.log_dir)
+
+        (handler,) = _managed_handlers(logger)
+        self.assertIsInstance(handler, RotatingFileHandler)
+        self.assertEqual(Path(handler.baseFilename), self.delivery_log.resolve())
+        self.assertEqual(handler.maxBytes, logger_module.LOG_MAX_BYTES)
+        self.assertEqual(handler.backupCount, logger_module.LOG_BACKUP_COUNT)
+        self.assertEqual(handler.encoding.lower().replace("-", ""), "utf8")
+        self.assertEqual(logger.level, logging.INFO)
+        self.assertFalse(logger.propagate)
+        self.assertEqual(DELIVERY_LOG_FILE_NAME, "delivery.log")
+
+    def test_it_replaces_only_the_handlers_this_module_made(self) -> None:
+        configure_logging(self.log_dir)
+        foreign = logging.StreamHandler(io.StringIO())
+        self.maria_logger.addHandler(foreign)
+
+        logger = configure_delivery_logging(self.log_dir)
+
+        (managed,) = _managed_handlers(logger)
+        self.assertEqual(Path(managed.baseFilename).name, DELIVERY_LOG_FILE_NAME)
+        self.assertIn(foreign, logger.handlers)
+        self.assertEqual(len(logger.handlers), 2)
+
+    def test_a_line_that_cannot_be_written_never_raises(self) -> None:
+        self.delivery_log.mkdir(parents=True)
+        logger = configure_delivery_logging(self.log_dir)
+
+        with redirect_stderr(io.StringIO()) as errors:
+            get_logger("delivery").error("unwritable-marker")
+        _flush_handlers(logger)
+
+        self.assertTrue(self.delivery_log.is_dir())
+        self.assertIn("Logging error", errors.getvalue())
 
 
 class LogAssertionHelperTests(unittest.TestCase):

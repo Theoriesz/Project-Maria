@@ -52,6 +52,13 @@ class FakeSession:
     request until it is set; ``failure``, when given, is raised by every
     request; and ``end_failure``, when given, is raised by ``end()`` once it
     has been recorded.
+
+    The reminder-delivery seam (V1-23-R1) is off unless
+    ``delivers_reminders`` is True. Each ``claim_due_reminders`` call then
+    returns the next of ``notices``, or None once they run out, and raises
+    ``claim_failure`` instead when one is given; ``record_reminder_notice``
+    keeps every recording in ``recorded``, raising ``record_failure`` after
+    recording the call when one is given.
     """
 
     def __init__(
@@ -60,6 +67,10 @@ class FakeSession:
         gate: threading.Event | None = None,
         failure: BaseException | None = None,
         end_failure: BaseException | None = None,
+        delivers_reminders: bool = False,
+        notices: tuple[object, ...] = (),
+        claim_failure: BaseException | None = None,
+        record_failure: BaseException | None = None,
     ) -> None:
         self.calls: list[str] = []
         self.threads: list[int] = []
@@ -69,6 +80,12 @@ class FakeSession:
         self._gate = gate
         self._failure = failure
         self._end_failure = end_failure
+        self.delivers_reminders = delivers_reminders
+        self._notices = list(notices)
+        self._claim_failure = claim_failure
+        self._record_failure = record_failure
+        self.recorded: list[tuple[object, bool]] = []
+        self.recorded_event = threading.Event()
 
     def submit(self, user_input: str) -> BrainResponse:
         """Answer one request, leaving an approval pending if it needs one."""
@@ -107,6 +124,21 @@ class FakeSession:
         self.pending_approval = None
         if self._end_failure is not None:
             raise self._end_failure
+
+    def claim_due_reminders(self) -> object | None:
+        """Return the next scripted notice, or None once there are none."""
+        self._note("claim_due_reminders")
+        if self._claim_failure is not None:
+            raise self._claim_failure
+        return self._notices.pop(0) if self._notices else None
+
+    def record_reminder_notice(self, notice: object, displayed: bool) -> None:
+        """Keep one recording of a notice's outcome."""
+        self._note("record_reminder_notice")
+        self.recorded.append((notice, displayed))
+        self.recorded_event.set()
+        if self._record_failure is not None:
+            raise self._record_failure
 
     def _note(self, call: str) -> None:
         """Record one call and the thread that made it."""
@@ -199,6 +231,10 @@ class RecordingWorker:
     def cancel(self) -> None:
         """Record a dismissal."""
         self.commands.append(("cancel",))
+
+    def acknowledge_reminder_notice(self, serial: int) -> None:
+        """Record that the window showed a reminder notice."""
+        self.commands.append(("acknowledge_reminder_notice", serial))
 
     def close(self) -> None:
         """Record a close."""

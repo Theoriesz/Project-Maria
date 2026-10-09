@@ -38,6 +38,11 @@ from core.reasoning import (
     ReasoningSettings,
     ReasoningTransport,
 )
+from core.runtime_paths import (
+    DEFAULT_DATABASE_SETTING,
+    DEFAULT_LOGS_SETTING,
+    resolve_project_path,
+)
 from core.time_resolution import is_zone_key
 
 
@@ -319,9 +324,13 @@ def load_config(
     # the protection value, so the filesystem boundary protects where Maria
     # actually keeps its database, its log, and its prompt rather than only
     # where the shipped layout would put them.
-    database_path = _resolve_project_path(paths.get("database", "database/maria.db"))
-    log_dir = _resolve_project_path(paths.get("logs", "logs"))
-    prompt_path = _resolve_project_path(
+    # The rule and the defaults are ``core.runtime_paths``'s, which the
+    # closed-app reminder pass reads too, so both find the same files.
+    database_path = resolve_project_path(
+        paths.get("database", DEFAULT_DATABASE_SETTING)
+    )
+    log_dir = resolve_project_path(paths.get("logs", DEFAULT_LOGS_SETTING))
+    prompt_path = resolve_project_path(
         paths.get("system_prompt", "prompts/system_prompt.txt")
     )
 
@@ -362,14 +371,6 @@ def load_config(
     if overriding.time_zone is not None:
         config = replace(config, time_zone=overriding.time_zone)
     return config
-
-
-def _resolve_project_path(value: Any) -> Path:
-    """Resolve a config path relative to the project root."""
-    path = Path(str(value))
-    if path.is_absolute():
-        return path.resolve()
-    return (PROJECT_ROOT / path).resolve()
 
 
 def _filesystem_roots(raw_config: dict[str, Any]) -> FilesystemRoots:

@@ -72,9 +72,10 @@ MARIA_ROOT = Path(__file__).resolve().parents[1]
 
 # The importable production roots. A new top-level production package fails
 # the unscanned-root guard until its stage adds it here, which is also what
-# brings it under every ownership check. V1-21 added the desktop GUI package.
+# brings it under every ownership check. V1-21 added the desktop GUI package,
+# and V1-23 the closed-app reminder pass's entry point.
 PRODUCTION_PACKAGES = ("core", "tools", "gui")
-PRODUCTION_ENTRY_POINTS = ("main.py",)
+PRODUCTION_ENTRY_POINTS = ("main.py", "deliver_reminders.py")
 TEST_PACKAGE = "tests"
 
 # Imports that reach SQLite. ``_sqlite3`` is the CPython extension ``sqlite3``
@@ -2093,10 +2094,10 @@ class MemoryContextConsentTests(unittest.TestCase):
                 memory.initialize()
                 memory.initialize()
 
-                # The current schema: 7 since V1-22, so a UTF-16 baseline
+                # The current schema: 8 since V1-23-R1, so a UTF-16 baseline
                 # climbs every step, the conversation-record and task tables
-                # included.
-                self.assertEqual(memory.schema_version(), 7)
+                # and the reminder delivery state included.
+                self.assertEqual(memory.schema_version(), 8)
                 with closing(sqlite3.connect(path)) as connection:
                     self.assertEqual(
                         connection.execute("PRAGMA encoding").fetchone()[0],

@@ -29,6 +29,7 @@ from core.audit import (
 from core.constants import (
     DATABASE_SCHEMA_VERSION,
     DEFAULT_DATABASE_BUSY_TIMEOUT_SECONDS,
+    REMINDER_NOTICE_LIMIT,
 )
 from core.context import (
     SEARCH_MAX_TERMS,
@@ -64,6 +65,14 @@ from core.task_records import (
     AS_OF_INSTANT_MESSAGE,
     CONTEXT_DIGEST_LENGTH,
     CONTEXT_DIGEST_MESSAGE,
+    DELIVERY_CHANNEL_MAX_LENGTH,
+    DELIVERY_CHANNEL_MESSAGE,
+    DELIVERY_OUTCOME_DISPLAYED,
+    DELIVERY_OUTCOME_MAX_LENGTH,
+    DELIVERY_OUTCOME_MESSAGE,
+    DELIVERY_RECORD_MESSAGE,
+    DELIVERY_SETTING_MESSAGE,
+    DELIVERY_STORAGE_MESSAGE,
     DUE_DATE_LENGTH,
     DUE_DATE_MESSAGE,
     REMIND_TIME_MAX_LENGTH,
@@ -77,19 +86,32 @@ from core.task_records import (
     TASK_QUERY_LIMIT,
     TASK_RECORD_MESSAGE,
     TASK_STATUS_MESSAGE,
+    TASK_TEXT_MAX_BYTES,
     TASK_TEXT_MESSAGE,
     UTC_INSTANT_LENGTH,
+    ClaimOutcome,
+    ClaimResult,
+    DeliveryCandidate,
+    DeliveryClaim,
+    DeliveryCounts,
+    DeliverySetting,
+    DeliverySettingState,
+    DeliveryStorageError,
     RecordUpdate,
     Reminder,
     StatusChange,
     Task,
     is_context_digest,
+    is_delivery_channel,
+    is_delivery_outcome,
     is_due_date,
     is_lifecycle,
     is_status,
     is_task_text,
     is_task_timestamp,
     is_utc_instant,
+    settle_delivery_setting,
+    settle_delivery_state,
     task_timestamp,
     timing_agrees,
 )
@@ -134,7 +156,8 @@ _UNVERSIONED_SCHEMA = 0
 # consent column, which holds the approved text's identity. Version 5 adds the
 # two audit-summary tables. Version 6 adds the saved-conversation and
 # conversation-summary tables. Version 7 adds the task and reminder tables.
-# The current version lives in ``core.constants`` as
+# Version 8 adds each reminder's delivery state and the one-row delivery
+# setting (V1-23-R1). The current version lives in ``core.constants`` as
 # ``DATABASE_SCHEMA_VERSION``.
 _SCHEMA_BEFORE_EXPLICIT_MEMORIES = 1
 _SCHEMA_V0_2_BASELINE = 2
@@ -143,6 +166,7 @@ _SCHEMA_NOTE_CONTEXT_CONSENT = 4
 _SCHEMA_AUDIT_SUMMARIES = 5
 _SCHEMA_CONVERSATION_RECORDS = 6
 _SCHEMA_TASKS_AND_REMINDERS = 7
+_SCHEMA_REMINDER_DELIVERY = 8
 
 # The live schema. These statements describe the database this build expects
 # and are what a brand-new database is created from, so they move whenever the
@@ -244,14 +268,22 @@ _CREATE_CONVERSATION_SUMMARIES_TABLE = """
 
 # ``tasks`` and ``reminders`` hold the owner's tasks and reminders, each
 # independent of every other table: no foreign key, trigger, index, cascade,
-# recurrence column, or delivered marker. SQL checks only what it can check
-# by shape: non-empty text by byte count, the status set, the date and
-# instant shapes, and the consent digest's length. Every other rule, from
-# the text's characters and a real calendar date to a reminder's saved
-# instant agreeing exactly with its saved local time and offset, is Maria's
-# own, checked in Python on every write and every read. ``remind_utc`` is the
-# saved instant that orders reminders and selects due ones. AUTOINCREMENT
-# keeps a deleted record's id from ever being reused.
+# or recurrence column. SQL checks only what it can check by shape: non-empty
+# text by byte count, the status set, the date and instant shapes, and the
+# consent digest's length. Every other rule, from the text's characters and a
+# real calendar date to a reminder's saved instant agreeing exactly with its
+# saved local time and offset, is Maria's own, checked in Python on every
+# write and every read. ``remind_utc`` is the saved instant that orders
+# reminders and selects due ones. AUTOINCREMENT keeps a deleted record's id
+# from ever being reused.
+#
+# A reminder also holds its delivery state (V1-23-R1): ``schedule_revision``,
+# an identity counter that starts at 1 and rises by one exactly when an
+# approved reschedule stores a different saved instant, and the three claim
+# columns of that revision's one claim, all NULL until something claims it.
+# SQL checks their shapes; Python checks that they hold a claim Maria could
+# have written. ``reminder_delivery_settings`` holds at most the one row of
+# the delivery setting, and no row means delivery is off.
 _CREATE_TASKS_TABLE = """
     CREATE TABLE IF NOT EXISTS tasks (
         id INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -283,7 +315,33 @@ _CREATE_REMINDERS_TABLE = """
         updated_at TEXT NOT NULL,
         completed_at TEXT,
         context_digest TEXT
-            CHECK (context_digest IS NULL OR length(context_digest) = 64)
+            CHECK (context_digest IS NULL OR length(context_digest) = 64),
+        schedule_revision INTEGER NOT NULL DEFAULT 1
+            CHECK (typeof(schedule_revision) = 'integer' AND schedule_revision >= 1),
+        delivery_claimed_at TEXT CHECK (
+            delivery_claimed_at IS NULL
+            OR delivery_claimed_at GLOB
+                '[0-9][0-9][0-9][0-9]-[0-9][0-9]-[0-9][0-9]T[0-9][0-9]:[0-9][0-9]:[0-9][0-9]Z'
+        ),
+        delivery_channel TEXT CHECK (
+            delivery_channel IS NULL
+            OR delivery_channel IN ('desktop', 'cli', 'gui')
+        ),
+        delivery_outcome TEXT CHECK (
+            delivery_outcome IS NULL
+            OR delivery_outcome IN ('displayed', 'failed')
+        )
+    )
+"""
+
+_CREATE_REMINDER_DELIVERY_SETTINGS_TABLE = """
+    CREATE TABLE IF NOT EXISTS reminder_delivery_settings (
+        id INTEGER PRIMARY KEY CHECK (id = 1),
+        enabled INTEGER NOT NULL CHECK (enabled IN (0, 1)),
+        changed_at TEXT NOT NULL CHECK (
+            changed_at GLOB
+                '[0-9][0-9][0-9][0-9]-[0-9][0-9]-[0-9][0-9]T[0-9][0-9]:[0-9][0-9]:[0-9][0-9]Z'
+        )
     )
 """
 
@@ -307,6 +365,7 @@ _CURRENT_SCHEMA_STATEMENTS: tuple[str, ...] = (
     _CREATE_CONVERSATION_SUMMARIES_TABLE,
     _CREATE_TASKS_TABLE,
     _CREATE_REMINDERS_TABLE,
+    _CREATE_REMINDER_DELIVERY_SETTINGS_TABLE,
     _CREATE_INTERACTIONS_INDEX,
     _CREATE_NOTES_INDEX,
 )
@@ -483,6 +542,89 @@ _HISTORICAL_REMINDERS_TABLE = """
     )
 """
 
+# The reminders table as version 8 freezes it: version 7's columns followed
+# by the four columns the version 8 step adds, written exactly as that step
+# writes them. SQLite records an added column in the table's stored
+# definition, so a migrated database and a newly created one fingerprint
+# alike and are the same schema.
+_HISTORICAL_REMINDERS_TABLE_WITH_DELIVERY_STATE = """
+    CREATE TABLE reminders (
+        id INTEGER PRIMARY KEY AUTOINCREMENT,
+        text TEXT NOT NULL CHECK (length(CAST(text AS BLOB)) > 0),
+        remind_time TEXT NOT NULL,
+        remind_utc TEXT NOT NULL CHECK (
+            remind_utc GLOB
+                '[0-9][0-9][0-9][0-9]-[0-9][0-9]-[0-9][0-9]T[0-9][0-9]:[0-9][0-9]:[0-9][0-9]Z'
+        ),
+        status TEXT NOT NULL CHECK (status IN ('open', 'completed')),
+        created_at TEXT NOT NULL,
+        updated_at TEXT NOT NULL,
+        completed_at TEXT,
+        context_digest TEXT
+            CHECK (context_digest IS NULL OR length(context_digest) = 64),
+        schedule_revision INTEGER NOT NULL DEFAULT 1
+            CHECK (typeof(schedule_revision) = 'integer' AND schedule_revision >= 1),
+        delivery_claimed_at TEXT CHECK (
+            delivery_claimed_at IS NULL
+            OR delivery_claimed_at GLOB
+                '[0-9][0-9][0-9][0-9]-[0-9][0-9]-[0-9][0-9]T[0-9][0-9]:[0-9][0-9]:[0-9][0-9]Z'
+        ),
+        delivery_channel TEXT CHECK (
+            delivery_channel IS NULL
+            OR delivery_channel IN ('desktop', 'cli', 'gui')
+        ),
+        delivery_outcome TEXT CHECK (
+            delivery_outcome IS NULL
+            OR delivery_outcome IN ('displayed', 'failed')
+        )
+    )
+"""
+
+# The one-row delivery setting table the version 8 step creates. It starts
+# empty, which means delivery is off.
+_HISTORICAL_REMINDER_DELIVERY_SETTINGS_TABLE = """
+    CREATE TABLE reminder_delivery_settings (
+        id INTEGER PRIMARY KEY CHECK (id = 1),
+        enabled INTEGER NOT NULL CHECK (enabled IN (0, 1)),
+        changed_at TEXT NOT NULL CHECK (
+            changed_at GLOB
+                '[0-9][0-9][0-9][0-9]-[0-9][0-9]-[0-9][0-9]T[0-9][0-9]:[0-9][0-9]:[0-9][0-9]Z'
+        )
+    )
+"""
+
+# The four columns the version 8 step adds to reminders, one statement each,
+# frozen the same way. The revision's DEFAULT gives every existing reminder
+# its first revision, which also satisfies its CHECK, and the three claim
+# columns start NULL, which means not yet claimed: no statement rewrites a
+# row.
+_ADD_REMINDER_SCHEDULE_REVISION_COLUMN = """
+    ALTER TABLE reminders ADD COLUMN schedule_revision INTEGER NOT NULL DEFAULT 1
+            CHECK (typeof(schedule_revision) = 'integer' AND schedule_revision >= 1)
+"""
+
+_ADD_REMINDER_DELIVERY_CLAIMED_AT_COLUMN = """
+    ALTER TABLE reminders ADD COLUMN delivery_claimed_at TEXT CHECK (
+            delivery_claimed_at IS NULL
+            OR delivery_claimed_at GLOB
+                '[0-9][0-9][0-9][0-9]-[0-9][0-9]-[0-9][0-9]T[0-9][0-9]:[0-9][0-9]:[0-9][0-9]Z'
+        )
+"""
+
+_ADD_REMINDER_DELIVERY_CHANNEL_COLUMN = """
+    ALTER TABLE reminders ADD COLUMN delivery_channel TEXT CHECK (
+            delivery_channel IS NULL
+            OR delivery_channel IN ('desktop', 'cli', 'gui')
+        )
+"""
+
+_ADD_REMINDER_DELIVERY_OUTCOME_COLUMN = """
+    ALTER TABLE reminders ADD COLUMN delivery_outcome TEXT CHECK (
+            delivery_outcome IS NULL
+            OR delivery_outcome IN ('displayed', 'failed')
+        )
+"""
+
 # Every version's complete schema, newest first. A marker is never taken at
 # its word: whatever version a database claims, its structure is checked
 # against the entry for that version before anything is migrated, so a file
@@ -491,6 +633,23 @@ _HISTORICAL_REMINDERS_TABLE = """
 # one up to DATABASE_SCHEMA_VERSION therefore needs an entry here, and the
 # migration ladder refuses to run if one is missing.
 _FROZEN_SCHEMAS: tuple[tuple[int, tuple[str, ...]], ...] = (
+    (
+        _SCHEMA_REMINDER_DELIVERY,
+        (
+            _HISTORICAL_INTERACTIONS_TABLE,
+            _HISTORICAL_NOTES_TABLE_WITH_CONTEXT_CONSENT,
+            _HISTORICAL_MEMORIES_TABLE_WITH_CONTEXT_CONSENT,
+            _HISTORICAL_AUDIT_SUMMARIES_TABLE,
+            _HISTORICAL_AUDIT_OUTCOMES_TABLE,
+            _HISTORICAL_SAVED_CONVERSATIONS_TABLE,
+            _HISTORICAL_CONVERSATION_SUMMARIES_TABLE,
+            _HISTORICAL_TASKS_TABLE,
+            _HISTORICAL_REMINDERS_TABLE_WITH_DELIVERY_STATE,
+            _HISTORICAL_REMINDER_DELIVERY_SETTINGS_TABLE,
+            _HISTORICAL_INTERACTIONS_INDEX,
+            _HISTORICAL_NOTES_INDEX,
+        ),
+    ),
     (
         _SCHEMA_TASKS_AND_REMINDERS,
         (
@@ -654,6 +813,17 @@ _MIGRATIONS: tuple[_Migration, ...] = (
             _HISTORICAL_REMINDERS_TABLE,
         ),
     ),
+    _Migration(
+        version=_SCHEMA_REMINDER_DELIVERY,
+        name="add_reminder_delivery_state",
+        statements=(
+            _ADD_REMINDER_SCHEDULE_REVISION_COLUMN,
+            _ADD_REMINDER_DELIVERY_CLAIMED_AT_COLUMN,
+            _ADD_REMINDER_DELIVERY_CHANNEL_COLUMN,
+            _ADD_REMINDER_DELIVERY_OUTCOME_COLUMN,
+            _HISTORICAL_REMINDER_DELIVERY_SETTINGS_TABLE,
+        ),
+    ),
 )
 
 
@@ -677,6 +847,20 @@ _SUMMARY_APPROVED_FUNCTION = "maria_summary_approved"
 # written, before the row can be returned or counted.
 _TASK_APPROVED_FUNCTION = "maria_task_approved"
 _REMINDER_APPROVED_FUNCTION = "maria_reminder_approved"
+
+# The SQL function a reminder-delivery read or claim registers, on its own
+# connection only: it tests whether one open reminder row holds only values
+# Maria could have written, before the row can be returned or claimed.
+_DELIVERABLE_REMINDER_FUNCTION = "maria_deliverable_reminder"
+
+# The reason a delivery readiness check gives when the database is not
+# exactly the schema this build expects, beside the shared busy and error
+# reasons. Like them it is this module's own fixed phrase.
+_DELIVERY_NOT_CURRENT = "the database is not at the current schema"
+
+# How many due candidates one delivery read may return: one notice's worth,
+# and the one more that shows whether more are due.
+_DELIVERY_CANDIDATE_LIMIT = REMINDER_NOTICE_LIMIT + 1
 
 # The reasons a saved-conversation or conversation-summary call's log line
 # may give. Each is this module's own fixed phrase: nothing SQLite reports
@@ -769,9 +953,24 @@ class NoteSnapshot:
 class Memory:
     """Provide all database interactions for Maria."""
 
-    def __init__(self, database_path: Path, logger: Logger | None = None) -> None:
+    def __init__(
+        self,
+        database_path: Path,
+        logger: Logger | None = None,
+        *,
+        existing_only: bool = False,
+    ) -> None:
+        """Use the database at ``database_path``.
+
+        ``existing_only`` is for the closed-app reminder pass (V1-23-R1):
+        every connection is then opened read-write without creating the
+        file, so a database that is missing stays missing, and a pass never
+        builds an empty one. The interfaces leave it False and create the
+        database at their first start, as always.
+        """
         self.database_path = database_path
         self.logger = logger or get_logger(__name__)
+        self._existing_only = existing_only
 
     def initialize(self) -> None:
         """Bring the configured database up to the schema this build expects.
@@ -3595,7 +3794,13 @@ class Memory:
         remind_time: str,
         remind_utc: str,
     ) -> RecordUpdate:
-        """Replace one reminder's saved time, turning its consent off first."""
+        """Replace one reminder's saved time, turning its consent off first.
+
+        A new saved instant starts a new scheduling revision and clears the
+        reminder's claim in the same statement (V1-23-R1), so the reminder
+        can be shown once at its new time. The same instant, even written
+        with another local time text for it, keeps both.
+        """
         if not timing_agrees(remind_time, remind_utc):
             raise ValueError(REMIND_TIME_MESSAGE)
         return self._rewrite_agenda(
@@ -3603,6 +3808,7 @@ class Memory:
             reminder_id,
             {"remind_time": remind_time, "remind_utc": remind_utc},
             "reschedule reminder",
+            starts_new_revision=True,
         )
 
     def delete_reminder(self, reminder_id: int) -> bool:
@@ -3655,6 +3861,398 @@ class Memory:
             len(identifiers),
             identifiers,
         )
+
+    # Reminder delivery (V1-23-R1). The delivery subsystem calls only
+    # delivery_state, reminder_delivery_setting, reminder_delivery_candidates,
+    # claim_reminder_delivery, and record_reminder_delivery, and two of them,
+    # a claim and an outcome, are its only writes: each targets one reminder
+    # row by its identity, the reminder id and its scheduling revision, and is
+    # not a tool action. Beside them, set_reminder_delivery and
+    # reminder_delivery_counts serve the reminders tool's confirmed setting
+    # change and its status. Every value a read hands to Python is typed and
+    # bounded inside SQLite first, as the Tier A read does; nothing logged is
+    # more than an id, a revision, a channel, an outcome, or a fixed phrase;
+    # an argument Maria could not have passed raises ``ValueError`` before any
+    # SQL; and every storage failure is a ``DeliveryStorageError`` with a fixed
+    # message, raised outside every handler so it has no cause or context.
+
+    def delivery_state(self) -> DeliverySetting:
+        """Check that the database is ready for delivery, and read the setting.
+
+        This is the closed-app pass's read-only readiness check. The
+        database must be stamped exactly ``DATABASE_SCHEMA_VERSION`` and
+        match its frozen structure, by the same structure check the
+        interfaces run at start; nothing is created, migrated, or written.
+        A missing, busy, unreadable, or not-current database raises
+        ``DeliveryStorageError``. Otherwise the setting is returned, which
+        may still be off, never set, or unreadable.
+        """
+        setting: DeliverySetting | None = None
+        failure: str | None = None
+        try:
+            with self._connection(classify_contention=False) as connection:
+                current = _read_schema_version(
+                    connection
+                ) == DATABASE_SCHEMA_VERSION and _describe_schema(
+                    connection
+                ) == _reference_schema(_frozen_schema(DATABASE_SCHEMA_VERSION))
+                if current:
+                    setting = _read_delivery_setting(connection)
+                else:
+                    failure = _DELIVERY_NOT_CURRENT
+        except sqlite3.Error as exc:
+            failure = _record_failure_reason(exc)
+        if failure is not None or setting is None:
+            raise self._delivery_failure(
+                "check reminder delivery",
+                failure or _RECORD_UNEXPECTED_VALUE,
+            )
+        return setting
+
+    def reminder_delivery_setting(self) -> DeliverySetting:
+        """Return the delivery setting, from one bounded read of its table.
+
+        Only typed, bounded values reach Python: the row count, an integer
+        0 or 1 or NULL, and one short text or NULL. No row is never set; one
+        well-formed row is on or off since its stamp; anything else is
+        unreadable. Only a well-formed row with delivery on enables claims.
+        """
+        setting: DeliverySetting | None = None
+        failure: str | None = None
+        try:
+            with self._connection(classify_contention=False) as connection:
+                setting = _read_delivery_setting(connection)
+        except sqlite3.Error as exc:
+            failure = _record_failure_reason(exc)
+        if failure is not None or setting is None:
+            raise self._delivery_failure(
+                "read the reminder delivery setting",
+                failure or _RECORD_UNEXPECTED_VALUE,
+            )
+        return setting
+
+    def set_reminder_delivery(self, enabled: bool) -> DeliverySetting:
+        """Turn reminder delivery on or off, and return the setting now.
+
+        One write transaction reads the setting under the write lock and
+        writes the one row only when it does not already say exactly this:
+        a setting already on stays on since its own time, and an unreadable
+        one is replaced. Every claim reads the setting under its own write
+        lock, so a change governs every claim that commits after it.
+        """
+        if type(enabled) is not bool:
+            raise ValueError(DELIVERY_SETTING_MESSAGE)
+        changed_at = task_timestamp()
+        if not is_task_timestamp(changed_at):
+            raise ValueError(DELIVERY_SETTING_MESSAGE)
+        wanted = (
+            DeliverySettingState.ENABLED
+            if enabled
+            else DeliverySettingState.DISABLED
+        )
+        result: DeliverySetting | None = None
+        failure: str | None = None
+        try:
+            with self._connection(classify_contention=False) as connection:
+                connection.execute("BEGIN IMMEDIATE")
+                current = _read_delivery_setting(connection)
+                if current.state is wanted:
+                    result = current
+                else:
+                    connection.execute(
+                        """
+                        INSERT INTO reminder_delivery_settings (
+                            id, enabled, changed_at
+                        )
+                        VALUES (1, ?, ?)
+                        ON CONFLICT (id) DO UPDATE SET
+                            enabled = excluded.enabled,
+                            changed_at = excluded.changed_at
+                        """,
+                        (int(enabled), changed_at),
+                    )
+                    result = DeliverySetting(wanted, changed_at)
+        except sqlite3.Error as exc:
+            failure = _record_failure_reason(exc)
+        if failure is not None or result is None:
+            raise self._delivery_failure(
+                "change the reminder delivery setting",
+                failure or _RECORD_UNEXPECTED_VALUE,
+            )
+        self.logger.info(
+            "Reminder delivery is %s.",
+            "on" if enabled else "off",
+        )
+        return result
+
+    def reminder_delivery_counts(self) -> DeliveryCounts:
+        """Count reminders whose current claim was displayed, unconfirmed, or not.
+
+        Only a reminder with a claim for its current scheduling revision
+        counts, and only when its claim columns are values Maria could have
+        written; each value is typed and bounded inside SQLite and settled
+        again in Python. Nothing about a reminder but its claim is read.
+        """
+        rows: list[sqlite3.Row] = []
+        failure: str | None = None
+        try:
+            with self._connection(classify_contention=False) as connection:
+                rows = connection.execute(
+                    """
+                    SELECT delivery_claimed_at, delivery_channel, delivery_outcome
+                    FROM reminders
+                    WHERE delivery_claimed_at IS NOT NULL
+                        AND typeof(delivery_claimed_at) = 'text'
+                        AND length(CAST(delivery_claimed_at AS BLOB)) <= ?
+                        AND typeof(delivery_channel) = 'text'
+                        AND length(CAST(delivery_channel AS BLOB)) <= ?
+                        AND (
+                            delivery_outcome IS NULL
+                            OR (
+                                typeof(delivery_outcome) = 'text'
+                                AND length(CAST(delivery_outcome AS BLOB)) <= ?
+                            )
+                        )
+                    """,
+                    (
+                        _stored_bound(connection, UTC_INSTANT_LENGTH),
+                        _stored_bound(connection, DELIVERY_CHANNEL_MAX_LENGTH),
+                        _stored_bound(connection, DELIVERY_OUTCOME_MAX_LENGTH),
+                    ),
+                ).fetchall()
+        except sqlite3.Error as exc:
+            failure = _record_failure_reason(exc)
+        if failure is not None:
+            raise self._delivery_failure("count reminder deliveries", failure)
+        displayed = unconfirmed = failed = 0
+        for row in rows:
+            try:
+                state = settle_delivery_state(*tuple(row))
+            except ValueError:
+                continue
+            if state is None:
+                continue
+            if state.outcome is None:
+                unconfirmed += 1
+            elif state.outcome == DELIVERY_OUTCOME_DISPLAYED:
+                displayed += 1
+            else:
+                failed += 1
+        return DeliveryCounts(displayed, unconfirmed, failed)
+
+    def reminder_delivery_candidates(
+        self,
+        as_of: str,
+        limit: int = _DELIVERY_CANDIDATE_LIMIT,
+    ) -> list[DeliveryCandidate]:
+        """Return due reminders with no claim for their revision, oldest first.
+
+        A candidate is open, saved at or before ``as_of``, unclaimed for its
+        current scheduling revision, and a row Maria could have written: its
+        id must be positive, every value the registered check receives is
+        first typed and bounded inside SQLite, its completion stamp must be
+        NULL, its revision an integer of at least 1, and its channel and
+        outcome NULL. The check then admits only valid text, agreeing timing,
+        stamps that follow the record rules for an open reminder, and a NULL
+        or well-formed consent digest. All of this applies before the limit,
+        so a row that fails never takes a place in the window. Only the id,
+        text, saved time and instant, and revision come back, settled again
+        in Python; a row that fails is skipped.
+        """
+        if not is_utc_instant(as_of):
+            raise ValueError(AS_OF_INSTANT_MESSAGE)
+        if type(limit) is not int or not 1 <= limit <= _DELIVERY_CANDIDATE_LIMIT:
+            raise ValueError(TASK_LIST_LIMIT_MESSAGE)
+        rows: list[sqlite3.Row] = []
+        failure: str | None = None
+        try:
+            with self._connection(classify_contention=False) as connection:
+                guards, bounds = _prepare_deliverable_check(connection)
+                rows = connection.execute(
+                    f"""
+                    SELECT id, text, remind_time, remind_utc, schedule_revision
+                    FROM reminders
+                    WHERE status = ?
+                        AND remind_utc <= ?
+                        AND delivery_claimed_at IS NULL
+                        AND CASE
+                            WHEN {guards}
+                            THEN {_DELIVERABLE_REMINDER_FUNCTION}(
+                                {_DELIVERABLE_COLUMNS}
+                            )
+                            ELSE 0
+                        END
+                    ORDER BY remind_utc, id
+                    LIMIT ?
+                    """,
+                    (STATUS_OPEN, as_of, *bounds, limit),
+                ).fetchall()
+        except sqlite3.Error as exc:
+            failure = _record_failure_reason(exc)
+        if failure is not None:
+            raise self._delivery_failure("read due reminders for delivery", failure)
+        candidates: list[DeliveryCandidate] = []
+        for row in rows:
+            candidate = _settled_candidate(row)
+            if candidate is not None:
+                candidates.append(candidate)
+        return candidates
+
+    def claim_reminder_delivery(
+        self,
+        candidate: DeliveryCandidate,
+        channel: str,
+        claimed_at: str,
+        as_of: str,
+    ) -> ClaimResult:
+        """Commit one claim for one candidate, or say why it was not claimed.
+
+        ``BEGIN IMMEDIATE`` takes the write lock before anything is read, so
+        nothing can change between the checks and the write. Under it the
+        setting must be one well-formed row with delivery on, or the result
+        is ``DISABLED`` and nothing is written. The reminder's current row
+        must then pass the candidate read's own gates and check, still have
+        no claim for its revision, hold exactly the candidate's text, saved
+        time and instant, and revision, and be due at ``as_of``; otherwise
+        the result is ``CHANGED`` and nothing is written. Only then is the
+        claim written, for exactly that reminder and revision, and committed
+        before this returns ``CLAIMED`` with the claim's identity.
+        """
+        if type(candidate) is not DeliveryCandidate:
+            raise ValueError(DELIVERY_RECORD_MESSAGE)
+        if not is_delivery_channel(channel):
+            raise ValueError(DELIVERY_CHANNEL_MESSAGE)
+        if not is_utc_instant(claimed_at) or not is_utc_instant(as_of):
+            raise ValueError(AS_OF_INSTANT_MESSAGE)
+        result: ClaimResult | None = None
+        failure: str | None = None
+        try:
+            with self._connection(classify_contention=False) as connection:
+                connection.execute("BEGIN IMMEDIATE")
+                if not _read_delivery_setting(connection).enabled:
+                    result = ClaimResult(ClaimOutcome.DISABLED)
+                else:
+                    guards, bounds = _prepare_deliverable_check(connection)
+                    current = _settled_candidate(
+                        connection.execute(
+                            f"""
+                            SELECT id, text, remind_time, remind_utc,
+                                schedule_revision
+                            FROM reminders
+                            WHERE id = ?
+                                AND status = ?
+                                AND delivery_claimed_at IS NULL
+                                AND CASE
+                                    WHEN {guards}
+                                    THEN {_DELIVERABLE_REMINDER_FUNCTION}(
+                                        {_DELIVERABLE_COLUMNS}
+                                    )
+                                    ELSE 0
+                                END
+                            """,
+                            (candidate.reminder_id, STATUS_OPEN, *bounds),
+                        ).fetchone()
+                    )
+                    if (
+                        current is None
+                        or current != candidate
+                        or current.remind_utc > as_of
+                    ):
+                        result = ClaimResult(ClaimOutcome.CHANGED)
+                    else:
+                        cursor = connection.execute(
+                            """
+                            UPDATE reminders
+                            SET delivery_claimed_at = ?, delivery_channel = ?
+                            WHERE id = ? AND schedule_revision = ?
+                                AND delivery_claimed_at IS NULL
+                                AND delivery_channel IS NULL
+                                AND delivery_outcome IS NULL
+                            """,
+                            (
+                                claimed_at,
+                                channel,
+                                candidate.reminder_id,
+                                candidate.schedule_revision,
+                            ),
+                        )
+                        if cursor.rowcount == 1:
+                            result = ClaimResult(
+                                ClaimOutcome.CLAIMED,
+                                DeliveryClaim(
+                                    candidate.reminder_id,
+                                    candidate.schedule_revision,
+                                ),
+                            )
+                        else:
+                            connection.rollback()
+                            result = ClaimResult(ClaimOutcome.CHANGED)
+        except sqlite3.Error as exc:
+            failure = _record_failure_reason(exc)
+        if failure is not None or result is None:
+            raise self._delivery_failure(
+                "claim a reminder for delivery",
+                failure or _RECORD_UNEXPECTED_VALUE,
+            )
+        if result.outcome is ClaimOutcome.CLAIMED:
+            self.logger.info(
+                "Claimed reminder %s, revision %s, for delivery by %s.",
+                candidate.reminder_id,
+                candidate.schedule_revision,
+                channel,
+            )
+        elif result.outcome is ClaimOutcome.CHANGED:
+            self.logger.info(
+                "Did not claim reminder %s: it changed before its claim.",
+                candidate.reminder_id,
+            )
+        return result
+
+    def record_reminder_delivery(self, claim: DeliveryClaim, outcome: str) -> bool:
+        """Write one claim's outcome; False when that claim no longer exists.
+
+        The write targets exactly the claim's reminder and revision, and only
+        while that claim has no outcome yet. A reminder deleted since, or
+        moved to a new revision, whose claim was cleared, matches nothing: the
+        outcome is dropped and nothing else is touched. No timestamp is part
+        of the identity.
+        """
+        if type(claim) is not DeliveryClaim:
+            raise ValueError(DELIVERY_RECORD_MESSAGE)
+        if not is_delivery_outcome(outcome):
+            raise ValueError(DELIVERY_OUTCOME_MESSAGE)
+        recorded = False
+        failure: str | None = None
+        try:
+            with self._connection(classify_contention=False) as connection:
+                cursor = connection.execute(
+                    """
+                    UPDATE reminders
+                    SET delivery_outcome = ?
+                    WHERE id = ? AND schedule_revision = ?
+                        AND delivery_claimed_at IS NOT NULL
+                        AND delivery_outcome IS NULL
+                    """,
+                    (outcome, claim.reminder_id, claim.schedule_revision),
+                )
+                recorded = cursor.rowcount == 1
+        except sqlite3.Error as exc:
+            failure = _record_failure_reason(exc)
+        if failure is not None:
+            raise self._delivery_failure("record a reminder delivery", failure)
+        if recorded:
+            self.logger.info(
+                "Recorded reminder %s, revision %s, as %s.",
+                claim.reminder_id,
+                claim.schedule_revision,
+                outcome,
+            )
+        else:
+            self.logger.info(
+                "Dropped an outcome for reminder %s: its claim no longer exists.",
+                claim.reminder_id,
+            )
+        return recorded
 
     def _insert_agenda(
         self,
@@ -3829,6 +4427,8 @@ class Memory:
         record_id: int,
         changes: dict[str, str | None],
         operation: str,
+        *,
+        starts_new_revision: bool = False,
     ) -> RecordUpdate:
         """Write new text or timing to one record, consent off first.
 
@@ -3838,6 +4438,15 @@ class Memory:
         so no other connection can enable it in between and a failure rolls
         both back. A record that does not exist changes in neither
         statement.
+
+        ``starts_new_revision`` is a reminder reschedule's rule: in that same
+        second statement, a saved instant different from the stored one
+        raises the scheduling revision by one and clears the three claim
+        columns, while the same instant keeps both. Every right-hand side is
+        evaluated before any assignment, so each ``remind_utc`` it compares is
+        the stored one. A revision that would pass the largest integer turns
+        into a real number, which the column's CHECK refuses, so it can never
+        wrap.
         """
         if not is_record_id(record_id):
             raise ValueError(table.id_message)
@@ -3859,14 +4468,42 @@ class Memory:
                     """,
                     (record_id,),
                 )
-                cursor = connection.execute(
-                    f"""
-                    UPDATE {table.name}
-                    SET {assignments}, updated_at = ?
-                    WHERE id = ?
-                    """,
-                    (*changes.values(), updated_at, record_id),
-                )
+                if starts_new_revision:
+                    new_instant = changes["remind_utc"]
+                    cursor = connection.execute(
+                        """
+                        UPDATE reminders
+                        SET remind_time = ?, remind_utc = ?, updated_at = ?,
+                            schedule_revision = schedule_revision
+                                + (CASE WHEN remind_utc = ? THEN 0 ELSE 1 END),
+                            delivery_claimed_at = CASE WHEN remind_utc = ?
+                                THEN delivery_claimed_at END,
+                            delivery_channel = CASE WHEN remind_utc = ?
+                                THEN delivery_channel END,
+                            delivery_outcome = CASE WHEN remind_utc = ?
+                                THEN delivery_outcome END
+                        WHERE id = ?
+                        """,
+                        (
+                            changes["remind_time"],
+                            new_instant,
+                            updated_at,
+                            new_instant,
+                            new_instant,
+                            new_instant,
+                            new_instant,
+                            record_id,
+                        ),
+                    )
+                else:
+                    cursor = connection.execute(
+                        f"""
+                        UPDATE {table.name}
+                        SET {assignments}, updated_at = ?
+                        WHERE id = ?
+                        """,
+                        (*changes.values(), updated_at, record_id),
+                    )
                 result = RecordUpdate(
                     cursor.rowcount == 1,
                     consent_cursor.rowcount == 1,
@@ -4186,6 +4823,23 @@ class Memory:
             return RuntimeError(_DATABASE_BUSY_MESSAGE)
         return RuntimeError(f"Unable to {operation}.")
 
+    def _delivery_failure(
+        self,
+        operation: str,
+        reason: str,
+    ) -> DeliveryStorageError:
+        """Log one fixed line and return a reminder-delivery call's failure.
+
+        As ``_record_failure``, but the failure is a ``DeliveryStorageError``,
+        so the delivery subsystem can tell a storage failure from any other.
+        Contention keeps the shared busy message; every other failure has
+        the fixed delivery message.
+        """
+        self.logger.error("Failed to %s: %s.", operation, reason)
+        if reason == _RECORD_DATABASE_BUSY:
+            return DeliveryStorageError(_DATABASE_BUSY_MESSAGE)
+        return DeliveryStorageError(DELIVERY_STORAGE_MESSAGE)
+
     def _record_failure(self, operation: str, reason: str) -> RuntimeError:
         """Log one fixed line and return a conversation-record call's failure.
 
@@ -4203,11 +4857,22 @@ class Memory:
         return RuntimeError(f"Unable to {operation}.")
 
     def _connect(self) -> sqlite3.Connection:
-        """Open a SQLite connection with row dictionaries enabled."""
-        connection = sqlite3.connect(
-            self.database_path,
-            timeout=DEFAULT_DATABASE_BUSY_TIMEOUT_SECONDS,
-        )
+        """Open a SQLite connection with row dictionaries enabled.
+
+        An existing-only memory opens the file through a ``mode=rw`` URI, so
+        SQLite refuses a missing database instead of creating it.
+        """
+        if self._existing_only:
+            connection = sqlite3.connect(
+                f"{Path(self.database_path).resolve().as_uri()}?mode=rw",
+                timeout=DEFAULT_DATABASE_BUSY_TIMEOUT_SECONDS,
+                uri=True,
+            )
+        else:
+            connection = sqlite3.connect(
+                self.database_path,
+                timeout=DEFAULT_DATABASE_BUSY_TIMEOUT_SECONDS,
+            )
         connection.row_factory = sqlite3.Row
         return connection
 
@@ -4601,6 +5266,7 @@ class _AgendaTable:
     id_message: str
     approved_function: str
     context_field: str
+    delivery_columns: tuple[str, ...] = ()
 
     @property
     def timing_columns(self) -> tuple[str, ...]:
@@ -4609,7 +5275,11 @@ class _AgendaTable:
 
     @property
     def columns(self) -> str:
-        """Return every column a read settles into a value object."""
+        """Return every column a read settles into a value object.
+
+        A reminder's reads also take its delivery state, so every listing,
+        due query, and read checks it (V1-23-R1); a task has none.
+        """
         return ", ".join(
             (
                 "id",
@@ -4620,6 +5290,7 @@ class _AgendaTable:
                 "updated_at",
                 "completed_at",
                 "context_digest",
+                *self.delivery_columns,
             )
         )
 
@@ -4642,6 +5313,12 @@ _REMINDERS = _AgendaTable(
     id_message=REMINDER_ID_MESSAGE,
     approved_function=_REMINDER_APPROVED_FUNCTION,
     context_field="when",
+    delivery_columns=(
+        "schedule_revision",
+        "delivery_claimed_at",
+        "delivery_channel",
+        "delivery_outcome",
+    ),
 )
 
 # The two stamps a context read hands its Python check after the text and
@@ -4757,7 +5434,10 @@ def _settled_reminders(rows: Sequence[sqlite3.Row]) -> list[Reminder] | None:
 
     As ``_settled_tasks``, and a reminder whose saved instant is not exactly
     the one its saved local time and offset encode is malformed too, even
-    when both are individually well formed.
+    when both are individually well formed. So is one whose scheduling
+    revision is not an integer from 1 up, or whose claim columns are not all
+    NULL or a claim Maria could have written, such as an outcome without a
+    claim or a channel without a stamp (V1-23-R1).
     """
     reminders: list[Reminder] = []
     for row in rows:
@@ -4780,11 +5460,144 @@ def _settled_reminders(rows: Sequence[sqlite3.Row]) -> list[Reminder] | None:
                     row["updated_at"],
                     row["completed_at"],
                     approved is not None and identity == approved,
+                    row["schedule_revision"],
+                    settle_delivery_state(
+                        row["delivery_claimed_at"],
+                        row["delivery_channel"],
+                        row["delivery_outcome"],
+                    ),
                 )
             )
         except ValueError:
             return None
     return reminders
+
+
+# The columns a delivery read hands its registered check, in its parameters'
+# order: the text, the saved time and instant, the two stamps, the
+# completion stamp, and the consent digest.
+_DELIVERABLE_COLUMNS = (
+    "text, remind_time, remind_utc, created_at, updated_at, completed_at, "
+    "context_digest"
+)
+
+# The values a delivery read admits to its check, each with its stored
+# bound. The completion stamp is admitted only as NULL, since only an open
+# reminder is ever claimed, and the digest may be NULL.
+_DELIVERABLE_BOUNDED = (
+    _StoredColumn("text", TASK_TEXT_MAX_BYTES),
+    _StoredColumn("remind_time", REMIND_TIME_MAX_LENGTH),
+    _StoredColumn("remind_utc", UTC_INSTANT_LENGTH),
+    _StoredColumn("created_at", UTC_INSTANT_LENGTH),
+    _StoredColumn("updated_at", UTC_INSTANT_LENGTH),
+    _StoredColumn("context_digest", CONTEXT_DIGEST_LENGTH, nullable=True),
+)
+
+
+def _prepare_deliverable_check(
+    connection: sqlite3.Connection,
+) -> tuple[str, tuple[int, ...]]:
+    """Register the delivery check here; return its SQL guards and bounds.
+
+    The guards admit a row to the check only when its id is positive, every
+    value it receives is typed and within its stored-byte bound in the
+    file's own encoding, the completion stamp is NULL, the revision is an
+    integer of at least 1, and the claim's channel and outcome are NULL. The
+    candidate read and every claim use these same guards, and the read
+    applies them before its limit, so a row whose id Maria never assigns,
+    zero or below, can never take a candidate's place. The bounds are the
+    guards' parameters, in order.
+    """
+    connection.create_function(
+        _DELIVERABLE_REMINDER_FUNCTION,
+        7,
+        _is_deliverable_reminder,
+        deterministic=True,
+    )
+    guards = " AND ".join(
+        (
+            "id >= 1",
+            *(column.guard for column in _DELIVERABLE_BOUNDED),
+            "completed_at IS NULL",
+            "typeof(schedule_revision) = 'integer'",
+            "schedule_revision >= 1",
+            "delivery_channel IS NULL",
+            "delivery_outcome IS NULL",
+        )
+    )
+    bounds = tuple(
+        _stored_bound(connection, column.length) for column in _DELIVERABLE_BOUNDED
+    )
+    return guards, bounds
+
+
+def _is_deliverable_reminder(
+    text: object,
+    remind_time: object,
+    remind_utc: object,
+    created_at: object,
+    updated_at: object,
+    completed_at: object,
+    context_digest: object,
+) -> int:
+    """Answer 1 only for an open reminder row Maria could have written.
+
+    The text must be task text, the saved time and instant must agree, the
+    stamps must follow the record rules for an open reminder, and the
+    consent digest must be NULL or a lowercase SHA-256. A digest that no
+    longer matches the text is allowed: consent and delivery are
+    independent.
+    """
+    return int(
+        is_task_text(text)
+        and timing_agrees(remind_time, remind_utc)
+        and is_lifecycle(STATUS_OPEN, created_at, updated_at, completed_at)
+        and (context_digest is None or is_context_digest(context_digest))
+    )
+
+
+def _settled_candidate(row: sqlite3.Row | None) -> DeliveryCandidate | None:
+    """Return one delivery row as a validated candidate, or None."""
+    if row is None:
+        return None
+    try:
+        return DeliveryCandidate(
+            row["id"],
+            row["text"],
+            row["remind_time"],
+            row["remind_utc"],
+            row["schedule_revision"],
+        )
+    except ValueError:
+        return None
+
+
+def _read_delivery_setting(connection: sqlite3.Connection) -> DeliverySetting:
+    """Read the delivery setting on this connection, by one bounded statement.
+
+    It always returns one row: the setting table's row count, and its
+    enabled value and stamp only when they are typed and bounded. Python
+    then settles what they say.
+    """
+    row = connection.execute(
+        """
+        SELECT (SELECT count(*) FROM reminder_delivery_settings) AS row_count,
+            enabled,
+            changed_at
+        FROM (SELECT 1)
+        LEFT JOIN reminder_delivery_settings
+            ON typeof(id) = 'integer' AND id = 1
+            AND typeof(enabled) = 'integer' AND enabled IN (0, 1)
+            AND typeof(changed_at) = 'text'
+            AND length(CAST(changed_at AS BLOB)) <= ?
+        """,
+        (_stored_bound(connection, UTC_INSTANT_LENGTH),),
+    ).fetchone()
+    return settle_delivery_setting(
+        row["row_count"],
+        row["enabled"],
+        row["changed_at"],
+    )
 
 
 def _settled_audit_summaries(

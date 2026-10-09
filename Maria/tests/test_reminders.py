@@ -130,6 +130,9 @@ class ReminderCreateTests(_ReminderToolTestCase):
                     "delete",
                     "enable_context",
                     "disable_context",
+                    "delivery_status",
+                    "enable_delivery",
+                    "disable_delivery",
                 }
             ),
         )
@@ -147,8 +150,8 @@ class ReminderCreateTests(_ReminderToolTestCase):
             ToolExecutionResult(
                 True,
                 f'Added reminder 1: "call mom", {EVENING_SHOWN}. It does not '
-                "repeat, Maria will not notify you when it is due, and its "
-                "context consent is off.",
+                "repeat, Maria shows it at most once and only while reminder "
+                "delivery is on, and its context consent is off.",
                 {"id": 1},
                 recorded_message="Added reminder 1.",
             ),

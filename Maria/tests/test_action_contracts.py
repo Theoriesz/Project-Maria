@@ -98,6 +98,9 @@ EXPECTED_ACTION_IDENTIFIERS = frozenset(
         "reminders.delete",
         "reminders.enable_context",
         "reminders.disable_context",
+        "reminders.delivery_status",
+        "reminders.enable_delivery",
+        "reminders.disable_delivery",
         "system.overview",
         "system.current_time",
         "tasks.create",
@@ -459,7 +462,7 @@ class RegistryCompletenessTests(unittest.TestCase):
         # V1-20 added four saved-conversation and seven conversation-summary
         # actions to V1-18's twenty-nine, and V1-22 adds eleven task and
         # eleven reminder actions.
-        self.assertEqual(len(EXPECTED_ACTION_IDENTIFIERS), 62)
+        self.assertEqual(len(EXPECTED_ACTION_IDENTIFIERS), 65)
 
     def test_registry_and_loaded_tool_inventory_agree_in_both_directions(self) -> None:
         with TemporaryDirectory() as name:
@@ -497,7 +500,7 @@ class RegistryCompletenessTests(unittest.TestCase):
         ]
 
         self.assertEqual(len(identifiers), len(set(identifiers)))
-        self.assertEqual(len(identifiers), 62)
+        self.assertEqual(len(identifiers), 65)
 
     def test_no_contract_exists_for_a_mandatorily_denied_filesystem_action(
         self,
@@ -775,7 +778,7 @@ class ModelEligibilityClassificationTests(unittest.TestCase):
         )
         self.assertEqual(eligible, EXPECTED_MODEL_ELIGIBLE)
         self.assertEqual(closed, EXPECTED_NOT_MODEL_ELIGIBLE)
-        self.assertEqual((len(eligible), len(closed)), (5, 57))
+        self.assertEqual((len(eligible), len(closed)), (5, 60))
         for identifier, decision in classified.items():
             with self.subTest(action=identifier):
                 self.assertIs(type(decision), ModelEligibility)
@@ -961,7 +964,7 @@ class RegistryConstructionTests(unittest.TestCase):
                 "sample", "run", model_eligibility=NOT_ELIGIBLE
             )
 
-        self.assertEqual(len(BUILT_IN_ACTION_CONTRACTS.action_identifiers), 62)
+        self.assertEqual(len(BUILT_IN_ACTION_CONTRACTS.action_identifiers), 65)
 
     def test_unsupported_declared_type_is_rejected(self) -> None:
         with self.assertRaises(ValueError):
@@ -2472,6 +2475,9 @@ TASK_AND_REMINDER_COMMANDS = (
     "delete reminder 1",
     "enable reminder context 1",
     "disable reminder context 1",
+    "reminder delivery",
+    "enable reminder delivery",
+    "disable reminder delivery",
 )
 
 

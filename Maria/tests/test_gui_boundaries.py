@@ -117,9 +117,19 @@ FORBIDDEN_GUI_NAMES = frozenset(
     }
 )
 
-# The session members the worker may use, and nothing private.
+# The session members the worker may use, and nothing private: the five of
+# V1-21, and exactly the three of the reminder-delivery seam (V1-23-R1).
 SESSION_MEMBERS = frozenset(
-    {"submit", "pending_approval", "confirm", "cancel", "end"}
+    {
+        "submit",
+        "pending_approval",
+        "confirm",
+        "cancel",
+        "end",
+        "delivers_reminders",
+        "claim_due_reminders",
+        "record_reminder_notice",
+    }
 )
 
 

@@ -23,6 +23,7 @@ from gui.session_worker import (
     ACTION_CANCELLED_MESSAGE,
     THREAD_NAME,
     ApprovalOffer,
+    DueReminderNotice,
     Reply,
     SessionEnded,
     SessionWorker,
@@ -387,7 +388,11 @@ class SessionWorkerTests(unittest.TestCase):
 
     def test_no_event_shows_its_text(self) -> None:
         secret = "private-event-text-6f0d2b9a41"
-        for event in (Reply(secret), ApprovalOffer(3, secret)):
+        for event in (
+            Reply(secret),
+            ApprovalOffer(3, secret),
+            DueReminderNotice(4, secret),
+        ):
             with self.subTest(event=type(event).__name__):
                 for shown in (repr(event), str(event), f"{event!r}"):
                     self.assertNotIn(secret, shown)

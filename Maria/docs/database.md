@@ -28,7 +28,8 @@ counter over Maria's schema history rather than a release number:
 | 4 | Adds the per-note `context_digest` consent column to `notes`, off (NULL) for every row. |
 | 5 | Adds the `audit_summaries` and `audit_outcomes` tables, both empty, which hold the audit summaries of approved model-proposed actions. |
 | 6 | Adds the `saved_conversations` and `conversation_summaries` tables, both empty, which hold explicitly saved conversations and owner-approved conversation summaries. |
-| 7 | Adds the `tasks` and `reminders` tables, both empty, which hold the owner's tasks and reminders. This is the current schema. |
+| 7 | Adds the `tasks` and `reminders` tables, both empty, which hold the owner's tasks and reminders. |
+| 8 | Adds each reminder's delivery state, a scheduling revision and three claim columns on `reminders`, and the empty one-row `reminder_delivery_settings` table (V1-23-R1). This is the current schema. |
 
 Versions 1 and 2 are the only shapes that can exist without a marker, because
 every database Maria creates or migrates from this build onwards is stamped.
@@ -321,8 +322,44 @@ schema plus these two statements; a database created new at version 7
 fingerprints exactly as a migrated one does. Neither table refers to the other
 or to any other table, and neither holds a recurrence column, a delivered
 marker, or an index. Adding them changed neither the frozen schemas of
-versions 1 through 6 nor the statements of the earlier steps. No step rewrites
-a row or deletes anything.
+versions 1 through 6 nor the statements of the earlier steps.
+`add_reminder_delivery_state` brings a version 7 database to version 8
+(V1-23-R1), with five statements:
+
+```sql
+ALTER TABLE reminders ADD COLUMN schedule_revision INTEGER NOT NULL DEFAULT 1
+    CHECK (typeof(schedule_revision) = 'integer' AND schedule_revision >= 1);
+ALTER TABLE reminders ADD COLUMN delivery_claimed_at TEXT CHECK (
+    delivery_claimed_at IS NULL
+    OR delivery_claimed_at GLOB
+        '[0-9][0-9][0-9][0-9]-[0-9][0-9]-[0-9][0-9]T[0-9][0-9]:[0-9][0-9]:[0-9][0-9]Z'
+);
+ALTER TABLE reminders ADD COLUMN delivery_channel TEXT CHECK (
+    delivery_channel IS NULL OR delivery_channel IN ('desktop', 'cli', 'gui')
+);
+ALTER TABLE reminders ADD COLUMN delivery_outcome TEXT CHECK (
+    delivery_outcome IS NULL OR delivery_outcome IN ('displayed', 'failed')
+);
+CREATE TABLE reminder_delivery_settings (
+    id INTEGER PRIMARY KEY CHECK (id = 1),
+    enabled INTEGER NOT NULL CHECK (enabled IN (0, 1)),
+    changed_at TEXT NOT NULL CHECK (
+        changed_at GLOB
+            '[0-9][0-9][0-9][0-9]-[0-9][0-9]-[0-9][0-9]T[0-9][0-9]:[0-9][0-9]:[0-9][0-9]Z'
+    )
+);
+```
+
+The revision's default gives every existing reminder its first revision and
+the three claim columns start NULL, meaning not yet claimed, so the step
+rewrites no row; the settings table starts empty, which means delivery is off.
+SQLite records each added column in the table's stored definition, so the
+frozen version 8 schema writes `reminders` with the four columns inline, and a
+database created new at version 8 fingerprints exactly as a migrated one does.
+No foreign key, trigger, index, or cascade is added, `tasks` gains nothing, and
+the frozen schemas of versions 1 through 7 and the earlier steps' statements
+are unchanged. An older build refuses a version 8 database as too new. No step
+rewrites a row or deletes anything.
 
 Every step runs its own frozen historical statements, never the live schema
 statements a new database is created from. The version 2 step therefore creates
@@ -336,8 +373,8 @@ and requires the frozen successor, so no step can drift that way again.
 ### No pre-migration backup
 
 V1-09 writes no backup copy before migrating, and that is a decision rather
-than an omission; V1-15's, V1-16's, V1-18's, V1-20's, and V1-22's steps keep it
-true. Every
+than an omission; V1-15's, V1-16's, V1-18's, V1-20's, V1-22's, and V1-23's
+steps keep it true. Every
 step is additive schema change plus the version stamp, committed in a single
 transaction that SQLite rolls back in full on any failure, so the failure a
 backup would protect
@@ -694,22 +731,46 @@ context consent.
 | status | TEXT NOT NULL, `open` or `completed` | The reminder's status |
 | created_at, updated_at, completed_at | As for a task | |
 | context_digest | TEXT, NULL or exactly 64 characters | The SHA-256 of the compact JSON array `[text, remind_time]` the owner approved, or NULL |
+| schedule_revision | INTEGER NOT NULL DEFAULT 1, an integer of at least 1 | The scheduling revision (V1-23-R1): an identity counter that starts at 1 and rises by one exactly when an approved reschedule stores a different `remind_utc`; it keeps no earlier time |
+| delivery_claimed_at | TEXT, NULL or shaped `YYYY-MM-DDTHH:MM:SSZ` | When the current revision's one claim was committed; NULL while unclaimed |
+| delivery_channel | TEXT, NULL or `desktop`, `cli`, or `gui` | The surface that claimed it |
+| delivery_outcome | TEXT, NULL or `displayed` or `failed` | What became of the claim: displayed, not displayed, or NULL while unconfirmed |
 
 SQL checks only the byte-count non-empty text, the status set, the shapes of
-`due_date` and `remind_utc`, and the digest length. It accepts by design what
-only Maria's rules refuse: text holding a NUL or a control character, text
-over 512 bytes or with outer whitespace, a well-shaped but impossible date
-such as `2026-02-30`, a malformed `remind_time`, and a `remind_utc` that
-disagrees with it. The memory layer applies every rule from
-`core/task_records.py` before writing, before any SQL runs, and settles every
-row into a validated value object after reading, so a row inserted from
-outside Maria that breaks a rule is refused privately on read, a listing
-holding one refusing as a whole, with the fixed record message and nothing
-logged from the row. The timing agreement takes offset arithmetic only and no
-time zone data. A later change to a zone's rules is not a broken row: the
-reminder keeps its saved instant and values, and its tool adds a warning.
-Neither table refers to the other or to any other table, and there is no
-foreign key, trigger, index, recurrence column, or delivered marker.
+`due_date` and `remind_utc`, the digest length, and, from version 8, the
+revision's type and floor and the shapes and sets of the three claim columns.
+It accepts by design what only Maria's rules refuse: text holding a NUL or a
+control character, text over 512 bytes or with outer whitespace, a
+well-shaped but impossible date such as `2026-02-30`, a malformed
+`remind_time`, a `remind_utc` that disagrees with it, and claim columns that
+do not make one claim, such as an outcome without a claim stamp or a channel
+without one. The memory layer applies every rule from `core/task_records.py`
+before writing, before any SQL runs, and settles every row into a validated
+value object after reading, so a row inserted from outside Maria that breaks
+a rule is refused privately on read, a listing holding one refusing as a
+whole, with the fixed record message and nothing logged from the row. The
+timing agreement takes offset arithmetic only and no time zone data. A later
+change to a zone's rules is not a broken row: the reminder keeps its saved
+instant and values, and its tool adds a warning. Neither table refers to the
+other or to any other table, and there is no foreign key, trigger, index, or
+recurrence column; a reminder's delivery state is its own four columns, and
+`tasks` has none.
+
+### reminder_delivery_settings
+
+Holds at most one row, the reminder delivery setting (V1-23-R1, decision D6-B).
+No row means delivery was never turned on, so it is off.
+
+| Column | Type and constraints | Purpose |
+| --- | --- | --- |
+| id | INTEGER PRIMARY KEY, exactly 1 | The one row |
+| enabled | INTEGER NOT NULL, 0 or 1 | Whether delivery is on |
+| changed_at | TEXT NOT NULL, shaped `YYYY-MM-DDTHH:MM:SSZ` | When the setting last changed |
+
+A row Maria could not have written, such as a `changed_at` stored as a BLOB or
+as a stamp followed by NUL and more, reads as unreadable, which leaves delivery
+off; `reminder delivery` then says the setting could not be read, and turning
+delivery on or off writes a readable row over it.
 
 ## Interaction Retrieval
 
@@ -1213,6 +1274,93 @@ date, time, zone, offset, instant, or digest is ever logged. The two tools,
 those `Memory` methods, and AUTOINCREMENT keeps a deleted id from being
 reused.
 
+## Reminder Delivery State
+
+Version 8 (V1-23-R1) keeps each reminder's delivery state in its own row and
+the delivery setting in `reminder_delivery_settings`. Neither is a record type
+of its own. The reminder-delivery subsystem reaches both only through the
+`Memory` methods below, and a claim and an outcome are its only writes: each
+targets one reminder row by its identity, the reminder id and its scheduling
+revision, and neither is a tool action. Turning delivery on or off is the
+confirmed `reminders` action that calls `set_reminder_delivery`.
+
+- `delivery_state()` is the closed-app pass's read-only readiness check. The
+  database must be stamped exactly `DATABASE_SCHEMA_VERSION` and match its
+  frozen structure, by the structure check initialization runs; nothing is
+  created, migrated, or written, and anything else raises. It then returns
+  the setting.
+- `reminder_delivery_setting()` reads the setting in one bounded statement:
+  the table's row count, and the enabled value and stamp only when they are
+  typed and within their stored-byte bounds. No row is never set, one
+  well-formed row is on or off since its stamp, and anything else is
+  unreadable. Only one well-formed row saying on lets anything be claimed.
+- `set_reminder_delivery(enabled)` reads the setting under `BEGIN IMMEDIATE`
+  and writes the one row only when it does not already say exactly this, so
+  turning delivery on twice keeps the first time, and an unreadable row is
+  replaced.
+- `reminder_delivery_candidates(as_of, limit)` returns at most six open
+  reminders saved at or before `as_of` with no claim for their current
+  revision, by saved instant, then id. The id must be positive: SQLite stores
+  an explicit `INTEGER PRIMARY KEY` of zero or below as written, and Maria
+  never assigns one. As for a Tier A read, every value the registered
+  deterministic check receives is first required, inside SQLite, to be text
+  within its stored-byte bound in the file's own encoding: the text within 512
+  bytes, `remind_time` within 91, `remind_utc` and both stamps within 20, and
+  the digest NULL or within 64, doubled in a UTF-16 file; the completion stamp
+  must be NULL, the revision an integer of at least 1, and the channel and
+  outcome NULL. The check then admits only valid text, agreeing timing, stamps
+  that follow the record rules for an open reminder, and a NULL or well-formed
+  digest; a digest that no longer matches the text is allowed, since consent
+  and delivery are independent. All of these gates apply before the limit, so
+  a row that fails any of them never takes a place among the six. Only the id,
+  text, saved time and instant, and revision come back, settled again in
+  Python, and a row that fails anywhere is skipped and never counted, so an
+  oversized or binary value never reaches Python.
+- `claim_reminder_delivery(candidate, channel, claimed_at, as_of)` is one write
+  transaction. `BEGIN IMMEDIATE` takes the write lock before anything is read.
+  The setting must say on, or the result is `DISABLED`. The reminder's current
+  row must then pass the same gates and check, still have no claim, hold
+  exactly the candidate's text, saved time and instant, and revision, and be
+  due at `as_of`, or the result is `CHANGED`. Neither writes anything. Only
+  then are `delivery_claimed_at` and `delivery_channel` written, for exactly
+  that id and revision, and committed before `CLAIMED` returns with the
+  claim's identity. A different `updated_at` or consent digest alone changes
+  nothing, and a change made and undone before the claim is not detected.
+- `record_reminder_delivery(claim, outcome)` writes `displayed` or `failed` for
+  exactly the claim's id and revision, only while that claim has no outcome,
+  and returns whether it did. A reminder deleted since, or moved to a new
+  revision, whose claim was cleared, matches nothing, and the outcome is
+  dropped; no timestamp is part of the identity, so a stale outcome never lands
+  on a newer claim, even one stamped in the same second.
+- `reminder_delivery_counts()` counts the current claims as displayed,
+  unconfirmed, and not displayed, reading only the three claim columns, each
+  typed and bounded in SQLite and settled again in Python; a claim Maria could
+  not have written is not counted.
+
+`reschedule_reminder` writes the new saved time and, in the same statement,
+raises the revision by one and clears the three claim columns exactly when the
+new saved instant differs from the stored one; every right-hand side reads the
+stored `remind_utc`. A reschedule to the same instant, even written as another
+local time and offset, keeps both, and so do an edit, completion, reopening,
+both consent changes, and turning delivery on or off. A revision at the
+largest integer SQLite stores cannot advance: the sum becomes a real number,
+which the column's check refuses, and the whole reschedule rolls back.
+Deleting a reminder deletes its delivery state with its row. Every reminder
+read now settles the four delivery columns too, so a listing, due query, or
+reading refuses a row whose delivery state Maria could not have written, as
+for any other malformed field; the Tier A context reads leave them unread.
+
+The pass's memory layer is built with `existing_only`, which opens every
+connection through a `mode=rw` URI, so a missing database stays missing rather
+than being created. Every storage failure of these methods is a
+`DeliveryStorageError`, a `RuntimeError`, carrying the shared busy message for
+contention and `Unable to read or write reminder delivery.` otherwise, raised
+after its handler has ended so it has no cause or context; the log receives
+one fixed line naming the operation and a fixed reason, and a success logs
+only ids, revisions, channels, and outcomes. An argument Maria never passes,
+such as an unknown channel or outcome, raises `ValueError` with a fixed message
+before anything is read.
+
 ## Data Considerations
 
 Interaction history, notes, explicit memories, audit summaries, saved
@@ -1256,9 +1404,17 @@ layer contains no network-transmission path, and the shipped runtime does not
 itself upload this history. Configured network-mounted or synchronized storage
 and operating-system backup or sync services remain outside Maria's boundary.
 
+A reminder's delivery state and the delivery setting are not record types of
+their own: the state is part of its reminder's row and goes with it, and the
+setting is one row. Neither holds text, neither is ever read for context or
+sent to a model, and neither has a reset or bulk operation.
+
 The configured operational log (`logs/maria.log` by default) is separate from
-SQLite interaction history. The log records application events, warnings, and
-failures; the `interactions` table records request and response text. Omitting
+SQLite interaction history, and so is the closed-app reminder pass's own
+`delivery.log` beside it, which names reminder ids, channels, outcomes, and
+fixed phrases only and which Maria never reads. The log records application
+events, warnings, and failures; the `interactions` table records request and
+response text. Omitting
 full content from an operational log entry does not mean the content is absent
 from an interaction row. In the other direction, deleting an audit summary
 removes nothing from the log, which may still show that a model-proposed
@@ -1326,9 +1482,10 @@ rollback and closing, success logging, recognised uniqueness conflicts, and
 owner-visible messages are unchanged. The audit methods
 (`record_audit_summary`, `record_audit_outcome`, `list_audit_summaries`,
 `get_audit_summary`, and `delete_audit_summary`), every saved-conversation
-and conversation-summary method, and every task and reminder method follow the
-same rule, as described under "Audit Summaries", "Saved Conversations and
-Conversation Summaries", and "Tasks and Reminders" above.
+and conversation-summary method, every task and reminder method, and every
+reminder-delivery method follow the same rule, as described under "Audit
+Summaries", "Saved Conversations and Conversation Summaries", "Tasks and
+Reminders", and "Reminder Delivery State" above.
 
 Busy/locked contention is still converted as described above, and outside the
 audit, conversation-record, and task and reminder methods that conversion
@@ -1353,3 +1510,6 @@ vocabulary they, the memory layer, and the conversation module share, and
 executes no SQL. `tools/tasks.py` and `tools/reminders.py` reach theirs only
 through `Memory`'s task and reminder methods, and `core/task_records.py`
 holds the vocabulary they and the memory layer share, and executes no SQL.
+The reminder-delivery subsystem reaches delivery state only through `Memory`'s
+delivery methods: `core/reminder_delivery.py` receives the memory layer as its
+store and executes no SQL, and `deliver_reminders.py` builds that store.

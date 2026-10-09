@@ -26,6 +26,7 @@ from core.reasoning import (
     ReasoningTransport,
 )
 from core.session import MariaSession
+from core.task_records import DeliverySetting, DeliverySettingState
 from tests.gui_fakes import window_module, without_qt
 
 
@@ -73,6 +74,22 @@ MOVE_PLAN = Plan(
 )
 
 
+def _runtime_brain_double() -> Mock:
+    """Return a spec-limited Brain double for the runtime composition path.
+
+    Without an injected Brain factory, the runtime composition builds the
+    reminder-delivery seam from the started Brain's memory (V1-23-R1). This
+    double's memory says delivery was never set, so each check reads the
+    setting and returns, claiming and showing nothing.
+    """
+    brain = Mock(spec=main_module.MariaBrain)
+    brain.memory = Mock()
+    brain.memory.reminder_delivery_setting.return_value = DeliverySetting(
+        DeliverySettingState.NEVER_SET
+    )
+    return brain
+
+
 class MainCliTests(unittest.TestCase):
     """Exercise CLI behavior using only injected and mocked Brain objects."""
 
@@ -93,7 +110,7 @@ class MainCliTests(unittest.TestCase):
         self.assertEqual(stderr, "")
 
     def test_none_factory_uses_from_defaults_exactly_once(self) -> None:
-        brain = Mock(spec=main_module.MariaBrain)
+        brain = _runtime_brain_double()
         stdout = StringIO()
         stderr = StringIO()
 
@@ -267,7 +284,7 @@ class MainCliTests(unittest.TestCase):
         self.assertNotIn("ValueError", stderr.getvalue())
 
     def test_module_entrypoint_converts_normal_exit_to_exit_zero(self) -> None:
-        brain = Mock(spec=main_module.MariaBrain)
+        brain = _runtime_brain_double()
         factory = Mock(return_value=brain)
         stdout = StringIO()
         stderr = StringIO()
@@ -1032,7 +1049,7 @@ class GuiStartupTests(unittest.TestCase):
     def test_the_default_gui_startup_uses_the_runtime_composition(
         self,
     ) -> None:
-        brain = Mock(spec=main_module.MariaBrain)
+        brain = _runtime_brain_double()
         with patch.object(
             main_module.MariaBrain,
             "from_defaults",
