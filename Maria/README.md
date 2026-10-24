@@ -80,7 +80,14 @@ command line exactly as before. The window is deliberately simple:
 - a short status line: `Ready`, `Working...`, `Waiting for your approval`, or
   a closing message;
 - while an action waits for approval, the complete approval text Maria
-  produced, with Approve and Cancel.
+  produced, with Approve and Cancel;
+- a project selector: a list naming each project as `<id>: <name>`, with
+  ` (active)` on the active one, or `No projects`, and Activate and
+  Deactivate buttons. They work only while the window is ready and never take
+  keyboard focus. Activate types `activate project <id>` for the project
+  chosen, which still asks for your approval, and Deactivate types
+  `deactivate project`, exactly as on the command line. The list is refreshed
+  when the window opens and after each reply; see "Projects".
 
 The window follows the command line's rules. Blank input is ignored, and
 `exit`, `quit`, or `q` closes the window. A request holding a line break is
@@ -189,6 +196,22 @@ disable reminder context 1
 reminder delivery
 enable reminder delivery
 disable reminder delivery
+projects
+create project Garden: workspace/garden
+create project Self review: project_maria
+read project 1
+retitle project 1: Garden plans
+delete project 1
+activate project 1
+deactivate project
+project facts 1
+add project fact 1: The beds are raised.
+edit project fact 1: The beds are raised and mulched.
+delete project fact 1
+project files
+project files notes
+read project file plan.md
+read project file plan.md lines 1-40
 system
 time
 history
@@ -212,9 +235,11 @@ summary lifecycle commands `edit summary <id>: <new text>` and
 `delete summary <id>`, the two summary context consent commands
 `enable summary context <id>` and `disable summary context <id>`, `add task`,
 `add reminder`, for tasks and reminders alike the `edit`, `reschedule`,
-`delete`, `enable ... context`, and `disable ... context` commands, and
-`enable reminder delivery` and `disable reminder delivery` require explicit
-confirmation. `delete interaction <id>` targets at most one
+`delete`, `enable ... context`, and `disable ... context` commands,
+`enable reminder delivery` and `disable reminder delivery`, and the six
+project commands `retitle project`, `delete project`, `activate project`,
+`add project fact`, `edit project fact`, and `delete project fact` require
+explicit confirmation; see "Projects". `delete interaction <id>` targets at most one
 interaction row by ID and removes it when found; it never cascades to notes or
 memories. Each note
 lifecycle command likewise targets at most one note by positive whole-number ID
@@ -234,7 +259,9 @@ that require confirmation, plus `read interaction <id>`, `read audit <id>`,
 1 to 9223372036854775807, the largest integer SQLite stores, with any number of
 leading zeroes; each answers a larger number with its invalid-ID reply before
 anything is planned or confirmed. `read note <id or exact title>` uses its
-separate, unchanged lookup path.
+separate, unchanged lookup path. Every project and fact id follows the same
+rule, answering anything else with `Project id must be a positive whole
+number.` or `Fact id must be a positive whole number.`
 Retitling and editing are deliberately separate commands, so neither can
 overwrite the other's field. Filesystem delete functionality remains
 intentionally unimplemented.
@@ -555,6 +582,193 @@ model. `delivery.log` is best effort: passes running at the same time can
 interleave or lose lines in it, and the database stays the record of what was
 delivered.
 
+## Projects
+
+A project names a place Maria may read for you, read-only: one folder of your
+workspace root, the whole workspace, or Project Maria, Maria's own source and
+documentation. One project at most is active, and only you change which: only
+the active project's facts and files can reach your local model, and only as
+described here. Every project command works without a language model, in the
+command line and the desktop window.
+
+### Creating and activating
+
+`create project <name>: workspace/<folder>` names a folder of your workspace
+root, `create project <name>: workspace` the workspace's top, and
+`create project <name>: project_maria` Maria's own repository. Maria first
+checks that a workspace folder is there and readable, by the rules under
+"Project files", and keeps its spelling on disk. A name is 1 to 64 UTF-8
+bytes on one line with no colon. Two projects never share or nest a location,
+compared ignoring case, so at most one Project Maria exists. A new project is
+never active, and a project cannot be moved: delete it and create it again.
+
+`activate project <id>`, or the window's Activate button, asks for your
+approval. The approval shows the project's quoted name, its location, its
+number of facts, the project it replaces, if any, and this notice:
+
+```text
+While a project is active, each of its facts may be sent to your local reasoning model on every conversational turn, within Maria's memory context limits, and Maria can read the project's files when you ask with project commands or @ references; she reads none on her own. The project stays active, also after Maria restarts, until you deactivate it or activate another project.
+```
+
+`deactivate project` needs no approval, because it only narrows what can
+reach your model. `projects` lists at most 50 projects by id, the active one
+marked ` (active)`, and `read project <id>` shows one. `retitle project` and
+`delete project` ask for approval; a project is deleted only when it is not
+active and has no facts left, and nothing else is ever deleted with it.
+
+Maria never activates a project on her own: not when a database is created or
+migrated, not when either interface starts, not in the closed-app reminder
+pass, and never from a model's proposal, since no project command is one a
+model may propose. If the stored setting is ever in a state Maria could not
+have written, she says `The active project setting could not be read, so no
+project is active.`, treats no project as active, and your next
+`activate project` or `deactivate project` replaces it.
+
+### Project facts
+
+A fact is one line of at most 512 UTF-8 bytes that you approve word for word.
+`add project fact <project id>: <text>`, `edit project fact <fact id>: <new
+text>`, and `delete project fact <fact id>` ask for approval and show the
+quoted text; an edit applies only while the fact is still the text you were
+shown. `project facts <project id>` lists at most 50.
+
+While its project is active, each fact may be sent to your local model on
+every conversational turn, after your enabled memories and before enabled
+tasks and reminders, within the same limits of 16 items and 2 KiB, by fact id
+and whole. A fact is sent only while its stored project and text still match
+the digest of your approval. Facts of every other project are never sent, and
+neither are project names or locations. Maria names what she sent below the
+reply, separately from the model's words:
+
+```text
+Active project: project 1.
+Project facts supplied: project fact 2, project fact 5. Maria cannot verify whether these facts are still current.
+```
+
+With facts present, Maria's fixed framing also asks the model to say plainly
+when it would recommend a different approach, and why, instead of simply
+agreeing. Editing or deleting a fact that was sent, deactivating, or switching
+projects clears the session's earlier conversation before anything else is
+sent, with a fixed notice. Maria does not check a fact for secrets, and the
+digest only notices changes made outside Maria's commands: anyone who can
+rewrite the database can recompute it.
+
+### Project files
+
+`project files [<folder>]` lists one folder of the active project: its
+folders and the files Maria may read, with their size as Windows lists it,
+at most 200 entries from the first 2,000 she examines. `read project file
+<path>` shows one file of the active project, and `read project file <path>
+lines <from>-<to>` part of it, under a header naming the project, the path,
+the lines, the size, and the first 16 digits of the file's SHA-256:
+
+```text
+Project 1 file plan.md, lines 1-3 of 3, 31 bytes, SHA-256 1c8f0a3e5b7d2946:
+```
+
+Paths are relative to the project's folder, written with `/`. Maria reads,
+never writes: there is no command to write, rename, move, or delete a project
+file. Reading is bounded and careful:
+
+- In a workspace project, Maria reads only files of these types: `.md`,
+  `.txt`, `.rst`, `.py`, `.toml`, `.ini`, `.cfg`, `.json`, `.yaml`, `.yml`,
+  `.xml`, `.html`, `.htm`, `.css`, `.js`, `.ts`, `.tsx`, `.jsx`, `.sql`, and
+  `.csv`, and files named `LICENSE` or `README`. No name may start with `.`.
+- A file is read whole and only if it is at most 512 KiB of UTF-8 text with no
+  NUL; at most 128 KiB is shown at once, so a longer file needs a line range.
+- A junction or other link anywhere on the path, a file with more than one
+  hard link, and a file Windows marks as not stored on this computer, such as
+  a cloud placeholder, are refused before any of the file is read. A file
+  another program has open for changes is refused, and a file that changes
+  while Maria reads it is not shown. While she reads, the file and every
+  folder from the root down to it cannot be renamed or deleted, and the file
+  cannot be written; the folders above the root are not held.
+- Maria's database, logs, private configuration, backups, and system prompt
+  stay unreachable wherever they are configured.
+- Project folders under cloud synchronization are not supported, and you
+  should not create projects in them. Maria cannot detect them: a file without
+  those markings is read as an ordinary file, whoever manages it, and Maria
+  does not promise that a read can never start a cloud download.
+- Project file reading works only on Windows. Elsewhere every file command
+  says `Project file reading is not available on this computer.`
+
+A refusal never tells an absent file from a protected one. If Maria ever
+cannot confirm that a setting she changes for each read was put back, she
+withholds that read and reads no project file again until she restarts:
+`Project file reading is not available until Maria restarts.`
+
+### Naming files in a request
+
+With reasoning enabled and a project active, a request to your local model
+may name up to three of that project's files: `@<path>` sends the whole file,
+and `@<path>:<from>-<to>` those lines:
+
+```text
+Review @docs/plan.md:1-60 against @notes/budget.md
+```
+
+`@@` writes a literal `@`, and a lone `@` or an address such as
+`me@example.com` is ordinary text; while no project is active, `@` is always
+ordinary text. A malformed reference, a fourth file, a part over 16 KiB, all
+parts together with Maria's framing over 32 KiB, a request over your
+configured input limit, and a file that cannot be read each refuse the whole
+request, with a fixed reason, before anything is sent. Maria reads each named
+file once, after the request's own reading of the active project, and names
+every part she sent:
+
+```text
+Project file parts supplied: project 1 file docs/plan.md lines 1-60 (SHA-256 1c8f0a3e5b7d2946). They were read when you asked, are not kept in this conversation, and this reply could not propose any action.
+```
+
+Such a request carries no earlier exchange and no invitation to propose an
+action. Its reply is only text, even when it is shaped like a proposal, and
+nothing of the request or the reply is kept in the conversation or recorded.
+Text inside a project file is data: it cannot create a plan, grant authority,
+or change a permission.
+
+Immediately before a request carrying a fact or a file part is sent, Maria
+reads the active project setting once more. If it changed after the request
+began, nothing is sent:
+
+```text
+Maria did not send this request to your local reasoning model: the active project changed while Maria prepared it. Nothing was sent.
+```
+
+A change after that last check does not stop the request, which is sent with
+the facts and parts it was prepared with and names that project; the change
+applies from your next request, and a request once sent cannot be recalled. A
+fact edited after a request began does not stop it either: the request
+carries the text it read.
+
+### Project Maria
+
+With Project Maria active, Maria can read, read-only, the source and
+documentation files on her approved list in `core/project_maria_manifest.py`,
+to explain her code, review her architecture, documentation, and tests,
+analyse bugs, and plan work with you. The list is fixed in the code, compared
+ignoring letter case, and never read from Git: a file not on it is never read
+or listed, tracked or not. Activating it shows one more paragraph:
+
+```text
+This is Project Maria: Maria can then read, read-only, the source and documentation files on her approved list. Her database, logs, private configuration, and backups stay excluded, and files not on the list stay unreadable.
+```
+
+Project Maria uses the `project_maria` root's configured path, which stays
+disabled for the generic file commands, so `rename`, `move`, and every other
+generic file command still refuse its paths, and write and delete stay
+refused everywhere. Maria's own source is untrusted input like any other
+project file, and nothing she reads there can change what she may do.
+
+### Privacy
+
+Logs name project and fact ids and counts only, never a name, location,
+path, fact, or file text. A project command's reply is recorded in your
+interaction history as a fixed line naming ids only, while its request keeps
+the command as you typed it, names, facts, and paths included, as for notes;
+`delete interaction <id>` removes it. File text is never recorded or kept.
+If Maria is stopped in the middle of a read, a file handle she held may stay
+open until her process ends.
+
 ## Filesystem Access
 
 Maria reads, lists, renames, and moves files only inside named filesystem roots
@@ -799,7 +1013,8 @@ of them and at most 2 KiB of context including Maria's framing and the IDs.
 Your current request and Maria's fixed proposal instructions always come
 first, then as much memory context as fits, then as many earlier turns as fit.
 Open tasks and reminders you enable follow the memories within the same
-limits; see "Tasks and Reminders".
+limits; see "Tasks and Reminders". The active project's facts come between
+the memories and them; see "Projects".
 Your approval covers the memory's text as
 it was when Maria asked: if that memory changes before you confirm, even from
 another Maria window, nothing is enabled and Maria asks you to request
@@ -1297,9 +1512,9 @@ that returned content into interaction history.
 
 Interaction history, notes, facts deliberately saved with `remember`, the
 audit summaries of approved model-proposed actions, saved conversations,
-conversation summaries, tasks, and reminders are eight separate record types
-in the same SQLite database, although the same text can appear in more than
-one table. The
+conversation summaries, tasks, reminders, projects, and project facts are ten
+separate record types in the same SQLite database, although the same text can
+appear in more than one table. The
 configured operational log (`logs/maria.log` by default) is a separate store
 for application events,
 warnings, and failures rather than the interaction store. Avoiding full content
@@ -1438,17 +1653,36 @@ its own operational log, `logs/delivery.log` by default, bounded like
 `maria.log` and holding ids, outcomes, and fixed phrases only; Maria never
 reads it.
 
+Projects and project facts are kept until you delete them, with no automatic
+retention period or pruning. A project holds its name and location, and a fact
+its text and the digest of your approval; the one activation setting row holds
+only which project is active, a change counter, and when it last changed.
+Listings and readings are recorded as the command you typed and a fixed reply
+such as `Listed projects.` or `Displayed a project file.`, never what was
+shown; as for a note edit, the command you typed keeps its name, fact text, or
+path in the request half. File text is never recorded, kept, or logged, and a
+request naming files with `@` is not recorded at all. `delete project <id>`
+and `delete project fact <id>` each remove at most one row by ID, after
+mandatory confirmation, cascade into no other record, and never reuse a
+deleted ID; a project with facts, or the active one, is not deleted. There is
+no bulk, wildcard, clear-all, or automatic deletion, no undo or recovery, and
+Maria promises no secure erasure. The operational log names projects and facts
+only by ID.
+
 Maria's shipped runtime has no cloud integration and does not itself transmit
 this history. Its only network-capable code is the local Ollama adapter
 described under "Local Ollama Adapter": it can reach only `127.0.0.1:11434` on
 the same machine, it is disabled by default, and when enabled it receives only
 Maria's fixed instructions, the current session's conversation, the explicit
-memories and the open tasks and reminders you have enabled for context, notes
-and conversation summaries you have enabled for context that contain a word of
-the request, and, when you ask for a summary, the session's exchanges with
-Maria's fixed summary request; it never receives stored history, a saved
-conversation, an audit summary, a memory, note, summary, task, or reminder you
-have not enabled, files, or the result of an action it proposed.
+memories and the open tasks and reminders you have enabled for context, the
+facts of the project you activated, notes and conversation summaries you have
+enabled for context that contain a word of the request, the parts of the
+active project's files you name with `@` in that request, and, when you ask
+for a summary, the session's exchanges with Maria's fixed summary request; it
+never receives stored history, a saved conversation, an audit summary, a
+memory, note, summary, task, or reminder you have not enabled, the facts of
+any other project, a project's name or location, any other file, or the result
+of an action it proposed.
 
 `enable memory context <id>` and `disable memory context <id>` change one
 memory's consent flag, `enable note context <id>` and `disable note context
@@ -1473,7 +1707,8 @@ displayed: it is held in the window while it is open, never saved by the
 window, never sent back to Maria as conversation, and gone when the window
 closes, and a new window starts empty apart from its banner. Display history
 is never populated automatically from stored records, except that due-reminder
-notices appear as plain text while reminder delivery is on. Explicit
+notices appear as plain text while reminder delivery is on; the project
+selector, outside the conversation area, lists project ids and names. Explicit
 record-reading commands still display their results. The window title never
 shows a request or a reply, the window keeps no recent-item list, and Maria
 shows no crash dialog. Anything you copy elsewhere, or an operating system's
@@ -1523,14 +1758,24 @@ no test shows a real message box, and none registers, runs, ends, or deletes a
 Task Scheduler task. Every clock the delivery code reads in them is injected,
 and none of them sleeps. Passing tests are not a check of the real box or the real task.
 
+Project file tests read through a stand-in for the Windows file functions,
+which can make each call fail in turn, and the few that make real Windows
+calls do so only on folders they create in a temporary directory: junctions,
+hard links, share modes, and short names there, with symbolic-link tests
+skipped when the account cannot create one and every real test skipped off
+Windows, each with its reason. The tests of Project Maria's approved list that
+look at files run only in a copy of the repository without its Git data,
+database, logs, or private configuration, and skip in a checkout.
+
 ## Project Layout
 
 - `core/`: application coordination, planning, memory, permissions, logging,
   configuration, constants, the local reasoning interface and adapter, the
   compiler that checks model proposals, the audit-summary, conversation-record,
   and task vocabularies, the four task and reminder request forms, date and
-  time resolution, and reminder delivery's claim protocol, Windows message box,
-  and runtime paths
+  time resolution, reminder delivery's claim protocol, Windows message box,
+  and runtime paths, and the project vocabulary, project file reader, its
+  Windows file functions, and Project Maria's approved list
 - `main.py`: the entry point for the command line and the desktop window
 - `deliver_reminders.py`: the closed-app reminder pass, started only by the
   Windows task you install
@@ -1552,3 +1797,6 @@ and none of them sleeps. Passing tests are not a check of the real box or the re
 
 Maria intentionally excludes internet search, browser automation, voice,
 text-to-speech, autonomous agents, multi-user support, and plugin marketplaces.
+She also writes, renames, and moves no project file, searches or indexes no
+project, runs no program of any kind, Git included, never activates a project
+on her own, and does not support project folders under cloud synchronization.

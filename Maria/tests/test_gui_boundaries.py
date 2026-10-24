@@ -129,6 +129,8 @@ SESSION_MEMBERS = frozenset(
         "delivers_reminders",
         "claim_due_reminders",
         "record_reminder_notice",
+        # V1-24-R1's one read-only member, for the project selector.
+        "project_choices",
     }
 )
 

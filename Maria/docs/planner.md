@@ -17,6 +17,7 @@ Supported command families:
 - Audit-summary commands
 - Saved-conversation and conversation-summary commands
 - Task and reminder commands
+- Project, project fact, and project file commands
 - Read-only system information commands
 
 Input that matches no command receives the planner's generic no-action
@@ -740,6 +741,74 @@ twenty-nine commands after the conversation-record commands and before
 Only `tasks.create` and `reminders.create` are model-eligible, and only for a
 request in one of the four natural-language forms that Maria's own parse
 reads; see "Model-to-Plan Compilation Gate" in `docs/architecture.md`.
+
+## Project Grammar
+
+The thirteen project commands of V1-24-R1 use strict command syntax, and
+their keywords are ASCII case-insensitive; see "Projects Tool" in
+`docs/tools.md` and "Projects and Project Files" in `docs/architecture.md`.
+The planner matches them before the task and reminder commands, the fact
+commands before the project commands, and `read project file` before
+`read project`, so a longer command is never taken for a shorter one. Each
+creates one step:
+
+| Command | Tool and action | Arguments |
+| --- | --- | --- |
+| `projects` | `projects.list` | `{}` |
+| `create project <name>: <location>` | `projects.create` | `{"name": name, "location": location}` |
+| `read`, `delete`, `activate project <id>` | `projects.read`, `.delete`, `.activate` | `{"id": id}` |
+| `retitle project <id>: <new name>` | `projects.retitle` | `{"id": id, "name": new_name}` |
+| `deactivate project` | `projects.deactivate` | `{}` |
+| `project facts <project id>` | `projects.list_facts` | `{"id": project_id}` |
+| `add project fact <project id>: <text>` | `projects.add_fact` | `{"id": project_id, "text": text}` |
+| `edit project fact <fact id>: <new text>` | `projects.edit_fact` | `{"id": fact_id, "text": new_text}` |
+| `delete project fact <fact id>` | `projects.delete_fact` | `{"id": fact_id}` |
+| `project files` / `project files <folder>` | `projects.list_files` | `{}` / `{"folder": folder}` |
+| `read project file <path>` | `projects.read_file` | `{"path": path}` |
+| `read project file <path> lines <from>-<to>` | `projects.read_file` | `{"path": path, "start": from, "end": to}` |
+
+`projects`, `deactivate project`, and `project files` match only the whole
+request, in any letter case and with outer whitespace ignored. `create
+project` splits its operand at the first colon, each side stripped and
+non-empty, so a name never holds a colon; `retitle project`, `add project
+fact`, and `edit project fact` split at the first colon too, and their text
+must be non-empty. In `read project file`, a final ` lines <word>` after a
+non-empty path is always the range, which must be `<from>-<to>` with each
+number from 1 to 999,999 and `<from>` no greater than `<to>`, or the range
+message is the answer. Every `<id>` takes the shared ID parser, so an invalid
+one returns `Project id must be a positive whole number.` or `Fact id must be
+a positive whole number.`, and a request that is only a command's words, or
+whose operand is malformed, returns that command's fixed usage line rather
+than reaching the model. The planner checks only that shape: names, locations,
+fact text, and paths are checked by the tool and the project file reader.
+`list projects` keeps its meaning as a `filesystem.list` step.
+
+`retitle project`, `delete project`, `activate project`, `add project fact`,
+`edit project fact`, and `delete project fact` always require confirmation;
+the other seven run without asking. None of the thirteen is open to the
+reasoning model. `help` lists them after the reminder-delivery commands and
+before `system`, with one more line on `@` references, fourteen lines in all:
+
+```text
+- projects
+- create project <name>: workspace/<folder> or project_maria
+- read project <id>
+- retitle project <id>: <new name>
+- delete project <id>
+- activate project <id>
+- deactivate project
+- project facts <project id>
+- add project fact <project id>: <text>
+- edit project fact <fact id>: <new text>
+- delete project fact <fact id>
+- project files [<folder>]
+- read project file <path> [lines <from>-<to>]
+- @<path> or @<path>:<from>-<to> in a question names an active project's file
+```
+
+An `@` reference is not planner grammar: a request holding one reaches the
+generic fallback like any other unsupported text, and Brain settles its
+references against the active project only on the model path.
 
 ## Plan Shape
 

@@ -114,6 +114,22 @@ DISABLE_REMINDER_DELIVERY_NOTICE = (
     "may still appear and be recorded, and a message box already on screen "
     "stays until you close it."
 )
+# V1-24-R1's three project notices, pinned word for word as approved.
+ACTIVATE_PROJECT_NOTICE = (
+    "While a project is active, each of its facts may be sent to your local "
+    "reasoning model on every conversational turn, within Maria's memory "
+    "context limits, and Maria can read the project's files when you ask with "
+    "project commands or @ references; she reads none on her own. The project "
+    "stays active, also after Maria restarts, until you deactivate it or "
+    "activate another project."
+)
+PROJECT_FACT_NOTICE = (
+    "While its project is active, this fact may be sent to your local "
+    "reasoning model on every conversational turn, within Maria's memory "
+    "context limits, so it is not always sent. Maria does not check the fact "
+    "for passwords or other secrets, and approving it does not mean it "
+    "contains none."
+)
 
 
 class PermissionManagerTests(unittest.TestCase):
@@ -449,10 +465,18 @@ class PermissionManagerTests(unittest.TestCase):
                     # confirmed, each with its fixed notice.
                     "reminders.enable_delivery",
                     "reminders.disable_delivery",
+                    # V1-24-R1: every change that renames, deletes, or
+                    # activates a project, or adds, edits, or deletes a fact.
+                    "projects.retitle",
+                    "projects.delete",
+                    "projects.activate",
+                    "projects.add_fact",
+                    "projects.edit_fact",
+                    "projects.delete_fact",
                 }
             ),
         )
-        self.assertEqual(len(MANDATORY_CONFIRMATION_ACTIONS), 33)
+        self.assertEqual(len(MANDATORY_CONFIRMATION_ACTIONS), 39)
         self.assertEqual(
             MANDATORY_DENIED_ACTIONS,
             frozenset({"filesystem.delete", "filesystem.write"}),
@@ -650,6 +674,10 @@ class PermissionManagerTests(unittest.TestCase):
                         reason = f"{reason} {ENABLE_REMINDER_DELIVERY_NOTICE}"
                     if action_id == "reminders.disable_delivery":
                         reason = f"{reason} {DISABLE_REMINDER_DELIVERY_NOTICE}"
+                    if action_id == "projects.activate":
+                        reason = f"{reason} {ACTIVATE_PROJECT_NOTICE}"
+                    if action_id in {"projects.add_fact", "projects.edit_fact"}:
+                        reason = f"{reason} {PROJECT_FACT_NOTICE}"
                     with self.subTest(action_id=action_id):
                         self.assertEqual(
                             manager.check(tool_name, action),
@@ -674,9 +702,13 @@ class PermissionManagerTests(unittest.TestCase):
             "reminders.enable_context": ENABLE_REMINDER_CONTEXT_NOTICE,
             "reminders.enable_delivery": ENABLE_REMINDER_DELIVERY_NOTICE,
             "reminders.disable_delivery": DISABLE_REMINDER_DELIVERY_NOTICE,
+            "projects.activate": ACTIVATE_PROJECT_NOTICE,
+            "projects.add_fact": PROJECT_FACT_NOTICE,
+            "projects.edit_fact": PROJECT_FACT_NOTICE,
         }
 
         self.assertEqual(set(expected), set(CONFIRMATION_NOTICES))
+        self.assertEqual(len(CONFIRMATION_NOTICES), 13)
         for action_id, notice in expected.items():
             with self.subTest(action=action_id):
                 tool_name, action = action_id.split(".")

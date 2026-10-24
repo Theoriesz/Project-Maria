@@ -12,12 +12,22 @@ the model path, to the compiler; every timing decision of the request uses
 it, and confirming an approved plan reads no clock. Brain holds no date
 logic itself. Besides the request text and that timing, the planner receives
 nothing. The only stored inputs to reasoning are records the owner enabled
-for context - Tier A memories and enabled open tasks and reminders, and what
-Tier B's bounded search finds among enabled memories, notes, and
-conversation summaries - read through the memory layer's bounded context
-queries on the conversational path, and on a summary request only by id, to
-recheck the records supplied to the conversation; interaction history and
-saved conversations are never read for planning or reasoning.
+for context - Tier A memories, the active project's facts, and enabled open
+tasks and reminders, and what Tier B's bounded search finds among enabled
+memories, notes, and conversation summaries - read through the memory
+layer's bounded context queries on the conversational path, and on a summary
+request only by id, to recheck the records supplied to the conversation;
+interaction history and saved conversations are never read for planning or
+reasoning.
+
+From V1-24, a model request reads one project snapshot first: the active
+project setting, the active project, and its eligible facts. While a project
+is active, each word that begins with exactly one "@" names a part of one of
+its files, which Brain reads through ``core/project_files.py`` after the
+snapshot; such a request carries no proposal instructions and no earlier
+exchange, and is refused whole when any reference cannot be used. A request
+carrying any fact or file part is handed on only after a final read of the
+setting finds it unchanged since the snapshot.
 
 A planner's plan whose one step's contract declares a session input, from
 V1-20, is given that text here, generically, before anything else checks it:
@@ -57,6 +67,7 @@ from core.constants import LOCAL_CONFIG_PATH
 from core.context import (
     CONTEXT_MAX_BYTES,
     CONTEXT_QUERY_LIMIT,
+    CONTEXT_UNREADABLE_NOTICE,
     SEARCH_QUERY_LIMIT,
     ContextFingerprint,
     ContextSource,
@@ -75,6 +86,7 @@ from core.conversation import (
     saved_conversation_plan,
     summary_draft_plan,
     summary_refused_plan,
+    transient_plan,
     unsupported_session_input_plan,
     with_notices,
 )
@@ -82,6 +94,15 @@ from core.failures import Failure, FailureKind
 from core.filesystem_roots import prepare_roots
 from core.logger import configure_logging, get_logger
 from core.memory import Memory
+from core.project_files import ProjectFileReader, file_parts, scan_references
+from core.project_records import (
+    ACTIVATION_UNREADABLE_REASON,
+    ActivationSnapshot,
+    ActivationState,
+    ProjectContextRead,
+    ProjectFilePart,
+    model_refusal,
+)
 from core.permissions import (
     PermissionDecision,
     PermissionManager,
@@ -229,7 +250,8 @@ class _ContextReads:
 
     Transient: it exists only to hand the rows to the conversation module,
     which validates them. ``enabled`` is None when any read failed, which
-    the conversation module treats as a read it cannot trust.
+    the conversation module treats as a read it cannot trust, and
+    ``project`` is then None too: the request's one project snapshot.
     """
 
     enabled: Sequence[object] | None
@@ -243,6 +265,7 @@ class _ContextReads:
     enabled_reminders: Sequence[object] = ()
     supplied_tasks: Sequence[object] = ()
     supplied_reminders: Sequence[object] = ()
+    project: ProjectContextRead | None = None
 
 
 @dataclass(frozen=True)
@@ -398,6 +421,7 @@ class MariaBrain:
         permissions: PermissionManager,
         logger: Logger | None = None,
         reasoning: ReasoningProvider | None = None,
+        project_files: ProjectFileReader | None = None,
     ) -> None:
         self.config = config
         self.planner = planner
@@ -406,6 +430,7 @@ class MariaBrain:
         self.permissions = permissions
         self.logger = logger or get_logger(__name__)
         self.reasoning = reasoning
+        self._project_files = project_files
 
     @classmethod
     def from_defaults(
@@ -585,6 +610,14 @@ class MariaBrain:
             request,
             validated_supplied_context(supplied_context),
         )
+        project = reads.project
+        files: tuple[ProjectFilePart, ...] = ()
+        references = scan_references(request)
+        if references.present:
+            outcome = self._referenced_parts(request, references, reads)
+            if type(outcome) is BrainResponse:
+                return outcome
+            files = outcome
 
         turn = converse(
             self.reasoning,
@@ -598,13 +631,22 @@ class MariaBrain:
             supplied_notes_read=reads.supplied_notes,
             searched_memories_read=reads.searched_memories,
             searched_notes_read=reads.searched_notes,
-            proposals=True,
+            proposals=not files,
             supplied_summaries_read=reads.supplied_summaries,
             searched_summaries_read=reads.searched_summaries,
             enabled_tasks_read=reads.enabled_tasks,
             enabled_reminders_read=reads.enabled_reminders,
             supplied_tasks_read=reads.supplied_tasks,
             supplied_reminders_read=reads.supplied_reminders,
+            active_project_id=(
+                None if project is None else project.activation.active_project_id
+            ),
+            enabled_facts_read=() if project is None else project.facts,
+            supplied_facts_read=() if project is None else project.supplied_facts,
+            files=files,
+            final_check=(
+                None if project is None else self._final_check(project.activation)
+            ),
         )
         if turn.proposal is not None:
             response = self._consider_proposal(
@@ -668,6 +710,101 @@ class MariaBrain:
             return BrainResponse(with_notices(outcome.message, notices))
         return self._run_model_plan(outcome, confirmed=False, notices=notices)
 
+    def _referenced_parts(
+        self,
+        request: str,
+        references: object,
+        reads: _ContextReads,
+    ) -> tuple[ProjectFilePart, ...] | BrainResponse:
+        """Settle a request's ``@`` references against its project snapshot.
+
+        With no project active they are ordinary text. While the setting is
+        unreadable, or after its read failed, the request is refused before
+        anything is sent; a failed read also clears the conversation, as any
+        failed context read does. With a project active, a malformed
+        reference, too many, or a part that cannot be read or used refuses
+        the whole request; otherwise every distinct file is read once, after
+        the snapshot, and its parts are returned.
+        """
+        project = reads.project
+        if reads.enabled is None or project is None:
+            self.logger.warning("Refused a project file request: setting unread.")
+            return self._refused_model_request(
+                request,
+                ACTIVATION_UNREADABLE_REASON,
+                cleared=True,
+            )
+        state = project.activation.state
+        if state is ActivationState.UNREADABLE:
+            self.logger.warning("Refused a project file request: setting unread.")
+            return self._refused_model_request(request, ACTIVATION_UNREADABLE_REASON)
+        if state is not ActivationState.ACTIVE or project.project is None:
+            return ()
+        if references.reason is not None:
+            self.logger.info("Refused a project file request: references.")
+            return self._refused_model_request(request, references.reason)
+        parts = file_parts(self._file_reader(), project.project, references.references)
+        if type(parts) is str:
+            self.logger.info("Refused a project file request: a file part.")
+            return self._refused_model_request(request, parts)
+        self.logger.info("Read %s project file part(s) for a request.", len(parts))
+        return parts
+
+    def _refused_model_request(
+        self,
+        request: str,
+        reason: str,
+        *,
+        cleared: bool = False,
+    ) -> BrainResponse:
+        """Refuse a model request with its fixed reason; nothing is sent.
+
+        The refusal is a transient zero-step plan, so it records nothing.
+        ``cleared`` also clears the session's conversation, with the
+        existing notice that context could not be read.
+        """
+        notices = (CONTEXT_UNREADABLE_NOTICE,) if cleared else ()
+        response = self._run_plan(
+            transient_plan(request, with_notices(model_refusal(reason), notices)),
+            confirmed=False,
+        )
+        if not cleared:
+            return response
+        return replace(response, conversation=(), supplied_context=frozenset())
+
+    def _final_check(self, snapshot: ActivationSnapshot) -> Callable[[], bool]:
+        """Return the final check of one request against its snapshot.
+
+        It reads the setting once, in its own read transaction, and answers
+        True only when the setting is readable and its token equals the
+        snapshot's. A read that fails answers False, so nothing is sent.
+        """
+        token = snapshot.token
+
+        def check() -> bool:
+            try:
+                current = self.memory.project_activation()
+            except (RuntimeError, ValueError):
+                self.logger.warning("Unable to read the active project setting.")
+                return False
+            return (
+                token is not None
+                and type(current) is ActivationSnapshot
+                and current.token == token
+            )
+
+        return check
+
+    def _file_reader(self) -> ProjectFileReader:
+        """Return the project file reader, built once from the settled roots."""
+        if self._project_files is None:
+            self._project_files = ProjectFileReader(
+                self.config.filesystem_roots,
+                self.config.filesystem_protections,
+                get_logger("project_files"),
+            )
+        return self._project_files
+
     def _read_context(
         self,
         request: str,
@@ -675,13 +812,16 @@ class MariaBrain:
     ) -> _ContextReads:
         """Run the bounded context reads one conversational turn needs.
 
-        Tier A's read of enabled memories always runs: in ascending id order,
-        one row more than can be sent, and never the text of a fact too long
-        ever to be sent. Its reads of enabled open tasks and reminders whose
-        text and timing are still the approved ones always run too, the same
-        way. Records supplied earlier in the conversation are then rechecked
-        by id, and only when there are any. Tier B's searches run only when
-        the request yields search terms: its memory search only when Tier A's
+        The request's one project snapshot is read first: the active project
+        setting, the active project, its eligible facts, and the facts
+        supplied earlier in the conversation, rechecked against it. Tier A's
+        read of enabled memories always runs: in ascending id order, one row
+        more than can be sent, and never the text of a fact too long ever to
+        be sent. Its reads of enabled open tasks and reminders whose text and
+        timing are still the approved ones always run too, the same way.
+        Records supplied earlier in the conversation are then rechecked by
+        id, and only when there are any. Tier B's searches run only when the
+        request yields search terms: its memory search only when Tier A's
         read found more enabled memories than it considers, starting after
         the last one it considered, and its note and summary searches over
         notes and summaries the owner enabled. Every read goes through the
@@ -691,6 +831,13 @@ class MariaBrain:
         search from, ends them all: the turn is handed None and fails closed.
         """
         try:
+            project = self.memory.project_context_snapshot(
+                CONTEXT_QUERY_LIMIT,
+                CONTEXT_MAX_BYTES,
+                supplied_record_ids(supplied, ContextSource.PROJECT_FACT),
+            )
+            if type(project) is not ProjectContextRead:
+                raise ValueError("A project snapshot must be one read's result.")
             enabled = self.memory.list_context_memories(
                 limit=CONTEXT_QUERY_LIMIT,
                 max_fact_bytes=CONTEXT_MAX_BYTES,
@@ -704,6 +851,7 @@ class MariaBrain:
             reminder_ids = supplied_record_ids(supplied, ContextSource.REMINDER)
             return _ContextReads(
                 enabled=enabled,
+                project=project,
                 enabled_tasks=self.memory.list_context_tasks(
                     limit=CONTEXT_QUERY_LIMIT,
                     max_text_bytes=CONTEXT_MAX_BYTES,
@@ -796,8 +944,10 @@ class MariaBrain:
         These are the only reads a summary draft makes before its exchanges
         are sent again: no Tier A read and no search runs, so nothing beyond
         the retained exchanges can reach the draft request. A record is read
-        only when one of its source was supplied. Any read that fails ends
-        them all, and the result's ``enabled`` is then None.
+        only when one of its source was supplied; supplied facts are
+        rechecked against one project snapshot, which reads no other fact.
+        Any read that fails ends them all, and the result's ``enabled`` is
+        then None.
         """
         try:
             memory_ids = supplied_record_ids(supplied, ContextSource.MEMORY)
@@ -805,8 +955,17 @@ class MariaBrain:
             summary_ids = supplied_record_ids(supplied, ContextSource.SUMMARY)
             task_ids = supplied_record_ids(supplied, ContextSource.TASK)
             reminder_ids = supplied_record_ids(supplied, ContextSource.REMINDER)
+            fact_ids = supplied_record_ids(supplied, ContextSource.PROJECT_FACT)
+            project = (
+                self.memory.project_context_snapshot(0, CONTEXT_MAX_BYTES, fact_ids)
+                if fact_ids
+                else None
+            )
+            if project is not None and type(project) is not ProjectContextRead:
+                raise ValueError("A project snapshot must be one read's result.")
             return _ContextReads(
                 enabled=(),
+                project=project,
                 supplied_tasks=(
                     self.memory.context_tasks_by_id(
                         task_ids,
@@ -936,6 +1095,14 @@ class MariaBrain:
             supplied_summaries_read=reads.supplied_summaries,
             supplied_tasks_read=reads.supplied_tasks,
             supplied_reminders_read=reads.supplied_reminders,
+            supplied_facts_read=(
+                () if reads.project is None else reads.project.supplied_facts
+            ),
+            active_project_id=(
+                None
+                if reads.project is None
+                else reads.project.activation.active_project_id
+            ),
         )
         return _SessionInputBinding(
             summary_draft_plan(request, draft),

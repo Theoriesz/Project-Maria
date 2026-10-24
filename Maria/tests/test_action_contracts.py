@@ -17,7 +17,12 @@ from core.action_contracts import (
     BUILT_IN_ACTION_CONTRACTS,
     FACT_DIGEST_LENGTH,
     MAXIMUM_EXPRESSION_LENGTH,
+    MAXIMUM_LINE_NUMBER,
     MAXIMUM_LIST_LIMIT,
+    MAXIMUM_PROJECT_FACT_LENGTH,
+    MAXIMUM_PROJECT_LOCATION_LENGTH,
+    MAXIMUM_PROJECT_NAME_LENGTH,
+    MAXIMUM_PROJECT_PATH_LENGTH,
     MAXIMUM_SUMMARY_LENGTH,
     MAXIMUM_TASK_TEXT_LENGTH,
     MAXIMUM_TRANSCRIPT_LENGTH,
@@ -87,6 +92,19 @@ EXPECTED_ACTION_IDENTIFIERS = frozenset(
         "notes.delete",
         "notes.enable_context",
         "notes.disable_context",
+        "projects.list",
+        "projects.create",
+        "projects.read",
+        "projects.retitle",
+        "projects.delete",
+        "projects.activate",
+        "projects.deactivate",
+        "projects.list_facts",
+        "projects.add_fact",
+        "projects.edit_fact",
+        "projects.delete_fact",
+        "projects.list_files",
+        "projects.read_file",
         "reminders.create",
         "reminders.list",
         "reminders.due",
@@ -460,9 +478,10 @@ class RegistryCompletenessTests(unittest.TestCase):
             EXPECTED_ACTION_IDENTIFIERS,
         )
         # V1-20 added four saved-conversation and seven conversation-summary
-        # actions to V1-18's twenty-nine, and V1-22 adds eleven task and
-        # eleven reminder actions.
-        self.assertEqual(len(EXPECTED_ACTION_IDENTIFIERS), 65)
+        # actions to V1-18's twenty-nine, V1-22 eleven task and eleven
+        # reminder actions, V1-23-R1 three delivery actions, and V1-24-R1
+        # thirteen project actions.
+        self.assertEqual(len(EXPECTED_ACTION_IDENTIFIERS), 78)
 
     def test_registry_and_loaded_tool_inventory_agree_in_both_directions(self) -> None:
         with TemporaryDirectory() as name:
@@ -500,7 +519,7 @@ class RegistryCompletenessTests(unittest.TestCase):
         ]
 
         self.assertEqual(len(identifiers), len(set(identifiers)))
-        self.assertEqual(len(identifiers), 65)
+        self.assertEqual(len(identifiers), 78)
 
     def test_no_contract_exists_for_a_mandatorily_denied_filesystem_action(
         self,
@@ -544,8 +563,11 @@ class RegistryCompletenessTests(unittest.TestCase):
         # due on create, status, as_of, the new text, the new due date, and
         # the pinned identity) and nine for reminders (text, when, and repeat
         # on create, status, as_of, the new text, when and repeat on
-        # reschedule, and the pinned identity).
-        self.assertEqual(len(text_fields), 39)
+        # reschedule, and the pinned identity). V1-24-R1 adds eight: a
+        # project's name and location on create, the new name, a fact's text
+        # on add and on edit, an edit's pinned digest, a listing's folder, and
+        # a read's path.
+        self.assertEqual(len(text_fields), 47)
         for contract, argument in text_fields:
             with self.subTest(field=f"{contract.identifier}.{argument.name}"):
                 self.assertIsInstance(argument.allow_blank, bool)
@@ -605,6 +627,16 @@ class RegistryCompletenessTests(unittest.TestCase):
                 "reminders.create.text": MAXIMUM_TASK_TEXT_LENGTH,
                 "reminders.edit.text": MAXIMUM_TASK_TEXT_LENGTH,
                 "reminders.enable_context.text_digest": FACT_DIGEST_LENGTH,
+                # V1-24-R1: every project text has a coarse ceiling of its
+                # own, and a fact edit's pinned digest is exactly a SHA-256.
+                "projects.create.name": MAXIMUM_PROJECT_NAME_LENGTH,
+                "projects.create.location": MAXIMUM_PROJECT_LOCATION_LENGTH,
+                "projects.retitle.name": MAXIMUM_PROJECT_NAME_LENGTH,
+                "projects.add_fact.text": MAXIMUM_PROJECT_FACT_LENGTH,
+                "projects.edit_fact.text": MAXIMUM_PROJECT_FACT_LENGTH,
+                "projects.edit_fact.text_digest": FACT_DIGEST_LENGTH,
+                "projects.list_files.folder": MAXIMUM_PROJECT_PATH_LENGTH,
+                "projects.read_file.path": MAXIMUM_PROJECT_PATH_LENGTH,
             },
         )
         self.assertEqual(MAXIMUM_EXPRESSION_LENGTH, 200)
@@ -612,6 +644,10 @@ class RegistryCompletenessTests(unittest.TestCase):
         self.assertEqual(MAXIMUM_SUMMARY_LENGTH, 2048)
         self.assertEqual(MAXIMUM_TRANSCRIPT_LENGTH, 65536)
         self.assertEqual(MAXIMUM_TASK_TEXT_LENGTH, 512)
+        self.assertEqual(MAXIMUM_PROJECT_NAME_LENGTH, 64)
+        self.assertEqual(MAXIMUM_PROJECT_FACT_LENGTH, 512)
+        self.assertEqual(MAXIMUM_PROJECT_PATH_LENGTH, 512)
+        self.assertEqual(MAXIMUM_PROJECT_LOCATION_LENGTH, 522)
         self.assertEqual(
             minimums,
             {
@@ -621,6 +657,7 @@ class RegistryCompletenessTests(unittest.TestCase):
                 "conversation_summaries.enable_context.text_digest",
                 "tasks.enable_context.text_digest",
                 "reminders.enable_context.text_digest",
+                "projects.edit_fact.text_digest",
             },
         )
         digest = BUILT_IN_ACTION_CONTRACTS.contract_for(
@@ -739,8 +776,27 @@ class RegistryCompletenessTests(unittest.TestCase):
                 ("tasks", "create", "due"),
                 ("tasks", "enable_context", "text_digest"),
                 ("reminders", "enable_context", "text_digest"),
+                # V1-24-R1: a fact edit's digest is pinned like a note's; a
+                # listing may name no folder, and a read no line range.
+                ("projects", "edit_fact", "text_digest"),
+                ("projects", "list_files", "folder"),
+                ("projects", "read_file", "start"),
+                ("projects", "read_file", "end"),
             },
         )
+
+    def test_the_project_line_numbers_are_whole_numbers_to_six_digits(
+        self,
+    ) -> None:
+        contract = BUILT_IN_ACTION_CONTRACTS.contract_for("projects", "read_file")
+
+        for argument in contract.arguments[1:]:
+            with self.subTest(field=argument.name):
+                self.assertIs(argument.value_type, int)
+                self.assertFalse(argument.required)
+                self.assertEqual(argument.minimum, 1)
+                self.assertEqual(argument.maximum, MAXIMUM_LINE_NUMBER)
+        self.assertEqual(MAXIMUM_LINE_NUMBER, 999_999)
 
 
 class ModelEligibilityClassificationTests(unittest.TestCase):
@@ -778,7 +834,7 @@ class ModelEligibilityClassificationTests(unittest.TestCase):
         )
         self.assertEqual(eligible, EXPECTED_MODEL_ELIGIBLE)
         self.assertEqual(closed, EXPECTED_NOT_MODEL_ELIGIBLE)
-        self.assertEqual((len(eligible), len(closed)), (5, 60))
+        self.assertEqual((len(eligible), len(closed)), (5, 73))
         for identifier, decision in classified.items():
             with self.subTest(action=identifier):
                 self.assertIs(type(decision), ModelEligibility)
@@ -964,7 +1020,7 @@ class RegistryConstructionTests(unittest.TestCase):
                 "sample", "run", model_eligibility=NOT_ELIGIBLE
             )
 
-        self.assertEqual(len(BUILT_IN_ACTION_CONTRACTS.action_identifiers), 65)
+        self.assertEqual(len(BUILT_IN_ACTION_CONTRACTS.action_identifiers), 78)
 
     def test_unsupported_declared_type_is_rejected(self) -> None:
         with self.assertRaises(ValueError):

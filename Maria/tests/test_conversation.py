@@ -1664,6 +1664,9 @@ class ConversationImportBoundaryTests(unittest.TestCase):
             "core.failures",
             "core.logger",
             "core.planner",
+            # V1-24-R1: the project vocabulary, a pure leaf, for file parts,
+            # their notices, and the model refusals.
+            "core.project_records",
             "core.reasoning",
         }
     )

@@ -15,6 +15,12 @@ judge, with no length cap that could silently cut a long request short.
 Approve and Cancel never take keyboard focus, so a keystroke meant for the
 input can never answer an approval. The window title never changes.
 
+The project selector (V1-24-R1) lists plain text items the controller
+chooses. Its Activate and Deactivate buttons never take keyboard focus, and
+choosing an item, scrolling the list, or typing activates nothing: only a
+click on Activate or Deactivate submits a command, through the controller,
+exactly as Send does.
+
 ``prepare_application`` creates Qt's application object before anything else
 starts, because that is where Qt checks whether it can show a window at all,
 and a failure there is fatal inside Qt rather than an exception. While it is
@@ -66,6 +72,7 @@ from PyQt6.QtCore import (
 from PyQt6.QtGui import QCloseEvent
 from PyQt6.QtWidgets import (
     QApplication,
+    QComboBox,
     QGroupBox,
     QHBoxLayout,
     QLabel,
@@ -80,7 +87,12 @@ from PyQt6.QtWidgets import (
 from core.constants import APP_NAME
 from core.logger import get_logger
 from core.session import MariaSession
-from gui.controller import GuiController
+from gui.controller import (
+    ACTIVATE_LABEL,
+    DEACTIVATE_LABEL,
+    PROJECT_LABEL,
+    GuiController,
+)
 from gui.session_worker import SessionWorker, WorkerEvent
 
 
@@ -129,6 +141,12 @@ class MariaWindow(QMainWindow):
         self.send_button.setAutoDefault(False)
         self.status = QLabel()
         self.status.setTextFormat(Qt.TextFormat.PlainText)
+        self.project_label = QLabel(PROJECT_LABEL)
+        self.project_label.setTextFormat(Qt.TextFormat.PlainText)
+        self.project_choice = QComboBox()
+        self.project_choice.setEditable(False)
+        self.activate_button = _answer_button(ACTIVATE_LABEL)
+        self.deactivate_button = _answer_button(DEACTIVATE_LABEL)
 
         self.approval = QGroupBox(APPROVAL_TITLE)
         answers = QHBoxLayout()
@@ -144,7 +162,14 @@ class MariaWindow(QMainWindow):
         entry.addWidget(self.request_input, 1)
         entry.addWidget(self.send_button)
 
+        projects = QHBoxLayout()
+        projects.addWidget(self.project_label)
+        projects.addWidget(self.project_choice, 1)
+        projects.addWidget(self.activate_button)
+        projects.addWidget(self.deactivate_button)
+
         layout = QVBoxLayout()
+        layout.addLayout(projects)
         layout.addWidget(self.conversation, 3)
         layout.addWidget(self.approval, 2)
         layout.addLayout(entry)
@@ -158,6 +183,8 @@ class MariaWindow(QMainWindow):
         self.send_button.clicked.connect(self._send_request)
         self.approve_button.clicked.connect(self._approve_offer)
         self.cancel_button.clicked.connect(self._cancel_offer)
+        self.activate_button.clicked.connect(self._activate_project)
+        self.deactivate_button.clicked.connect(self._deactivate_project)
         self.event_delivered.connect(
             self._receive,
             Qt.ConnectionType.QueuedConnection,
@@ -208,6 +235,19 @@ class MariaWindow(QMainWindow):
         """Empty the input once its text has been taken."""
         self.request_input.clear()
 
+    def show_projects(self, items: tuple[str, ...]) -> None:
+        """Show the selector's plain text items, keeping the chosen position."""
+        chosen = self.project_choice.currentIndex()
+        self.project_choice.clear()
+        self.project_choice.addItems(list(items))
+        if 0 <= chosen < len(items):
+            self.project_choice.setCurrentIndex(chosen)
+
+    def set_project_controls(self, *, activating: bool, deactivating: bool) -> None:
+        """Enable Activate and Deactivate."""
+        self.activate_button.setEnabled(activating)
+        self.deactivate_button.setEnabled(deactivating)
+
     def close_window(self) -> None:
         """Close the window once the session has ended."""
         self.close()
@@ -244,6 +284,19 @@ class MariaWindow(QMainWindow):
         """Dismiss the offer this window is showing."""
         if self._controller is not None and self._offer_serial is not None:
             self._shielded(self._controller.cancel, self._offer_serial)
+
+    def _activate_project(self) -> None:
+        """Ask to activate the project the selector shows as chosen."""
+        if self._controller is not None:
+            self._shielded(
+                self._controller.activate,
+                self.project_choice.currentIndex(),
+            )
+
+    def _deactivate_project(self) -> None:
+        """Ask to leave no project active."""
+        if self._controller is not None:
+            self._shielded(self._controller.deactivate)
 
     def _shielded(
         self,
@@ -471,7 +524,10 @@ def _read_only_display() -> QPlainTextEdit:
 
 
 def _answer_button(label: str) -> QPushButton:
-    """Return an approval answer that only a deliberate click can press."""
+    """Return a button only a deliberate click can press, never focused.
+
+    Approve, Cancel, Activate, and Deactivate are all made this way.
+    """
     button = QPushButton(label)
     button.setFocusPolicy(Qt.FocusPolicy.NoFocus)
     button.setAutoDefault(False)

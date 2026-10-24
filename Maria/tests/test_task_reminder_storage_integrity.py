@@ -113,7 +113,7 @@ class _StorageCase(unittest.TestCase):
         self.memory = Memory(self.database_path, logger=self.logger)
         self.memory.initialize()
         self.assertEqual(_database_encoding(self.database_path), self.encoding)
-        self.assertEqual(self.memory.schema_version(), 8)
+        self.assertEqual(self.memory.schema_version(), 9)
         self.zones = SyntheticZones(self, {SYNTHETIC_KEY: CENTRAL_RULES})
 
     def raw(self, statement: str, parameters: tuple[object, ...] = ()) -> int:

@@ -12,8 +12,10 @@ needs Qt.
 Each interface's session also gets the reminder-delivery seam (V1-23-R1),
 built from the started Brain's memory, so due reminders surface in session:
 the command line checks before each prompt and prints what it claimed. The
-closed-app pass has its own entry point, ``deliver_reminders.py``, and this
-module's argument handling is unchanged.
+window's session also gets the projects seam (V1-24-R1), built the same way,
+which its project selector reads. The closed-app pass has its own entry
+point, ``deliver_reminders.py``, and this module's argument handling is
+unchanged.
 """
 
 from __future__ import annotations
@@ -30,13 +32,17 @@ from core.logger import get_logger
 from core.ollama_adapter import OllamaReasoningProvider
 from core.reasoning import ReasoningProvider, ReasoningSettings
 from core.reminder_delivery import ReminderDeliverySeam
-from core.session import MariaSession
+from core.session import MariaSession, ProjectChoicesSeam
 from core.task_records import DELIVERY_CHANNEL_CLI, DELIVERY_CHANNEL_GUI
 
 
 # Builds an interface's reminder-delivery seam from its started Brain, or
 # returns None for a session without one.
 DeliveryFactory = Callable[[MariaBrain], ReminderDeliverySeam | None]
+
+# Builds the window's projects seam from its started Brain, or returns None
+# for a session without one.
+ProjectsFactory = Callable[[MariaBrain], ProjectChoicesSeam | None]
 
 
 EXIT_COMMANDS = {"exit", "quit", "q"}
@@ -114,6 +120,11 @@ def build_runtime_delivery(brain: MariaBrain, channel: str) -> ReminderDeliveryS
     at any time; with it off, a check reads the setting and returns.
     """
     return ReminderDeliverySeam(brain.memory, channel, utc_now)
+
+
+def build_runtime_projects(brain: MariaBrain) -> ProjectChoicesSeam:
+    """Return the projects seam over the runtime Brain's memory."""
+    return ProjectChoicesSeam(brain.memory)
 
 
 def run_cli(
@@ -207,6 +218,7 @@ def show_due_reminders(session: MariaSession) -> None:
 def run_gui(
     brain_factory: Callable[[], MariaBrain] | None = None,
     delivery_factory: DeliveryFactory | None = None,
+    projects_factory: ProjectsFactory | None = None,
 ) -> int:
     """Run Maria's desktop window over the same Brain and session contract.
 
@@ -217,6 +229,8 @@ def run_gui(
     startup failures, and the window is given a session factory, never Brain
     itself. A window that fails, or whose session ends unexpectedly, is
     reported with a fixed message as well, and logged by exception type only.
+    A caller that injects a Brain factory gets no projects seam unless it
+    also injects a projects factory, as with the delivery seam.
     """
     try:
         from gui.window import prepare_application, run_window
@@ -241,8 +255,11 @@ def run_gui(
         delivery_factory,
         DELIVERY_CHANNEL_GUI,
     )
+    projects = _start_projects(started, brain_factory, projects_factory)
     try:
-        status = run_window(partial(MariaSession, started, delivery=delivery))
+        status = run_window(
+            partial(MariaSession, started, delivery=delivery, projects=projects)
+        )
     except KeyboardInterrupt:
         print(_STARTUP_INTERRUPTED_MESSAGE, file=sys.stderr)
         return _EXIT_STARTUP_INTERRUPTED
@@ -289,6 +306,24 @@ def _start_delivery(
     if brain_factory is not None:
         return None
     return build_runtime_delivery(brain, channel)
+
+
+def _start_projects(
+    brain: MariaBrain,
+    brain_factory: Callable[[], MariaBrain] | None,
+    projects_factory: ProjectsFactory | None,
+) -> ProjectChoicesSeam | None:
+    """Return the window's projects seam, or None for a session without one.
+
+    An injected projects factory decides. Otherwise the runtime default
+    applies only to the runtime Brain: a caller that injected a Brain factory
+    gets no seam.
+    """
+    if projects_factory is not None:
+        return projects_factory(brain)
+    if brain_factory is not None:
+        return None
+    return build_runtime_projects(brain)
 
 
 def _start_brain(

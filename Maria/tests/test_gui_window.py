@@ -1303,6 +1303,12 @@ class _StandInWindow:
     def clear_input(self) -> None:
         """Show nothing."""
 
+    def show_projects(self, items: tuple[str, ...]) -> None:
+        """Show nothing (V1-24-R1's project selector)."""
+
+    def set_project_controls(self, *, activating: bool, deactivating: bool) -> None:
+        """Show nothing (V1-24-R1's project selector)."""
+
     def close_window(self) -> None:
         """Count the attempt; there is nothing to close."""
         self.closed += 1

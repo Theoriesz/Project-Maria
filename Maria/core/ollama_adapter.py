@@ -29,9 +29,13 @@ they open the one system message, followed by the context instructions when
 there is context; with no context they are the system message alone. With
 the flag off and no context the request is byte for byte what it was before
 context existed, and with the flag off and Tier A context alone it is byte
-for byte what it was in V1-15. The whole request, context and instructions
-included, is validated and measured against the input budget again here,
-before anything is serialized. Only the assistant message's ``content`` comes
+for byte what it was in V1-15. A request carrying owner-named parts of
+project files, from V1-24, has no earlier exchange and no proposal
+instructions: Maria's fixed file framing closes the one system message, and
+the file block is a user message of its own just before the prompt, so file
+text is only ever data. The whole request, context, instructions, and file
+parts included, is validated and measured against the input budget again
+here, before anything is serialized. Only the assistant message's ``content`` comes
 back, as one inert string.
 Thinking text, tool calls, and every other field of the reply are ignored
 after bounded JSON parsing; only ``message.content`` is returned. This module
@@ -69,6 +73,7 @@ from typing import NoReturn
 
 from core.context import ContextItem, render_context_data
 from core.failures import Failure, FailureKind, TypedFailureError
+from core.project_records import ProjectFilePart, render_file_block
 from core.reasoning import (
     REASONING_REQUEST_TYPE_MESSAGE,
     REASONING_SETTINGS_TYPE_MESSAGE,
@@ -168,9 +173,9 @@ class OllamaReasoningProvider:
         """Ask the local runtime one question and return its complete answer.
 
         Raises ``TypedFailureError`` carrying one reasoning kind: input over
-        budget, when the prompt, history, rendered context, and any selected
-        instructions together exceed the input budget, before any connection
-        is opened; timeout
+        budget, when the prompt, history, rendered context, any selected
+        instructions, and any file parts together exceed the input budget,
+        before any connection is opened; timeout
         when the deadline passes at any stage; unavailable when nothing
         answers, or the answer is not success; truncated when the reply ends early or says it is
         incomplete; malformed when it is not the expected shape; and output
@@ -192,21 +197,23 @@ class OllamaReasoningProvider:
         """Run one bounded exchange and settle it as a reply or a failure."""
         deadline = time.monotonic() + self._deadline_seconds
 
-        # The prompt, the history, the context, and the instructions flag are
-        # read again rather than trusted from construction, and the whole
-        # request is validated and measured against this adapter's own
-        # budget, without being copied when it is plainly too long, before
-        # any of it is serialized.
+        # The prompt, the history, the context, the instructions flag, and
+        # the file parts are read again rather than trusted from
+        # construction, and the whole request is validated and measured
+        # against this adapter's own budget, without being copied when it is
+        # plainly too long, before any of it is serialized.
         prompt = request.prompt
         history = getattr(request, "history", None)
         context = getattr(request, "context", None)
         proposal_instructions = getattr(request, "proposal_instructions", None)
+        files = getattr(request, "files", None)
         size = request_content_bytes(
             prompt,
             history,
             self._max_input_bytes,
             context,
             proposal_instructions,
+            files,
         )
         if size > self._max_input_bytes:
             return Failure(FailureKind.REASONING_INPUT_OVER_BUDGET)
@@ -218,6 +225,7 @@ class OllamaReasoningProvider:
                     history,
                     context,
                     proposal_instructions,
+                    files,
                 ),
                 deadline,
             )
@@ -231,6 +239,7 @@ class OllamaReasoningProvider:
         history: tuple[ReasoningExchange, ...],
         context: tuple[ContextItem, ...] = (),
         proposal_instructions: bool = False,
+        files: tuple[ProjectFilePart, ...] = (),
     ) -> bytes:
         """Return the one HTTP request: the model and the conversation.
 
@@ -238,13 +247,15 @@ class OllamaReasoningProvider:
         message, oldest first, and the prompt is the final user message.
         Maria's fixed instructions, when there are any, come first as the one
         system message: the proposal instructions when the request selects
-        them, then the context instructions when there is context. Context
-        then follows as the delimited data block in a user message of its
-        own, so no stored text is ever placed in a system-level instruction.
-        With neither there is no system message at all. There is no
-        template, option, tool, or thinking request, and no credential or
-        proxy header. The request line names only the path, never a scheme
-        or host.
+        them, then the context instructions when there is context, then the
+        file instructions when there are file parts. Context then follows as
+        the delimited data block in a user message of its own, and file
+        parts as the file block in a user message of its own just before the
+        prompt, so no stored or file text is ever placed in a system-level
+        instruction. With none of them there is no system message at all.
+        There is no template, option, tool, or thinking request, and no
+        credential or proxy header. The request line names only the path,
+        never a scheme or host.
         """
         messages = [
             message
@@ -258,9 +269,11 @@ class OllamaReasoningProvider:
             messages[:0] = [
                 {"role": "user", "content": render_context_data(context)},
             ]
-        instructions = system_instructions(context, proposal_instructions)
+        instructions = system_instructions(context, proposal_instructions, files)
         if instructions is not None:
             messages[:0] = [{"role": "system", "content": instructions}]
+        if files:
+            messages.append({"role": "user", "content": render_file_block(files)})
         messages.append({"role": "user", "content": prompt})
         body = json.dumps(
             {

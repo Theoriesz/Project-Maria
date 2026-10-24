@@ -5,7 +5,7 @@ Tools are small modules that expose controlled capabilities to Maria.
 ## Declared Argument Contracts
 
 Every built-in tool action is declared once in `core/action_contracts.py`,
-which is the positive allowlist of the 65 supported tool actions and of the
+which is the positive allowlist of the 78 supported tool actions and of the
 arguments each one accepts. A tool's `actions` set answers only whether an
 action is registered; the contract answers which arguments it takes, whether
 each is required, its exact type, any numeric bound, and, for a path field, the
@@ -50,7 +50,12 @@ date is `ISO_DATE`, or `ISO_DATE_OR_NONE` for a reschedule; a reminder's
 `ISO_DATE` for tasks and `UTC_INSTANT` for reminders. Each is matched whole,
 with calendar validity, and consults no time zone's rules. Task and reminder
 text declares a 512-character ceiling, its exact rule being
-`core/task_records.py`'s.
+`core/task_records.py`'s. A project's `name` declares 64 characters, a fact's
+`text` 512, a `folder` and a project file's `path` 512 each, and a `location`
+522, `workspace/` and a folder, the exact byte and grammar rules being
+`core/project_records.py`'s; an edited fact's optional `text_digest` is
+exactly 64 characters, and a file's optional `start` and `end` are integers
+from 1 to 999,999.
 
 Two text fields are session inputs, declared as such on their contracts:
 `conversations.save.transcript` and `conversation_summaries.create.text`.
@@ -60,13 +65,14 @@ that already carries it is refused, and a contract that declares one can
 never be model-eligible.
 
 Every contract also states, with no default, whether a reasoning model may
-ever propose its action. Only five of the 65 actions are model-eligible:
+ever propose its action. Only five of the 78 actions are model-eligible:
 `calculator.calculate`, `filesystem.list`, `system.current_time`,
 `tasks.create`, and `reminders.create`, the last two only for a request in one
-of the four natural-language forms Maria reads herself. The other 60,
+of the four natural-language forms Maria reads herself. The other 73,
 including all three audit actions, all eleven saved-conversation and
-conversation-summary actions, the other twenty task and reminder actions, and
-the three reminder-delivery actions, are closed to the model. The
+conversation-summary actions, the other twenty task and reminder actions, the
+three reminder-delivery actions, and all thirteen project actions, are closed
+to the model. The
 classification is independent of permission and approves nothing by itself:
 `core/plan_compiler.py` keeps its own closed allowlist and compiles a proposal
 only when the two agree and every argument satisfies the action's contract.
@@ -93,6 +99,9 @@ allows its action outright; see "Model-to-Plan Compilation Gate" and
 - `memory`: store, search, list, update, and forget explicit SQLite-backed
   memories
 - `notes`: create, list, read, retitle, edit, and delete SQLite-backed notes
+- `projects`: list, create, read, rename, and delete projects, activate and
+  deactivate one, list, add, edit, and delete a project's facts, and list and
+  show the active project's files, read-only
 - `reminders`: add, list, query, read, complete, reopen, edit, reschedule, and
   delete reminders, turn one reminder's context consent on or off, and show or
   change the reminder delivery setting; it never delivers or notifies
@@ -949,6 +958,68 @@ below. A correctly chosen time in a repeated hour agrees with the rules it was
 resolved under and shows no warning. Neither ever refuses, rewrites, or moves
 a reminder.
 
+## Projects Tool
+
+The projects tool, `tools/projects.py` (V1-24-R1), supports thirteen actions,
+reaching the project tables only through the shared `Memory` object and
+project files only through the project file reader of
+`core/project_files.py`. None is model-eligible.
+
+| Action | Command | Arguments | Permission |
+| --- | --- | --- | --- |
+| `list` | `projects` | none | allowed |
+| `create` | `create project <name>: <location>` | `name`, `location` | allowed |
+| `read` | `read project <id>` | `id` | allowed |
+| `retitle` | `retitle project <id>: <new name>` | `id`, `name` | confirmation |
+| `delete` | `delete project <id>` | `id` | confirmation |
+| `activate` | `activate project <id>` | `id` | confirmation, with a notice |
+| `deactivate` | `deactivate project` | none | allowed |
+| `list_facts` | `project facts <project id>` | `id` | allowed |
+| `add_fact` | `add project fact <project id>: <text>` | `id`, `text` | confirmation, with a notice |
+| `edit_fact` | `edit project fact <fact id>: <new text>` | `id`, `text`, and the pinned `text_digest` | confirmation, with a notice |
+| `delete_fact` | `delete project fact <fact id>` | `id` | confirmation |
+| `list_files` | `project files [<folder>]` | optional `folder` | allowed |
+| `read_file` | `read project file <path> [lines <from>-<to>]` | `path`, optional `start` and `end` | allowed |
+
+`create` accepts `workspace`, `workspace/<folder>`, or `project_maria`. A
+workspace folder is first checked through the reader, which closes every
+handle it opened before the project is stored, and is stored in its on-disk
+spelling; a location equal to, inside, or around another project's is
+refused, so at most one Project Maria exists. A new project is not active.
+
+Each confirmation-required action shows what its approval covers before
+anything changes, through the tool's confirmation binding, every stored text
+quoted: a rename the current and the new name, a deletion or an activation the
+project's name, location, and fact count, an activation also the project it
+replaces and, for Project Maria, a fixed paragraph about the approved list,
+an addition the project, whether it is active, and the new fact, and an edit
+the saved and the new text side by side, pinning the fact's approval digest as
+`text_digest`, so the edit applies only while the fact is still exactly what
+was shown. The preview is never recorded, logged, or sent to a model.
+Deleting an active project, or one that still has facts, is refused with a
+fixed reply and nothing deleted.
+
+`list_files` and `read_file` work only while a project is active, through one
+snapshot of the setting and the active project, and refuse with
+`No project is active. Type projects to see them, then activate project <id>.`
+otherwise, or with `The active project setting could not be read, so no
+project is active.` A listing shows at most 200 entries, each a directory or
+a file with its size as Windows lists it, with a line when more exist and one
+when the scan stopped after 2,000 examined entries. A display shows at most
+131,072 bytes of decoded text under a header naming the project, path, lines,
+line count, size, and the first 16 digits of its SHA-256; a longer file needs a
+line range. Every refusal is a fixed text that never tells an absent file from
+a protected one.
+
+Every successful action records a fixed line naming ids at most, such as
+`Listed projects.`, `Created project 4.`, `Renamed project 4.`,
+`Activated project 4.`, `Listed facts of project 4.`, `Added fact 9 to project
+4.`, `Updated fact 9.`, `Listed project files.`, or `Displayed a project
+file.`, and a refusal records its fixed text, so no name, location, fact,
+path, listing, or file text reaches interaction history from a reply; the log
+names ids and counts only. A storage failure answers with the shared busy text
+or `Unable to read or write projects.`
+
 ## System Tool
 
 The system tool supports exactly two actions:
@@ -1020,7 +1091,12 @@ rescheduling, deleting, and both consent actions for tasks and reminders,
 and turning reminder delivery on or off, while completing and reopening one
 changes its status alone and is allowed, as is showing the delivery status.
 Neither the tasks nor the reminders tool starts a thread, a timer, or any
-background work. An action a reasoning model proposes needs exactly one
+background work. Renaming, deleting, and activating a project, and adding,
+editing, or deleting a project fact, are checked the same way and always
+require explicit confirmation, while deactivating, which only narrows what can
+reach a model, is allowed; the projects tool writes, renames, moves, and
+deletes no file, and is the only module that changes the active project
+setting. An action a reasoning model proposes needs exactly one
 approval from the owner before it runs, even when `permissions.py` allows it
 outright; a denied one is refused before any approval is offered, and an
 approved one does not run at all unless its audit summary is committed first.

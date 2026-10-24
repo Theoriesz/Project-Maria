@@ -1994,8 +1994,17 @@ ADAPTER_REACH = frozenset(
         "core.reasoning",
         "core.logger",
         "core.constants",
+        # V1-24-R1: the project vocabulary that renders the file block, and
+        # the record vocabulary it takes its shared rules from; both pure.
+        "core.project_records",
+        "core.task_records",
     }
 )
+
+# Project Maria's approved path list (V1-24-R1) is data only, which
+# tests.test_project_maria_manifest proves. Its paths name this adapter's
+# file, so the text search below skips it; every import guard still covers it.
+DATA_ONLY_MANIFEST = "core.project_maria_manifest"
 
 # The core modules the roadmap names. Every production tool is added to
 # these, found rather than listed.
@@ -2609,7 +2618,8 @@ class NetworkImportBoundaryTests(unittest.TestCase):
 
                 self.assertNotIn(ADAPTER_MODULE, reached)
                 self.assertNotIn(COMPOSITION_POINT, reached)
-                self.assertNotIn("ollama_adapter", source)
+                if name != DATA_ONLY_MANIFEST:
+                    self.assertNotIn("ollama_adapter", source)
                 self.assertNotIn("OllamaReasoningProvider", source)
 
         reached, unfollowed = reachable_modules(COMPOSITION_POINT)

@@ -2097,7 +2097,7 @@ class MemoryContextConsentTests(unittest.TestCase):
                 # The current schema: 8 since V1-23-R1, so a UTF-16 baseline
                 # climbs every step, the conversation-record and task tables
                 # and the reminder delivery state included.
-                self.assertEqual(memory.schema_version(), 8)
+                self.assertEqual(memory.schema_version(), 9)
                 with closing(sqlite3.connect(path)) as connection:
                     self.assertEqual(
                         connection.execute("PRAGMA encoding").fetchone()[0],

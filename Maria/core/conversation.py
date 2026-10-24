@@ -24,16 +24,25 @@ exchange the session keeps, and nothing a model writes can change it. There
 is no import path from here to permissions, tool dispatch, or persistence.
 
 The conversation itself belongs to the caller's session, together with the
-fingerprints of every memory, note, summary, task, and reminder supplied
-since that conversation was last cleared. This module keeps no state between
-turns; it only computes what a turn sends and what the session should keep
-afterwards. Before anything is sent, those fingerprints are checked against
-what a bounded read by id finds enabled now, and a conversation whose
-supplied record was disabled, changed, completed, deleted, or forgotten is
-discarded whole, so an earlier reply cannot carry that text back to the
-model. The check sees current state only: a record changed away and back to
-the identical approved text between two checks is indistinguishable from one
-never changed.
+fingerprints of every memory, note, summary, project fact, task, and reminder
+supplied since that conversation was last cleared. This module keeps no state
+between turns; it only computes what a turn sends and what the session should
+keep afterwards. Before anything is sent, those fingerprints are checked
+against what a bounded read by id finds enabled now, and a conversation whose
+supplied record was disabled, changed, completed, deleted, or forgotten, or
+whose supplied fact no longer belongs to the active project with its approved
+text, is discarded whole, so an earlier reply cannot carry that text back to
+the model. The check sees current state only: a record changed away and back
+to the identical approved text between two checks is indistinguishable from
+one never changed.
+
+From V1-24 a turn may instead carry owner-named parts of the active
+project's files. Such a turn sends no earlier exchange and no proposal
+instructions, its reply is plain text that never reaches the compiler, and
+nothing of it is kept: no exchange, no fingerprint, and no part. A turn that
+carries any project fact or file part is handed to the reasoning boundary
+only after one final check, made after every size check, finds the active
+project setting readable and unchanged since the request's snapshot.
 
 This module also settles the session text a planner's plan asks Maria to
 supply, from V1-20: the canonical transcript of exactly the retained
@@ -57,6 +66,7 @@ from core.context import (
     CONTEXT_QUERY_LIMIT,
     CONTEXT_UNREADABLE_NOTICE,
     CONVERSATION_CLEARED_NOTICE,
+    FACT_CLEARED_NOTICE,
     NO_MEMORY_CONTEXT_NOTICE,
     SEARCH_QUERY_LIMIT,
     SUPPLIED_CONTEXT_MAX_RECORDS,
@@ -64,16 +74,22 @@ from core.context import (
     ContextFingerprint,
     ContextItem,
     ContextSelection,
+    ContextSource,
+    FactSelection,
     SearchSelection,
     agenda_omission_notice,
     agenda_selected_notice,
     agenda_supplied_notice,
     divergent_notices,
+    enabled_facts,
     enabled_memories,
     enabled_notes,
     enabled_reminders,
     enabled_summaries,
     enabled_tasks,
+    fact_omission_notice,
+    fact_selected_notice,
+    fact_supplied_notice,
     omission_notice,
     search_omission_notice,
     search_selected_notice,
@@ -82,6 +98,7 @@ from core.context import (
     searched_notes_whole,
     searched_summaries_whole,
     select_agenda_context,
+    select_fact_context,
     select_memory_context,
     select_search_context,
     selected_notice,
@@ -99,6 +116,16 @@ from core.planner import (
     RecordingPolicy,
     own_origin,
     plan_snapshot,
+)
+from core.project_records import (
+    PROJECT_CHANGED_REASON,
+    REFERENCE_BLOCK_TOO_LARGE_REASON,
+    ProjectFilePart,
+    active_project_notice,
+    file_parts_bytes,
+    file_parts_notice,
+    model_refusal,
+    validated_file_parts,
 )
 from core.reasoning import (
     INSTRUCTION_SEPARATOR,
@@ -248,7 +275,8 @@ class ConversationTurn:
 class _SettledReads:
     """Every bounded context read of one turn, validated.
 
-    ``enabled`` is Tier A's read of enabled memories, and ``enabled_tasks``
+    ``enabled`` is Tier A's read of enabled memories, ``enabled_facts`` the
+    snapshot's eligible facts of the active project, and ``enabled_tasks``
     and ``enabled_reminders`` its reads of enabled open tasks and reminders;
     ``supplied_*`` are the rechecks, by id, of records supplied earlier in
     the conversation; and ``searched_*`` are Tier B's search results. Each is
@@ -266,6 +294,8 @@ class _SettledReads:
     enabled_reminders: tuple[tuple[int, str, str | None], ...] = ()
     supplied_tasks: tuple[tuple[int, str, str | None], ...] = ()
     supplied_reminders: tuple[tuple[int, str, str | None], ...] = ()
+    enabled_facts: tuple[tuple[int, int, str], ...] = ()
+    supplied_facts: tuple[tuple[int, int, str], ...] = ()
 
 
 def is_proposal_attempt(text: object) -> bool:
@@ -415,20 +445,38 @@ def converse(
     enabled_reminders_read: Sequence[object] = (),
     supplied_tasks_read: Sequence[object] = (),
     supplied_reminders_read: Sequence[object] = (),
+    active_project_id: int | None = None,
+    enabled_facts_read: Sequence[object] = (),
+    supplied_facts_read: Sequence[object] = (),
+    files: tuple[ProjectFilePart, ...] = (),
+    final_check: Callable[[], bool] | None = None,
 ) -> ConversationTurn:
     """Answer one request conversationally, or hand back a proposal attempt.
 
     ``enabled_memories_read`` is what Brain's bounded Tier A read returned,
     or None when Brain's context reads failed, and ``enabled_tasks_read``
     and ``enabled_reminders_read`` are its reads of enabled open tasks and
-    reminders. The ``supplied_*`` reads are the rechecks, by id, of every
-    record ``supplied_context`` names, and the ``searched_*`` reads are Tier
-    B's search results, summaries included. All of them are settled first.
-    A failed or untrustworthy read sends no context and no earlier exchange,
-    clears the session's conversation and fingerprints, and says so.
-    Otherwise, when a record in ``supplied_context`` is no longer among the
-    enabled records rechecked with the same text, the whole earlier
-    conversation is discarded before anything is sent.
+    reminders. ``active_project_id`` is the active project of the request's
+    one snapshot, or None, and ``enabled_facts_read`` that snapshot's
+    eligible facts of it. The ``supplied_*`` reads are the rechecks, by id,
+    of every record ``supplied_context`` names, and the ``searched_*`` reads
+    are Tier B's search results, summaries included. All of them are settled
+    first. A failed or untrustworthy read sends no context and no earlier
+    exchange, clears the session's conversation and fingerprints, and says
+    so. Otherwise, when a record in ``supplied_context`` is no longer among
+    the enabled records rechecked with the same text, or a supplied fact is
+    no longer one of the active project's with its approved text, the whole
+    earlier conversation is discarded before anything is sent.
+
+    ``files`` are owner-named parts of the active project's files, which
+    only a request with proposal mode off may carry. Such a request sends no
+    earlier exchange, and its context is selected as for any request; its
+    file framing and block must stay within ``FILE_BLOCK_MAX_BYTES`` and the
+    whole request within the configured input budget, or it is refused
+    before anything is sent. Its reply is shown with Maria's notices and
+    nothing of it is kept. ``final_check`` is called once, after every size
+    check and immediately before a request carrying any project fact or file
+    part is handed on; unless it answers True, nothing is sent.
 
     ``proposals`` turns on proposal mode and must be exactly True or False.
     In proposal mode the request selects Maria's fixed proposal
@@ -465,6 +513,9 @@ def converse(
     """
     if type(proposals) is not bool:
         raise ValueError(REASONING_PROPOSAL_INSTRUCTIONS_MESSAGE)
+    files = validated_file_parts(files)
+    if files and proposals:
+        raise ValueError(REASONING_PROPOSAL_INSTRUCTIONS_MESSAGE)
     log = logger or get_logger(__name__)
     budget = conversation_budget(settings)
     supplied = validated_supplied_context(supplied_context)
@@ -486,6 +537,9 @@ def converse(
                 enabled_reminders_read,
                 supplied_tasks_read,
                 supplied_reminders_read,
+                enabled_facts_read,
+                supplied_facts_read,
+                active_project_id,
             )
         except ValueError:
             reads = None
@@ -494,17 +548,12 @@ def converse(
         before.append(CONTEXT_UNREADABLE_NOTICE)
         reads = _SettledReads()
         cleared = True
-    elif not supplied_still_current(
-        supplied,
-        reads.supplied_memories,
-        reads.supplied_notes,
-        reads.supplied_summaries,
-        reads.supplied_tasks,
-        reads.supplied_reminders,
-    ):
-        log.info("Earlier conversation cleared: supplied memory context changed.")
-        before.append(CONVERSATION_CLEARED_NOTICE)
-        cleared = True
+    else:
+        changed = _changed_notices(supplied, reads)
+        if changed:
+            log.info("Earlier conversation cleared: supplied memory context changed.")
+            before.extend(changed)
+            cleared = True
     if cleared:
         conversation = ()
         supplied = frozenset()
@@ -546,13 +595,18 @@ def converse(
     if proposals:
         context_budget -= len(INSTRUCTION_SEPARATOR.encode("utf-8"))
     selection = select_memory_context(reads.enabled, context_budget)
-    agenda = select_agenda_context(
+    facts = select_fact_context(
         selection.items,
+        reads.enabled_facts,
+        context_budget,
+    )
+    agenda = select_agenda_context(
+        selection.items + facts.items,
         reads.enabled_tasks,
         reads.enabled_reminders,
         context_budget,
     )
-    enabled_items = selection.items + agenda.items
+    enabled_items = selection.items + facts.items + agenda.items
     search = select_search_context(
         enabled_items,
         reads.searched_memories,
@@ -561,16 +615,25 @@ def converse(
         reads.searched_summaries,
     )
     context = enabled_items + search.items
-    if len(_records(supplied) | _records(context)) > SUPPLIED_CONTEXT_MAX_RECORDS:
+    if not files and (
+        len(_records(supplied) | _records(context)) > SUPPLIED_CONTEXT_MAX_RECORDS
+    ):
         # Counted by record, not by digest, so nothing is hashed before the
-        # request is known to complete.
+        # request is known to complete. A file request keeps nothing, so it
+        # never needs this.
         log.info("Earlier conversation cleared: context recheck limit reached.")
         before.append(CONTEXT_LIMIT_CLEARED_NOTICE)
         cleared = True
         conversation = ()
         supplied = frozenset()
-    history = fitted_history(request, conversation, budget, context, proposals)
+    history = (
+        ()
+        if files
+        else fitted_history(request, conversation, budget, context, proposals)
+    )
     log.info("Memory context selected: %s item(s).", len(selection.items))
+    if reads.enabled_facts:
+        log.info("Project fact context selected: %s item(s).", len(facts.items))
     if reads.enabled_tasks or reads.enabled_reminders:
         log.info(
             "Task and reminder context selected: %s item(s).",
@@ -578,21 +641,43 @@ def converse(
         )
     log.info("Search context selected: %s item(s).", len(search.items))
 
-    outcome = request_reasoning(
-        provider,
-        ReasoningRequest(request, history, context, proposals),
-        settings,
-        log,
-    )
+    if files and not _files_fit(request, context, files, settings):
+        log.warning("Project file request refused: over the file limits.")
+        return turn(model_refusal(REFERENCE_BLOCK_TOO_LARGE_REASON), ())
+    reasoning_request = ReasoningRequest(request, history, context, proposals, files)
+    if (facts.items or files) and (final_check is None or final_check() is not True):
+        # The active project changed, or could not be read, after the
+        # request's snapshot: nothing is sent.
+        log.warning("Request refused: the active project changed.")
+        return turn(model_refusal(PROJECT_CHANGED_REASON), ())
+
+    outcome = request_reasoning(provider, reasoning_request, settings, log)
+
+    def notices_for(delivered: bool) -> tuple[str, ...]:
+        """Return this turn's notices, naming records supplied or selected."""
+        notices = _context_notices(
+            selection,
+            search,
+            delivered=delivered,
+            agenda=agenda,
+            facts=facts,
+            project_id=active_project_id,
+        )
+        if files:
+            notices += (file_parts_notice(files, delivered=delivered),)
+        return notices
+
     if type(outcome) is Failure:
         # Delivery cannot be established, so nothing is claimed as supplied
         # and nothing new is tracked: no reply is kept that could repeat it.
-        return turn(
-            outcome.message,
-            _context_notices(selection, search, delivered=False, agenda=agenda),
-        )
+        return turn(outcome.message, notices_for(False))
 
-    notices = _context_notices(selection, search, delivered=True, agenda=agenda)
+    notices = notices_for(True)
+    if files:
+        # Plain text, never compiled, and never kept: no exchange, no
+        # fingerprint, and no file part stays in the session.
+        log.info("Project file reply shown; nothing kept.")
+        return turn(outcome.text, notices)
     if proposals and is_proposal_attempt(outcome.text):
         # Handed back untouched for the compiler. A proposal is never kept as
         # an exchange, so the fingerprints of what this request supplied are
@@ -828,6 +913,8 @@ def draft_summary(
     supplied_summaries_read: Sequence[object] = (),
     supplied_tasks_read: Sequence[object] = (),
     supplied_reminders_read: Sequence[object] = (),
+    supplied_facts_read: Sequence[object] = (),
+    active_project_id: int | None = None,
 ) -> SummaryDraft:
     """Ask the provider once for a summary of exactly the retained exchanges.
 
@@ -836,8 +923,10 @@ def draft_summary(
     to summarize; a failed recheck, which Brain reports as
     ``supplied_memories_read`` of None, or a read that cannot be trusted,
     clears the conversation and refuses with the existing unreadable
-    notice; a supplied record no longer enabled with the same text clears it
-    and refuses with the existing cleared notice; and a request that, with
+    notice; a supplied record no longer enabled with the same text, or a
+    supplied fact no longer one of the active project's with its approved
+    text, clears it and refuses with the cleared notice that names what
+    changed; and a request that, with
     every retained exchange and ``SUMMARY_DRAFT_PROMPT``, is over the
     configured input budget is refused whole, never with an exchange
     dropped.
@@ -859,40 +948,53 @@ def draft_summary(
         return SummaryDraft(None, SUMMARY_NO_CONVERSATION_MESSAGE)
 
     supplied = validated_supplied_context(supplied_context)
-    current: bool | None = None
+    changed: tuple[str, ...] | None = None
     if supplied_memories_read is not None:
         try:
-            current = supplied_still_current(
+            changed = _changed_notices(
                 supplied,
-                enabled_memories(
-                    supplied_memories_read,
-                    SUPPLIED_CONTEXT_MAX_RECORDS,
-                ),
-                enabled_notes(supplied_notes_read, SUPPLIED_CONTEXT_MAX_RECORDS),
-                enabled_summaries(
-                    supplied_summaries_read,
-                    SUPPLIED_CONTEXT_MAX_RECORDS,
-                ),
-                enabled_tasks(supplied_tasks_read, SUPPLIED_CONTEXT_MAX_RECORDS),
-                enabled_reminders(
-                    supplied_reminders_read,
-                    SUPPLIED_CONTEXT_MAX_RECORDS,
+                _SettledReads(
+                    supplied_memories=enabled_memories(
+                        supplied_memories_read,
+                        SUPPLIED_CONTEXT_MAX_RECORDS,
+                    ),
+                    supplied_notes=enabled_notes(
+                        supplied_notes_read,
+                        SUPPLIED_CONTEXT_MAX_RECORDS,
+                    ),
+                    supplied_summaries=enabled_summaries(
+                        supplied_summaries_read,
+                        SUPPLIED_CONTEXT_MAX_RECORDS,
+                    ),
+                    supplied_tasks=enabled_tasks(
+                        supplied_tasks_read,
+                        SUPPLIED_CONTEXT_MAX_RECORDS,
+                    ),
+                    supplied_reminders=enabled_reminders(
+                        supplied_reminders_read,
+                        SUPPLIED_CONTEXT_MAX_RECORDS,
+                    ),
+                    supplied_facts=enabled_facts(
+                        supplied_facts_read,
+                        SUPPLIED_CONTEXT_MAX_RECORDS,
+                        active_project_id,
+                    ),
                 ),
             )
         except ValueError:
-            current = None
-    if current is None:
+            changed = None
+    if changed is None:
         log.warning(
             "Conversation summary not drafted: supplied context unreadable; "
             "earlier conversation cleared."
         )
         return SummaryDraft(None, CONTEXT_UNREADABLE_NOTICE, cleared=True)
-    if not current:
+    if changed:
         log.info(
             "Conversation summary not drafted: supplied context changed; "
             "earlier conversation cleared."
         )
-        return SummaryDraft(None, CONVERSATION_CLEARED_NOTICE, cleared=True)
+        return SummaryDraft(None, "\n".join(changed), cleared=True)
 
     try:
         size = request_content_bytes(
@@ -982,13 +1084,17 @@ def _settled_reads(
     reminders: object = (),
     supplied_tasks: object = (),
     supplied_reminders: object = (),
+    facts: object = (),
+    supplied_facts: object = (),
+    project_id: int | None = None,
 ) -> _SettledReads:
     """Validate every bounded read of one turn, or raise ``ValueError``.
 
     Each read must have the shape and size its bound allows, a memory
     search must hold only memories after those Tier A considered, so no
-    memory can be supplied twice, and a note or summary search must hold
-    only records whose text it returned whole.
+    memory can be supplied twice, a note or summary search must hold only
+    records whose text it returned whole, and every fact must belong to the
+    snapshot's active project, with none when no project is active.
     """
     settled = _SettledReads(
         enabled_memories(enabled),
@@ -1002,11 +1108,75 @@ def _settled_reads(
         enabled_reminders(reminders, CONTEXT_QUERY_LIMIT),
         enabled_tasks(supplied_tasks, SUPPLIED_CONTEXT_MAX_RECORDS),
         enabled_reminders(supplied_reminders, SUPPLIED_CONTEXT_MAX_RECORDS),
+        enabled_facts(facts, CONTEXT_QUERY_LIMIT, project_id),
+        enabled_facts(supplied_facts, SUPPLIED_CONTEXT_MAX_RECORDS, project_id),
     )
     searched_memories_follow(settled.enabled, settled.searched_memories)
     searched_notes_whole(settled.searched_notes)
     searched_summaries_whole(settled.searched_summaries)
     return settled
+
+
+def _changed_notices(
+    supplied: frozenset[ContextFingerprint],
+    reads: _SettledReads,
+) -> tuple[str, ...]:
+    """Say why the earlier conversation must be cleared, or nothing if not.
+
+    A supplied record that is no longer enabled with its text gets the
+    existing cleared notice, and a supplied fact that is no longer one of the
+    active project's with its approved text the fact notice, so each notice
+    names what actually changed.
+    """
+    facts = frozenset(
+        fingerprint
+        for fingerprint in supplied
+        if fingerprint.source is ContextSource.PROJECT_FACT
+    )
+    notices: list[str] = []
+    if not supplied_still_current(
+        supplied - facts,
+        reads.supplied_memories,
+        reads.supplied_notes,
+        reads.supplied_summaries,
+        reads.supplied_tasks,
+        reads.supplied_reminders,
+    ):
+        notices.append(CONVERSATION_CLEARED_NOTICE)
+    if not supplied_still_current(facts, (), facts=reads.supplied_facts):
+        notices.append(FACT_CLEARED_NOTICE)
+    return tuple(notices)
+
+
+def _files_fit(
+    request: str,
+    context: tuple[ContextItem, ...],
+    files: tuple[ProjectFilePart, ...],
+    settings: ReasoningSettings,
+) -> bool:
+    """Return whether file parts fit their two limits beside the request.
+
+    The file framing and block must render within ``FILE_BLOCK_MAX_BYTES``,
+    and the request, its context, and the file framing and block together
+    within the configured input budget; the request and its context already
+    fit the conversation budget. Without a configured budget the reasoning
+    boundary refuses the request anyway.
+    """
+    try:
+        file_parts_bytes(files, with_context=bool(context))
+        if settings.max_input_bytes is None:
+            return True
+        size = request_content_bytes(
+            request,
+            (),
+            settings.max_input_bytes,
+            context,
+            False,
+            files,
+        )
+    except ValueError:
+        return False
+    return size <= settings.max_input_bytes
 
 
 def _records(
@@ -1022,28 +1192,44 @@ def _context_notices(
     *,
     delivered: bool,
     agenda: AgendaSelection = AgendaSelection(),
+    facts: FactSelection = FactSelection(),
+    project_id: int | None = None,
 ) -> tuple[str, ...]:
     """Return Maria's notices about what one request carried.
 
     Tier A's memory notice comes first, then what its limits left out, then
-    the notice for its tasks and reminders and what the limits left out of
-    them, then Tier B's notice, what its limits left out, and any possible
-    divergent versions among the selected notes. ``delivered`` says whether
-    the model is known to have received the request; when it is not, the
-    records are named as selected rather than supplied. With no context at
-    all the one notice says none was supplied. A request with no eligible
-    task or reminder gets exactly the notices it had before V1-22.
+    the active project of the request's snapshot, its facts' notice and
+    what the limits left out of them, then the notice for its tasks and
+    reminders and what the limits left out of them, then Tier B's notice,
+    what its limits left out, and any possible divergent versions among the
+    selected notes. ``delivered`` says whether the model is known to have
+    received the request; when it is not, the records are named as selected
+    rather than supplied. With no context at all the one notice says none
+    was supplied. A request with no active project and no eligible task or
+    reminder gets exactly the notices it had before V1-22.
     """
     enabled, searched = selection.items, search.items
     timed = agenda.items
+    known = facts.items
     notices: list[str] = []
     if enabled:
         notices.append(
             supplied_notice(enabled) if delivered else selected_notice(enabled)
         )
-    elif not searched and not timed:
+    elif not searched and not timed and not known:
         notices.append(NO_MEMORY_CONTEXT_NOTICE)
     omitted = omission_notice(selection)
+    if omitted is not None:
+        notices.append(omitted)
+    if project_id is not None:
+        notices.append(active_project_notice(project_id))
+    if known:
+        notices.append(
+            fact_supplied_notice(known)
+            if delivered
+            else fact_selected_notice(known)
+        )
+    omitted = fact_omission_notice(facts)
     if omitted is not None:
         notices.append(omitted)
     if timed:

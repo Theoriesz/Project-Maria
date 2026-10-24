@@ -48,6 +48,15 @@ plan, a tool, Tool Manager, permissions, or a provider, and neither touches
 a pending approval, the conversation, or the supplied-context fingerprints.
 A notice is never recorded as an interaction, kept in the conversation, or
 sent to a model.
+
+A session may also hold a projects seam (V1-24-R1), which the desktop
+window's project selector reads through ``project_choices``: at most fifty
+projects by id and name, and the active project's id while one is active.
+It changes nothing, contains every ``Exception``, logging only its type, and
+like the delivery seam never calls Brain, a plan, a tool, Tool Manager,
+permissions, or a provider, and never touches a pending approval, the
+conversation, or the supplied-context fingerprints. Activating or
+deactivating a project is an ordinary submitted command.
 """
 
 from __future__ import annotations
@@ -60,6 +69,7 @@ from core.brain import BrainResponse, MariaBrain
 from core.context import SUPPLIED_CONTEXT_MAX_RECORDS, ContextFingerprint
 from core.conversation import bounded_conversation
 from core.logger import get_logger
+from core.memory import Memory
 from core.planner import (
     PLAN_STEP_LIMIT_MESSAGE,
     Plan,
@@ -69,6 +79,10 @@ from core.planner import (
     own_origin,
     plan_snapshot,
 )
+# ``ProjectChoices`` is imported here also so that the desktop window's
+# worker and controller, which may import no core module but this one,
+# ``core.constants``, and ``core.logger``, can name the choices type.
+from core.project_records import ProjectChoices
 from core.reasoning import ReasoningExchange
 # ``ReminderNotice`` is imported here also so that the desktop window's
 # worker, which may import no core module but this one, ``core.constants``,
@@ -123,6 +137,26 @@ class PendingApproval:
         return "PendingApproval(<redacted>)"
 
 
+class ProjectChoicesSeam:
+    """The one read a window's project selector makes (V1-24-R1).
+
+    It asks the memory layer for the selector's projects and the active id,
+    and for nothing else: it changes nothing, and it never calls Brain, a
+    plan, a tool, Tool Manager, permissions, or a provider.
+    """
+
+    def __init__(self, memory: Memory) -> None:
+        self._memory = memory
+
+    def __repr__(self) -> str:
+        """Name the type and nothing it holds."""
+        return "ProjectChoicesSeam()"
+
+    def choices(self) -> ProjectChoices:
+        """Return at most fifty projects by id and name, and the active id."""
+        return self._memory.project_choices()
+
+
 class MariaSession:
     """Bind an owner's approval to one exact plan, for any interface."""
 
@@ -132,6 +166,7 @@ class MariaSession:
         logger: Logger | None = None,
         *,
         delivery: ReminderDeliverySeam | None = None,
+        projects: ProjectChoicesSeam | None = None,
     ) -> None:
         self.brain = brain
         self.logger = logger or get_logger(__name__)
@@ -139,6 +174,7 @@ class MariaSession:
         self._conversation: tuple[ReasoningExchange, ...] = ()
         self._supplied_context: frozenset[ContextFingerprint] = frozenset()
         self._delivery = delivery
+        self._projects = projects
 
     @property
     def pending_approval(self) -> PendingApproval | None:
@@ -194,6 +230,32 @@ class MariaSession:
                 "Recording a reminder notice failed: %s.",
                 type(error).__name__,
             )
+
+    def project_choices(self) -> ProjectChoices | None:
+        """Return the projects a window's selector lists, or None.
+
+        That is at most fifty projects by id and name, in ascending id
+        order, and the active project's id, given only while a project is
+        active. With no seam, or when the read fails, this returns None and
+        the selector keeps what it shows. An ``Exception`` is logged by its
+        type alone; a failure that is not an ``Exception`` propagates. Brain,
+        the conversation, the supplied-context fingerprints, and any pending
+        approval are never touched.
+        """
+        if self._projects is None:
+            return None
+        try:
+            choices = self._projects.choices()
+        except Exception as error:  # noqa: BLE001 - the seam's boundary.
+            self.logger.error(
+                "Reading the project choices failed: %s.",
+                type(error).__name__,
+            )
+            return None
+        if type(choices) is not ProjectChoices:
+            self.logger.error("Reading the project choices failed: unexpected.")
+            return None
+        return choices
 
     @property
     def conversation(self) -> tuple[ReasoningExchange, ...]:

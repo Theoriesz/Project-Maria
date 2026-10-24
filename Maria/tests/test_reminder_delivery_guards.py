@@ -124,6 +124,9 @@ PASS_REACH = frozenset(
         "core.failures",
         "core.logger",
         "core.memory",
+        # V1-24-R1: the project vocabulary, a pure leaf, through the memory
+        # layer.
+        "core.project_records",
         "core.reminder_delivery",
         "core.runtime_paths",
         "core.task_records",
@@ -132,8 +135,8 @@ PASS_REACH = frozenset(
 
 # Maria modules the subsystem never reaches: configuration, reasoning and its
 # adapter, permissions, planning and compilation, Tool Manager, the
-# conversation, the session, and the composition point; and no tool or GUI
-# module at all.
+# conversation, the session, the composition point, and V1-24-R1's project
+# file reading; and no tool or GUI module at all.
 NEVER_REACHED = frozenset(
     {
         "main",
@@ -145,11 +148,15 @@ NEVER_REACHED = frozenset(
         "core.permissions",
         "core.plan_compiler",
         "core.planner",
+        "core.project_file_access",
+        "core.project_files",
+        "core.project_maria_manifest",
         "core.reasoning",
         "core.session",
         "core.task_requests",
         "core.time_resolution",
         "core.tool_manager",
+        "tools.projects",
     }
 )
 NEVER_REACHED_PACKAGES = ("tools", "gui")
@@ -332,7 +339,11 @@ class SubsystemImportGuardTests(unittest.TestCase):
             if any(entry.split(".")[0] == "ctypes" for entry in names):
                 importers.add(module_name(path))
 
-        self.assertEqual(importers, {"core.desktop_notice", "tools.system"})
+        # V1-24-R1 adds the one project file access module.
+        self.assertEqual(
+            importers,
+            {"core.desktop_notice", "tools.system", "core.project_file_access"},
+        )
 
     def test_the_subsystem_names_no_planning_tool_or_provider_symbol(self) -> None:
         for name in SUBSYSTEM:
