@@ -37,6 +37,14 @@ state but closed, changes nothing else, and only then acknowledges it to the
 worker, which records it as displayed. A notice whose rendering fails is
 never acknowledged, so it stays unconfirmed, and the window's existing
 shield closes the window as a failure.
+
+Under V1-24-R1 the worker also sends the project selector's choices. The
+controller shows them as plain text items, ``<id>: <name>`` with
+`` (active)`` on the active one, or one "No projects" item, without changing
+its state. Activate and Deactivate are accepted only while the window is
+ready, and each submits exactly ``activate project <id>`` or ``deactivate
+project`` through the same path as Send, so an activation is still offered
+for the owner's approval like any other.
 """
 
 from __future__ import annotations
@@ -48,6 +56,7 @@ from core.constants import APP_NAME, APP_VERSION
 from gui.session_worker import (
     ApprovalOffer,
     DueReminderNotice,
+    ProjectList,
     Reply,
     SessionEnded,
     WorkerEvent,
@@ -75,6 +84,20 @@ STATUS_AWAITING_APPROVAL = "Waiting for your approval"
 STATUS_CLOSING = "Closing"
 STATUS_CLOSING_BUSY = "Closing after the current request finishes"
 STATUS_CLOSED = "Closed"
+
+# The project selector's fixed texts (V1-24-R1, D12), and the two commands
+# its buttons submit.
+PROJECT_LABEL = "Project"
+ACTIVATE_LABEL = "Activate"
+DEACTIVATE_LABEL = "Deactivate"
+NO_PROJECTS_ITEM = "No projects"
+ACTIVE_ITEM_SUFFIX = " (active)"
+DEACTIVATE_COMMAND = "deactivate project"
+
+
+def activate_command(project_id: int) -> str:
+    """Return the exact command Activate submits for one project."""
+    return f"activate project {project_id}"
 
 
 class WindowView(Protocol):
@@ -106,6 +129,12 @@ class WindowView(Protocol):
 
     def close_window(self) -> None:
         """Close the window once the session has ended."""
+
+    def show_projects(self, items: tuple[str, ...]) -> None:
+        """Show the project selector's items, as plain text, in order."""
+
+    def set_project_controls(self, *, activating: bool, deactivating: bool) -> None:
+        """Enable Activate and Deactivate."""
 
 
 class SessionCommands(Protocol):
@@ -169,6 +198,8 @@ class GuiController:
         self._offer_serial: int | None = None
         self._closing_status = STATUS_CLOSING
         self._failed = False
+        # The ids of the projects the selector shows, in its order.
+        self._project_ids: tuple[int, ...] = ()
 
     @property
     def state(self) -> ControllerState:
@@ -213,10 +244,27 @@ class GuiController:
         if request.lower() in EXIT_COMMANDS:
             self.request_close()
             return True
-        self._view.append(f"You: {request}")
-        self._state = ControllerState.BUSY
-        self._worker.submit(request)
-        self._refresh()
+        self._submit(request)
+        return True
+
+    def activate(self, index: int) -> bool:
+        """Submit ``activate project <id>`` for the item at ``index``.
+
+        Accepted only while the window is ready and the item names a project;
+        the activation is then offered for approval like any other request.
+        """
+        if self._state is not ControllerState.READY or not (
+            type(index) is int and 0 <= index < len(self._project_ids)
+        ):
+            return False
+        self._submit(activate_command(self._project_ids[index]))
+        return True
+
+    def deactivate(self) -> bool:
+        """Submit ``deactivate project``, if the window is ready."""
+        if self._state is not ControllerState.READY:
+            return False
+        self._submit(DEACTIVATE_COMMAND)
         return True
 
     def approve(self, serial: int) -> bool:
@@ -278,6 +326,12 @@ class GuiController:
             self._view.append(f"{APP_NAME}: {event.text}")
             self._worker.acknowledge_reminder_notice(event.serial)
             return
+        if isinstance(event, ProjectList):
+            # The selector changes; the state, the offer shown, and the
+            # approval area do not.
+            self._show_projects(event)
+            self._refresh()
+            return
         if isinstance(event, ApprovalOffer):
             self._offer(event)
         elif isinstance(event, Reply):
@@ -285,6 +339,23 @@ class GuiController:
             if self._state is ControllerState.BUSY:
                 self._state = ControllerState.READY
         self._refresh()
+
+    def _submit(self, request: str) -> None:
+        """Show one accepted request and hand it to the worker."""
+        self._view.append(f"You: {request}")
+        self._state = ControllerState.BUSY
+        self._worker.submit(request)
+        self._refresh()
+
+    def _show_projects(self, event: ProjectList) -> None:
+        """Show the selector's items as plain text, and keep their ids."""
+        self._project_ids = tuple(project_id for project_id, _ in event.projects)
+        items = tuple(
+            f"{project_id}: {name}"
+            f"{ACTIVE_ITEM_SUFFIX if project_id == event.active_id else ''}"
+            for project_id, name in event.projects
+        )
+        self._view.show_projects(items or (NO_PROJECTS_ITEM,))
 
     def _offer(self, event: ApprovalOffer) -> None:
         """Show an offer the owner can answer, unless the window is closing.
@@ -359,4 +430,8 @@ class GuiController:
             sending=state is ControllerState.READY,
             answering=state is ControllerState.AWAITING_APPROVAL,
             typing=state in _TYPING_STATES,
+        )
+        self._view.set_project_controls(
+            activating=state is ControllerState.READY and bool(self._project_ids),
+            deactivating=state is ControllerState.READY,
         )

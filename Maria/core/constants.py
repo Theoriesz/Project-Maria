@@ -55,9 +55,11 @@ DEFAULT_DATABASE_BUSY_TIMEOUT_SECONDS = 5.0
 # ``audit_outcomes`` tables; 6 adds the ``saved_conversations`` and
 # ``conversation_summaries`` tables; 7 adds the ``tasks`` and ``reminders``
 # tables; 8 adds each reminder's delivery state and the one-row delivery
-# setting, and is the current schema. A new version is added by appending one
-# migration, never by editing this value's meaning.
-DATABASE_SCHEMA_VERSION = 8
+# setting; 9 adds the ``projects`` and ``project_facts`` tables and the
+# one-row project activation setting (V1-24-R1), and is the current schema.
+# A new version is added by appending one migration, never by editing this
+# value's meaning.
+DATABASE_SCHEMA_VERSION = 9
 
 # The closed-app reminder pass's own log file, beside ``maria.log`` in the
 # configured log directory (V1-23-R1). Only that pass writes it, and Maria

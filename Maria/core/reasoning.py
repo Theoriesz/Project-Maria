@@ -29,8 +29,11 @@ earlier exchanges of the owner's current conversation, each text the owner
 typed and text the model already replied, and one typed field of context:
 ``ContextItem`` values from ``core/context.py``, Tier A memories and Tier B
 search matches, each bearing the source and record id Maria read, empty by
-default and validated again here rather than trusted. Nothing else personal
-can be carried, and raw interaction history has no field at all.
+default and validated again here rather than trusted. From V1-24 a request
+may instead carry the owner-named parts of files of the active project, each
+a ``ProjectFilePart`` with its identity, and then carries no earlier exchange
+and no proposal instructions. Nothing else personal can be carried, and raw
+interaction history has no field at all.
 
 The instructions invite the model to answer an allowed request with a
 proposal, of one action or of a short ordered plan of actions, instead of
@@ -56,6 +59,11 @@ from core.context import (
 )
 from core.failures import Failure, FailureKind, TypedFailureError
 from core.logger import get_logger
+from core.project_records import (
+    FILE_PART_INSTRUCTIONS,
+    ProjectFilePart,
+    file_parts_bytes,
+)
 
 
 # Hard ceilings. A request or reply beyond these cannot exist as a value at
@@ -182,6 +190,11 @@ REASONING_PROPOSAL_INSTRUCTIONS_MESSAGE = (
     "A reasoning request's proposal instructions flag must be exactly True or "
     "False."
 )
+REASONING_FILES_MESSAGE = (
+    "A reasoning request's project file parts must be a tuple of at most three "
+    "parts Maria built, rendering within their bound, and a request carrying "
+    "any carries no earlier exchange and no proposal instructions."
+)
 
 
 # Maria's fixed instructions for a request that may be answered with a
@@ -305,14 +318,17 @@ class ReasoningRequest:
     ``PROPOSAL_INSTRUCTIONS``; it must be exactly True or False and is False
     by default, which leaves the request exactly as it was before the flag
     existed. There is no field for a system prompt, a template, or raw
-    interaction history.
+    interaction history. ``files`` holds the owner-named parts of files of
+    the active project, from V1-24-R1, empty by default; a request carrying
+    any has no history and no proposal instructions.
 
     The prompt is exact, non-empty text; the context meets every bound
     ``context_content_bytes`` checks, at most
     ``COMBINED_CONTEXT_MAX_ITEMS`` items rendering to at most
     ``COMBINED_CONTEXT_MAX_BYTES``, with Tier A inside its own V1-15 bounds;
-    and the prompt, every exchange's text, the rendered context, and any
-    selected instructions together are at most
+    the file parts meet every bound ``file_parts_bytes`` checks; and the
+    prompt, every exchange's text, the rendered context, any selected
+    instructions, and the file framing and block together are at most
     ``REASONING_MAXIMUM_INPUT_BYTES`` UTF-8 bytes, counted as
     ``request_content_bytes`` counts them. The configured input budget is
     narrower and is applied by ``request_reasoning`` before any provider is
@@ -323,9 +339,10 @@ class ReasoningRequest:
     history: tuple[ReasoningExchange, ...] = ()
     context: tuple[ContextItem, ...] = ()
     proposal_instructions: bool = False
+    files: tuple[ProjectFilePart, ...] = ()
 
     def __post_init__(self) -> None:
-        """Refuse anything but bounded text, history, context, and flag."""
+        """Refuse anything but bounded text, history, context, flag, and files."""
         if not _is_bounded_text(self.prompt, REASONING_MAXIMUM_INPUT_BYTES):
             raise ValueError(REASONING_PROMPT_MESSAGE)
         if type(self.proposal_instructions) is not bool:
@@ -336,6 +353,7 @@ class ReasoningRequest:
             REASONING_MAXIMUM_INPUT_BYTES,
             self.context,
             self.proposal_instructions,
+            self.files,
         )
         if size > REASONING_MAXIMUM_INPUT_BYTES:
             raise ValueError(REASONING_HISTORY_MESSAGE)
@@ -468,10 +486,11 @@ def request_reasoning(
     """Ask a provider one question and settle the outcome as a value.
 
     Disabled settings answer unavailable, and a request whose prompt,
-    history, rendered context, and any selected proposal instructions
-    together are over the configured input budget answers over-budget, both
-    without the provider being asked. The request's size is measured again
-    here, by ``request_content_bytes``, whatever its construction checked.
+    history, rendered context, any selected proposal instructions, and any
+    file framing and block together are over the configured input budget
+    answers over-budget, both without the provider being asked. The
+    request's size is measured again here, by ``request_content_bytes``,
+    whatever its construction checked.
     Otherwise the provider is asked exactly once. A typed reasoning failure
     it raises is returned as that failure; any other exception is contained
     as unavailable without being bound to a name, so neither it nor its text
@@ -505,6 +524,7 @@ def request_content_bytes(
     maximum_bytes: int,
     context: object = (),
     proposal_instructions: object = False,
+    files: object = (),
 ) -> int:
     """Measure the text a request carries, in UTF-8 bytes, against a bound.
 
@@ -515,9 +535,11 @@ def request_content_bytes(
     source, and id, and nothing when the context is empty, plus, when
     ``proposal_instructions`` selects them, ``proposal_instruction_bytes``:
     the fixed proposal instructions and the separator that joins them to
-    the context framing. Nothing else counts, so no role name, message
-    structure, or model identifier a provider adds to carry the text is
-    included.
+    the context framing, plus, when the request carries file parts,
+    ``file_parts_bytes``: the fixed file framing, the separator that joins
+    it to the context framing when there is context, and the rendered file
+    block. Nothing else counts, so no role name, message structure, or model
+    identifier a provider adds to carry the text is included.
 
     Every text is read again rather than trusted from construction, and the
     count stops as soon as it passes ``maximum_bytes``, so a request
@@ -527,8 +549,10 @@ def request_content_bytes(
     non-empty text raises ``ValueError`` with the prompt message, a flag
     that is not exactly True or False raises it with the flag message, a
     history ``history_content_bytes`` refuses raises it with the history
-    message, and a context ``context_content_bytes`` refuses raises it with
-    the context message.
+    message, a context ``context_content_bytes`` refuses raises it with the
+    context message, and file parts that are not Maria's own, that render
+    beyond their bound, or that come with history or proposal instructions
+    raise it with the files message.
     """
     size = _bounded_utf8_size(prompt, maximum_bytes)
     if size is None or size == 0:
@@ -541,6 +565,7 @@ def request_content_bytes(
     size += context_size
     if proposal_instructions:
         size += proposal_instruction_bytes(context_size > 0)
+    size += _file_bytes(files, history, proposal_instructions, context_size > 0)
     if size > maximum_bytes:
         return size
     return size + history_content_bytes(history, maximum_bytes - size)
@@ -563,21 +588,26 @@ def proposal_instruction_bytes(with_context: bool) -> int:
 def system_instructions(
     context: tuple[ContextItem, ...],
     proposal_instructions: bool,
+    files: tuple[ProjectFilePart, ...] = (),
 ) -> str | None:
     """Return the one system message a request carries, or None for none.
 
     Maria's fixed proposal instructions come first when the request selects
-    them, then the context framing when there is context, joined by
-    ``INSTRUCTION_SEPARATOR`` into a single message. Neither part ever holds
-    stored text, request text, or anything a model wrote. With the flag off
-    this is exactly what a request carried before the flag existed: the
-    context framing alone, or no system message at all without context.
+    them, then the context framing when there is context, then the fixed
+    file framing when the request carries file parts, joined by
+    ``INSTRUCTION_SEPARATOR`` into a single message. No part ever holds
+    stored text, file text, request text, or anything a model wrote. With
+    the flag off and no file part this is exactly what a request carried
+    before either existed: the context framing alone, or no system message
+    at all without context.
     """
     parts: list[str] = []
     if proposal_instructions:
         parts.append(PROPOSAL_INSTRUCTIONS)
     if context:
         parts.append(context_instructions(context))
+    if files:
+        parts.append(FILE_PART_INSTRUCTIONS)
     if not parts:
         return None
     return INSTRUCTION_SEPARATOR.join(parts)
@@ -627,6 +657,7 @@ def _settle(
         settings.max_input_bytes,
         getattr(request, "context", None),
         getattr(request, "proposal_instructions", None),
+        getattr(request, "files", None),
     )
     if size > settings.max_input_bytes:
         return Failure(FailureKind.REASONING_INPUT_OVER_BUDGET)
@@ -641,6 +672,32 @@ def _settle(
         return Failure(FailureKind.REASONING_UNAVAILABLE)
 
     return _settle_answer(answer, settings)
+
+
+def _file_bytes(
+    files: object,
+    history: object,
+    proposal_instructions: bool,
+    with_context: bool,
+) -> int:
+    """Return F + D for a request's file parts, or raise ``ValueError``.
+
+    The parts are read again rather than trusted. A request carrying any
+    must carry no earlier exchange and no proposal instructions, so a file
+    part never reaches a request that could propose an action or be kept.
+    """
+    if type(files) is not tuple:
+        raise ValueError(REASONING_FILES_MESSAGE)
+    if not files:
+        return 0
+    if proposal_instructions or type(history) is not tuple or history:
+        raise ValueError(REASONING_FILES_MESSAGE)
+    try:
+        return file_parts_bytes(files, with_context=with_context)
+    except ValueError:
+        pass
+    # Raised here, outside the handler, so the refusal carries nothing else.
+    raise ValueError(REASONING_FILES_MESSAGE)
 
 
 def _reported_kind(raised: TypedFailureError) -> FailureKind:

@@ -1680,8 +1680,11 @@ class TierCExclusionTests(unittest.TestCase):
 
     Tier C is raw interaction history, arbitrary files, logs, credentials
     and private configuration, and sensitive records, which here means every
-    memory and note without context consent. Each is seeded with a sentinel
-    the request literally contains, so a search that could reach it would.
+    memory and note without context consent. From V1-24-R1 it also holds the
+    facts of every project that is not the active one, project files a
+    request does not name, and the project rows themselves. Each is seeded
+    with a sentinel the request literally contains, so a search that could
+    reach it would.
     """
 
     def test_the_automatic_sources_are_exactly_the_approved_ones(self) -> None:
@@ -1694,7 +1697,9 @@ class TierCExclusionTests(unittest.TestCase):
         saved conversation is not a source at all. V1-22 changed it on purpose
         again: open tasks and reminders the owner enabled for context are a
         fourth and fifth source, Tier A only, untitled, and carrying their
-        timing.
+        timing. V1-24-R1 changed it on purpose once more: the active
+        project's facts are a sixth source, Tier A only, untitled, carrying
+        their project's id, and declared before tasks.
         """
         self.assertEqual(
             [(source.name, source.value) for source in ContextSource],
@@ -1702,6 +1707,7 @@ class TierCExclusionTests(unittest.TestCase):
                 ("MEMORY", "memory"),
                 ("NOTE", "note"),
                 ("SUMMARY", "summary"),
+                ("PROJECT_FACT", "project fact"),
                 ("TASK", "task"),
                 ("REMINDER", "reminder"),
             ],
@@ -1829,6 +1835,47 @@ class TierCExclusionTests(unittest.TestCase):
         for statement in statements:
             with self.subTest(statement=statement[:60]):
                 self.assertNotIn("interactions", statement)
+
+    def test_no_project_tier_c_sentinel_reaches_any_request(self) -> None:
+        # The search terms of one request are capped, so the project sources
+        # of V1-24-R1 get a request of their own. The active project's own
+        # fact is the control that does reach it.
+        provider, harness = _harness(self, _echoing_model)
+        keys = {
+            "inactive_fact": ("tiercinactivefact", "payload-inactive-fact-6b2e"),
+            "unrelated_fact": ("tiercunrelatedfact", "payload-unrelated-fact-0d9c"),
+            "unnamed_file": ("tiercunnamedfile", "payload-unnamed-file-4a71"),
+            "project_name": ("tiercprojectname", "payload-project-name-8e35"),
+            "location": ("tierclocation", "payload-location-1f6a"),
+        }
+        stored = {kind: f"{key} {payload}" for kind, (key, payload) in keys.items()}
+        active = harness.memory.create_project(
+            stored["project_name"],
+            "workspace",
+            "tierclocation/payload-location-1f6a",
+        )
+        inactive = harness.memory.create_project("Inactive", "workspace", "inactive")
+        unrelated = harness.memory.create_project("Unrelated", "workspace", "other")
+        harness.memory.add_project_fact(inactive, stored["inactive_fact"])
+        harness.memory.add_project_fact(unrelated, stored["unrelated_fact"])
+        harness.memory.add_project_fact(active, "tiercactivefact zebra")
+        harness.memory.activate_project(inactive)
+        harness.memory.activate_project(active)
+        folder = harness.workspace / "tierclocation" / "payload-location-1f6a"
+        folder.mkdir(parents=True)
+        (folder / "notes.md").write_text(stored["unnamed_file"], encoding="utf-8")
+
+        request = " ".join(key for key, _ in keys.values()) + " zebra"
+        self.assertEqual(len(search_terms(request)), 6)
+        response = harness.session().submit(request)
+
+        sent = everything_sent(provider.requests)
+        for kind, (_, payload) in keys.items():
+            with self.subTest(kind=kind):
+                self.assertNotIn(payload, sent)
+                self.assertNotIn(payload, response.text)
+        self.assertIn("tiercactivefact zebra", sent)
+        self.assertEqual([request.files for request in provider.requests], [()])
 
 
 class TierBLogPrivacyTests(unittest.TestCase):

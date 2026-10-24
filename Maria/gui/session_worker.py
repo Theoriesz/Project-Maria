@@ -31,6 +31,14 @@ displayed, delivers no event, and starts no check. A notice the window never
 acknowledges stays unconfirmed, and the kept notices go with the session
 when it ends.
 
+Under V1-24-R1 the worker also asks the session for the project selector's
+choices, at the same moments as the reminder check and under the same rules:
+once after creating the session, once after each operation whose event is a
+``Reply``, never after an approval offer, never on a timer, and never once
+``close()`` was called. Choices it reads go to the window as one
+``ProjectList``; a read that gives none delivers nothing, so the selector
+keeps what it shows.
+
 An event carries only text Maria shows the owner, and its ``repr`` shows none
 of it. Every failure, whatever its kind, is contained in the worker's thread:
 creating the session, an operation, delivering an event, and ending the
@@ -113,7 +121,21 @@ class DueReminderNotice:
     text: str = field(repr=False)
 
 
-WorkerEvent = Reply | ApprovalOffer | SessionEnded | DueReminderNotice
+@dataclass(frozen=True)
+class ProjectList:
+    """The projects the window's selector lists, and the active one (V1-24-R1).
+
+    ``projects`` holds at most fifty (id, name) pairs in ascending id order,
+    and ``active_id`` names the active project only while one is active.
+    """
+
+    projects: tuple[tuple[int, str], ...] = field(repr=False)
+    active_id: int | None = None
+
+
+WorkerEvent = (
+    Reply | ApprovalOffer | SessionEnded | DueReminderNotice | ProjectList
+)
 
 # One queued operation: it runs on the worker thread with the session and
 # returns the event to deliver, or None for an operation that delivers none.
@@ -220,6 +242,7 @@ class SessionWorker:
             session = self._session_factory()
             self.logger.info("GUI session started.")
             self._check(session)
+            self._list_projects(session)
             while (operation := self._operations.get()) is not None:
                 event = operation(session)
                 if event is None:
@@ -227,6 +250,7 @@ class SessionWorker:
                 self._send(event)
                 if isinstance(event, Reply):
                     self._check(session)
+                    self._list_projects(session)
             reached_close = True
         except BaseException as error:  # noqa: BLE001 - thread boundary.
             self.logger.error(
@@ -305,6 +329,20 @@ class SessionWorker:
         self._notice_serial += 1
         self._notices[self._notice_serial] = notice
         self._send(DueReminderNotice(self._notice_serial, notice.text))
+
+    def _list_projects(self, session: MariaSession) -> None:
+        """Hand the window the selector's choices the session reads now.
+
+        Nothing runs once the window has asked to close. A read that gives no
+        choices delivers nothing. The retained offer and the session's
+        pending approval are never touched.
+        """
+        if self._closing.is_set():
+            return
+        choices = session.project_choices()
+        if choices is None:
+            return
+        self._send(ProjectList(choices.projects, choices.active_id))
 
     def _acknowledge(self, session: MariaSession, serial: int) -> None:
         """Record a notice the window showed as displayed; deliver nothing.

@@ -196,8 +196,14 @@ In the current implementation, successful `history.read`, `audit.list`,
 `audit.read`, `conversations.list`, `conversations.read`,
 `conversation_summaries.list`, and `conversation_summaries.read` results,
 and V1-22's twelve, `create`, `list`, `due`, `read`, `edit`, and `reschedule`
-for tasks and for reminders, are the only ones that supply a non-`None`
-`recorded_message`: nineteen actions. For
+for tasks and for reminders, and V1-24-R1's thirteen project actions, are the
+only ones that supply a non-`None` `recorded_message`: thirty-two actions.
+Each project action records a fixed line naming ids at most, such as
+`Listed projects.`, `Created project <id>.`, `Activated project <id>.`,
+`Added fact <id> to project <id>.`, `Listed project files.`, or
+`Displayed a project file.`, so no project name, location, fact text, path,
+listing, or file text reaches interaction history that way; a refusal
+records its own fixed text, which holds none of them either. For
 `history.read` that keeps redisplayed interaction content from being
 duplicated into a new interaction row, the two audit actions record only
 `Listed audit summaries.` and `Displayed audit summary <id>.`, the four
@@ -439,7 +445,8 @@ The package has three modules with separate jobs:
   production module that imports PyQt6, and it touches widgets only on the GUI
   thread; the worker's events reach it through a queued Qt signal.
 
-Brain is unchanged, and the session API gains only V1-23-R1's delivery seam.
+The GUI changes no Brain API, and the session API gains only V1-23-R1's
+delivery seam and V1-24-R1's `project_choices()`, nine members in all.
 Brain is built on the main thread, exactly as for the CLI, and is safe to hand
 to the worker because it holds no thread-bound resource: the memory layer
 opens and closes one SQLite connection per operation, and the local adapter
@@ -467,6 +474,22 @@ a failure, and no acknowledgment is sent, so nothing records it either way. A
 failure that is not an `Exception`, raised in the session's claim or record
 call, and an `Exception` in the worker's own new lines end the session as a
 failed operation does.
+
+Under V1-24-R1 the worker also reads the session's project choices at the
+same two points, after the session's due-reminder check: once after creating
+the session and once after each operation whose event is a `Reply`, never
+after an approval offer and never once `close()` was called. Choices the
+session returns go to the window as one `ProjectList`: at most fifty
+`(id, name)` pairs in ascending id order and the active project's id, given
+only while one is active. A session without a projects seam, or whose read
+failed, returns none, and the window keeps what it shows. The controller
+shows them as plain-text items, `<id>: <name>`, with ` (active)` on the active
+one, or one `No projects` item, without changing its state, the offer it
+shows, or the approval area. Activate and Deactivate are accepted only while
+the window is ready, and the controller then submits exactly
+`activate project <id>` for the chosen item or `deactivate project`, through
+the same path as Send, so an activation is still offered for approval and
+nothing about it is decided in the GUI. The buttons take no focus.
 
 The window shows a read-only conversation area, a one-line input with Send, a
 short status line, and, while an approval is pending, the complete approval
@@ -534,8 +557,9 @@ What the window shows is presentation state: it is never replayed into the
 session's conversation or saved automatically, and a new window starts with
 only the banner. Display history is never populated automatically from stored
 records, except due-reminder notices from the session's delivery seam, shown
-as plain text (V1-23-R1). Explicit record-reading commands still display their
-results. The GUI
+as plain text (V1-23-R1); the project selector, outside the conversation area,
+lists project ids and names (V1-24-R1). Explicit record-reading commands still
+display their results. The GUI
 never configures logging. Its worker logs fixed lines through the same `maria`
 logger, so running both interfaces in one process keeps exactly one managed
 log handler throughout.
@@ -664,6 +688,17 @@ was. With delivery off, a check reads the setting and nothing else. A notice
 is never recorded as an interaction, kept in the conversation, or sent to a
 model.
 
+A session may also hold a projects seam (V1-24-R1), given as the optional
+`projects` keyword argument. `project_choices()` returns, through the seam's
+one read of the memory layer, the `ProjectChoices` a window's selector lists,
+or `None` without a seam or when the read fails or returns anything else. It
+contains every `Exception`, logging only its type, lets anything else
+propagate, changes nothing, never calls Brain, a plan, a tool, Tool Manager,
+permissions, or a provider, and never touches the pending approval, the
+conversation, or the supplied-context fingerprints. `main.py` builds the seam
+from the runtime Brain's memory through an injectable factory; a caller that
+injects a Brain factory gets none unless it also injects a projects factory.
+
 ## Permission Policy
 
 All planned actions pass through `PermissionManager`.
@@ -675,7 +710,7 @@ malformed present arrays stop configuration loading instead of weakening it.
 When an action is both denied and confirmation-required, denial wins.
 
 In the current implementation, the mandatory confirmation baseline is
-thirty-three actions: `audit.delete`, `conversations.delete`,
+thirty-nine actions: `audit.delete`, `conversations.delete`,
 `conversation_summaries.create`, `conversation_summaries.edit`,
 `conversation_summaries.delete`, `conversation_summaries.enable_context`,
 `conversation_summaries.disable_context`, `filesystem.rename`,
@@ -684,8 +719,11 @@ thirty-three actions: `audit.delete`, `conversations.delete`,
 `memory.update`, `memory.forget`, `memory.enable_context`,
 `memory.disable_context`, from V1-22, `create`, `edit`, `reschedule`,
 `delete`, `enable_context`, and `disable_context` for both `tasks` and
-`reminders`, and, from V1-23-R1, `reminders.enable_delivery` and
-`reminders.disable_delivery`. The confirmation for `memory.enable_context` also
+`reminders`, from V1-23-R1, `reminders.enable_delivery` and
+`reminders.disable_delivery`, and, from V1-24-R1, `projects.retitle`,
+`projects.delete`, `projects.activate`, `projects.add_fact`,
+`projects.edit_fact`, and `projects.delete_fact`. The confirmation for
+`memory.enable_context` also
 carries a fixed notice, from `CONFIRMATION_NOTICES` in `core/permissions.py`,
 that an enabled memory may be sent to the local reasoning model on any
 conversational turn within Maria's memory context limits, and that Maria does
@@ -720,7 +758,17 @@ are shown too, five at a time, and marked overdue when more than fifteen
 minutes late. The confirmation for `reminders.disable_delivery` carries one
 that turning delivery off stops every new notice from the moment it is saved,
 while a notice already started may still appear and be recorded and a box
-already on screen stays until closed: ten notices in all. A deterministic
+already on screen stays until closed. Under V1-24-R1 the confirmation for
+`projects.activate` carries one that, while a project is active, each of its
+facts may be sent to the local model on every conversational turn within the
+memory context limits, and Maria can read the project's files when the owner
+asks with project commands or `@` references and reads none on her own, and
+that the project stays active, also after Maria restarts, until the owner
+deactivates it or activates another; and the confirmations for
+`projects.add_fact` and `projects.edit_fact` share one that, while its project
+is active, the fact may be sent on every conversational turn within the same
+limits, so it is not always sent, and that Maria does not check it for
+secrets: thirteen notices in all. A deterministic
 plan's confirmation request shows each notice as part of its step's permission
 reason. A model plan's approval shows, after the exact compiled steps and
 before the turn's context notices, the notice of every step PermissionManager
@@ -1067,13 +1115,18 @@ which keeps tracked source, documentation, prompts, `config.toml`, and arbitrary
 untracked repository files out of generic filesystem reach even under a root
 declared around them.
 
-A later Project Maria capability is expected to reuse `FilesystemRoot`,
-`FilesystemRoots`, `ResolvedPath`, canonical containment, and
-`FilesystemProtections.excludes` unchanged, and to add its own tracked-source
-admission predicate on top. It may not bypass the universal exclusions and may not
-introduce a second path model. Making the generic tool's root available is not how
-that capability is switched on. A later stage that settles an export location must
-add that location to the same universal exclusion boundary.
+The Project Maria capability of V1-24-R1 reuses this model unchanged: the
+project file reader builds every candidate from a root's canonical path as
+configuration settled it, applies `FilesystemProtections.excludes` to every
+prefix from the root to the candidate before any filesystem call, and adds its
+own admission on top, membership of the approved path list in
+`core/project_maria_manifest.py`, rather than a tracked-source check; it
+introduces no second path model. It reads the `project_maria` root whether or
+not that root is enabled for the generic commands, whose repository barrier
+keeps refusing every repository path; making the generic tool's root
+available is not how the capability is switched on. See "Projects and Project
+Files". A later stage that settles an export location must add that location
+to the same universal exclusion boundary.
 
 ## Persistence Models
 
@@ -1084,16 +1137,18 @@ the schema advances. Startup settles that version once, classifies an
 unversioned database structurally against the shapes Maria actually shipped,
 runs any missing forward migrations in order, and refuses a database stamped
 newer than the running build before writing anything.
-`docs/database.md` describes the rules; the eight record types below are
-unchanged by them. The current schema is version 8, whose one appended
-migration, `add_reminder_delivery_state` (V1-23-R1), adds each reminder's
-delivery state and creates the empty one-row delivery setting table, and
-rewrites no row; version 7's `create_tasks_and_reminders` created the two
+`docs/database.md` describes the rules; the ten record types below are
+unchanged by them. The current schema is version 9, whose one appended
+migration, `create_project_records` (V1-24-R1), creates the three empty tables
+`projects`, `project_facts`, and `project_activation`, and touches no existing
+table or row; version 8's `add_reminder_delivery_state` (V1-23-R1) added each
+reminder's delivery state and created the empty one-row delivery setting
+table, rewriting no row; version 7's `create_tasks_and_reminders` created the two
 empty tables `tasks` and `reminders`, version 6's
 `create_conversation_records` the two conversation-record tables, and
 version 5's `create_audit_summaries` the two audit tables, the same way.
 
-Maria keeps eight kinds of persistent data separate:
+Maria keeps ten kinds of persistent data separate:
 
 - **Interaction history** records cleaned requests and the responses chosen
   for recording on the four recording branches described above, for every
@@ -1180,6 +1235,20 @@ Maria keeps eight kinds of persistent data separate:
   revision and its current revision's one claim, in its own row; that state
   is not a record type of its own, and neither is the one-row delivery
   setting. See "Reminder Delivery".
+- **Projects** each name one place Maria may read: a folder of the workspace
+  root, the workspace's top, or Project Maria, with a name of 1 to 64 UTF-8
+  bytes on one line and no colon, and UTC stamps; locations never overlap,
+  compared ignoring case. **Project facts** are one line of 1 to 512 UTF-8
+  bytes each that the owner approved word for word, stored with their
+  project's id and the approval digest, the SHA-256 of the compact JSON
+  `[project_id, text]`. A project is renamed, deleted, or activated, and a
+  fact added, edited, or deleted, only through confirmation-gated commands,
+  one row by id; a project is deleted only while inactive and without facts,
+  nothing cascades, and ids are never reused. The one-row activation setting,
+  which names the active project, if any, with a change counter, is not a
+  record type. Only the active project's facts whose stored project and text
+  still match their digest can reach the reasoning model; see "Projects and
+  Project Files".
 
 On the completed paths described above, memory commands and their responses
 also appear in interaction history when recording succeeds. A stored fact can
@@ -1487,9 +1556,10 @@ one discards its conversation and its supplied-record fingerprints.
 In V1-15, Tier A was exactly the owner's explicit memories that the owner has
 enabled for context. Since V1-22 (decision D6, amendment V1-22-R1) it also
 holds the owner's open tasks and reminders that the owner has enabled for
-context, after the memories; see "Tasks and reminders" below. Preferences
-exist only as memories the owner stores and enables, and project facts do not
-exist yet.
+context, after the memories; see "Tasks and reminders" below. Since V1-24
+(amendment V1-24-R1) it also holds the facts of the owner's active project,
+between the memories and the tasks; see "Project facts" below. Preferences
+exist only as memories the owner stores and enables.
 
 **Consent.** Every memory's consent is off by default: the V1-15 migration
 leaves every existing memory off, and a new memory is stored off.
@@ -1603,6 +1673,41 @@ check, it admits each only as text, or NULL where allowed, within a small
 stored-byte bound in the file's own encoding, so no oversized or binary value
 reaches Python, and a value holding NUL reaches it only within that bound, to
 be refused there; see `docs/database.md`.
+
+**Project facts.** A fact has no consent flag: its consent is the owner's
+confirmed addition or edit, which shows the exact quoted text and pins it as
+the approval digest, the SHA-256 of the compact JSON array
+`[project_id, text]`, together with the owner's confirmed activation of its
+project. Each model-backed request reads, in its one project snapshot, the
+active project's facts whose stored project id and text still match their
+digest, in ascending id order, one row more than can be considered, with every
+check of type, size, validity, and digest run before a row is returned or
+counted; facts of every other project are never read for context. `context.py`
+considers the first 16, after the memories Tier A already chose and before
+the tasks and reminders, and takes each whole only while Tier A as a whole
+stays within 16 items, 2 KiB, and the budget. A fact is rendered as
+`project fact <id>: "<text>"`, its project's id never shown, under the header
+`Owner memories, active-project facts, tasks, and reminders (reference
+data):`, with framing that also asks the model, when the owner asks for a
+review of a plan, a document, code, or tests, to say plainly when it would
+recommend a different approach and why, instead of simply agreeing; a request
+with no fact keeps exactly the framing and header it had before. Below the
+reply Maria names the snapshot's active project, `Active project: project
+<id>.`, then the facts sent, `Project facts supplied: project fact <id>.
+Maria cannot verify whether these facts are still current.`, or, after a
+failure, the facts selected, and any eligible one the limits left out; the
+active project is named whenever one is active, fact or no fact. A supplied
+fact's fingerprint digest is its approval digest, so the recheck, which reads
+the supplied facts by id within the same snapshot and only for the active
+project, finds it current only while it is still a fact of the active project
+with its approved text: an edit, a deletion, a deactivation, or a switch to
+another project clears the conversation, with the fixed notice `This
+session's earlier conversation was cleared because a project fact supplied to
+it no longer belongs to the active project with the same approved text, so the
+copy supplied earlier was invalidated.` A request carrying a fact is also held
+to the final check described under "Projects and Project Files". The digest
+is an integrity check against changes made outside Maria's confirmed commands,
+not authentication.
 
 ## Tier B Search Context
 
@@ -2280,6 +2385,176 @@ waits no later pass of the task starts, so an unanswered box delays later
 desktop notices without limit; in-session delivery is unaffected. Displayed
 never means read.
 
+## Projects and Project Files
+
+V1-24 (amendment V1-24-R1, decisions D1 to D17 with five owner corrections)
+adds named projects, owner-approved project facts as Tier A context, and
+bounded, read-only reading of project files, Maria's own source included when
+the owner activates Project Maria. Nothing in it writes, renames, or moves a
+file, starts a process, or works on its own.
+
+**Modules.** `core/project_records.py` is the vocabulary: limits, the path
+grammar, the two roots and project locations, the activation states and serial
+rules, the value objects, the fact approval digest, every fixed project text,
+and the rendering of the file block; it imports only the standard library and
+`core/task_records.py`, and holds no SQL, I/O, or logging.
+`core/project_files.py` is the reader: the lexical phase, the filesystem
+phase, the `@` reference grammar, decoding, the display, and model file
+parts. `core/project_file_access.py` is the only module that calls the nine
+Windows functions reading uses, through standard-library `ctypes` with every
+argument and result type pinned, and the descriptor steps through `msvcrt`.
+`core/project_maria_manifest.py` is data only. `tools/projects.py` holds the
+thirteen commands and is the only module that calls the memory layer's
+`activate_project` and `deactivate_project`, the only methods whose SQL writes
+the setting. The memory layer owns the three tables of schema 9 and every
+read and write of them; see `docs/database.md`, under "Projects". Brain reads
+each model request's project snapshot, settles its `@` references, and hands
+the conversation module the final check; `core/context.py`,
+`core/conversation.py`, `core/reasoning.py`, and the adapter carry facts and
+file parts as described below. None of the thirteen actions is model-eligible.
+
+**Activation.** The setting is at most one row of `project_activation`. No row
+is never activated; a well-formed row naming an existing project, or none, is
+active or inactive; anything else is unreadable, which `projects` reports,
+which is never taken for never activated, and which only the owner's two
+commands replace. Every change raises a serial by one, so a token, the project
+id and the serial, names exactly one state Maria wrote; at the largest serial,
+SQLite's largest integer, an activation is refused and a deactivation clears
+the project and keeps the serial, so no earlier token can recur. Only
+`activate project`, which needs approval, and `deactivate project`, which
+needs none because it only narrows exposure, change it; a fresh database, a
+migration, either interface starting, the closed-app pass, and model plans
+leave it as it was.
+
+**One snapshot per request.** A model request first reads, in one read
+transaction, the setting, the active project's row, its eligible facts, and
+the recheck of facts supplied earlier in the conversation. Every fact, file
+part, and notice of the request comes from that snapshot; file reads run after
+it and are attributed to its project, and nothing reads the setting again to
+choose a project. Deterministic project commands take a snapshot of their own
+and need no final check, because nothing they show reaches a model.
+
+**The final check.** A request carrying any project fact or file part is
+handed to the reasoning boundary only after one more read of the setting, in
+its own read transaction, after every size check Maria makes before the
+hand-off. It is sent only if the setting is readable and its token equals the
+snapshot's; otherwise nothing is sent and the owner is told that the active
+project changed while Maria prepared the request. A switch or deactivation
+committed before that read stops the request, including a switch away and back
+within one second, which the serial tells apart; one committed after it does
+not, and the request goes out with its snapshot's facts and parts, its notices
+naming the snapshot's project, while the change applies from the next request.
+After the check nothing is read again, rendered again, or substituted. The
+check covers the setting only: a fact edited or deleted after the snapshot
+does not stop the request. The serial orders Maria's own writes; a write from
+outside Maria can set any value, including a token a request already holds,
+and the check cannot tell such a write apart.
+
+**The lexical phase.** Every project file operation starts with checks that
+make no filesystem call: the path grammar; the candidate built from the
+root's canonical path as configuration settled it, the project folder, and the
+typed components, with `FilesystemProtections.excludes` applied to every
+prefix from the root to the candidate; and admission by name. For Project
+Maria the typed path must equal a member of the approved list, ignoring ASCII
+letter case, and the member's spelling is used from then on; for a workspace
+project no component may begin with "." and the final one must have an
+admitted type.
+
+**The filesystem phase.** An operation is one folder check for
+`create project`, one listing, or one file read, run on the calling thread,
+the command line's main thread or the window's one worker, from start to end
+with no other Maria work in between; no handle outlives it, and none spans a
+database transaction or a provider call. The thread's placeholder mode is set
+once to expose placeholders and restored exactly once, also after a failure;
+a restore that does not report the exposed mode withholds the result, is
+reported, and trips a process-wide latch that refuses every later project file
+operation until Maria restarts. The root is opened by its canonical path;
+each component after it is first looked up by enumeration and refused there
+when a reparse point, offline, recall-on-open, or recall-on-data-access
+attribute shows, so a link or placeholder is refused before it is opened.
+Each, the root included, is opened by handle with sharing that never allows
+delete, held, and checked on that handle: its type, its reparse tag,
+the offline and recall-on-data-access attributes, a pending deletion, and its
+final path, which must be exactly the expected path, so a short-name alias or
+a component replaced by a link is refused. A file is opened with read sharing
+only, so an existing writer makes the open fail and no writer can join; its
+link count, size, and identity are checked on that handle before any data is
+read, so a hard link is refused before reading, and it is then read whole,
+at most 524,288 bytes, through a binary, non-inheritable descriptor that takes
+over the handle in a three-state transfer; afterwards its identity, size,
+last-write time, and every held final path are checked again. Every handle,
+search, and descriptor belongs to the operation and is released exactly once,
+newest first, by its own function. A listing is built from find data alone,
+and its normal ends, an empty folder and the end of the directory, are not
+failures. On another system, or without any of the functions, every operation
+is refused before any filesystem call.
+
+**Stated residuals.** The folders above a root are not held, and a change there
+is caught only by the root's final-path check and the checks after the read.
+Final paths are compared one handle at a time, not atomically. An entry that
+becomes a placeholder or a link between its lookup and its open is opened and
+then refused on the handle before any data is read; whether that open alone
+starts a download is not known, so Maria does not promise that a read never
+starts one, and project folders under cloud synchronization are not supported,
+a rule she states but cannot detect. An interruption can leave one handle or
+descriptor open until the process ends, and a failed release keeps it until
+then too; "no handle remains" holds after every operation whose cleanup
+succeeded. Privileged code can bypass sharing, FAT always reports one link,
+the file index is not guaranteed unique on ReFS, and a drive without a
+drive-letter final path cannot be read.
+
+**Decoding and display.** Decoding uses only the bytes the filesystem phase
+released: one leading UTF-8 byte-order mark is removed, a NUL byte, invalid
+UTF-8, and an empty file are refused, and lines end at line feeds. A display
+shows at most 131,072 bytes of decoded text under a header naming the project,
+path, lines, line count, size, and the first 16 digits of the SHA-256 of
+exactly the bytes read, with a carriage return before a line feed shown as a
+line feed and every other control, format, surrogate, or separator character
+but tab shown as an escape, so no file text can pose as Maria's own. Refusals
+are fixed texts that never tell an absent file from a protected one.
+
+**Model use of files.** While a project is active, each whitespace-separated
+word of a model request beginning with exactly one `@` is a reference,
+`@<path>` or `@<path>:<from>-<to>`; `@@` and a lone `@` are text, and while no
+project is active every `@` is text. A malformed reference, a fourth distinct
+one, a part over 16,384 bytes, an unreadable file, and an unreadable or failed
+setting each refuse the whole request with a fixed reason before anything is
+sent. Each distinct file is read once and its parts share its SHA-256. The
+request then carries the owner's text as typed, Tier A and Tier B context as
+any request does, no proposal instructions, no earlier exchange, and the file
+block as its own message just before the prompt, with fixed framing that says
+the parts are reference data, that the model cannot propose actions in this
+reply, and that it should say plainly when it would recommend a different
+approach. Its sizes are measured in UTF-8 bytes: P, the request; C, the
+rendered context; F, the file framing, plus 2 for its separator when C is not
+0; and D, the file block. P + C must fit within min(8,192, the configured
+input budget), F + D within 32,768, and P + C + F + D within the configured
+input budget, and the reasoning boundary and the adapter measure the same
+number. The reply is plain text: it never reaches the compiler, it is shown
+with Maria's notices, which name each part by project, path, lines, and the
+first 16 digits of its SHA-256, and nothing of it, its parts, or the request
+is kept in the conversation or recorded. Text inside a project file is data
+and cannot create a plan step, grant authority, or change a permission.
+
+**Project Maria.** Admission is membership of the approved list, a sorted
+tuple of unique ASCII paths that the code holds as data; Maria never runs Git,
+reads `.git`, or checks whether a path is tracked, so a file not on the list
+is never read or listed, tracked or not, and the run-time exclusions still
+apply to members. A listing shows only members and the folders that hold
+them. The list changes only in the pull request that adds, renames, or
+removes a file, and three tests keep it true in an isolated copy. The reader
+uses the `project_maria` root's settled path whether or not the root is
+enabled for the generic commands, whose repository barrier keeps refusing
+every repository path, so rename and move stay refused there, and write and
+delete stay denied everywhere.
+
+**No execution.** A repository-wide guard proves, statically over every
+production module and in a run of every project command with every process and
+code-execution function made to fail, that no production path starts a
+process, runs a shell command, or evaluates, compiles, or executes code;
+registered-tool dispatch through ToolManager's fixed module list is the one
+dynamic import.
+
 ## Boundaries
 
 The brain does not run SQL or perform tool work directly. The planner does not
@@ -2293,9 +2568,10 @@ registry declares argument shapes only: it holds no tool logic, never calls a
 tool to decide whether arguments are valid, and decides nothing about
 permission. `core/context.py` imports no Maria module at all.
 `core/reasoning.py` reaches nothing but the context module, the shared
-failures, and the logger, and `core/ollama_adapter.py` nothing but those and
-the reasoning interface. `core/conversation.py` reaches only those, the
-logger, the planner's plan types, and two leaf declarations that import
+failures, the logger, and, since V1-24, `core/project_records.py` and the leaf
+`core/task_records.py` it imports, and `core/ollama_adapter.py` nothing but
+those and the reasoning interface. `core/conversation.py` reaches only those,
+the logger, the planner's plan types, and two leaf declarations that import
 nothing from Maria, the action contracts and `core/conversation_records.py`,
 never Tool Manager, permissions, the compiler, or the memory layer. A
 summary draft reaches storage only as the declared argument of the planner's
@@ -2308,9 +2584,11 @@ arguments reach a tool only after the owner's approval and a committed audit
 summary.
 `core/plan_compiler.py` reaches only the action contracts, the planner's plan
 types, the reasoning response type, the logger, and, since V1-22, the two
-leaves `core/task_requests.py` and `core/time_resolution.py`, never Tool
-Manager, a tool, permissions, the memory layer, or conversation, and Brain is
-the only production module that imports it. `core/time_resolution.py`
+leaves `core/task_requests.py` and `core/time_resolution.py`, and, since
+V1-24, through the planner, the leaves `core/project_records.py` and
+`core/task_records.py`, never Tool Manager, a tool, permissions, the memory
+layer, or conversation, and Brain is the only production module that imports
+it. `core/time_resolution.py`
 imports only the standard library, and is the only production module that
 imports `zoneinfo`; it never imports `tzdata`, which zoneinfo loads itself
 when installed. `core/task_requests.py` imports only it, and
@@ -2351,7 +2629,9 @@ proves that the delivery code uses none of them. A SQL trace proves that the
 delivery code reads only catalogue metadata, the setting, and the five
 reminder fields a notice shows and a claim compares, and writes only claim
 columns, and a file-access guard that a pass opens only the tracked
-configuration, its database, and its log. `core/desktop_notice.py` and the
+configuration, its database, and its log, and it never reaches the project
+file reader, its Windows functions, the approved list, or the projects tool.
+`core/desktop_notice.py`, `core/project_file_access.py` (V1-24-R1), and the
 system tool are the only production modules that import `ctypes`. The
 subsystem is the one exception to the Planner, PermissionManager, Tool Manager
 pipeline, out of session and, for its claim and outcome writes, in session: it
@@ -2376,7 +2656,10 @@ scheduled work. Under V1-23-R1, nothing in Maria starts a timer or background
 work either: the only scheduled work is the owner-installed task's one-minute
 pass, which Task Scheduler starts and which ends after one pass, and the
 in-session checks run only at the moments "CLI Boundary" and "GUI Boundary"
-name.
+name. Under V1-24-R1 Brain likewise names no project tool or action: it reads
+the project snapshot and the final check through the memory layer's public
+methods, and file parts through the project file reader, and `ProjectsTool`
+contains no SQL.
 
 ## Scope
 
@@ -2384,7 +2667,13 @@ This foundation intentionally excludes autonomous agents, voice, browser
 automation, internet search, and user interfaces beyond the command line and
 the optional desktop GUI of Stage V1-21; the closed-app reminder message box
 of V1-23-R1 is the one owner-facing surface beyond them, and it accepts no
-command. Future
+command. Project assistance (V1-24-R1) is read-only: it writes, renames, and
+moves no project file, searches or indexes nothing, offers no automatic file
+context, keeps no file part in a conversation, sends no project name or
+location to a model, moves no project, adds no third root, runs no Git or any
+other process, supports no folder under cloud synchronization, holds no
+activation setting across a send, and reads no project file off Windows.
+Future
 versions can add richer capabilities by extending the planner, tool manager, and
 tool set without rewriting the foundation.
 

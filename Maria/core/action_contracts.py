@@ -75,6 +75,17 @@ MAXIMUM_TRANSCRIPT_LENGTH = 64 * 1024
 # ``core.task_records``, which a test holds this to.
 MAXIMUM_TASK_TEXT_LENGTH = 512
 
+# The longest project name, project fact, and project path, and the longest
+# typed location, ``workspace/`` and a folder, in characters, coarse ceilings
+# as above; the exact UTF-8 and character rules belong to
+# ``core.project_records``, which a test holds these to. A line number is a
+# whole number up to six digits.
+MAXIMUM_PROJECT_NAME_LENGTH = 64
+MAXIMUM_PROJECT_FACT_LENGTH = 512
+MAXIMUM_PROJECT_PATH_LENGTH = 512
+MAXIMUM_PROJECT_LOCATION_LENGTH = len("workspace/") + MAXIMUM_PROJECT_PATH_LENGTH
+MAXIMUM_LINE_NUMBER = 999_999
+
 # The statuses a task or reminder listing names, and the one repeat a
 # reminder has.
 TASK_STATUSES = ("open", "completed")
@@ -917,7 +928,7 @@ def _is_iso_date(value: str) -> bool:
 
 
 def _identifier(required: bool = True) -> ArgumentContract:
-    """Declare the positive row identifier shared by thirty-six actions.
+    """Declare the positive row identifier shared by forty-four actions.
 
     Every tool that takes an ``id`` rejects a bool, a non-int, and anything
     below 1, and none imposes a ceiling.
@@ -1015,6 +1026,28 @@ def _task_text() -> ArgumentContract:
         allow_blank=False,
         minimum_length=None,
         maximum_length=MAXIMUM_TASK_TEXT_LENGTH,
+    )
+
+
+def _project_text(name: str, maximum_length: int) -> ArgumentContract:
+    """Declare a project command's required text, within its coarse ceiling."""
+    return _text(
+        name,
+        required=True,
+        allow_blank=False,
+        minimum_length=None,
+        maximum_length=maximum_length,
+    )
+
+
+def _line_number(name: str) -> ArgumentContract:
+    """Declare one optional end of a project file's line range."""
+    return ArgumentContract(
+        name,
+        int,
+        required=False,
+        minimum=1,
+        maximum=MAXIMUM_LINE_NUMBER,
     )
 
 
@@ -1435,6 +1468,113 @@ BUILT_IN_ACTION_CONTRACTS = ActionContractRegistry(
             "notes",
             "disable_context",
             (_identifier(),),
+            model_eligibility=ModelEligibility.NOT_MODEL_ELIGIBLE,
+        ),
+        # Projects (V1-24-R1). None is ever a model's to select: activation
+        # and facts are the owner's own acts, and a tool result never reaches
+        # the model, so a proposed read or listing would only show content
+        # the owner did not ask for.
+        ActionContract(
+            "projects",
+            "list",
+            model_eligibility=ModelEligibility.NOT_MODEL_ELIGIBLE,
+        ),
+        ActionContract(
+            "projects",
+            "create",
+            (
+                _project_text("name", MAXIMUM_PROJECT_NAME_LENGTH),
+                _project_text("location", MAXIMUM_PROJECT_LOCATION_LENGTH),
+            ),
+            model_eligibility=ModelEligibility.NOT_MODEL_ELIGIBLE,
+        ),
+        ActionContract(
+            "projects",
+            "read",
+            (_identifier(),),
+            model_eligibility=ModelEligibility.NOT_MODEL_ELIGIBLE,
+        ),
+        ActionContract(
+            "projects",
+            "retitle",
+            (
+                _identifier(),
+                _project_text("name", MAXIMUM_PROJECT_NAME_LENGTH),
+            ),
+            model_eligibility=ModelEligibility.NOT_MODEL_ELIGIBLE,
+        ),
+        ActionContract(
+            "projects",
+            "delete",
+            (_identifier(),),
+            model_eligibility=ModelEligibility.NOT_MODEL_ELIGIBLE,
+        ),
+        ActionContract(
+            "projects",
+            "activate",
+            (_identifier(),),
+            model_eligibility=ModelEligibility.NOT_MODEL_ELIGIBLE,
+        ),
+        ActionContract(
+            "projects",
+            "deactivate",
+            model_eligibility=ModelEligibility.NOT_MODEL_ELIGIBLE,
+        ),
+        ActionContract(
+            "projects",
+            "list_facts",
+            (_identifier(),),
+            model_eligibility=ModelEligibility.NOT_MODEL_ELIGIBLE,
+        ),
+        ActionContract(
+            "projects",
+            "add_fact",
+            (
+                _identifier(),
+                _project_text("text", MAXIMUM_PROJECT_FACT_LENGTH),
+            ),
+            model_eligibility=ModelEligibility.NOT_MODEL_ELIGIBLE,
+        ),
+        ActionContract(
+            "projects",
+            "edit_fact",
+            (
+                _identifier(),
+                _project_text("text", MAXIMUM_PROJECT_FACT_LENGTH),
+                # Absent from the planner's plan; pinned when confirmation is
+                # offered: the fact's approved digest when it was shown.
+                _text_digest(),
+            ),
+            model_eligibility=ModelEligibility.NOT_MODEL_ELIGIBLE,
+        ),
+        ActionContract(
+            "projects",
+            "delete_fact",
+            (_identifier(),),
+            model_eligibility=ModelEligibility.NOT_MODEL_ELIGIBLE,
+        ),
+        ActionContract(
+            "projects",
+            "list_files",
+            (
+                _text(
+                    "folder",
+                    required=False,
+                    allow_blank=False,
+                    minimum_length=None,
+                    maximum_length=MAXIMUM_PROJECT_PATH_LENGTH,
+                ),
+            ),
+            model_eligibility=ModelEligibility.NOT_MODEL_ELIGIBLE,
+        ),
+        ActionContract(
+            "projects",
+            "read_file",
+            (
+                _project_text("path", MAXIMUM_PROJECT_PATH_LENGTH),
+                _line_number("start"),
+                _line_number("end"),
+            ),
             model_eligibility=ModelEligibility.NOT_MODEL_ELIGIBLE,
         ),
         ActionContract(

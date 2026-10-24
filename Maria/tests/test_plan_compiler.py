@@ -102,6 +102,7 @@ from tools.filesystem import FilesystemTool
 from tools.history import HistoryTool
 from tools.memory import MemoryTool
 from tools.notes import NotesTool
+from tools.projects import ProjectsTool
 from tools.reminders import RemindersTool
 from tools.system import SystemTool
 from tools.tasks import TasksTool
@@ -184,6 +185,16 @@ PERMITTED_BUT_CLOSED = frozenset(
         # V1-23-R1: showing the delivery status is allowed and closed to the
         # model; turning delivery on or off always requires confirmation.
         "reminders.delivery_status",
+        # V1-24-R1: the seven allowed project actions are closed to the model,
+        # since activation and facts are the owner's own acts and a result
+        # never reaches the model.
+        "projects.list",
+        "projects.create",
+        "projects.read",
+        "projects.deactivate",
+        "projects.list_facts",
+        "projects.list_files",
+        "projects.read_file",
     }
 )
 
@@ -258,6 +269,19 @@ VALID_ARGUMENTS: dict[str, dict[str, Any]] = {
     "notes.delete": {"id": 1},
     "notes.enable_context": {"id": 1, "text_digest": DIGEST},
     "notes.disable_context": {"id": 1},
+    "projects.list": {},
+    "projects.create": {"name": "Garden", "location": "workspace/garden"},
+    "projects.read": {"id": 1},
+    "projects.retitle": {"id": 1, "name": "Allotment"},
+    "projects.delete": {"id": 1},
+    "projects.activate": {"id": 1},
+    "projects.deactivate": {},
+    "projects.list_facts": {"id": 1},
+    "projects.add_fact": {"id": 1, "text": "Plant in spring."},
+    "projects.edit_fact": {"id": 1, "text": "Plant in autumn.", "text_digest": DIGEST},
+    "projects.delete_fact": {"id": 1},
+    "projects.list_files": {"folder": "docs"},
+    "projects.read_file": {"path": "docs/plan.md", "start": 1, "end": 20},
     "system.overview": {},
     "system.current_time": {},
     "tasks.create": {"text": "Pay rent", "due": "2026-10-09"},
@@ -565,6 +589,7 @@ _TRIPWIRE_TARGETS = (
     (HistoryTool, "execute"),
     (MemoryTool, "execute"),
     (NotesTool, "execute"),
+    (ProjectsTool, "execute"),
     (RemindersTool, "execute"),
     (SystemTool, "execute"),
     (TasksTool, "execute"),
@@ -2864,6 +2889,11 @@ class CompilerImportBoundaryTests(unittest.TestCase):
             # V1-22: exactly two more, the request forms and the timing leaf.
             "core.task_requests",
             "core.time_resolution",
+            # V1-24-R1: exactly two more pure vocabulary leaves, reached
+            # through the planner's project usage texts and the reasoning
+            # boundary's file parts. Neither holds SQL, I/O, or a clock.
+            "core.project_records",
+            "core.task_records",
         }
     )
 
@@ -2926,7 +2956,7 @@ class CompilerImportBoundaryTests(unittest.TestCase):
                 self.assertNotIn("sqlite3", _direct_imports(source))
                 self.assertNotIn("subprocess", _direct_imports(source))
 
-    def test_v1_22_widens_the_reach_by_exactly_its_two_leaves(self) -> None:
+    def test_v1_22_and_v1_24_widen_the_reach_by_exactly_their_leaves(self) -> None:
         # The reach V1-21 left, written out by hand.
         before = {
             "core.plan_compiler",
@@ -2941,7 +2971,9 @@ class CompilerImportBoundaryTests(unittest.TestCase):
 
         self.assertEqual(
             _maria_reach("core.plan_compiler"),
-            before | {"core.task_requests", "core.time_resolution"},
+            before
+            | {"core.task_requests", "core.time_resolution"}
+            | {"core.project_records", "core.task_records"},
         )
 
     def test_only_brain_reaches_the_compiler(self) -> None:

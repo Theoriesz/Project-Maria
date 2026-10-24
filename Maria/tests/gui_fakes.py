@@ -59,6 +59,11 @@ class FakeSession:
     ``claim_failure`` instead when one is given; ``record_reminder_notice``
     keeps every recording in ``recorded``, raising ``record_failure`` after
     recording the call when one is given.
+
+    The projects seam (V1-24-R1) answers None, recording nothing, unless
+    ``choices`` is given: each ``project_choices`` call then records itself
+    and returns the next of ``choices``, the last one repeating, or raises
+    ``choices_failure`` instead when one is given.
     """
 
     def __init__(
@@ -71,6 +76,8 @@ class FakeSession:
         notices: tuple[object, ...] = (),
         claim_failure: BaseException | None = None,
         record_failure: BaseException | None = None,
+        choices: tuple[object, ...] | None = None,
+        choices_failure: BaseException | None = None,
     ) -> None:
         self.calls: list[str] = []
         self.threads: list[int] = []
@@ -86,6 +93,8 @@ class FakeSession:
         self._record_failure = record_failure
         self.recorded: list[tuple[object, bool]] = []
         self.recorded_event = threading.Event()
+        self._choices = None if choices is None else list(choices)
+        self._choices_failure = choices_failure
 
     def submit(self, user_input: str) -> BrainResponse:
         """Answer one request, leaving an approval pending if it needs one."""
@@ -140,6 +149,19 @@ class FakeSession:
         if self._record_failure is not None:
             raise self._record_failure
 
+    def project_choices(self) -> object | None:
+        """Return the next scripted choices, or None without a seam."""
+        if self._choices is None and self._choices_failure is None:
+            return None
+        self._note("project_choices")
+        if self._choices_failure is not None:
+            raise self._choices_failure
+        if not self._choices:
+            return None
+        if len(self._choices) > 1:
+            return self._choices.pop(0)
+        return self._choices[0]
+
     def _note(self, call: str) -> None:
         """Record one call and the thread that made it."""
         self.calls.append(call)
@@ -157,6 +179,8 @@ class RecordingView:
         self.controls: dict[str, bool] = {}
         self.cleared = 0
         self.closed = 0
+        self.project_items: list[tuple[str, ...]] = []
+        self.project_controls: dict[str, bool] = {}
 
     def append(self, line: str) -> None:
         """Record one conversation line."""
@@ -196,6 +220,17 @@ class RecordingView:
     def close_window(self) -> None:
         """Record that the window was closed."""
         self.closed += 1
+
+    def show_projects(self, items: tuple[str, ...]) -> None:
+        """Record the project selector's items."""
+        self.project_items.append(items)
+
+    def set_project_controls(self, *, activating: bool, deactivating: bool) -> None:
+        """Record which project controls are enabled."""
+        self.project_controls = {
+            "activating": activating,
+            "deactivating": deactivating,
+        }
 
     @property
     def status(self) -> str:

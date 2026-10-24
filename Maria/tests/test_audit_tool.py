@@ -1950,12 +1950,13 @@ class AuditWithReasoningTests(unittest.TestCase):
         self.assertEqual(request.context, ())
         self.assertEqual(request.history, ())
         # V1-20's "summary" source is the owner's conversation summaries,
-        # read only from their own table, and V1-22's "task" and "reminder"
-        # sources read only theirs; no audit summary is ever a source, which
-        # the two audit reads below never being called still proves.
+        # read only from their own table, V1-22's "task" and "reminder"
+        # sources read only theirs, and V1-24-R1's "project fact" source reads
+        # only the active project's facts; no audit summary is ever a source,
+        # which the two audit reads below never being called still proves.
         self.assertEqual(
             {source.value for source in ContextSource},
-            {"memory", "note", "summary", "task", "reminder"},
+            {"memory", "note", "summary", "project fact", "task", "reminder"},
         )
         self.harness.list_audit_summaries.assert_not_called()
         self.harness.get_audit_summary.assert_not_called()

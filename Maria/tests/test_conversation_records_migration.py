@@ -75,7 +75,7 @@ from tests.test_audit_migration import (
     UNVERSIONED,
     V5_SCHEMA,
     V6_SCHEMA,
-    V8_SCHEMA,
+    V9_SCHEMA,
     _applied,
     _build_schema,
     _build_unversioned_baseline,
@@ -97,12 +97,15 @@ from tests.test_audit_migration import (
 
 STEP_NAME = "create_conversation_records"
 APPLIED_LINE = APPLIED_STEP_LINES[STEP_NAME]
-# V1-22 and V1-23-R1 each append one step after this one, so this step is
-# found by name.
+# V1-22, V1-23-R1, and V1-24-R1 each append one step after this one, so this
+# step is found by name.
 TASK_STEP_NAME = "create_tasks_and_reminders"
 TASK_STEP_LINE = APPLIED_STEP_LINES[TASK_STEP_NAME]
 DELIVERY_STEP_NAME = "add_reminder_delivery_state"
 DELIVERY_STEP_LINE = APPLIED_STEP_LINES[DELIVERY_STEP_NAME]
+PROJECT_STEP_NAME = "create_project_records"
+PROJECT_STEP_LINE = APPLIED_STEP_LINES[PROJECT_STEP_NAME]
+LATER_STEPS = [STEP_NAME, TASK_STEP_NAME, DELIVERY_STEP_NAME, PROJECT_STEP_NAME]
 FAILED_LINE = (
     "Migration create_conversation_records to schema version 6 failed and was "
     "rolled back; the database remains at version 5."
@@ -115,7 +118,9 @@ DRIFTED_VERSION_SIX_LINE = (
     "Refused a database stamped at schema version 6 whose structure is not "
     "the frozen schema for that version."
 )
-TOO_NEW_LINE = "Refused a database stamped at schema version 9; this build expects 8."
+TOO_NEW_LINE = (
+    "Refused a database stamped at schema version 10; this build expects 9."
+)
 VERSION_FIVE_TABLES = frozenset((*RECORD_TABLES, *AUDIT_TABLES))
 
 # Three audit summaries, the second deleted, so the version 5 database holds a
@@ -218,7 +223,7 @@ START_V5 = _Start(
     "stamped version 5",
     _build_stamped_v5,
     None,
-    (STEP_NAME, TASK_STEP_NAME, DELIVERY_STEP_NAME),
+    tuple(LATER_STEPS),
     MIGRATED_MEMORIES,
 )
 EVERY_START = (*ALL_STARTS, START_V5)
@@ -242,15 +247,15 @@ def _altered(table: str, old: str, new: str) -> tuple[str, ...]:
 class ConversationRecordsSchemaPinTests(unittest.TestCase):
     """Pin schema 6, its step, and the history it must not disturb.
 
-    Version 6 is frozen history now: V1-22's task step and V1-23-R1's
-    delivery step follow it, and this step is found by its name rather than
-    by its place.
+    Version 6 is frozen history now: V1-22's task step, V1-23-R1's delivery
+    step, and V1-24-R1's project step follow it, and this step is found by its
+    name rather than by its place.
     """
 
     def test_version_six_is_frozen_and_the_app_version_is_unchanged(self) -> None:
         self.assertEqual(CONVERSATION_RECORDS_VERSION, 6)
         self.assertEqual(DATABASE_SCHEMA_VERSION, CURRENT_SCHEMA_VERSION)
-        self.assertEqual(memory_module.DATABASE_SCHEMA_VERSION, 8)
+        self.assertEqual(memory_module.DATABASE_SCHEMA_VERSION, 9)
         self.assertEqual(APP_VERSION, "0.2.0")
 
     def test_the_step_is_fifth_and_runs_exactly_its_two_frozen_creates(
@@ -259,7 +264,7 @@ class ConversationRecordsSchemaPinTests(unittest.TestCase):
         step = _conversation_step()
         names = [migration.name for migration in memory_module._MIGRATIONS]
         self.assertEqual(names.index(STEP_NAME), 4)
-        self.assertEqual(names[5:], [TASK_STEP_NAME, DELIVERY_STEP_NAME])
+        self.assertEqual(names[4:], LATER_STEPS)
 
         self.assertEqual(
             (step.version, step.name, step.statements),
@@ -300,7 +305,7 @@ class ConversationRecordsSchemaPinTests(unittest.TestCase):
     def test_the_frozen_version_six_entry_is_pinned_after_version_seven(self) -> None:
         versions = [version for version, _ in memory_module._FROZEN_SCHEMAS]
 
-        self.assertEqual(versions, [8, 7, 6, 5, 4, 3, 2, 1])
+        self.assertEqual(versions, [9, 8, 7, 6, 5, 4, 3, 2, 1])
         self.assertEqual(
             dict(memory_module._FROZEN_SCHEMAS)[6],
             EXPECTED_FROZEN_SCHEMAS[6],
@@ -315,10 +320,10 @@ class ConversationRecordsSchemaPinTests(unittest.TestCase):
         six = memory_module._reference_schema(memory_module._frozen_schema(6))
 
         self.assertEqual(six, memory_module._reference_schema(V6_SCHEMA))
-        self.assertEqual(current, memory_module._reference_schema(V8_SCHEMA))
+        self.assertEqual(current, memory_module._reference_schema(V9_SCHEMA))
         self.assertEqual(
             current,
-            memory_module._reference_schema(memory_module._frozen_schema(8)),
+            memory_module._reference_schema(memory_module._frozen_schema(9)),
         )
         self.assertLessEqual(set(six), set(current))
 
@@ -392,10 +397,7 @@ class ConversationRecordsUpgradeTests(_TemporaryDatabaseTestCase):
 
                 self.assert_at_current_version(database_path, start)
                 self.assertEqual(_applied(recording), list(start.steps))
-                self.assertEqual(
-                    _applied(recording)[-3:],
-                    [STEP_NAME, TASK_STEP_NAME, DELIVERY_STEP_NAME],
-                )
+                self.assertEqual(_applied(recording)[-4:], LATER_STEPS)
                 self.assertEqual(
                     _row_counts(database_path),
                     {**BASELINE_COUNTS, "memories": len(start.memories)},
@@ -447,15 +449,21 @@ class ConversationRecordsUpgradeTests(_TemporaryDatabaseTestCase):
                 "tasks": [],
                 "reminders": [],
                 "reminder_delivery_settings": [],
+                "projects": [],
+                "project_facts": [],
+                "project_activation": [],
             },
         )
-        self.assertEqual(
-            _applied(recording),
-            [STEP_NAME, TASK_STEP_NAME, DELIVERY_STEP_NAME],
-        )
+        self.assertEqual(_applied(recording), LATER_STEPS)
         self.assertEqual(
             _messages(recording),
-            [APPLIED_LINE, TASK_STEP_LINE, DELIVERY_STEP_LINE, READY_LINE],
+            [
+                APPLIED_LINE,
+                TASK_STEP_LINE,
+                DELIVERY_STEP_LINE,
+                PROJECT_STEP_LINE,
+                READY_LINE,
+            ],
         )
         # Consent survives exactly as set, rather than being reset.
         memories = {row[0]: row for row in after["memories"]}
@@ -648,10 +656,7 @@ class ConversationStepAtomicityTests(_TemporaryDatabaseTestCase):
         retrying.initialize()
         retrying.initialize()
 
-        self.assertEqual(
-            _applied(recording),
-            [STEP_NAME, TASK_STEP_NAME, DELIVERY_STEP_NAME],
-        )
+        self.assertEqual(_applied(recording), LATER_STEPS)
         self.assertEqual(_messages(recording).count(APPLIED_LINE), 1)
         self.assert_at_current_version(database_path, START_V5)
 
@@ -693,7 +698,7 @@ class ConversationStepAtomicityTests(_TemporaryDatabaseTestCase):
 
                 retrying.initialize()
 
-                self.assertEqual(_applied(recording)[-1], DELIVERY_STEP_NAME)
+                self.assertEqual(_applied(recording)[-1], PROJECT_STEP_NAME)
                 self.assertEqual(_applied(recording).count(STEP_NAME), 1)
                 self.assertEqual(_applied(recording).count("create_audit_summaries"), 1)
                 self.assert_at_current_version(database_path, ALL_STARTS[0])
@@ -745,10 +750,7 @@ class ConversationStepContentionTests(_TemporaryDatabaseTestCase):
         retrying.initialize()
         retrying.initialize()
 
-        self.assertEqual(
-            _applied(recording),
-            [STEP_NAME, TASK_STEP_NAME, DELIVERY_STEP_NAME],
-        )
+        self.assertEqual(_applied(recording), LATER_STEPS)
         self.assert_at_current_version(database_path, START_V5)
 
     def test_a_locked_report_during_the_step_is_contention_too(self) -> None:
@@ -799,11 +801,11 @@ class VersionSixDriftTests(_TemporaryDatabaseTestCase):
                     [DRIFTED_VERSION_SIX_LINE],
                 )
 
-    def test_the_exact_version_six_schema_is_accepted_and_climbs_two_steps(
+    def test_the_exact_version_six_schema_is_accepted_and_climbs_three_steps(
         self,
     ) -> None:
-        """Version 6 is frozen now, so an exact one climbs the task step and
-        the delivery step only."""
+        """Version 6 is frozen now, so an exact one climbs the task step, the
+        delivery step, and the project step only."""
         database_path = self.database("exact")
         _build_schema(database_path, V6_SCHEMA, 6)
         before_rows = _record_rows(database_path)
@@ -811,10 +813,10 @@ class VersionSixDriftTests(_TemporaryDatabaseTestCase):
 
         Memory(database_path, logger=recording).initialize()
 
-        self.assertEqual(_applied(recording), [TASK_STEP_NAME, DELIVERY_STEP_NAME])
+        self.assertEqual(_applied(recording), LATER_STEPS[1:])
         self.assertEqual(
             _messages(recording),
-            [TASK_STEP_LINE, DELIVERY_STEP_LINE, READY_LINE],
+            [TASK_STEP_LINE, DELIVERY_STEP_LINE, PROJECT_STEP_LINE, READY_LINE],
         )
         self.assertEqual(_messages(recording, "error"), [])
         self.assertEqual(read_schema_version(database_path), CURRENT_SCHEMA_VERSION)
@@ -951,7 +953,7 @@ class VersionSixDriftTests(_TemporaryDatabaseTestCase):
             [UNRECOGNISED_UNVERSIONED_LINE],
         )
 
-    def test_a_database_stamped_nine_is_too_new_and_left_untouched(self) -> None:
+    def test_a_database_stamped_ten_is_too_new_and_left_untouched(self) -> None:
         database_path = self.database("newer")
         _build_schema(database_path, V6_SCHEMA, NEWER_SCHEMA_VERSION)
         before = database_path.read_bytes()
@@ -1044,6 +1046,7 @@ class ConversationMigrationLoggingTests(unittest.TestCase):
                 ("INFO", "maria.memory", APPLIED_LINE),
                 ("INFO", "maria.memory", TASK_STEP_LINE),
                 ("INFO", "maria.memory", DELIVERY_STEP_LINE),
+                ("INFO", "maria.memory", PROJECT_STEP_LINE),
                 ("INFO", "maria.memory", READY_LINE),
             ],
         )

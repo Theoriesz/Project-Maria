@@ -2,6 +2,58 @@
 
 ## Unreleased
 
+- Maria now keeps named projects with explicit activation, owner-approved
+  project facts available as Tier A context, and bounded, read-only project
+  file reading with file-identity provenance (V1-24, amendment V1-24-R1).
+  Thirteen commands work in both interfaces with no model present:
+  `projects`, `create project`, `read project`, `retitle project`,
+  `delete project`, `activate project`, `deactivate project`,
+  `project facts`, `add project fact`, `edit project fact`,
+  `delete project fact`, `project files`, and `read project file`, with
+  fourteen new help lines; renaming, deleting, activating, and adding,
+  editing, or deleting a fact need confirmation, each showing exactly what
+  it covers, and activation shows a fixed notice. A project names a folder
+  of the workspace root or Project Maria, Maria's own repository; a new
+  project is never active, at most one is active at a time, and it stays
+  active across restarts until the owner deactivates it or activates
+  another. Maria never activates a project on her own, Project Maria above
+  all. While a project is active, its facts, each bound to the digest of the
+  owner's approval, are eligible on every conversational turn after the
+  enabled memories and before tasks and reminders, within Tier A's unchanged
+  limits, with their own framing, which asks the model to say plainly when
+  it would recommend a different approach, and their own notices; facts of
+  any other project, and project names and locations, never reach a model,
+  and a fact that changes, or a project that stops being active, clears the
+  conversation that carried it. Project files are read only on Windows,
+  through nine Windows functions in one new module, and only in the active
+  project's folder: text of admitted types up to 512 KiB, 128 KiB shown at
+  once, Project Maria's files only from the approved list in
+  `core/project_maria_manifest.py`, and a link, a hard-linked file, a file
+  Windows marks as not stored locally, or one open for changes refused
+  before any data is read, with Maria's database, logs, private
+  configuration, backups, and system prompt unreachable wherever they are
+  configured. With reasoning enabled, `@<path>` or `@<path>:<from>-<to>`
+  names up to three of those files in a request; their parts, at most
+  16 KiB each and 32 KiB together, are sent with their project, path,
+  lines, and SHA-256, without earlier exchanges or proposal instructions, so
+  the reply is only text, and nothing of the request is kept or recorded.
+  Text in a project file can never create a plan or grant authority. Every
+  request carrying a fact or a file part is sent only if the activation,
+  read once more immediately before the hand-off, is unchanged since the
+  request began; a later change applies from the next request. The desktop
+  window gains a project selector with Activate and Deactivate, which type
+  the same commands, and the session one read for it. Project folders under
+  cloud synchronization are not supported, which Maria states but cannot
+  detect. A new guard proves that no production path starts a process or
+  runs code. Schema version 9 adds the empty `projects`, `project_facts`,
+  and `project_activation` tables through one appended migration that
+  touches no existing row; an older build refuses a version 9 database, and
+  the closed-app reminder pass refuses a version 8 database until the
+  command line or the window has started once. The actions grow from 65 to
+  78 with the five model-eligible ones unchanged, the mandatory
+  confirmations from 33 to 39, and the confirmation notices from ten to 13.
+  `requirements.txt`, the shipped configuration, and the version stay
+  unchanged.
 - Maria can now show due reminders on her own (V1-23, amendment V1-23-R1),
   each at most once, while reminder delivery is on, which it is not until the
   owner turns it on. Three new commands, `reminder delivery`,

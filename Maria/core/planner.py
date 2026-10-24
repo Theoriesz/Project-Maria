@@ -18,6 +18,22 @@ from types import MappingProxyType
 from typing import Any
 
 from core.logger import get_logger
+from core.project_records import (
+    ACTIVATE_USAGE,
+    ADD_FACT_USAGE,
+    CREATE_USAGE,
+    DELETE_FACT_USAGE,
+    DELETE_USAGE,
+    EDIT_FACT_USAGE,
+    FACT_ID_MESSAGE,
+    FACTS_USAGE,
+    LINE_RANGE_MESSAGE,
+    PROJECT_ID_MESSAGE,
+    READ_FILE_USAGE,
+    READ_USAGE,
+    RETITLE_USAGE,
+    parse_line_range,
+)
 from core.task_requests import CREATION_TEXT_MESSAGE, is_creation_text
 from core.time_resolution import (
     ResolvedTime,
@@ -1004,6 +1020,10 @@ class Planner:
                 {"id": summary_id},
             )
 
+        project = _project_plan(text, lowered)
+        if project is not None:
+            return project
+
         agenda = _task_plan(text, lowered, timing)
         if agenda is None:
             agenda = _reminder_plan(text, lowered, timing)
@@ -1302,6 +1322,123 @@ def _reminder_plan(
     return None
 
 
+# The project commands that take only an id (V1-24-R1), by command words,
+# the action each one plans, its usage reply, and its id reply. Fact
+# commands come first, so ``delete project fact`` is never taken for
+# ``delete project``.
+_PROJECT_ID_COMMANDS = (
+    ("delete project fact", "delete_fact", DELETE_FACT_USAGE, FACT_ID_MESSAGE),
+    ("project facts", "list_facts", FACTS_USAGE, PROJECT_ID_MESSAGE),
+    ("read project", "read", READ_USAGE, PROJECT_ID_MESSAGE),
+    ("delete project", "delete", DELETE_USAGE, PROJECT_ID_MESSAGE),
+    ("activate project", "activate", ACTIVATE_USAGE, PROJECT_ID_MESSAGE),
+)
+
+# The project commands that take an id, a colon, and text, by command words,
+# the action, the text argument's name, the usage reply, and the id reply.
+_PROJECT_TEXT_COMMANDS = (
+    ("add project fact", "add_fact", "text", ADD_FACT_USAGE, PROJECT_ID_MESSAGE),
+    ("edit project fact", "edit_fact", "text", EDIT_FACT_USAGE, FACT_ID_MESSAGE),
+    ("retitle project", "retitle", "name", RETITLE_USAGE, PROJECT_ID_MESSAGE),
+)
+
+# What ends a file's path before its line range in ``read project file``.
+_LINES_MARKER = " lines"
+
+
+def _project_plan(text: str, lowered: str) -> Plan | None:
+    """Return the plan for a project command (V1-24-R1), or None.
+
+    Fact commands are matched before project commands, and ``read project
+    file`` before ``read project``, so a longer command is never taken for a
+    shorter one. A request that begins with an operand-taking command's words
+    gets that command's usage or id reply rather than reaching the model.
+    ``list projects`` is not one of these: it stays a directory listing.
+    """
+    if lowered == "projects":
+        return Planner._single_step(text, "projects", "list", {})
+    if lowered == "deactivate project":
+        return Planner._single_step(text, "projects", "deactivate", {})
+    if lowered == "project files":
+        return Planner._single_step(text, "projects", "list_files", {})
+    if lowered.startswith("project files "):
+        folder = text[len("project files ") :].strip()
+        return Planner._single_step(
+            text,
+            "projects",
+            "list_files",
+            {"folder": folder} if folder else {},
+        )
+    if lowered == "read project file":
+        return Planner._no_action(text, READ_FILE_USAGE)
+    if lowered.startswith("read project file "):
+        return _read_project_file_plan(text, text[len("read project file ") :].strip())
+    for words, action, argument, usage, id_message in _PROJECT_TEXT_COMMANDS:
+        if lowered == words:
+            return Planner._no_action(text, usage)
+        if lowered.startswith(f"{words} "):
+            parsed = _parse_id_and_colon_operand(text[len(words) + 1 :].strip())
+            if parsed is None or not parsed[1]:
+                return Planner._no_action(text, usage)
+            record_id = _parse_positive_ascii_id(parsed[0])
+            if record_id is None:
+                return Planner._no_action(text, id_message)
+            return Planner._single_step(
+                text,
+                "projects",
+                action,
+                {"id": record_id, argument: parsed[1]},
+            )
+    for words, action, usage, id_message in _PROJECT_ID_COMMANDS:
+        if lowered == words:
+            return Planner._no_action(text, usage)
+        if lowered.startswith(f"{words} "):
+            record_id = _parse_positive_ascii_id(text[len(words) + 1 :].strip())
+            if record_id is None:
+                return Planner._no_action(text, id_message)
+            return Planner._single_step(text, "projects", action, {"id": record_id})
+    if lowered == "create project":
+        return Planner._no_action(text, CREATE_USAGE)
+    if lowered.startswith("create project "):
+        operand = text[len("create project ") :].strip()
+        if ":" not in operand:
+            return Planner._no_action(text, CREATE_USAGE)
+        name, location = (part.strip() for part in operand.split(":", maxsplit=1))
+        if not name or not location:
+            return Planner._no_action(text, CREATE_USAGE)
+        return Planner._single_step(
+            text,
+            "projects",
+            "create",
+            {"name": name, "location": location},
+        )
+    return None
+
+
+def _read_project_file_plan(text: str, operand: str) -> Plan:
+    """Return the plan for ``read project file <path> [lines <from>-<to>]``.
+
+    A final `` lines <word>`` is always taken as the range, and a range that
+    is not ``<from>-<to>`` within the line limits gets the range reply.
+    """
+    if not operand:
+        return Planner._no_action(text, READ_FILE_USAGE)
+    head, separator, range_text = operand.rpartition(" ")
+    if separator and head[-len(_LINES_MARKER) :].lower() == _LINES_MARKER:
+        path = head[: -len(_LINES_MARKER)].strip()
+        if path:
+            lines = parse_line_range(range_text)
+            if lines is None:
+                return Planner._no_action(text, LINE_RANGE_MESSAGE)
+            return Planner._single_step(
+                text,
+                "projects",
+                "read_file",
+                {"path": path, "start": lines[0], "end": lines[1]},
+            )
+    return Planner._single_step(text, "projects", "read_file", {"path": operand})
+
+
 def _id_command(
     text: str,
     lowered: str,
@@ -1503,6 +1640,21 @@ def _help_text() -> str:
         "- reminder delivery\n"
         "- enable reminder delivery\n"
         "- disable reminder delivery\n"
+        "- projects\n"
+        "- create project <name>: workspace/<folder> or project_maria\n"
+        "- read project <id>\n"
+        "- retitle project <id>: <new name>\n"
+        "- delete project <id>\n"
+        "- activate project <id>\n"
+        "- deactivate project\n"
+        "- project facts <project id>\n"
+        "- add project fact <project id>: <text>\n"
+        "- edit project fact <fact id>: <new text>\n"
+        "- delete project fact <fact id>\n"
+        "- project files [<folder>]\n"
+        "- read project file <path> [lines <from>-<to>]\n"
+        "- @<path> or @<path>:<from>-<to> in a question names an active "
+        "project's file\n"
         "- system\n"
         "- time\n"
         "- history\n"

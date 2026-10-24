@@ -127,6 +127,21 @@ HELP_TEXT = (
     "- reminder delivery\n"
     "- enable reminder delivery\n"
     "- disable reminder delivery\n"
+    "- projects\n"
+    "- create project <name>: workspace/<folder> or project_maria\n"
+    "- read project <id>\n"
+    "- retitle project <id>: <new name>\n"
+    "- delete project <id>\n"
+    "- activate project <id>\n"
+    "- deactivate project\n"
+    "- project facts <project id>\n"
+    "- add project fact <project id>: <text>\n"
+    "- edit project fact <fact id>: <new text>\n"
+    "- delete project fact <fact id>\n"
+    "- project files [<folder>]\n"
+    "- read project file <path> [lines <from>-<to>]\n"
+    "- @<path> or @<path>:<from>-<to> in a question names an active project's "
+    "file\n"
     "- system\n"
     "- time\n"
     "- history\n"
@@ -553,6 +568,70 @@ COMMAND_CORPUS: tuple[CorpusEntry, ...] = (
         "already started may still appear.",
         CONFIRM,
     ),
+    # V1-24-R1's project commands. Project Maria needs no folder check, and
+    # the file commands run while no project is active, so every row is the
+    # same on any computer. A success records a fixed line naming ids at
+    # most, a refusal its fixed text, and a fact's request keeps its text, as
+    # a note edit does.
+    _records("projects", "Listed projects."),
+    _records(
+        "create project",
+        "Use: create project <name>: workspace/<folder> or create project "
+        "<name>: project_maria",
+    ),
+    _records(
+        "create project Elsewhere: somewhere",
+        "A project location must be workspace, workspace/<folder>, or "
+        "project_maria.",
+    ),
+    _records("create project Self review: project_maria", "Created project 1."),
+    _records("read project 1", "Displayed project 1."),
+    _records("read project x", "Project id must be a positive whole number."),
+    _records(
+        "project files",
+        "No project is active. Type projects to see them, then activate project "
+        "<id>.",
+    ),
+    _records(
+        "read project file README.md lines 1-3",
+        "No project is active. Type projects to see them, then activate project "
+        "<id>.",
+    ),
+    _records("retitle project 1: Maria review", "Renamed project 1.", CONFIRM),
+    _records(
+        "add project fact 1: Reviews follow the roadmap.",
+        "Added fact 1 to project 1.",
+        CONFIRM,
+    ),
+    _records("project facts 1", "Listed facts of project 1."),
+    _records(
+        "edit project fact 1: Reviews follow the amendment.",
+        "Updated fact 1.",
+        CONFIRM,
+    ),
+    _records_nothing("activate project 1", CANCEL),
+    _records("activate project 1", "Activated project 1.", CONFIRM),
+    _records(
+        "activate project 1",
+        "Project 1 was already the active project.",
+        CONFIRM,
+    ),
+    _records(
+        "delete project 1",
+        "Project 1 is the active project. Type deactivate project first. "
+        "Nothing was deleted.",
+        CONFIRM,
+    ),
+    _records("deactivate project", "No project is active now."),
+    _records("deactivate project", "No project was active."),
+    _records(
+        "delete project 1",
+        "Project 1 still has facts. Delete them first. Nothing was deleted.",
+        CONFIRM,
+    ),
+    _records("delete project fact 1", "Deleted fact 1.", CONFIRM),
+    _records("delete project 1", "Deleted project 1.", CONFIRM),
+    _records("delete project 1", "Project 1 was not found.", CONFIRM),
     _records("add a task to buy milk", UNSUPPORTED_RESPONSE),
     _records("remind me tomorrow at 09:00 to call mom", UNSUPPORTED_RESPONSE),
     _records_nothing("   ", RUN),

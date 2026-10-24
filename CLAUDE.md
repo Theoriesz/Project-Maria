@@ -33,8 +33,8 @@ rather than assume. **All application code lives in `Maria/`.**
 |---|---|
 | `Maria/main.py` | entry point: selects the CLI, or the desktop GUI with `--gui`, and composes the runtime |
 | `Maria/deliver_reminders.py` | the closed-app reminder-delivery entry point (V1-23-R1): one pass, then exit; not an interface, and builds no Brain |
-| `Maria/core/` | `brain`, `planner`, `memory`, `permissions`, `tool_manager`, `logger`, `config`, `constants`, `action_contracts`, `audit`, `context`, `conversation`, `conversation_records`, `desktop_notice`, `failures`, `filesystem_roots`, `ollama_adapter`, `plan_compiler`, `reasoning`, `reminder_delivery`, `runtime_paths`, `session`, `task_records`, `task_requests`, `time_resolution` |
-| `Maria/tools/` | `audit`, `calculator`, `conversation_summaries`, `conversations`, `filesystem`, `history`, `memory`, `notes`, `reminders`, `system`, `tasks` |
+| `Maria/core/` | `brain`, `planner`, `memory`, `permissions`, `tool_manager`, `logger`, `config`, `constants`, `action_contracts`, `audit`, `context`, `conversation`, `conversation_records`, `desktop_notice`, `failures`, `filesystem_roots`, `ollama_adapter`, `plan_compiler`, `project_file_access`, `project_files`, `project_maria_manifest`, `project_records`, `reasoning`, `reminder_delivery`, `runtime_paths`, `session`, `task_records`, `task_requests`, `time_resolution` |
+| `Maria/tools/` | `audit`, `calculator`, `conversation_summaries`, `conversations`, `filesystem`, `history`, `memory`, `notes`, `projects`, `reminders`, `system`, `tasks` |
 | `Maria/gui/` | the optional desktop GUI: `controller` (Qt-free), `session_worker` (the one worker thread), `window` (the only Qt module) |
 | `Maria/tests/` | standard-library `unittest` suite |
 | `Maria/docs/` | `architecture`, `api`, `database`, `planner`, `tools`, `coding_style`, `roadmap`, `vision`, and the `reminder-delivery-task.xml` task template (documentation, never loaded by Maria) |
@@ -103,9 +103,11 @@ The GUI contract:
   and never reimplements approval policy. It reaches application behavior only through the
   session's `submit()`, `pending_approval`, `confirm()`, `cancel()`, and `end()`, and,
   under V1-23-R1, the session's delivery seam, `delivers_reminders`,
-  `claim_due_reminders()`, and `record_reminder_notice()`: eight members in all. The GUI
-  changes neither Brain nor the Session API; V1-23-R1 adds exactly the delivery seam to
-  the Session API and leaves Brain unchanged.
+  `claim_due_reminders()`, and `record_reminder_notice()`, and, under V1-24-R1,
+  `project_choices()` for the project selector: nine members in all. The GUI changes
+  neither Brain nor the Session API; V1-23-R1 adds exactly the delivery seam to the
+  Session API and V1-24-R1 adds exactly `project_choices()`, and the GUI still never
+  reaches Brain.
 - **One worker, serialized.** The narrow concurrency exception covers GUI event delivery
   to the GUI thread plus exactly one non-daemon worker thread, started by
   `gui/session_worker.py`, the only production module that may import `threading`. That
@@ -116,7 +118,11 @@ The GUI contract:
   due-reminder check and one acknowledgment per notice it handed to the window, as "The
   reminder-delivery contract" below describes; for these two alone, V1-23-R1 supersedes
   "in the order the owner asked" and "grants no reminder scheduling". Neither runs on a
-  timer, and the check never runs once the close was requested. Only the worker's thread
+  timer, and the check never runs once the close was requested. Under V1-24-R1 the worker
+  also reads the session's project choices at the same two points, after creating the
+  session and after each operation that ends with a reply, never after an approval offer
+  and never once the close was requested, and hands them to the window as a
+  `ProjectList`; the read changes nothing. Only the worker's thread
   boundary catches failures of every kind, `BaseException` included, and it logs only
   fixed text or the exception type; no global exception hook is changed. A failure to
   create the session or of an operation stops the queue at once; `end()` is then
@@ -162,7 +168,13 @@ The GUI contract:
   one-line input, Send, a short idle or busy status, and the complete core approval text
   with Approve and Cancel; every command, record commands included, is typed exactly as in
   the CLI. A mascot, eye animation, elaborate themes, taskbar or tray behavior, dedicated
-  record browsers, and settings panels are deferred until separately approved.
+  record browsers, and settings panels are deferred until separately approved. Under
+  V1-24-R1 the window adds one project selector: a `Project` label, a non-editable list of
+  plain-text items, `<id>: <name>` with ` (active)` on the active project or one
+  `No projects` item, and Activate and Deactivate buttons that take no focus and are
+  enabled only while the window is ready. They submit exactly `activate project <id>` or
+  `deactivate project` through the same path as Send, so an activation is still offered
+  for approval; the selector's items change no state, offer, or approval.
 
 The reminder-delivery contract (V1-23-R1):
 
@@ -214,7 +226,9 @@ The reminder-delivery contract (V1-23-R1):
   owns the CLI's terminal work; and is the one production module that names the local
   reasoning adapter. It imports the GUI only inside `run_gui()`, so CLI startup never loads
   Qt. Under V1-23-R1 it also builds the session's delivery seam through an injectable
-  factory, and the CLI checks for due reminders before each prompt and prints them.
+  factory, and the CLI checks for due reminders before each prompt and prints them. Under
+  V1-24-R1 it builds the window's projects seam the same way: a caller that injects a
+  Brain factory gets none unless it also injects a projects factory.
 - `Maria/deliver_reminders.py` — the closed-app reminder pass's entry point and
   composition point (V1-23-R1): one pass, an exit status from 0 to 5, and the entry
   boundary, which catches Exception only. It builds no Brain, never reads the private
@@ -240,7 +254,41 @@ The reminder-delivery contract (V1-23-R1):
   check and before planning, and hands that reference instant with the configured time
   zone key to the planner and the compiler; it holds no date logic, and confirmation reads
   no clock. **Never** put direct database access or tool-specific logic here. Dispatch must
-  stay generic, with no per-tool branch.
+  stay generic, with no per-tool branch. Under V1-24-R1 each model request first reads its
+  one project snapshot (the activation, the active project, its eligible facts, and the
+  recheck of facts supplied earlier) in one read transaction; Brain then settles the
+  request's `@` references against that snapshot, reads each named file once through the
+  project file reader, and hands the conversation module a final check of the activation.
+  A request that names files is sent with proposal mode off and keeps nothing.
+- `Maria/core/context.py`, `Maria/core/conversation.py`, `Maria/core/reasoning.py`, and
+  `Maria/core/ollama_adapter.py` — under V1-24-R1, the active project's facts are a Tier A
+  context source between memories and tasks, with their own framing, header, notices, and
+  cleared notice, and a request may carry owner-named file parts, with their own framing,
+  counted in its bytes, and sent as their own message just before the prompt. The
+  conversation module runs the final check after every size check, immediately before the
+  hand-off to the reasoning boundary, and keeps nothing of a file request.
+- `Maria/core/project_records.py` — the project vocabulary (V1-24-R1): limits, the path
+  grammar, the two roots and project locations, the activation states and serial rules,
+  value objects, the fact approval digest, every fixed project text, and the file block's
+  rendering; no SQL, I/O, or logging.
+- `Maria/core/project_files.py` — the project file reader: the lexical phase, then, for
+  each operation, the placeholder mode exposed and restored once, every component held and
+  checked on its own handle, the bounded whole-file read, and listings from find data; also
+  the `@` reference grammar, decoding, the display, and file parts. It calls Windows only
+  through `core/project_file_access.py`, and a detected restore failure stops every later
+  operation until Maria restarts.
+- `Maria/core/project_file_access.py` — the only module that calls the nine Windows
+  functions project file reading uses, through standard-library `ctypes` with every
+  argument and result type pinned: kernel32's CreateFileW, GetFileInformationByHandle,
+  GetFileInformationByHandleEx, GetFinalPathNameByHandleW, FindFirstFileExW,
+  FindNextFileW, FindClose, and CloseHandle, and ntdll's
+  RtlSetThreadPlaceholderCompatibilityMode, plus the binary, non-inheritable descriptor
+  steps.
+- `Maria/core/project_maria_manifest.py` — data only: Project Maria's approved path list
+  and the files decided against, compared ignoring ASCII case and never read from the
+  repository at run time.
+- `Maria/tools/projects.py` — the projects tool's thirteen commands, and the only module
+  that calls the memory layer's `activate_project` and `deactivate_project`.
 - `Maria/core/planner.py` — turns user input into structured `Plan` and `PlanStep` objects,
   and owns the no-action response copy and the help text. `PlanOrigin.MODEL` is set only by
   the compiler. The same text, reference instant, and configured zone always give the same
@@ -267,6 +315,8 @@ The reminder-delivery contract (V1-23-R1):
   model-originated plan for approval from the very plan the approval binds, and keeps the
   conversation. Under V1-23-R1 it also holds the delivery seam, which claims and records
   through the reminder-delivery subsystem, contains Exceptions, and never calls Brain.
+  Under V1-24-R1 it also holds the projects seam, whose one read, `project_choices()`,
+  contains Exceptions, logs only their type, and never calls Brain.
 - `Maria/core/audit.py` — the closed audit-summary vocabulary and its validation; no SQL.
 - `Maria/core/conversation_records.py` — the saved-conversation and conversation-summary
   vocabulary: limits, the canonical transcript, value objects, and fixed messages; no SQL,
@@ -275,6 +325,9 @@ The reminder-delivery contract (V1-23-R1):
   `sqlite3` or execute SQL, and the only one that does. One generalized guard test in
   `Maria/tests/test_memory.py` enforces this boundary; keep it true. (Tests may connect
   to a temporary test database directly when necessary — never to the live database.)
+  Under V1-24-R1 it owns the project tables (schema 9), the activation setting's serial
+  rules, and the one-read project snapshot; only its `activate_project` and
+  `deactivate_project` reach the SQL that writes the setting.
 - `Maria/core/permissions.py` — decides `ALLOWED` / `REQUIRES_CONFIRMATION` / `DENIED`.
 - `Maria/core/tool_manager.py` — discovers, loads, and dispatches tools.
 - `Maria/core/logger.py` — application logging only. Under V1-23-R1 it also configures
@@ -294,12 +347,16 @@ The reminder-delivery contract (V1-23-R1):
 - `Maria/gui/controller.py` — the Qt-free controller: decides what the window shows and
   which owner actions are accepted, from its own state and the worker's events. Under
   V1-23-R1 it appends a due-reminder notice without changing state, then acknowledges it.
+  Under V1-24-R1 it shows the project selector's items without changing state, and
+  accepts Activate and Deactivate only while the window is ready.
 - `Maria/gui/session_worker.py` — the one worker thread: owns the window's session and runs
   its operations in order, delivering results as events. The only production module that
   imports `threading`. Under V1-23-R1 it also runs the session's due-reminder check and
-  records each notice the window acknowledges.
-- `Maria/gui/window.py` — the Qt Widgets window and its launcher. The only production
-  module that imports PyQt6; presentation only, touched only on the GUI thread.
+  records each notice the window acknowledges, and under V1-24-R1 it reads the session's
+  project choices after creating the session and after each reply.
+- `Maria/gui/window.py` — the Qt Widgets window and its launcher, the project selector
+  included. The only production module that imports PyQt6; presentation only, touched only
+  on the GUI thread.
 
 New code should extend the correct module, not add logic to the wrong layer because it is
 faster.
@@ -319,8 +376,11 @@ faster.
   `tasks.create`, `tasks.edit`, `tasks.reschedule`, `tasks.delete`,
   `tasks.enable_context`, `tasks.disable_context`, `reminders.create`, `reminders.edit`,
   `reminders.reschedule`, `reminders.delete`, `reminders.enable_context`,
-  `reminders.disable_context`, `reminders.enable_delivery`, and
-  `reminders.disable_delivery` (thirty-three in all; the last two under V1-23-R1)
+  `reminders.disable_context`, `reminders.enable_delivery`,
+  `reminders.disable_delivery`, `projects.retitle`, `projects.delete`,
+  `projects.activate`, `projects.add_fact`, `projects.edit_fact`, and
+  `projects.delete_fact` (thirty-nine in all; the two delivery actions under V1-23-R1,
+  and the six project actions under V1-24-R1)
 
 `PermissionManager.__init__` and `Maria/core/config.py` union these into whatever
 configuration supplies, so **configuration can extend the mandatory baseline but can never
@@ -368,7 +428,14 @@ refused before any approval is offered. That approval requirement lives in Brain
 from the two mandatory sets above, which it does not change. Only `calculator.calculate`,
 `filesystem.list`, `system.current_time`, `tasks.create`, and `reminders.create` are
 model-eligible; every new action contract must state its model eligibility explicitly.
-The three reminder-delivery actions of V1-23-R1 are all not model-eligible.
+The three reminder-delivery actions of V1-23-R1 and the thirteen project actions of
+V1-24-R1 are all not model-eligible.
+
+A model request that names project files with `@` (V1-24-R1) is sent with proposal mode
+off: it carries no proposal instructions and no earlier exchange, and its reply is shown
+as plain text only, never handed to the compiler, so text in a project file, or a reply
+shaped like a proposal, can produce no plan, offer, permission decision, tool call, or
+audit row. Nothing of such a request or its reply is kept.
 
 A creation step (`tasks.create` or `reminders.create`) compiles only when the owner's
 whole cleaned request is one to five items in the four supported forms of V1-22-R1
@@ -418,8 +485,9 @@ model-written text: what it stores is the owner's own text, extracted by Maria.
 ## Persistence
 
 Interaction history (cleaned requests plus recorded response text), notes, explicit
-memories, audit summaries, saved conversations, conversation summaries, tasks, and
-reminders are eight separate SQLite record types. Maria normally records most requests
+memories, audit summaries, saved conversations, conversation summaries, tasks,
+reminders, projects, and project facts are ten separate SQLite record types. Maria
+normally records most requests
 together with the result message it displayed. `ToolExecutionResult.recorded_message`,
 when set, replaces only the response half of that record; when Brain records an
 interaction, the cleaned `user_input` is preserved unchanged. `history.read`,
@@ -427,8 +495,15 @@ interaction, the cleaned `user_input` is preserved unchanged. `history.read`,
 `conversation_summaries.list`, `conversation_summaries.read`, `tasks.create`,
 `tasks.list`, `tasks.due`, `tasks.read`, `tasks.edit`, `tasks.reschedule`,
 `reminders.create`, `reminders.list`, `reminders.due`, `reminders.read`,
-`reminders.edit`, and `reminders.reschedule` are the only current actions that set this
-field, each using a fixed content-free summary. Brain applies the field generically, with
+`reminders.edit`, `reminders.reschedule`, and the thirteen project actions of V1-24-R1
+(`projects.list`, `projects.create`, `projects.read`, `projects.retitle`,
+`projects.delete`, `projects.activate`, `projects.deactivate`, `projects.list_facts`,
+`projects.add_fact`, `projects.edit_fact`, `projects.delete_fact`,
+`projects.list_files`, and `projects.read_file`) are the only current actions that set
+this field, thirty-two in all, each using a fixed content-free summary; a project
+command's summary names ids only, never a name, location, path, fact, or file text,
+while its request half keeps the command as typed, as a note command's does. Brain
+applies the field generically, with
 no tool-specific branch. A model-originated plan is transient, so neither its request nor
 its result ever becomes an interaction row, and so is every outcome of
 `summarize conversation`; a summary, task, or reminder edit keeps its new text in the
@@ -436,7 +511,8 @@ request half, as a note edit does. Both interfaces record identically, because r
 happens in Brain, never in an interface; what the GUI displays is never recorded by the
 GUI itself. In-session reminder notices are never recorded as interactions, and the three
 reminder-delivery actions of V1-23-R1 record ordinary content-free replies without
-setting `recorded_message`.
+setting `recorded_message`. A model request that names project files with `@` is
+transient: it records nothing, and nothing of it is kept (V1-24-R1).
 
 A saved conversation (schema 6) is an exact, immutable copy of the exchanges a session
 retained, one canonical compact-JSON transcript per explicit `save conversation`; it is
@@ -471,6 +547,24 @@ or malformed; it is not a record type either. Tasks get no delivery columns. A r
 delivery state Maria could not have written is refused privately on read, like any other
 malformed field.
 
+Projects and project facts (schema 9, V1-24-R1) are two record types, with no foreign
+key, trigger, index, or cascade. A project holds its name, one line of 1 to 64 UTF-8
+bytes with no colon, its root, `workspace` or `project_maria`, its folder within that
+root, empty for the root's top and always empty for Project Maria, and UTC stamps.
+Locations never overlap, compared ignoring case, and at most one Project Maria exists. A
+project fact holds its project's id, one line of at most 512 UTF-8 bytes the owner
+approved word for word, its approval digest, the SHA-256 of the compact JSON
+`[project_id, text]`, and UTC stamps. The activation setting is at most one row of
+`project_activation` (id 1, the active project's id or NULL, a serial, changed_at); it is
+not a record type. It is in one of four states: never activated, with no row; active;
+inactive; and unreadable, any row Maria could not have written, which is reported and
+never taken for never activated. Only `activate project` and `deactivate project` change
+it, and each change raises the serial by one, never past SQLite's largest integer: at
+that serial an activation is refused and a deactivation keeps the serial. A project is
+deleted only while it is inactive and holds no facts, facts are deleted one at a time,
+and nothing cascades. A project or fact row Maria could not have written is refused
+privately on read.
+
 An audit summary (schema 5: an `audit_summaries` row plus at most one `audit_outcomes`
 row) records that the owner approved one model-proposed execution attempt and Maria
 authorised it for dispatch; it is committed before the tool runs, and the outcome is
@@ -481,7 +575,7 @@ means the execution is unknown, and a summary alone never proves the tool ran. A
 several steps gets one summary per step reached for dispatch and none for later steps;
 no stored value groups a plan's summaries.
 
-Thirty lifecycle actions can update or remove an existing stored record. These twenty-six
+Thirty-four lifecycle actions can update or remove an existing stored record. These thirty
 require explicit confirmation: `history.delete`, `notes.retitle`, `notes.edit`,
 `notes.delete`, `notes.enable_context`, `notes.disable_context`, `memory.update`,
 `memory.forget`, `memory.enable_context`, `memory.disable_context`, `audit.delete`,
@@ -489,7 +583,8 @@ require explicit confirmation: `history.delete`, `notes.retitle`, `notes.edit`,
 `conversation_summaries.enable_context`, `conversation_summaries.disable_context`,
 `tasks.edit`, `tasks.reschedule`, `tasks.delete`, `tasks.enable_context`,
 `tasks.disable_context`, `reminders.edit`, `reminders.reschedule`, `reminders.delete`,
-`reminders.enable_context`, and `reminders.disable_context`. The four complete and
+`reminders.enable_context`, `reminders.disable_context`, `projects.retitle`,
+`projects.delete`, `projects.edit_fact`, and `projects.delete_fact`. The four complete and
 reopen actions, `tasks.complete`, `tasks.reopen`, `reminders.complete`, and
 `reminders.reopen`, are allowed under the owner's explicit permission-risk decision
 (V1-22-R1, D7a): each changes one row's status only, complete stamps the time of that
@@ -497,13 +592,17 @@ completion, reopen clears it, and an earlier completion time is never restored. 
 lifecycle action targets at most one row selected by id, with one owner-approved
 exception: `audit.delete` removes one logical audit summary, its summary row together
 with its optional outcome row, in one transaction, and summary ids are never reused.
-Saved-conversation, conversation-summary, task, and reminder ids are never reused either.
+Saved-conversation, conversation-summary, task, reminder, project, and project-fact ids
+are never reused either.
 The reminder-delivery subsystem's claim and outcome writes each target one reminder row by
 its id and revision, and `reminders.enable_delivery` and `reminders.disable_delivery` each
 write the one setting row; none of them is a lifecycle action of a record (V1-23-R1).
+Likewise `projects.activate` and `projects.deactivate` each write the one activation
+setting row and are not lifecycle actions of a record; deactivation, which only narrows
+what can reach a model, needs no confirmation (V1-24-R1).
 There is no bulk, wildcard, clear-all, or date-range deletion; no automatic retention or
 pruning; no cascade between
-the eight record types; no undo or revision history (a reminder's scheduling revision is
+the ten record types; no undo or revision history (a reminder's scheduling revision is
 an identity counter that keeps no earlier time, text, or claim, not a history); and no
 guarantee of secure erasure. Be
 careful not to leak sensitive content into any of them when adding features. See
@@ -527,7 +626,21 @@ Tier A after memories, by ascending id and only within Tier A's unchanged bounds
 eligible one is not always sent; a completed one is not eligible until it is reopened,
 and neither is one whose stamps break the record rules. A task or reminder Tier A read
 admits a row's values only as typed text, or NULL where allowed, within small
-stored-byte bounds before any of them reaches Python. Consent is not inspection: Maria
+stored-byte bounds before any of them reaches Python. A project fact (V1-24-R1) has no
+consent flag of its own: its consent is the owner's confirmed addition or edit, which
+shows its exact text, together with the confirmed activation of its project. Only the
+active project's facts whose stored project id and text still match their approval digest
+are eligible, for Tier A only, after memories and before tasks, by ascending id and within
+Tier A's unchanged bounds; facts of every other project are never read for context, and
+project names and locations are never sent to a model. A supplied fact is current only
+while it belongs to the active project with its approved digest, and a conversation that
+carried a fact no longer current is cleared with a fixed notice. The digest is an
+integrity check against changes made outside Maria's confirmed commands, not
+authentication. Project file parts reach the model only as owner-named parts of a single
+request, outside Tier A and Tier B, and are never kept in a conversation; a model request
+carrying a fact or a file part is sent only if the activation setting, read once more
+immediately before the hand-off, still holds the token of the request's snapshot.
+Consent is not inspection: Maria
 cannot tell a secret from other free text. Interaction history, saved conversations, and
 audit summaries are never read for planning or reasoning. A reminder's delivery state
 (V1-23-R1) is never part of its consent identity, never turns consent on or off, and is
@@ -561,6 +674,13 @@ treat them as gated pending approval rather than as permanent exclusions:
   toast, or AppUserModelID registration; no recurrence, snooze, or delivery of tasks; no
   retry after a claim or cancellation of a claimed attempt; no automatic installation or
   removal of the task; and no timer in any interface
+- Any project capability beyond V1-24-R1's: writing, renaming, or moving project files
+  (Project Maria's root stays read-only); recursive search or indexing; automatic file
+  context; keeping file parts in a conversation; sending project names or locations to a
+  model; moving a project; a third root; Git or any other process; support for folders
+  under cloud synchronization, or detecting cloud providers or the files they manage;
+  holding the activation setting across a send; project file reading off Windows; and any
+  automatic activation of a project, of Project Maria above all
 
 If a task seems to require one of these, stop and flag it instead of working around the
 boundary.
@@ -623,6 +743,15 @@ the CLI does.
   standard-library `ctypes`: MessageBoxW and SHQueryUserNotificationState only, with
   exactly MB_OK, MB_ICONINFORMATION, and MB_TOPMOST. It calls no foreground or clipboard
   function (V1-23-R1).
+- Only `Maria/core/project_file_access.py`, one additional `ctypes` module, calls the nine
+  Windows functions project file reading uses, with every argument and result type
+  pinned: CreateFileW, GetFileInformationByHandle, GetFileInformationByHandleEx,
+  GetFinalPathNameByHandleW, FindFirstFileExW, FindNextFileW, FindClose, CloseHandle,
+  and RtlSetThreadPlaceholderCompatibilityMode (V1-24-R1). No other production module
+  names them.
+- No production module starts a process, runs a shell command, or evaluates, compiles,
+  or executes code; registered-tool dispatch through ToolManager's fixed module list is
+  the one dynamic import (V1-24-R1).
 - Avoid circular imports.
 
 ## Testing
@@ -648,6 +777,15 @@ python -m unittest discover -s tests -v
   SHQueryUserNotificationState and never register, run, end, or delete an
   operating-system task; every clock the delivery code reads is injected,
   and nothing sleeps.
+- Project file tests (V1-24-R1) make real Windows calls only on temporary folders the
+  test creates, where they try junctions, hard links, share modes, short-name aliases
+  (skipped when the volume keeps none), and symbolic links (skipped without the privilege
+  to make one); every other reader test goes through the fake access of
+  `Maria/tests/project_fakes.py`, which can make each Windows call fail in turn. Project
+  storage tests run in UTF-8, UTF-16le, and UTF-16be databases. The Project Maria
+  manifest tests that look at files run only in an isolated copy that holds every
+  explicitly approved application path, new unstaged files included, and no private,
+  runtime, or Git file; nothing is staged or committed to build it.
 - Any behavior change needs a corresponding focused test. A task that changes behavior
   without adding or updating tests is not done.
 - **Never state that the suite passes unless you actually executed it and saw the output.**
@@ -669,10 +807,12 @@ python -m unittest discover -s tests -v
   uses into a tracked file. Run the suite both without and with the pinned `tzdata`, as
   well as without and with the pinned PyQt6.
 - Agent-run verification: run Maria imports, tests, probes, and the CLI only in a fresh
-  isolated copy of the tracked files outside the checkout, with bytecode writing disabled
+  isolated copy outside the checkout of the tracked files and every explicitly approved
+  new application path, new unstaged files included, with bytecode writing disabled
   (`python -B`), synthetic data, and temporary resources; never against the real checkout,
   the private override, the live database, or the live log. Prove the copy excludes them
-  before running. Install PyQt6 and `tzdata` only into isolated virtual environments
+  before running, and never stage or commit anything to build it. Install PyQt6 and
+  `tzdata` only into isolated virtual environments
   outside the checkout, never globally.
 
 ## Documentation

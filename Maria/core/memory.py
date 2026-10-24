@@ -60,6 +60,44 @@ from core.conversation_records import (
 )
 from core.failures import Failure, FailureKind, TypedFailureError
 from core.logger import get_logger
+from core.project_records import (
+    ACTIVATION_SERIAL_FIRST,
+    ACTIVATION_SERIAL_MAX,
+    FACT_DIGEST_LENGTH,
+    FACT_ID_MESSAGE,
+    FACT_QUERY_LIMIT,
+    PROJECT_FACT_MAX_BYTES,
+    PROJECT_ID_MESSAGE,
+    PROJECT_LIST_LIMIT,
+    PROJECT_NAME_MAX_BYTES,
+    PROJECT_PATH_MAX_BYTES,
+    PROJECT_QUERY_LIMIT,
+    PROJECT_RECORD_MESSAGE,
+    PROJECT_ROOT_MAX_CHARACTERS,
+    PROJECT_STORAGE_MESSAGE,
+    ActivationChange,
+    ActivationResult,
+    ActivationSnapshot,
+    ActivationState,
+    DeactivationChange,
+    FactEdit,
+    FactListing,
+    Project,
+    ProjectChoices,
+    ProjectContextRead,
+    ProjectDeletion,
+    ProjectFact,
+    ProjectListing,
+    ProjectReading,
+    fact_digest,
+    is_fact_digest,
+    is_fact_text,
+    is_project_location,
+    is_project_name,
+    locations_overlap,
+    replacement_serial,
+    settle_activation,
+)
 from core.task_records import (
     AS_OF_DATE_MESSAGE,
     AS_OF_INSTANT_MESSAGE,
@@ -157,8 +195,9 @@ _UNVERSIONED_SCHEMA = 0
 # two audit-summary tables. Version 6 adds the saved-conversation and
 # conversation-summary tables. Version 7 adds the task and reminder tables.
 # Version 8 adds each reminder's delivery state and the one-row delivery
-# setting (V1-23-R1). The current version lives in ``core.constants`` as
-# ``DATABASE_SCHEMA_VERSION``.
+# setting (V1-23-R1). Version 9 adds the project and project-fact tables and
+# the one-row project activation setting (V1-24-R1). The current version
+# lives in ``core.constants`` as ``DATABASE_SCHEMA_VERSION``.
 _SCHEMA_BEFORE_EXPLICIT_MEMORIES = 1
 _SCHEMA_V0_2_BASELINE = 2
 _SCHEMA_MEMORY_CONTEXT_CONSENT = 3
@@ -167,6 +206,7 @@ _SCHEMA_AUDIT_SUMMARIES = 5
 _SCHEMA_CONVERSATION_RECORDS = 6
 _SCHEMA_TASKS_AND_REMINDERS = 7
 _SCHEMA_REMINDER_DELIVERY = 8
+_SCHEMA_PROJECT_RECORDS = 9
 
 # The live schema. These statements describe the database this build expects
 # and are what a brand-new database is created from, so they move whenever the
@@ -345,6 +385,55 @@ _CREATE_REMINDER_DELIVERY_SETTINGS_TABLE = """
     )
 """
 
+# ``projects``, ``project_facts``, and ``project_activation`` hold the owner's
+# projects, their facts, and the one-row activation setting (V1-24-R1), each
+# independent of every other table: no foreign key, trigger, index, or
+# cascade. SQL checks only shapes, and only in forms that hold in every
+# database encoding: an upper bound counts characters, because a byte count
+# of a value cast to a blob doubles in a UTF-16 database, and a byte count is
+# used only to test that a value is not empty. Every other rule, from a
+# name's characters and a folder's exact 512-byte UTF-8 bound to a fact's
+# approval digest, is Maria's own, checked in Python on every write and every
+# read. The activation table starts empty, which means never activated.
+_CREATE_PROJECTS_TABLE = """
+    CREATE TABLE IF NOT EXISTS projects (
+        id INTEGER PRIMARY KEY AUTOINCREMENT,
+        name TEXT NOT NULL CHECK (length(CAST(name AS BLOB)) > 0),
+        root TEXT NOT NULL CHECK (length(root) BETWEEN 1 AND 32),
+        folder TEXT NOT NULL CHECK (length(folder) <= 512),
+        created_at TEXT NOT NULL,
+        updated_at TEXT NOT NULL
+    )
+"""
+
+_CREATE_PROJECT_FACTS_TABLE = """
+    CREATE TABLE IF NOT EXISTS project_facts (
+        id INTEGER PRIMARY KEY AUTOINCREMENT,
+        project_id INTEGER NOT NULL
+            CHECK (typeof(project_id) = 'integer' AND project_id >= 1),
+        text TEXT NOT NULL CHECK (length(CAST(text AS BLOB)) > 0),
+        approved_digest TEXT NOT NULL CHECK (length(approved_digest) = 64),
+        created_at TEXT NOT NULL,
+        updated_at TEXT NOT NULL
+    )
+"""
+
+_CREATE_PROJECT_ACTIVATION_TABLE = """
+    CREATE TABLE IF NOT EXISTS project_activation (
+        id INTEGER PRIMARY KEY CHECK (id = 1),
+        project_id INTEGER CHECK (
+            project_id IS NULL
+            OR (typeof(project_id) = 'integer' AND project_id >= 1)
+        ),
+        serial INTEGER NOT NULL
+            CHECK (typeof(serial) = 'integer' AND serial >= 1),
+        changed_at TEXT NOT NULL CHECK (
+            changed_at GLOB
+                '[0-9][0-9][0-9][0-9]-[0-9][0-9]-[0-9][0-9]T[0-9][0-9]:[0-9][0-9]:[0-9][0-9]Z'
+        )
+    )
+"""
+
 _CREATE_INTERACTIONS_INDEX = """
     CREATE INDEX IF NOT EXISTS idx_interactions_created_at
         ON interactions (created_at)
@@ -366,6 +455,9 @@ _CURRENT_SCHEMA_STATEMENTS: tuple[str, ...] = (
     _CREATE_TASKS_TABLE,
     _CREATE_REMINDERS_TABLE,
     _CREATE_REMINDER_DELIVERY_SETTINGS_TABLE,
+    _CREATE_PROJECTS_TABLE,
+    _CREATE_PROJECT_FACTS_TABLE,
+    _CREATE_PROJECT_ACTIVATION_TABLE,
     _CREATE_INTERACTIONS_INDEX,
     _CREATE_NOTES_INDEX,
 )
@@ -625,6 +717,47 @@ _ADD_REMINDER_DELIVERY_OUTCOME_COLUMN = """
         )
 """
 
+# The three tables the version 9 step creates (V1-24-R1), frozen the same
+# way. The activation table starts empty, which means never activated.
+_HISTORICAL_PROJECTS_TABLE = """
+    CREATE TABLE projects (
+        id INTEGER PRIMARY KEY AUTOINCREMENT,
+        name TEXT NOT NULL CHECK (length(CAST(name AS BLOB)) > 0),
+        root TEXT NOT NULL CHECK (length(root) BETWEEN 1 AND 32),
+        folder TEXT NOT NULL CHECK (length(folder) <= 512),
+        created_at TEXT NOT NULL,
+        updated_at TEXT NOT NULL
+    )
+"""
+
+_HISTORICAL_PROJECT_FACTS_TABLE = """
+    CREATE TABLE project_facts (
+        id INTEGER PRIMARY KEY AUTOINCREMENT,
+        project_id INTEGER NOT NULL
+            CHECK (typeof(project_id) = 'integer' AND project_id >= 1),
+        text TEXT NOT NULL CHECK (length(CAST(text AS BLOB)) > 0),
+        approved_digest TEXT NOT NULL CHECK (length(approved_digest) = 64),
+        created_at TEXT NOT NULL,
+        updated_at TEXT NOT NULL
+    )
+"""
+
+_HISTORICAL_PROJECT_ACTIVATION_TABLE = """
+    CREATE TABLE project_activation (
+        id INTEGER PRIMARY KEY CHECK (id = 1),
+        project_id INTEGER CHECK (
+            project_id IS NULL
+            OR (typeof(project_id) = 'integer' AND project_id >= 1)
+        ),
+        serial INTEGER NOT NULL
+            CHECK (typeof(serial) = 'integer' AND serial >= 1),
+        changed_at TEXT NOT NULL CHECK (
+            changed_at GLOB
+                '[0-9][0-9][0-9][0-9]-[0-9][0-9]-[0-9][0-9]T[0-9][0-9]:[0-9][0-9]:[0-9][0-9]Z'
+        )
+    )
+"""
+
 # Every version's complete schema, newest first. A marker is never taken at
 # its word: whatever version a database claims, its structure is checked
 # against the entry for that version before anything is migrated, so a file
@@ -633,6 +766,26 @@ _ADD_REMINDER_DELIVERY_OUTCOME_COLUMN = """
 # one up to DATABASE_SCHEMA_VERSION therefore needs an entry here, and the
 # migration ladder refuses to run if one is missing.
 _FROZEN_SCHEMAS: tuple[tuple[int, tuple[str, ...]], ...] = (
+    (
+        _SCHEMA_PROJECT_RECORDS,
+        (
+            _HISTORICAL_INTERACTIONS_TABLE,
+            _HISTORICAL_NOTES_TABLE_WITH_CONTEXT_CONSENT,
+            _HISTORICAL_MEMORIES_TABLE_WITH_CONTEXT_CONSENT,
+            _HISTORICAL_AUDIT_SUMMARIES_TABLE,
+            _HISTORICAL_AUDIT_OUTCOMES_TABLE,
+            _HISTORICAL_SAVED_CONVERSATIONS_TABLE,
+            _HISTORICAL_CONVERSATION_SUMMARIES_TABLE,
+            _HISTORICAL_TASKS_TABLE,
+            _HISTORICAL_REMINDERS_TABLE_WITH_DELIVERY_STATE,
+            _HISTORICAL_REMINDER_DELIVERY_SETTINGS_TABLE,
+            _HISTORICAL_PROJECTS_TABLE,
+            _HISTORICAL_PROJECT_FACTS_TABLE,
+            _HISTORICAL_PROJECT_ACTIVATION_TABLE,
+            _HISTORICAL_INTERACTIONS_INDEX,
+            _HISTORICAL_NOTES_INDEX,
+        ),
+    ),
     (
         _SCHEMA_REMINDER_DELIVERY,
         (
@@ -824,6 +977,15 @@ _MIGRATIONS: tuple[_Migration, ...] = (
             _HISTORICAL_REMINDER_DELIVERY_SETTINGS_TABLE,
         ),
     ),
+    _Migration(
+        version=_SCHEMA_PROJECT_RECORDS,
+        name="create_project_records",
+        statements=(
+            _HISTORICAL_PROJECTS_TABLE,
+            _HISTORICAL_PROJECT_FACTS_TABLE,
+            _HISTORICAL_PROJECT_ACTIVATION_TABLE,
+        ),
+    ),
 )
 
 
@@ -847,6 +1009,16 @@ _SUMMARY_APPROVED_FUNCTION = "maria_summary_approved"
 # written, before the row can be returned or counted.
 _TASK_APPROVED_FUNCTION = "maria_task_approved"
 _REMINDER_APPROVED_FUNCTION = "maria_reminder_approved"
+
+# The SQL function a project-fact context read registers, on its own
+# connection only (V1-24-R1): it tests whether one fact row still holds its
+# approved text for its project, and only values Maria could have written,
+# before the row can be returned or counted.
+_FACT_APPROVED_FUNCTION = "maria_project_fact_approved"
+
+# The most eligible facts one project snapshot may read, as the other
+# context reads bound theirs.
+_CONTEXT_FACT_READ_LIMIT = 100
 
 # The SQL function a reminder-delivery read or claim registers, on its own
 # connection only: it tests whether one open reminder row holds only values
@@ -4254,6 +4426,606 @@ class Memory:
             )
         return recorded
 
+    # Projects, project facts, and the activation setting, from V1-24-R1.
+    # Every read types and bounds each value inside SQLite, by its stored
+    # bytes in the file's own encoding, before Python sees it, and Python
+    # then settles it into a value object; a row Maria could not have written
+    # is refused privately with the fixed failure, never repaired. Names,
+    # locations, and fact text are never logged: a log line names ids, a
+    # count, or a fixed phrase only.
+
+    def create_project(self, name: str, root: str, folder: str) -> int | None:
+        """Store one project and return its id, or None when it overlaps.
+
+        One write transaction reads every stored location under the write
+        lock and refuses, by returning None, a location equal to, inside, or
+        around another project's, compared case-insensitively; at most one
+        Project Maria project can exist. A stored location that cannot be
+        read refuses the creation privately, since overlap could not be
+        judged.
+        """
+        if not is_project_name(name) or not is_project_location(root, folder):
+            raise ValueError(PROJECT_RECORD_MESSAGE)
+        timestamp = task_timestamp()
+        if not is_task_timestamp(timestamp):
+            raise ValueError(PROJECT_RECORD_MESSAGE)
+        project_id: object = None
+        overlapping = False
+        failure: str | None = None
+        try:
+            with self._connection(classify_contention=False) as connection:
+                connection.execute("BEGIN IMMEDIATE")
+                locations = _stored_locations(connection)
+                if locations is None:
+                    failure = _RECORD_UNEXPECTED_VALUE
+                elif any(
+                    locations_overlap(root, folder, stored_root, stored_folder)
+                    for stored_root, stored_folder in locations
+                ):
+                    overlapping = True
+                else:
+                    cursor = connection.execute(
+                        """
+                        INSERT INTO projects (
+                            name, root, folder, created_at, updated_at
+                        )
+                        VALUES (?, ?, ?, ?, ?)
+                        """,
+                        (name, root, folder, timestamp, timestamp),
+                    )
+                    if cursor.rowcount != 1:
+                        failure = _RECORD_NO_ROW_INSERTED
+                    project_id = cursor.lastrowid
+        except sqlite3.Error as exc:
+            failure = _record_failure_reason(exc)
+        if failure is None and not overlapping and not is_record_id(project_id):
+            failure = _RECORD_INVALID_ID
+        if failure is not None:
+            raise self._project_failure("store project", failure)
+        if overlapping:
+            self.logger.info("Refused a project whose location overlaps another.")
+            return None
+        self.logger.info("Stored project %s.", project_id)
+        return project_id
+
+    def list_projects(self, limit: int = PROJECT_QUERY_LIMIT) -> ProjectListing:
+        """Return at most ``limit`` projects by id, with the activation.
+
+        Both come from one read transaction, so the listing marks exactly
+        the project active when it was read. A project row Maria could not
+        have written refuses the listing as a whole.
+        """
+        _require_project_limit(limit)
+        projects: list[Project] | None = None
+        activation: ActivationSnapshot | None = None
+        failure: str | None = None
+        try:
+            with self._connection(classify_contention=False) as connection:
+                connection.execute("BEGIN")
+                projects = _settled_projects(
+                    _project_rows(connection, "", (), limit)
+                )
+                activation = _read_project_activation(connection)
+        except sqlite3.Error as exc:
+            failure = _record_failure_reason(exc)
+        if failure is None and (projects is None or activation is None):
+            failure = _RECORD_UNEXPECTED_VALUE
+        if failure is not None:
+            raise self._project_failure("list projects", failure)
+        return ProjectListing(tuple(projects), activation)
+
+    def get_project(self, project_id: int) -> ProjectReading:
+        """Return one project, the activation, and its fact count, in one read.
+
+        A project that does not exist reads as None; one Maria could not
+        have written is refused privately.
+        """
+        _require_project_id(project_id)
+        project: Project | None = None
+        activation: ActivationSnapshot | None = None
+        count: object = 0
+        failure: str | None = None
+        try:
+            with self._connection(classify_contention=False) as connection:
+                connection.execute("BEGIN")
+                rows = _project_rows(connection, "WHERE id = ?", (project_id,), 1)
+                if rows:
+                    project = _settled_project(rows[0])
+                    if project is None:
+                        failure = _RECORD_UNEXPECTED_VALUE
+                    else:
+                        count = connection.execute(
+                            "SELECT count(*) FROM project_facts WHERE project_id = ?",
+                            (project_id,),
+                        ).fetchone()[0]
+                activation = _read_project_activation(connection)
+        except sqlite3.Error as exc:
+            failure = _record_failure_reason(exc)
+        if failure is None and (activation is None or type(count) is not int):
+            failure = _RECORD_UNEXPECTED_VALUE
+        if failure is not None:
+            raise self._project_failure("read project", failure)
+        return ProjectReading(project, activation, count)
+
+    def retitle_project(self, project_id: int, name: str) -> bool:
+        """Replace one project's name; True when a project matched.
+
+        The update stamp is never earlier than the creation stamp.
+        """
+        _require_project_id(project_id)
+        if not is_project_name(name):
+            raise ValueError(PROJECT_RECORD_MESSAGE)
+        updated_at = task_timestamp()
+        if not is_task_timestamp(updated_at):
+            raise ValueError(PROJECT_RECORD_MESSAGE)
+        if _beyond_sqlite((project_id,)):
+            return False
+        updated = False
+        failure: str | None = None
+        try:
+            with self._connection(classify_contention=False) as connection:
+                cursor = connection.execute(
+                    """
+                    UPDATE projects
+                    SET name = ?, updated_at = max(?, created_at)
+                    WHERE id = ?
+                    """,
+                    (name, updated_at, project_id),
+                )
+                updated = cursor.rowcount == 1
+        except sqlite3.Error as exc:
+            failure = _record_failure_reason(exc)
+        if failure is not None:
+            raise self._project_failure("rename project", failure)
+        if updated:
+            self.logger.info("Renamed project %s.", project_id)
+        return updated
+
+    def delete_project(self, project_id: int) -> ProjectDeletion:
+        """Delete one project unless it is active or has facts.
+
+        One write transaction checks both under the write lock; nothing
+        cascades, and no other record is touched.
+        """
+        _require_project_id(project_id)
+        outcome = ProjectDeletion.NOT_FOUND
+        if _beyond_sqlite((project_id,)):
+            return outcome
+        failure: str | None = None
+        try:
+            with self._connection(classify_contention=False) as connection:
+                connection.execute("BEGIN IMMEDIATE")
+                exists = connection.execute(
+                    "SELECT 1 FROM projects WHERE id = ?",
+                    (project_id,),
+                ).fetchone()
+                if exists is not None:
+                    activation = _read_project_activation(connection)
+                    if activation.active_project_id == project_id:
+                        outcome = ProjectDeletion.ACTIVE
+                    elif connection.execute(
+                        "SELECT 1 FROM project_facts WHERE project_id = ? LIMIT 1",
+                        (project_id,),
+                    ).fetchone() is not None:
+                        outcome = ProjectDeletion.HAS_FACTS
+                    else:
+                        cursor = connection.execute(
+                            "DELETE FROM projects WHERE id = ?",
+                            (project_id,),
+                        )
+                        if cursor.rowcount == 1:
+                            outcome = ProjectDeletion.DELETED
+        except sqlite3.Error as exc:
+            failure = _record_failure_reason(exc)
+        if failure is not None:
+            raise self._project_failure("delete project", failure)
+        if outcome is ProjectDeletion.DELETED:
+            self.logger.info("Deleted project %s.", project_id)
+        return outcome
+
+    def project_activation(self) -> ActivationSnapshot:
+        """Return the activation setting, from one bounded read.
+
+        No row is never activated; a well-formed row naming an existing,
+        well-formed project, or none, is active or inactive; anything else
+        is unreadable. This is also the final check's read.
+        """
+        activation: ActivationSnapshot | None = None
+        failure: str | None = None
+        try:
+            with self._connection(classify_contention=False) as connection:
+                connection.execute("BEGIN")
+                activation = _read_project_activation(connection)
+        except sqlite3.Error as exc:
+            failure = _record_failure_reason(exc)
+        if failure is None and activation is None:
+            failure = _RECORD_UNEXPECTED_VALUE
+        if failure is not None:
+            raise self._project_failure("read the active project setting", failure)
+        return activation
+
+    def activate_project(self, project_id: int) -> ActivationResult:
+        """Make one existing project the active one, by the serial's rules.
+
+        One write transaction reads the setting under the write lock. Never
+        activated inserts row 1 with serial 1; inactive, or another project
+        active, raises the serial by one; the same project already active
+        writes nothing. An unreadable setting is replaced: every row removed
+        and row 1 inserted, with the serial ``replacement_serial`` chooses.
+        At the largest serial an activation that would write is refused and
+        nothing changes; the serial never wraps or resets.
+        """
+        _require_project_id(project_id)
+        changed_at = task_timestamp()
+        if not is_task_timestamp(changed_at):
+            raise ValueError(PROJECT_RECORD_MESSAGE)
+        result: ActivationResult | None = None
+        failure: str | None = None
+        try:
+            with self._connection(classify_contention=False) as connection:
+                connection.execute("BEGIN IMMEDIATE")
+                rows = _project_rows(connection, "WHERE id = ?", (project_id,), 1)
+                if not rows:
+                    result = ActivationResult(ActivationChange.NOT_FOUND)
+                elif _settled_project(rows[0]) is None:
+                    failure = _RECORD_UNEXPECTED_VALUE
+                else:
+                    result = _activate(connection, project_id, changed_at)
+        except sqlite3.Error as exc:
+            failure = _record_failure_reason(exc)
+        if failure is None and result is None:
+            failure = _RECORD_UNEXPECTED_VALUE
+        if failure is not None:
+            raise self._project_failure("activate project", failure)
+        if result.change is ActivationChange.ACTIVATED:
+            self.logger.info("Activated project %s.", project_id)
+        elif result.change is ActivationChange.AT_LIMIT:
+            self.logger.warning(
+                "Refused to activate project %s: the activation serial is at its "
+                "limit.",
+                project_id,
+            )
+        return result
+
+    def deactivate_project(self) -> DeactivationChange:
+        """Leave no project active, by the serial's rules.
+
+        Never activated or inactive writes nothing. Active clears the project
+        and raises the serial by one, or keeps it at the largest serial. An
+        unreadable setting is replaced with an inactive one.
+        """
+        changed_at = task_timestamp()
+        if not is_task_timestamp(changed_at):
+            raise ValueError(PROJECT_RECORD_MESSAGE)
+        outcome: DeactivationChange | None = None
+        failure: str | None = None
+        try:
+            with self._connection(classify_contention=False) as connection:
+                connection.execute("BEGIN IMMEDIATE")
+                outcome = _deactivate(connection, changed_at)
+        except sqlite3.Error as exc:
+            failure = _record_failure_reason(exc)
+        if failure is None and outcome is None:
+            failure = _RECORD_UNEXPECTED_VALUE
+        if failure is not None:
+            raise self._project_failure("deactivate the active project", failure)
+        if outcome is DeactivationChange.DEACTIVATED:
+            self.logger.info("Deactivated the active project.")
+        return outcome
+
+    def project_choices(self, limit: int = PROJECT_LIST_LIMIT) -> ProjectChoices:
+        """Return the projects a window's selector lists, and the active id.
+
+        One read transaction reads at most ``limit`` projects by id and the
+        activation; a project row Maria could not have written refuses the
+        read as a whole. The active id is given only in the active state.
+        """
+        if type(limit) is not int or not 1 <= limit <= PROJECT_LIST_LIMIT:
+            raise ValueError(PROJECT_RECORD_MESSAGE)
+        listing = self.list_projects(limit)
+        return ProjectChoices(
+            tuple((project.project_id, project.name) for project in listing.projects),
+            listing.activation.active_project_id,
+        )
+
+    def add_project_fact(self, project_id: int, text: str) -> int | None:
+        """Store one approved fact and its approval digest, or None.
+
+        One write transaction checks that the project exists, then writes
+        the text and its digest in one INSERT. None means no project has
+        the id; a project row Maria could not have written is refused
+        privately.
+        """
+        _require_project_id(project_id)
+        if not is_fact_text(text):
+            raise ValueError(PROJECT_RECORD_MESSAGE)
+        timestamp = task_timestamp()
+        if not is_task_timestamp(timestamp):
+            raise ValueError(PROJECT_RECORD_MESSAGE)
+        fact_id: object = None
+        found = False
+        failure: str | None = None
+        try:
+            with self._connection(classify_contention=False) as connection:
+                connection.execute("BEGIN IMMEDIATE")
+                rows = _project_rows(connection, "WHERE id = ?", (project_id,), 1)
+                if rows and _settled_project(rows[0]) is None:
+                    failure = _RECORD_UNEXPECTED_VALUE
+                elif rows:
+                    found = True
+                    cursor = connection.execute(
+                        """
+                        INSERT INTO project_facts (
+                            project_id, text, approved_digest, created_at,
+                            updated_at
+                        )
+                        VALUES (?, ?, ?, ?, ?)
+                        """,
+                        (
+                            project_id,
+                            text,
+                            fact_digest(project_id, text),
+                            timestamp,
+                            timestamp,
+                        ),
+                    )
+                    if cursor.rowcount != 1:
+                        failure = _RECORD_NO_ROW_INSERTED
+                    fact_id = cursor.lastrowid
+        except sqlite3.Error as exc:
+            failure = _record_failure_reason(exc)
+        if failure is None and found and not is_record_id(fact_id):
+            failure = _RECORD_INVALID_ID
+        if failure is not None:
+            raise self._project_failure("store project fact", failure)
+        if not found:
+            return None
+        self.logger.info("Stored fact %s of project %s.", fact_id, project_id)
+        return fact_id
+
+    def list_project_facts(
+        self,
+        project_id: int,
+        limit: int = FACT_QUERY_LIMIT,
+    ) -> FactListing:
+        """Return one project and at most ``limit`` of its facts, by id.
+
+        Both come from one read transaction. A fact or project row Maria
+        could not have written refuses the listing as a whole, and a fact
+        whose approval digest no longer matches its text and project is one.
+        """
+        _require_project_id(project_id)
+        if type(limit) is not int or not 1 <= limit <= FACT_QUERY_LIMIT:
+            raise ValueError(PROJECT_RECORD_MESSAGE)
+        project: Project | None = None
+        facts: list[ProjectFact] | None = []
+        failure: str | None = None
+        try:
+            with self._connection(classify_contention=False) as connection:
+                connection.execute("BEGIN")
+                rows = _project_rows(connection, "WHERE id = ?", (project_id,), 1)
+                if rows:
+                    project = _settled_project(rows[0])
+                    if project is None:
+                        failure = _RECORD_UNEXPECTED_VALUE
+                    else:
+                        facts = _settled_facts(
+                            _fact_rows(
+                                connection,
+                                "WHERE project_id = ?",
+                                (project_id,),
+                                limit,
+                            )
+                        )
+        except sqlite3.Error as exc:
+            failure = _record_failure_reason(exc)
+        if failure is None and facts is None:
+            failure = _RECORD_UNEXPECTED_VALUE
+        if failure is not None:
+            raise self._project_failure("list project facts", failure)
+        return FactListing(project, tuple(facts))
+
+    def get_project_fact(self, fact_id: int) -> ProjectFact | None:
+        """Return one fact, or None if absent; a malformed row is refused."""
+        _require_fact_id(fact_id)
+        fact: ProjectFact | None = None
+        failure: str | None = None
+        try:
+            with self._connection(classify_contention=False) as connection:
+                rows = _fact_rows(connection, "WHERE id = ?", (fact_id,), 1)
+                if rows:
+                    settled = _settled_facts(rows)
+                    if settled is None:
+                        failure = _RECORD_UNEXPECTED_VALUE
+                    else:
+                        fact = settled[0]
+        except sqlite3.Error as exc:
+            failure = _record_failure_reason(exc)
+        if failure is not None:
+            raise self._project_failure("read project fact", failure)
+        return fact
+
+    def edit_project_fact(
+        self,
+        fact_id: int,
+        text: str,
+        expected_digest: str | None,
+    ) -> FactEdit:
+        """Replace one fact's text and digest, only while it is as shown.
+
+        One write transaction reads the fact under the write lock; unless it
+        still holds exactly the approval digest pinned when the owner was
+        shown it, and only values Maria could have written, nothing changes
+        and the edit is ``CHANGED``. The new text and its new digest are
+        written in one UPDATE.
+        """
+        _require_fact_id(fact_id)
+        if not is_fact_text(text):
+            raise ValueError(PROJECT_RECORD_MESSAGE)
+        if expected_digest is not None and not is_fact_digest(expected_digest):
+            raise ValueError(PROJECT_RECORD_MESSAGE)
+        updated_at = task_timestamp()
+        if not is_task_timestamp(updated_at):
+            raise ValueError(PROJECT_RECORD_MESSAGE)
+        outcome = FactEdit.NOT_FOUND
+        failure: str | None = None
+        try:
+            with self._connection(classify_contention=False) as connection:
+                connection.execute("BEGIN IMMEDIATE")
+                rows = _fact_rows(connection, "WHERE id = ?", (fact_id,), 1)
+                if rows:
+                    settled = _settled_facts(rows)
+                    if (
+                        settled is None
+                        or expected_digest is None
+                        or settled[0].approved_digest != expected_digest
+                    ):
+                        outcome = FactEdit.CHANGED
+                    else:
+                        fact = settled[0]
+                        cursor = connection.execute(
+                            """
+                            UPDATE project_facts
+                            SET text = ?, approved_digest = ?,
+                                updated_at = max(?, created_at)
+                            WHERE id = ? AND approved_digest = ?
+                            """,
+                            (
+                                text,
+                                fact_digest(fact.project_id, text),
+                                updated_at,
+                                fact_id,
+                                expected_digest,
+                            ),
+                        )
+                        outcome = (
+                            FactEdit.EDITED
+                            if cursor.rowcount == 1
+                            else FactEdit.CHANGED
+                        )
+        except sqlite3.Error as exc:
+            failure = _record_failure_reason(exc)
+        if failure is not None:
+            raise self._project_failure("edit project fact", failure)
+        if outcome is FactEdit.EDITED:
+            self.logger.info("Edited project fact %s.", fact_id)
+        elif outcome is FactEdit.CHANGED:
+            self.logger.info(
+                "Refused to edit project fact %s: it changed after it was shown.",
+                fact_id,
+            )
+        return outcome
+
+    def delete_project_fact(self, fact_id: int) -> bool:
+        """Delete one fact by id; its text is never read, logged, or returned."""
+        _require_fact_id(fact_id)
+        if _beyond_sqlite((fact_id,)):
+            return False
+        deleted = False
+        failure: str | None = None
+        try:
+            with self._connection(classify_contention=False) as connection:
+                cursor = connection.execute(
+                    "DELETE FROM project_facts WHERE id = ?",
+                    (fact_id,),
+                )
+                deleted = cursor.rowcount == 1
+        except sqlite3.Error as exc:
+            failure = _record_failure_reason(exc)
+        if failure is not None:
+            raise self._project_failure("delete project fact", failure)
+        if deleted:
+            self.logger.info("Deleted project fact %s.", fact_id)
+        return deleted
+
+    def active_project(self) -> ProjectContextRead:
+        """Return the activation and the active project, from one read.
+
+        This is a deterministic project command's snapshot: no fact is read.
+        """
+        return self.project_context_snapshot(0, PROJECT_FACT_MAX_BYTES)
+
+    def project_context_snapshot(
+        self,
+        limit: int,
+        max_text_bytes: int,
+        supplied_fact_ids: Sequence[int] = (),
+    ) -> ProjectContextRead:
+        """Return one request's project snapshot, from one read transaction.
+
+        It reads the activation setting and, only while a project is active,
+        that project's row and its eligible facts: at most ``limit`` of them,
+        by ascending id, each still exactly its approved text for that
+        project and holding only values Maria could have written. The facts
+        named in ``supplied_fact_ids``, those supplied to the conversation
+        earlier, are rechecked by the same rule in the same transaction, so a
+        fact of any other project is never among them. Every value is typed
+        and bounded inside SQLite before a registered check sees it, and a
+        fact that check refuses is never returned or counted.
+        """
+        if type(limit) is not int or not 0 <= limit <= _CONTEXT_FACT_READ_LIMIT:
+            raise ValueError(PROJECT_RECORD_MESSAGE)
+        identifiers = (
+            _require_record_ids(supplied_fact_ids) if supplied_fact_ids else ()
+        )
+        activation: ActivationSnapshot | None = None
+        project: Project | None = None
+        facts: list[dict[str, Any]] = []
+        supplied: list[dict[str, Any]] = []
+        failure: str | None = None
+        try:
+            with self._connection(classify_contention=False) as connection:
+                connection.execute("BEGIN")
+                activation = _read_project_activation(connection)
+                active = activation.active_project_id
+                if active is not None:
+                    rows = _project_rows(connection, "WHERE id = ?", (active,), 1)
+                    project = _settled_project(rows[0]) if rows else None
+                    if limit:
+                        facts = _context_fact_rows(
+                            connection,
+                            active,
+                            max_text_bytes,
+                            limit,
+                        )
+                    if identifiers:
+                        supplied = _context_fact_rows(
+                            connection,
+                            active,
+                            max_text_bytes,
+                            len(identifiers),
+                            identifiers,
+                        )
+        except sqlite3.Error as exc:
+            failure = _record_failure_reason(exc)
+        if failure is None and (
+            activation is None
+            or (activation.active_project_id is not None and project is None)
+        ):
+            failure = _RECORD_UNEXPECTED_VALUE
+        if failure is not None:
+            raise self._project_failure("read project context", failure)
+        return ProjectContextRead(
+            activation,
+            project,
+            tuple(facts),
+            tuple(supplied),
+        )
+
+    def _project_failure(self, operation: str, reason: str) -> RuntimeError:
+        """Log one fixed line and return a project call's failure.
+
+        ``operation`` and ``reason`` are always this module's own fixed
+        phrases. Contention keeps the shared busy message; every other
+        failure has the fixed project storage message. A caller raises the
+        result only after its ``except`` block has ended, so the failure has
+        neither a cause nor a context.
+        """
+        self.logger.error("Failed to %s: %s.", operation, reason)
+        if reason == _RECORD_DATABASE_BUSY:
+            return RuntimeError(_DATABASE_BUSY_MESSAGE)
+        return RuntimeError(PROJECT_STORAGE_MESSAGE)
+
     def _insert_agenda(
         self,
         table: _AgendaTable,
@@ -5598,6 +6370,497 @@ def _read_delivery_setting(connection: sqlite3.Connection) -> DeliverySetting:
         row["enabled"],
         row["changed_at"],
     )
+
+
+# The guards every project and project-fact read applies inside SQLite
+# (V1-24-R1): each value Python receives must be an integer id of at least 1
+# or text whose stored bytes, in the file's own encoding and NUL characters
+# included, are within the bound the statement supplies next. A length or
+# GLOB check alone would not do: both stop at the first NUL.
+_PROJECT_GUARDS = (
+    "typeof(id) = 'integer' AND id >= 1"
+    " AND typeof(name) = 'text' AND length(CAST(name AS BLOB)) <= ?"
+    " AND typeof(root) = 'text' AND length(CAST(root AS BLOB)) <= ?"
+    " AND typeof(folder) = 'text' AND length(CAST(folder AS BLOB)) <= ?"
+    " AND typeof(created_at) = 'text'"
+    " AND length(CAST(created_at AS BLOB)) <= ?"
+    " AND typeof(updated_at) = 'text'"
+    " AND length(CAST(updated_at AS BLOB)) <= ?"
+)
+_FACT_GUARDS = (
+    "typeof(id) = 'integer' AND id >= 1"
+    " AND typeof(project_id) = 'integer' AND project_id >= 1"
+    " AND typeof(text) = 'text' AND length(CAST(text AS BLOB)) <= ?"
+    " AND typeof(approved_digest) = 'text'"
+    " AND length(CAST(approved_digest AS BLOB)) <= ?"
+    " AND typeof(created_at) = 'text'"
+    " AND length(CAST(created_at AS BLOB)) <= ?"
+    " AND typeof(updated_at) = 'text'"
+    " AND length(CAST(updated_at AS BLOB)) <= ?"
+)
+
+
+def _require_project_id(project_id: object) -> None:
+    """Refuse anything but an exact positive int project id."""
+    if not is_record_id(project_id):
+        raise ValueError(PROJECT_ID_MESSAGE)
+
+
+def _require_fact_id(fact_id: object) -> None:
+    """Refuse anything but an exact positive int fact id."""
+    if not is_record_id(fact_id):
+        raise ValueError(FACT_ID_MESSAGE)
+
+
+def _require_project_limit(limit: object) -> None:
+    """Refuse a project listing limit outside its one-more window."""
+    if type(limit) is not int or not 1 <= limit <= PROJECT_QUERY_LIMIT:
+        raise ValueError(PROJECT_RECORD_MESSAGE)
+
+
+def _beyond_sqlite(parameters: tuple[Any, ...]) -> bool:
+    """Return whether an id parameter is larger than any row can have.
+
+    Such an id names no row, so it is answered without being handed to
+    SQLite, which could not even bind it.
+    """
+    return any(
+        type(parameter) is int and parameter > _SQLITE_MAXIMUM_INTEGER
+        for parameter in parameters
+    )
+
+
+def _project_rows(
+    connection: sqlite3.Connection,
+    where: str,
+    parameters: tuple[Any, ...],
+    limit: int | None,
+) -> list[sqlite3.Row]:
+    """Run one bounded read of projects, by id, with this module's own SQL.
+
+    Each row comes back with ``bounded``, 1 when every value passed its
+    guard, and with its values only then; ``where`` is always this module's
+    own constant text.
+    """
+    if _beyond_sqlite(parameters):
+        return []
+    limit_clause = "" if limit is None else "LIMIT ?"
+    return connection.execute(
+        f"""
+        SELECT id, bounded,
+            CASE WHEN bounded THEN name END AS name,
+            CASE WHEN bounded THEN root END AS root,
+            CASE WHEN bounded THEN folder END AS folder,
+            CASE WHEN bounded THEN created_at END AS created_at,
+            CASE WHEN bounded THEN updated_at END AS updated_at
+        FROM (
+            SELECT id, name, root, folder, created_at, updated_at,
+                ({_PROJECT_GUARDS}) AS bounded
+            FROM projects
+            {where}
+            ORDER BY id
+            {limit_clause}
+        )
+        ORDER BY id
+        """,
+        (
+            *_stored_bounds(
+                connection,
+                (
+                    PROJECT_NAME_MAX_BYTES,
+                    PROJECT_ROOT_MAX_CHARACTERS,
+                    PROJECT_PATH_MAX_BYTES,
+                    UTC_INSTANT_LENGTH,
+                    UTC_INSTANT_LENGTH,
+                ),
+            ),
+            *parameters,
+            *(() if limit is None else (limit,)),
+        ),
+    ).fetchall()
+
+
+def _fact_rows(
+    connection: sqlite3.Connection,
+    where: str,
+    parameters: tuple[Any, ...],
+    limit: int,
+) -> list[sqlite3.Row]:
+    """Run one bounded read of project facts, as ``_project_rows`` reads."""
+    if _beyond_sqlite(parameters):
+        return []
+    return connection.execute(
+        f"""
+        SELECT id, bounded,
+            CASE WHEN bounded THEN project_id END AS project_id,
+            CASE WHEN bounded THEN text END AS text,
+            CASE WHEN bounded THEN approved_digest END AS approved_digest,
+            CASE WHEN bounded THEN created_at END AS created_at,
+            CASE WHEN bounded THEN updated_at END AS updated_at
+        FROM (
+            SELECT id, project_id, text, approved_digest, created_at,
+                updated_at, ({_FACT_GUARDS}) AS bounded
+            FROM project_facts
+            {where}
+            ORDER BY id
+            LIMIT ?
+        )
+        ORDER BY id
+        """,
+        (*_fact_bounds(connection), *parameters, limit),
+    ).fetchall()
+
+
+def _stored_bounds(
+    connection: sqlite3.Connection,
+    lengths: tuple[int, ...],
+) -> tuple[int, ...]:
+    """Return the stored-size bound of each length, in the file's encoding."""
+    return tuple(_stored_bound(connection, length) for length in lengths)
+
+
+def _fact_bounds(connection: sqlite3.Connection) -> tuple[int, ...]:
+    """Return a fact read's stored bounds, in ``_FACT_GUARDS`` order."""
+    return _stored_bounds(
+        connection,
+        (
+            PROJECT_FACT_MAX_BYTES,
+            FACT_DIGEST_LENGTH,
+            UTC_INSTANT_LENGTH,
+            UTC_INSTANT_LENGTH,
+        ),
+    )
+
+
+def _settled_project(row: sqlite3.Row) -> Project | None:
+    """Return one bounded row as a validated project, or None."""
+    if row["bounded"] != 1:
+        return None
+    try:
+        return Project(
+            row["id"],
+            row["name"],
+            row["root"],
+            row["folder"],
+            row["created_at"],
+            row["updated_at"],
+        )
+    except ValueError:
+        return None
+
+
+def _settled_projects(rows: Sequence[sqlite3.Row]) -> list[Project] | None:
+    """Return bounded rows as validated projects, or None for any bad row."""
+    projects: list[Project] = []
+    for row in rows:
+        project = _settled_project(row)
+        if project is None:
+            return None
+        projects.append(project)
+    return projects
+
+
+def _settled_facts(rows: Sequence[sqlite3.Row]) -> list[ProjectFact] | None:
+    """Return bounded rows as validated facts, or None for any bad row.
+
+    A fact whose approval digest is not exactly the digest of its project id
+    and text is a bad row, so a fact changed outside Maria is refused.
+    """
+    facts: list[ProjectFact] = []
+    for row in rows:
+        if row["bounded"] != 1:
+            return None
+        try:
+            facts.append(
+                ProjectFact(
+                    row["id"],
+                    row["project_id"],
+                    row["text"],
+                    row["approved_digest"],
+                    row["created_at"],
+                    row["updated_at"],
+                )
+            )
+        except ValueError:
+            return None
+    return facts
+
+
+def _stored_locations(
+    connection: sqlite3.Connection,
+) -> list[tuple[str, str]] | None:
+    """Return every stored project's root and folder, or None for a bad row."""
+    projects = _settled_projects(_project_rows(connection, "", (), None))
+    if projects is None:
+        return None
+    return [(project.root, project.folder) for project in projects]
+
+
+def _read_project_activation(connection: sqlite3.Connection) -> ActivationSnapshot:
+    """Read the activation setting on this connection, bounded, and settle it.
+
+    One statement returns the table's row count and the one row's project
+    id, serial, and stamp only when they are typed and bounded. A named
+    project must then exist as a well-formed row, read the same way.
+    """
+    row = connection.execute(
+        """
+        SELECT (SELECT count(*) FROM project_activation) AS row_count,
+            project_id,
+            serial,
+            changed_at
+        FROM (SELECT 1)
+        LEFT JOIN project_activation
+            ON typeof(id) = 'integer' AND id = 1
+            AND (
+                project_id IS NULL
+                OR (typeof(project_id) = 'integer' AND project_id >= 1)
+            )
+            AND typeof(serial) = 'integer' AND serial >= 1
+            AND typeof(changed_at) = 'text'
+            AND length(CAST(changed_at AS BLOB)) <= ?
+        """,
+        (_stored_bound(connection, UTC_INSTANT_LENGTH),),
+    ).fetchone()
+    project_id = row["project_id"]
+    exists = False
+    if is_record_id(project_id):
+        rows = _project_rows(connection, "WHERE id = ?", (project_id,), 1)
+        exists = bool(rows) and _settled_project(rows[0]) is not None
+    return settle_activation(
+        row["row_count"],
+        project_id,
+        row["serial"],
+        row["changed_at"],
+        exists,
+    )
+
+
+def _unreadable_serial(connection: sqlite3.Connection) -> int | None:
+    """Return an unreadable setting's serial, when it is one usable integer.
+
+    Only a table of exactly one row whose serial is an integer has one.
+    """
+    row = connection.execute(
+        """
+        SELECT (SELECT count(*) FROM project_activation) AS row_count,
+            (
+                SELECT serial FROM project_activation
+                WHERE typeof(serial) = 'integer'
+            ) AS serial
+        """
+    ).fetchone()
+    if row["row_count"] == 1 and type(row["serial"]) is int:
+        return row["serial"]
+    return None
+
+
+def _write_activation(
+    connection: sqlite3.Connection,
+    project_id: int | None,
+    serial: int,
+    changed_at: str,
+) -> None:
+    """Replace the whole setting with row 1: the one write that may remove
+    more than one row, all of them in this one-row setting table."""
+    connection.execute("DELETE FROM project_activation")
+    connection.execute(
+        """
+        INSERT INTO project_activation (id, project_id, serial, changed_at)
+        VALUES (1, ?, ?, ?)
+        """,
+        (project_id, serial, changed_at),
+    )
+
+
+def _activate(
+    connection: sqlite3.Connection,
+    project_id: int,
+    changed_at: str,
+) -> ActivationResult | None:
+    """Apply one activation's rules under the caller's write lock.
+
+    None means the setting changed although the write lock was held, which
+    the caller refuses privately.
+    """
+    current = _read_project_activation(connection)
+    state = current.state
+    if state is ActivationState.ACTIVE and current.project_id == project_id:
+        return ActivationResult(ActivationChange.ALREADY_ACTIVE)
+    if state is ActivationState.NEVER_ACTIVATED:
+        _write_activation(connection, project_id, ACTIVATION_SERIAL_FIRST, changed_at)
+        return ActivationResult(ActivationChange.ACTIVATED)
+    if state is ActivationState.UNREADABLE:
+        serial = replacement_serial(_unreadable_serial(connection), activating=True)
+        if serial is None:
+            return ActivationResult(ActivationChange.AT_LIMIT)
+        _write_activation(connection, project_id, serial, changed_at)
+        return ActivationResult(ActivationChange.ACTIVATED)
+    if current.serial >= ACTIVATION_SERIAL_MAX:
+        return ActivationResult(ActivationChange.AT_LIMIT)
+    cursor = connection.execute(
+        """
+        UPDATE project_activation
+        SET project_id = ?, serial = serial + 1, changed_at = ?
+        WHERE id = 1 AND serial = ? AND serial < ?
+        """,
+        (project_id, changed_at, current.serial, ACTIVATION_SERIAL_MAX),
+    )
+    if cursor.rowcount != 1:
+        return None
+    return ActivationResult(
+        ActivationChange.ACTIVATED,
+        current.active_project_id,
+    )
+
+
+def _deactivate(
+    connection: sqlite3.Connection,
+    changed_at: str,
+) -> DeactivationChange | None:
+    """Apply one deactivation's rules under the caller's write lock.
+
+    None means the setting changed although the write lock was held.
+    """
+    current = _read_project_activation(connection)
+    state = current.state
+    if state in (ActivationState.NEVER_ACTIVATED, ActivationState.INACTIVE):
+        return DeactivationChange.NONE_ACTIVE
+    if state is ActivationState.UNREADABLE:
+        serial = replacement_serial(
+            _unreadable_serial(connection),
+            activating=False,
+        )
+        _write_activation(connection, None, serial, changed_at)
+        return DeactivationChange.DEACTIVATED
+    if current.serial < ACTIVATION_SERIAL_MAX:
+        cursor = connection.execute(
+            """
+            UPDATE project_activation
+            SET project_id = NULL, serial = serial + 1, changed_at = ?
+            WHERE id = 1 AND serial = ? AND serial < ?
+            """,
+            (changed_at, current.serial, ACTIVATION_SERIAL_MAX),
+        )
+    else:
+        # At the largest serial the project is cleared and the serial kept:
+        # every token naming a project then differs, and no project can be
+        # activated again, so nothing can repeat an earlier token.
+        cursor = connection.execute(
+            """
+            UPDATE project_activation
+            SET project_id = NULL, changed_at = ?
+            WHERE id = 1 AND serial = ?
+            """,
+            (changed_at, current.serial),
+        )
+    return DeactivationChange.DEACTIVATED if cursor.rowcount == 1 else None
+
+
+def _approved_fact_values(
+    project_id: object,
+    text: object,
+    approved_digest: object,
+    created_at: object,
+    updated_at: object,
+    max_bytes: int,
+) -> bool:
+    """Return whether one fact row is eligible context for its project.
+
+    Its text must be fact text within ``max_bytes`` UTF-8 bytes, its digest
+    exactly the approval digest of its project id and text, and its stamps
+    canonical, the update never earlier than the creation.
+    """
+    return (
+        is_record_id(project_id)
+        and is_fact_text(text)
+        and _is_within_bound(text, max_bytes)
+        and is_fact_digest(approved_digest)
+        and approved_digest == fact_digest(project_id, text)
+        and is_utc_instant(created_at)
+        and is_utc_instant(updated_at)
+        and updated_at >= created_at
+    )
+
+
+def _approved_fact_check(max_bytes: int) -> Callable[..., int]:
+    """Return a fact context read's check, registered on its connection.
+
+    SQLite calls it only with values it has already typed and bounded. It
+    answers 1 only for a row ``_approved_fact_values`` admits.
+    """
+
+    def approved(*values: object) -> int:
+        return int(_approved_fact_values(*values, max_bytes))
+
+    return approved
+
+
+def _context_fact_rows(
+    connection: sqlite3.Connection,
+    project_id: int,
+    max_text_bytes: int,
+    limit: int,
+    identifiers: tuple[int, ...] = (),
+) -> list[dict[str, Any]]:
+    """Run one bounded read of a project's eligible facts, by id or all.
+
+    Every guard runs inside SQLite, row by row, before a row reaches the
+    registered check or can be counted toward ``limit``, and the rows are
+    settled again in Python afterwards.
+    """
+    if type(max_text_bytes) is not int or max_text_bytes < 1:
+        raise ValueError("A text size bound must be a positive whole number.")
+    if _beyond_sqlite((project_id, *identifiers)):
+        return []
+    safe_limit = max(1, min(limit, _CONTEXT_FACT_READ_LIMIT))
+    connection.create_function(
+        _FACT_APPROVED_FUNCTION,
+        5,
+        _approved_fact_check(max_text_bytes),
+        deterministic=True,
+    )
+    selection = ""
+    if identifiers:
+        placeholders = ", ".join("?" for _ in identifiers)
+        selection = f"AND id IN ({placeholders})"
+    rows = connection.execute(
+        f"""
+        SELECT id, project_id, text, approved_digest, created_at, updated_at
+        FROM project_facts
+        WHERE project_id = ?
+            {selection}
+            AND CASE
+                WHEN {_FACT_GUARDS}
+                THEN {_FACT_APPROVED_FUNCTION}(
+                    project_id, text, approved_digest, created_at, updated_at
+                )
+                ELSE 0
+            END
+        ORDER BY id ASC
+        LIMIT ?
+        """,
+        (project_id, *identifiers, *_fact_bounds(connection), safe_limit),
+    ).fetchall()
+    settled: list[dict[str, Any]] = []
+    for row in rows:
+        if not is_record_id(row["id"]) or not _approved_fact_values(
+            row["project_id"],
+            row["text"],
+            row["approved_digest"],
+            row["created_at"],
+            row["updated_at"],
+            max_text_bytes,
+        ):
+            continue
+        settled.append(
+            {
+                "id": row["id"],
+                "project_id": row["project_id"],
+                "text": row["text"],
+            }
+        )
+    return settled
 
 
 def _settled_audit_summaries(

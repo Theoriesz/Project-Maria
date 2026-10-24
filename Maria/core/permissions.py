@@ -31,6 +31,12 @@ MANDATORY_CONFIRMATION_ACTIONS = frozenset(
         "memory.forget",
         "memory.enable_context",
         "memory.disable_context",
+        "projects.retitle",
+        "projects.delete",
+        "projects.activate",
+        "projects.add_fact",
+        "projects.edit_fact",
+        "projects.delete_fact",
         "reminders.create",
         "reminders.edit",
         "reminders.reschedule",
@@ -85,6 +91,29 @@ CONFIRMATION_NOTICES = MappingProxyType(
             "literally in its title or its body, within Maria's context "
             "limits. Maria does not check the note for passwords or other "
             "secrets, and enabling it does not mean it contains none."
+        ),
+        "projects.activate": (
+            "While a project is active, each of its facts may be sent to your "
+            "local reasoning model on every conversational turn, within "
+            "Maria's memory context limits, and Maria can read the project's "
+            "files when you ask with project commands or @ references; she "
+            "reads none on her own. The project stays active, also after "
+            "Maria restarts, until you deactivate it or activate another "
+            "project."
+        ),
+        "projects.add_fact": (
+            "While its project is active, this fact may be sent to your local "
+            "reasoning model on every conversational turn, within Maria's "
+            "memory context limits, so it is not always sent. Maria does not "
+            "check the fact for passwords or other secrets, and approving it "
+            "does not mean it contains none."
+        ),
+        "projects.edit_fact": (
+            "While its project is active, this fact may be sent to your local "
+            "reasoning model on every conversational turn, within Maria's "
+            "memory context limits, so it is not always sent. Maria does not "
+            "check the fact for passwords or other secrets, and approving it "
+            "does not mean it contains none."
         ),
         "reminders.create": (
             "Maria shows a reminder at most once when it is due, and only "

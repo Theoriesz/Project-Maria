@@ -76,6 +76,7 @@ from tests.test_audit_migration import (
     NEVER_COMMITTED,
     V7_SCHEMA,
     V8_SCHEMA,
+    V9_SCHEMA,
     _applied,
     _build_schema,
     _describe,
@@ -132,6 +133,8 @@ NOT_CURRENT_LINE = (
     "the database is not at the current schema",
 )
 DELIVERY_STEP_NAME = "add_reminder_delivery_state"
+# V1-24-R1's step follows this one, so a climb through version 8 ends at 9.
+PROJECT_STEP_NAME = "create_project_records"
 DRIFTED_VERSION_EIGHT_LINE = (
     "Refused a database stamped at schema version 8 whose structure is not "
     "the frozen schema for that version."
@@ -1819,6 +1822,9 @@ class DeliveryReadinessTests(_TemporaryDatabaseTestCase):
     def test_a_database_not_at_the_current_schema_is_refused_untouched(self) -> None:
         for label, schema, marker in (
             ("version seven", V7_SCHEMA, 7),
+            # Version 8 is no longer current (V1-24-R1): the pass refuses it
+            # until the command line or the window has started once.
+            ("version eight", V8_SCHEMA, 8),
             (
                 "version eight without its setting table",
                 tuple(
@@ -1828,7 +1834,8 @@ class DeliveryReadinessTests(_TemporaryDatabaseTestCase):
                 ),
                 8,
             ),
-            ("stamped nine", V8_SCHEMA, 9),
+            ("stamped nine with the version eight shape", V8_SCHEMA, 9),
+            ("stamped ten", V9_SCHEMA, 10),
         ):
             with self.subTest(case=label):
                 database_path = self.database(label.replace(" ", "-"))
@@ -1902,7 +1909,7 @@ class DeliveryReadinessTests(_TemporaryDatabaseTestCase):
         self.assertEqual(str(caught.exception), "Database is busy. Try again shortly.")
         self.assertIsNone(caught.exception.__cause__)
         self.assertEqual(database_path.read_bytes(), before)
-        self.assertEqual(read_schema_version(database_path), 8)
+        self.assertEqual(read_schema_version(database_path), 9)
 
 
 class DeliveryMigrationTests(_TemporaryDatabaseTestCase):
@@ -1959,8 +1966,8 @@ class DeliveryMigrationTests(_TemporaryDatabaseTestCase):
         memory.initialize()
         memory.initialize()
 
-        self.assertEqual(read_schema_version(database_path), 8)
-        self.assertEqual(_applied(recording), [DELIVERY_STEP_NAME])
+        self.assertEqual(read_schema_version(database_path), 9)
+        self.assertEqual(_applied(recording), [DELIVERY_STEP_NAME, PROJECT_STEP_NAME])
         self.assertEqual(
             self.reminders(database_path),
             [row + (1, None, None, None) for row in before],
@@ -2018,7 +2025,7 @@ class DeliveryMigrationTests(_TemporaryDatabaseTestCase):
                 self.assertEqual(self.reminders(database_path), before)
 
                 Memory(database_path, logger=recording).initialize()
-                self.assertEqual(read_schema_version(database_path), 8)
+                self.assertEqual(read_schema_version(database_path), 9)
                 self.assertEqual(
                     self.reminders(database_path),
                     [row + (1, None, None, None) for row in before],

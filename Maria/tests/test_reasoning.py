@@ -128,7 +128,8 @@ FORBIDDEN_ATTRIBUTE_CALLS = frozenset({"import_module"})
 # The only Maria modules the interface may depend on. Anything reaching
 # planning, permissions, dispatch, persistence, sessions, or tools is refused.
 PERMITTED_MARIA_IMPORTS = frozenset(
-    {"core.context", "core.failures", "core.logger"}
+    # V1-24-R1 adds the project vocabulary, a pure leaf, for file parts.
+    {"core.context", "core.failures", "core.logger", "core.project_records"}
 )
 
 PRODUCTION_SOURCES = (
@@ -137,6 +138,12 @@ PRODUCTION_SOURCES = (
     *sorted((PROJECT_ROOT / "gui").glob("*.py")),
     PROJECT_ROOT / "main.py",
 )
+
+# Project Maria's approved path list (V1-24-R1) is data only: tuples of path
+# strings, which tests.test_project_maria_manifest proves hold nothing else.
+# Its paths name test files and modules, so a guard that searches source text
+# for a module's name skips it; every import guard still covers it.
+DATA_ONLY_MANIFEST = "project_maria_manifest.py"
 
 
 def enabled_settings(
@@ -240,7 +247,7 @@ class ReasoningValueTests(unittest.TestCase):
     ) -> None:
         self.assertEqual(
             [f.name for f in fields(ReasoningRequest)],
-            ["prompt", "history", "context", "proposal_instructions"],
+            ["prompt", "history", "context", "proposal_instructions", "files"],
         )
         self.assertEqual([f.name for f in fields(ReasoningResponse)], ["text"])
         self.assertEqual(ReasoningRequest(PROMPT_SENTINEL).history, ())
@@ -1376,7 +1383,8 @@ class ReasoningImportBoundaryTests(unittest.TestCase):
                 imported = {name.split(".")[0] for name in own_imports(source)}
 
                 self.assertNotIn("tests", imported)
-                self.assertNotIn("reasoning_fakes", source)
+                if path.name != DATA_ONLY_MANIFEST:
+                    self.assertNotIn("reasoning_fakes", source)
                 self.assertNotIn("AdversarialReasoningProvider", source)
 
 

@@ -30,6 +30,7 @@ BUILT_IN_TOOL_MODULES = (
     "tools.history",
     "tools.memory",
     "tools.notes",
+    "tools.projects",
     "tools.reminders",
     "tools.system",
     "tools.tasks",

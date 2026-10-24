@@ -29,7 +29,8 @@ counter over Maria's schema history rather than a release number:
 | 5 | Adds the `audit_summaries` and `audit_outcomes` tables, both empty, which hold the audit summaries of approved model-proposed actions. |
 | 6 | Adds the `saved_conversations` and `conversation_summaries` tables, both empty, which hold explicitly saved conversations and owner-approved conversation summaries. |
 | 7 | Adds the `tasks` and `reminders` tables, both empty, which hold the owner's tasks and reminders. |
-| 8 | Adds each reminder's delivery state, a scheduling revision and three claim columns on `reminders`, and the empty one-row `reminder_delivery_settings` table (V1-23-R1). This is the current schema. |
+| 8 | Adds each reminder's delivery state, a scheduling revision and three claim columns on `reminders`, and the empty one-row `reminder_delivery_settings` table (V1-23-R1). |
+| 9 | Adds the `projects`, `project_facts`, and `project_activation` tables, all empty, through the step `create_project_records` (V1-24-R1). This is the current schema. |
 
 Versions 1 and 2 are the only shapes that can exist without a marker, because
 every database Maria creates or migrates from this build onwards is stamped.
@@ -358,8 +359,54 @@ frozen version 8 schema writes `reminders` with the four columns inline, and a
 database created new at version 8 fingerprints exactly as a migrated one does.
 No foreign key, trigger, index, or cascade is added, `tasks` gains nothing, and
 the frozen schemas of versions 1 through 7 and the earlier steps' statements
-are unchanged. An older build refuses a version 8 database as too new. No step
-rewrites a row or deletes anything.
+are unchanged. An older build refuses a version 8 database as too new.
+`create_project_records` brings a version 8 database to version 9
+(V1-24-R1), with three statements:
+
+```sql
+CREATE TABLE projects (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    name TEXT NOT NULL CHECK (length(CAST(name AS BLOB)) > 0),
+    root TEXT NOT NULL CHECK (length(root) BETWEEN 1 AND 32),
+    folder TEXT NOT NULL CHECK (length(folder) <= 512),
+    created_at TEXT NOT NULL,
+    updated_at TEXT NOT NULL
+);
+CREATE TABLE project_facts (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    project_id INTEGER NOT NULL
+        CHECK (typeof(project_id) = 'integer' AND project_id >= 1),
+    text TEXT NOT NULL CHECK (length(CAST(text AS BLOB)) > 0),
+    approved_digest TEXT NOT NULL CHECK (length(approved_digest) = 64),
+    created_at TEXT NOT NULL,
+    updated_at TEXT NOT NULL
+);
+CREATE TABLE project_activation (
+    id INTEGER PRIMARY KEY CHECK (id = 1),
+    project_id INTEGER CHECK (
+        project_id IS NULL
+        OR (typeof(project_id) = 'integer' AND project_id >= 1)
+    ),
+    serial INTEGER NOT NULL
+        CHECK (typeof(serial) = 'integer' AND serial >= 1),
+    changed_at TEXT NOT NULL CHECK (
+        changed_at GLOB
+            '[0-9][0-9][0-9][0-9]-[0-9][0-9]-[0-9][0-9]T[0-9][0-9]:[0-9][0-9]:[0-9][0-9]Z'
+    )
+);
+```
+
+All three start empty, so a migrated database was never activated and nothing
+reports it unreadable; the step touches no existing table, row, or
+AUTOINCREMENT high-water mark, and the frozen version 9 schema is the frozen
+version 8 schema plus these three statements, so a database created new at
+version 9 fingerprints exactly as a migrated one does. No foreign key,
+trigger, index, or cascade is added, and the frozen schemas of versions 1
+through 8 and the earlier steps' statements are unchanged. An older build
+refuses a version 9 database as too new, and the closed-app reminder pass,
+which opens only a database already at the current schema, exits 3 on a
+version 8 one until the command line or the window has started once and
+migrated it. No step rewrites a row or deletes anything.
 
 Every step runs its own frozen historical statements, never the live schema
 statements a new database is created from. The version 2 step therefore creates
@@ -771,6 +818,52 @@ A row Maria could not have written, such as a `changed_at` stored as a BLOB or
 as a stamp followed by NUL and more, reads as unreadable, which leaves delivery
 off; `reminder delivery` then says the setting could not be read, and turning
 delivery on or off writes a readable row over it.
+
+### projects
+
+Stores one project (V1-24-R1): a name and one place Maria may read.
+
+| Column | Type and constraints | Purpose |
+| --- | --- | --- |
+| id | INTEGER PRIMARY KEY AUTOINCREMENT | Stable project identifier, never reused |
+| name | TEXT NOT NULL, at least one byte | The owner's name: 1 to 64 UTF-8 bytes on one line, equal to its stripped form, with no colon and no control, format, surrogate, or separator character |
+| root | TEXT NOT NULL, 1 to 32 characters | `workspace` or `project_maria` |
+| folder | TEXT NOT NULL, at most 512 characters | The folder within the root, in the on-disk spelling found at creation; empty for the root's top, and always empty for Project Maria |
+| created_at | TEXT NOT NULL | Maria's own UTC timestamp to the second |
+| updated_at | TEXT NOT NULL | The same form, never earlier than `created_at`; refreshed by a rename only |
+
+### project_facts
+
+Stores one owner-approved fact of one project.
+
+| Column | Type and constraints | Purpose |
+| --- | --- | --- |
+| id | INTEGER PRIMARY KEY AUTOINCREMENT | Stable fact identifier, never reused |
+| project_id | INTEGER NOT NULL, an integer of at least 1 | The fact's project; no foreign key |
+| text | TEXT NOT NULL, at least one byte | The approved or edited text: 1 to 512 UTF-8 bytes, equal to its stripped form, with no control, format, surrogate, or separator character |
+| approved_digest | TEXT NOT NULL, exactly 64 characters | The lowercase hexadecimal SHA-256 of the UTF-8 of the compact JSON array `[project_id, text]`, non-ASCII kept |
+| created_at, updated_at | As for a project | |
+
+### project_activation
+
+Holds at most one row, the active project setting. No row means no project was
+ever activated.
+
+| Column | Type and constraints | Purpose |
+| --- | --- | --- |
+| id | INTEGER PRIMARY KEY, exactly 1 | The one row |
+| project_id | INTEGER, NULL or an integer of at least 1 | The active project, or NULL while none is |
+| serial | INTEGER NOT NULL, an integer of at least 1 | The change counter: it rises by one with every change Maria makes |
+| changed_at | TEXT NOT NULL, shaped `YYYY-MM-DDTHH:MM:SSZ` | When the setting last changed |
+
+SQL checks only these shapes. It accepts by design what only Maria's rules
+refuse, such as a name with a colon, an unknown root, a folder outside the
+path grammar, a fact whose digest is not its own, or a setting naming a
+project that does not exist; the memory layer applies every rule of
+`core/project_records.py` before writing and settles every row after reading,
+so a row written from outside Maria that breaks one is refused privately. The
+three tables refer to no other table, and there is no foreign key, trigger,
+index, or cascade.
 
 ## Interaction Retrieval
 
@@ -1361,11 +1454,96 @@ only ids, revisions, channels, and outcomes. An argument Maria never passes,
 such as an unknown channel or outcome, raises `ValueError` with a fixed message
 before anything is read.
 
+## Projects
+
+Version 9 (V1-24-R1) keeps projects, their facts, and the active project
+setting in the three tables above. `tools/projects.py`, Brain, and the
+session's projects seam reach them only through these `Memory` methods, and
+AUTOINCREMENT keeps a deleted id from being reused.
+
+**Bounded reads.** Every read of a project, fact, or setting row types and
+bounds each value inside SQLite, by its stored bytes in the file's own
+encoding, before Python sees it: the name within the stored bound for 64
+UTF-8 bytes, the root for 32, the folder and a fact's text for 512, a digest
+for 64, and each stamp for 20, each bound exact in a UTF-8 database and
+doubled in a UTF-16 one, with ids, project ids, and serials integers of at
+least 1. A project or fact read hands back a row's values only when every
+guard passed, and Python then settles them by the exact rules; a row that
+fails is refused, and a listing holding one refuses as a whole, with the fixed
+message `Unable to read or write projects.` and nothing logged from the row.
+
+**The setting.** `project_activation()` reads it in one bounded statement: the
+table's row count, and the row's project id, serial, and stamp only when they
+are typed and bounded, followed by a bounded read of the named project. No row
+is never activated (`NEVER_ACTIVATED`, token `(None, 0)`); one well-formed row
+naming an existing, well-formed project is `ACTIVE`, and one naming none is
+`INACTIVE`, each with the token `(project_id, serial)`; anything else is
+`UNREADABLE`, which has no token. This is also the final check's read.
+
+**Writes.** Each is one write transaction under `BEGIN IMMEDIATE`:
+
+- `create_project(name, root, folder)` reads every stored location under the
+  write lock and returns `None`, storing nothing, for a location equal to,
+  inside, or around another project's, compared ignoring case, so at most one
+  Project Maria exists; a stored location it cannot read refuses the write.
+- `retitle_project(project_id, name)` replaces the name only.
+- `delete_project(project_id)` deletes one project unless it is active or has
+  facts, which it checks under the same lock, and returns which.
+- `activate_project(project_id)` reads the setting under the write lock. Never
+  activated inserts row 1 with serial 1; inactive, or another project active,
+  raises the serial by one in one UPDATE that also requires the serial it read
+  and a serial below 9,223,372,036,854,775,807; the same project already active
+  writes nothing; at the largest serial nothing is written and the result is
+  `AT_LIMIT`. An unreadable setting is replaced: every row is removed and row 1
+  inserted, with serial s + 1 when the table held exactly one row whose serial
+  was an integer s below the largest, and serial 1 when it held no usable
+  serial, since an earlier value written outside Maria cannot be known; when
+  that one serial is already the largest, the activation is refused as
+  `AT_LIMIT` and nothing is written.
+- `deactivate_project()` writes nothing when no project is active. An active
+  setting clears the project and raises the serial by one, or keeps the serial
+  at the largest one, and an unreadable one is replaced by an inactive row
+  under the same serial rule, which keeps a largest serial instead of refusing.
+- `add_project_fact(project_id, text)` checks that the project exists, then
+  writes the text and its approval digest in one INSERT; `None` means no
+  project has the id.
+- `edit_project_fact(fact_id, text, expected_digest)` writes the new text and
+  its new digest in one UPDATE, only while the fact still holds exactly the
+  digest pinned when the owner was shown it, and returns `EDITED`,
+  `NOT_FOUND`, or `CHANGED`.
+- `delete_project_fact(fact_id)` removes one row; its text is never read.
+
+Only `activate_project` and `deactivate_project` reach the SQL that writes the
+setting, and only `tools/projects.py` calls them.
+
+**Reads.** `list_projects`, `get_project`, `project_choices`,
+`list_project_facts`, and `get_project_fact` each read in one transaction,
+`list_projects` and `get_project` together with the setting, so a listing
+marks exactly the active project it read. `project_context_snapshot(limit,
+max_text_bytes, supplied_fact_ids)` is a model request's one snapshot: in one
+read transaction it reads the setting and, only while a project is active,
+that project's row, at most `limit` of its eligible facts by ascending id,
+and, by id, those of the facts supplied earlier in the conversation that are
+still eligible facts of that project. A fact is eligible only when every
+guard passes inside SQLite and a registered deterministic check, which
+receives only guarded values, recomputes its digest from its project id and
+text and validates its text and stamps; a fact that check refuses is never
+returned or counted toward the limit, and Python settles the rows again.
+`limit` is at most 100. `active_project()` is the same snapshot with no fact,
+which a deterministic project command takes.
+
+Every storage failure of these methods raises `RuntimeError` with the shared
+busy message for contention and `Unable to read or write projects.` otherwise,
+raised after its handler has ended, so it has no cause or context; the log
+receives one fixed line naming the operation and a fixed reason, and a success
+logs only ids and counts, never a name, location, or fact.
+
 ## Data Considerations
 
 Interaction history, notes, explicit memories, audit summaries, saved
-conversations, conversation summaries, tasks, and reminders are distinct
-persistent concepts and use separate tables in the same configured database;
+conversations, conversation summaries, tasks, reminders, projects, and project
+facts are distinct persistent concepts and use separate tables in the same
+configured database;
 an audit summary spans two of them, `audit_summaries` and `audit_outcomes`. The same
 text may nevertheless appear more than once: an explicit fact can occur in its
 `remember` request, the `memories` table, and later recall or list responses;
@@ -1375,9 +1553,9 @@ its original source. Removing or changing source data outside Maria does not
 automatically remove matching text from existing interaction rows. An audit
 summary holds none of that text, while a saved conversation or a summary can
 repeat any of it, and a task's or reminder's text can also remain in the
-request half of the command that added or edited it. All of these tables share
-one database file; external removal or replacement affects all eight
-datasets.
+request half of the command that added or edited it, and so can a project's
+name and location and a fact's text. All of these tables share one database
+file; external removal or replacement affects all ten datasets.
 
 In the current implementation, `delete interaction <id>`,
 `delete note <id>`, and `forget memory <id>` each target at most one row by ID
@@ -1513,3 +1691,8 @@ holds the vocabulary they and the memory layer share, and executes no SQL.
 The reminder-delivery subsystem reaches delivery state only through `Memory`'s
 delivery methods: `core/reminder_delivery.py` receives the memory layer as its
 store and executes no SQL, and `deliver_reminders.py` builds that store.
+`tools/projects.py`, Brain, and the session's projects seam reach the project
+tables only through `Memory`'s project methods, and `core/project_records.py`
+holds the vocabulary they, the memory layer, the reader, and the context and
+conversation modules share, and executes no SQL; only `tools/projects.py`
+calls `activate_project` and `deactivate_project`.

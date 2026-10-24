@@ -6,11 +6,15 @@ public network APIs.
 ## Brain
 
 `MariaBrain(config, planner, memory, tool_manager, permissions, logger=None,
-reasoning: ReasoningProvider | None = None)`
+reasoning: ReasoningProvider | None = None, project_files: ProjectFileReader |
+None = None)`
 
 `reasoning` is the owner's reasoning provider, typed only through the
 `ReasoningProvider` protocol, or `None` for a deterministic-only Brain. Brain
 never imports or names an adapter, and it keeps no state between requests.
+`project_files` is the reader for a model request's `@` references (V1-24-R1);
+without one, Brain builds `ProjectFileReader(config.filesystem_roots,
+config.filesystem_protections)` the first time a request needs it.
 
 `MariaBrain.from_defaults(reasoning_factory: Callable[[ReasoningSettings],
 ReasoningProvider | None] | None = None) -> MariaBrain`
@@ -65,6 +69,25 @@ request text and the request's `TimingContext`, and no interaction history is
 read. `supplied_context` is the only keyword accepted; no keyword can approve
 anything.
 
+Under V1-24-R1 the request's one project snapshot is read first, through
+`Memory.project_context_snapshot(17, 2048, fact_ids)`, where `fact_ids` are the
+supplied project facts' ids; a result that is not exactly a
+`ProjectContextRead` counts as a failed read and ends every read. When
+`project_files.scan_references(request)` finds a word beginning with exactly
+one `@`: a failed read refuses the request and clears the conversation with
+the unreadable notice; an unreadable setting refuses it; with no project
+active the words are ordinary text; and otherwise a malformed or fourth
+reference refuses it with its reason, and `project_files.file_parts(reader,
+project, references)` reads each distinct file once, after the snapshot,
+refusing with the first part's reason that cannot be read or used. Each
+refusal is `model_refusal(reason)` as a transient zero-step plan, so nothing
+is sent or recorded. `conversation.converse()` then receives the snapshot's
+active project id, its eligible facts, the supplied facts' recheck, any file
+parts, with `proposals` off whenever there are file parts, and a final check:
+a closure that reads `Memory.project_activation()` once, in its own read
+transaction, and answers True only when the setting is readable and its token
+equals the snapshot's.
+
 Right after the empty-request check and before planning, `process` reads the
 clock exactly once, through the module function `brain._reference_instant()`,
 Brain's one clock seam, and builds
@@ -88,8 +111,10 @@ that there is nothing to save. For `SessionInput.CONVERSATION_SUMMARY_DRAFT`,
 Brain checks the step's permission first, refusing a denied one with
 `Permission denied: <reason>` before anything is read or sent, then refuses
 when no provider is present or reasoning is disabled, then rechecks by id,
-through the five `context_*_by_id` reads only, every record `supplied_context`
-names, and `conversation.draft_summary()` asks the provider at most once;
+through the five `context_*_by_id` reads and, only when project facts were
+supplied, one `Memory.project_context_snapshot(0, 2048, fact_ids)`, every
+record `supplied_context` names, and `conversation.draft_summary()` asks the
+provider at most once;
 `conversation.summary_draft_plan()` builds the transient result. A plan that
 already carries the declared argument, or holds any other step, gets
 `conversation.SESSION_INPUT_REFUSED_MESSAGE`, and so does a declared input of
@@ -136,16 +161,24 @@ UTC instant, read once per check. It always exists at run time, because
 delivery can be turned on at any moment; with delivery off, a check reads the
 setting and returns.
 
+`main.build_runtime_projects(brain: MariaBrain) -> ProjectChoicesSeam`
+
+The runtime projects seam (V1-24-R1): `ProjectChoicesSeam(brain.memory)`, the
+window's one read for its project selector.
+
 `main.main(arguments: Sequence[str] | None = None) -> int`,
 `main.run_cli(brain_factory=None, delivery_factory=None) -> int`, and
-`main.run_gui(brain_factory=None, delivery_factory=None) -> int`
+`main.run_gui(brain_factory=None, delivery_factory=None,
+projects_factory=None) -> int`
 
 `delivery_factory`, when given, builds the interface's seam from the started
 Brain and may return None. Without one, the runtime default
 `build_runtime_delivery(brain, channel)` applies only when Brain came from the
 runtime default too, so a caller that injects a Brain factory gets no seam
 unless it also injects a delivery factory. The CLI passes `cli` and the GUI
-`gui`. `main.show_due_reminders(session) -> None` is the CLI's check: nothing
+`gui`. `projects_factory` works the same way for the window's projects seam,
+with `build_runtime_projects(brain)` as the runtime default; the command line
+has no selector and takes none. `main.show_due_reminders(session) -> None` is the CLI's check: nothing
 without a seam or when nothing was claimed; otherwise it prints the notice as
 `Maria: <text>` and records it displayed, or not displayed when printing
 raises an `Exception`. `run_cli()` calls it before every prompt, inside the
@@ -462,7 +495,7 @@ argument, a report, or a result, and
 ## Session
 
 `MariaSession(brain: MariaBrain, logger: Logger | None = None, *, delivery:
-ReminderDeliverySeam | None = None)`
+ReminderDeliverySeam | None = None, projects: ProjectChoicesSeam | None = None)`
 
 The interface-agnostic confirmation boundary. It needs no standard input,
 standard output, or terminal, so the CLI and the desktop GUI share one
@@ -487,6 +520,21 @@ failed: <exception type>.` or `Recording a reminder notice failed:
 plan, a tool, Tool Manager, permissions, or a provider, and neither touches the
 pending approval, the conversation, or the supplied-context fingerprints. A
 notice is never recorded, kept in the conversation, or sent to a model.
+
+`MariaSession.project_choices() -> ProjectChoices | None` and
+`ProjectChoicesSeam(memory: Memory)`
+
+The session's projects seam (V1-24-R1), the window selector's one read.
+`ProjectChoicesSeam.choices()` returns `Memory.project_choices()`: at most
+fifty `(id, name)` pairs in ascending id order and the active project's id,
+given only while one is active; its `repr` names the type alone.
+`project_choices()` returns None without a seam, and otherwise the seam's
+result when it is exactly a `ProjectChoices`. An `Exception` is logged as
+`Reading the project choices failed: <exception type>.`, and any other result
+as `Reading the project choices failed: unexpected.`, both returning None;
+anything else propagates. It changes nothing, never calls Brain, a plan, a
+tool, Tool Manager, permissions, or a provider, and never touches the pending
+approval, the conversation, or the supplied-context fingerprints.
 
 `MariaSession.submit(user_input: str) -> BrainResponse`
 
@@ -691,6 +739,16 @@ due-reminder check may deliver one notice of its own:
 - `DueReminderNotice(serial, text)`: due reminders the session claimed, for
   the window to show (V1-23-R1). `serial` is a notice serial of the worker's
   own, counted apart from offer serials, and `text` is the notice's text.
+- `ProjectList(projects, active_id=None)`: the project selector's choices the
+  session read (V1-24-R1), at most fifty `(id, name)` pairs in ascending id
+  order and the active project's id, given only while one is active. Its
+  `repr` never shows the names.
+
+The worker reads `session.project_choices()` once after creating the session
+and once after each operation whose event is a `Reply`, after the due-reminder
+check; never after an `ApprovalOffer` or an acknowledgment, never on a timer,
+and never once `close()` was called. Choices the session returns are
+delivered as one `ProjectList`; a read that gives none delivers nothing.
 
 When the session delivers reminders, the worker runs its check once after
 creating the session and once after each operation whose event is a `Reply`,
@@ -728,8 +786,9 @@ without stopping the worker.
 
 The Qt-free controller. It decides what the window shows, through the view's
 `append`, `set_status`, `show_approval`, `hide_approval`, `set_controls`,
-`clear_input`, and `close_window`, and which owner actions it accepts. Every
-method is called on the GUI thread.
+`clear_input`, and `close_window`, and, under V1-24-R1, `show_projects(items)`
+and `set_project_controls(*, activating, deactivating)`, and which owner
+actions it accepts. Every method is called on the GUI thread.
 
 - `start()` shows the CLI's banner and help line and starts the worker.
 - `send(text) -> bool` takes one request only while `state` is `READY`. The text
@@ -752,6 +811,20 @@ method is called on the GUI thread.
   rendering raises is never acknowledged. `SessionEnded` settles
   the outcome, then clears the window and asks it to close; the close is
   attempted even when clearing fails, and that failure is raised afterwards.
+- A `ProjectList` is shown through `show_projects` as plain-text items,
+  `<id>: <name>`, with `ACTIVE_ITEM_SUFFIX` (` (active)`) on the active
+  project, or the one item `NO_PROJECTS_ITEM` (`No projects`), and the ids
+  are kept in that order; the state, the offer shown, and the approval area
+  do not change. `set_project_controls` enables Activate only while `READY`
+  with at least one project, and Deactivate only while `READY`.
+- `activate(index) -> bool` accepts only while `READY` and only an exact `int`
+  index of a shown project, then submits exactly
+  `activate_command(project_id)`, `activate project <id>`, through the same
+  path as `send`, so the activation is still offered for approval.
+  `deactivate() -> bool` accepts only while `READY` and submits exactly
+  `DEACTIVATE_COMMAND`, `deactivate project`. `PROJECT_LABEL`,
+  `ACTIVATE_LABEL`, and `DEACTIVATE_LABEL` are `Project`, `Activate`, and
+  `Deactivate`.
 - `request_close() -> bool` starts closing once, asking the worker to end the
   session after anything running and refusing every later action, and returns
   `True` only once the session has ended.
@@ -805,7 +878,11 @@ and nothing failed, and 1 otherwise. `MariaWindow` is the presentation: a
 read-only conversation display and approval display that cannot be selected,
 copied from, or focused and have no context menu, a one-line input with no
 length cap below Qt's maximum, Send, Approve and Cancel buttons that never take
-keyboard focus, and a plain-text status label. Its title is always `Maria`.
+keyboard focus, a plain-text status label, and, under V1-24-R1, a plain-text
+`Project` label, a non-editable list of the selector's items that keeps the
+chosen position across a refresh, and Activate and Deactivate buttons that
+never take keyboard focus, Activate passing the chosen position to the
+controller. Its title is always `Maria`.
 Its close event is accepted only once the controller reports the session
 ended; a close that fails to start leaves the window open. Every callback it
 hands to Qt reaches the controller through a shield, because Qt ends the
@@ -822,8 +899,9 @@ status line that no longer changes, but nothing it shows can still be
 approved. What the window shows is presentation state, never saved
 automatically or replayed into the session. Display history is never
 populated automatically from stored records, except due-reminder notices from
-the session's delivery seam, shown as plain text. Explicit record-reading
-commands still display their results.
+the session's delivery seam, shown as plain text; the project selector lists
+project ids and names. Explicit record-reading commands still display their
+results.
 
 ## Conversation
 
@@ -831,9 +909,10 @@ commands still display their results.
 session text a planner's plan declares. It keeps no state; the conversation
 belongs to the caller's session. It imports only the context module, the
 shared failures, the logger, the planner's plan types, the reasoning
-interface, and two leaf declarations that import nothing from Maria, the
-action contracts and `core/conversation_records.py`, so it has no path to
-permissions, tool dispatch, persistence, or the compiler. It parses no reply:
+interface, two leaf declarations that import nothing from Maria, the action
+contracts and `core/conversation_records.py`, and, since V1-24,
+`core/project_records.py`, so it has no path to permissions, tool dispatch,
+persistence, or the compiler. It parses no reply:
 in proposal mode it only recognises a proposal attempt and hands it back
 untouched for Brain to compile.
 
@@ -896,7 +975,10 @@ exactly as it is.
 supplied_context=frozenset(), enabled_memories_read=(),
 supplied_memories_read=(), supplied_notes_read=(), searched_memories_read=(),
 searched_notes_read=(), proposals=False, supplied_summaries_read=(),
-searched_summaries_read=()) -> ConversationTurn`
+searched_summaries_read=(), enabled_tasks_read=(), enabled_reminders_read=(),
+supplied_tasks_read=(), supplied_reminders_read=(), active_project_id=None,
+enabled_facts_read=(), supplied_facts_read=(), files=(), final_check=None)
+-> ConversationTurn`
 
 Answers one request conversationally, or, in proposal mode, hands back a
 proposal attempt. `proposals` must be exactly `True` or `False`, or
@@ -924,6 +1006,28 @@ carry more than 64 supplied records is cleared before sending, with
 exchange, the fingerprints of what it was given are not kept, and the session
 changes only if this turn already cleared it.
 
+Under V1-24-R1, `active_project_id` is the active project of the request's
+one snapshot, or `None`, and `enabled_facts_read` and `supplied_facts_read`
+are that snapshot's eligible facts and recheck, each row an `id`,
+`project_id`, and `text` that `context.enabled_facts` settles against
+`active_project_id`; a fact of any other project, or any fact with no active
+project, makes the read untrustworthy. A supplied fact no longer among the
+recheck clears the conversation with `FACT_CLEARED_NOTICE`, a supplied record
+of any other kind with `CONVERSATION_CLEARED_NOTICE`, each when it applies.
+Facts are selected after the memories and before the tasks and reminders.
+`files` are owner-named `ProjectFilePart` values, at most three, which only a
+request with `proposals` off may carry, or `ValueError` is raised: such a
+request sends no earlier exchange and is never cleared for the recheck limit,
+its file framing and block must render within 32,768 bytes and the whole
+request within `max_input_bytes`, or it is refused with
+`model_refusal(REFERENCE_BLOCK_TOO_LARGE_REASON)` before anything is sent,
+and its reply is shown with the notices and kept nowhere. `final_check` is
+called once, after every size check and immediately before a request
+carrying any fact or file part is handed to `request_reasoning`; unless it
+answers exactly True, or when it is `None`, nothing is sent and the turn
+answers `model_refusal(PROJECT_CHANGED_REASON)`. A request with neither calls
+no check.
+
 | Situation | Response text | Provider asked | Conversation |
 | --- | --- | --- | --- |
 | Request cannot be carried as text (for example a lone surrogate) | `CONVERSATION_UNSENDABLE_MESSAGE` | no | unchanged |
@@ -939,13 +1043,22 @@ cleared, recheck-limit, or unreadable notice when it applies; then `Memory
 context supplied: memory <id>, ...` with the uncertainty sentence after a
 reply, or `Memory context selected for this request: memory <id>, ...` with
 the delivery caveat after a failure, when Tier A was sent; the Tier A omission
-notice when a bound left enabled memories out; then `Found by search and
+notice when a bound left enabled memories out; under V1-24-R1, `Active
+project: project <id>.` whenever the snapshot holds an active project, then
+`Project facts supplied: project fact <id>, ...` with `Maria cannot verify
+whether these facts are still current.`, or `Project facts selected for this
+request: ...` with `Maria cannot confirm that the local model received them.`
+after a failure, and the fact omission notice; the task and reminder notices;
+then `Found by search and
 supplied: memory <id>, note <id>, ...` with its uncertainty sentence, or the
 matching `Found by search and selected for this request: ...` after a failure,
 when Tier B was sent; the search omission notice when a bound left matches
 out; and `Possible divergent versions: note <id> and note <id> have the same
-title and different bodies. ...` for selected notes that share a title. With
-no context at all the one notice is `No memory context supplied.` A proposal
+title and different bodies. ...` for selected notes that share a title, and,
+last, for file parts, `Project file parts supplied: project <id> file <path>
+lines <from>-<to> (SHA-256 <16 digits>), ...` with its fixed tail, or the
+matching `Project file parts selected for this request: ...` after a failure.
+With no context at all the first notice is `No memory context supplied.` A proposal
 attempt carries the notices a reply would, in `ConversationTurn.notices`
 rather than after a text; Brain shows them once, after a refusal or with the
 approval request, and they are never kept with an approval or shown again
@@ -993,7 +1106,9 @@ retains, more than 8 or over 8 KiB of text, or anything but exact
 
 `draft_summary(provider, settings, conversation, logger=None, *,
 supplied_context=frozenset(), supplied_memories_read=(),
-supplied_notes_read=(), supplied_summaries_read=()) -> SummaryDraft`
+supplied_notes_read=(), supplied_summaries_read=(), supplied_tasks_read=(),
+supplied_reminders_read=(), supplied_facts_read=(), active_project_id=None)
+-> SummaryDraft`
 
 Asks the provider at most once for a summary of exactly the retained
 exchanges. Before any request it answers, in order: disabled settings, the
@@ -1001,7 +1116,9 @@ unavailable message; no exchange, `SUMMARY_NO_CONVERSATION_MESSAGE`; a failed
 recheck, which Brain passes as `supplied_memories_read=None`, or a malformed
 one, the existing `CONTEXT_UNREADABLE_NOTICE` with `cleared=True`; a supplied
 record no longer enabled with the same text, the existing
-`CONVERSATION_CLEARED_NOTICE` with `cleared=True`; history that cannot be
+`CONVERSATION_CLEARED_NOTICE`, and a supplied project fact no longer one of
+the active project's with its approved text, `FACT_CLEARED_NOTICE`, each with
+`cleared=True`; history that cannot be
 measured, `CONVERSATION_UNSENDABLE_MESSAGE`; and a request that, with
 `SUMMARY_DRAFT_PROMPT` and every exchange, is over `max_input_bytes`,
 `SUMMARY_REQUEST_TOO_LARGE_MESSAGE`. Otherwise it sends
@@ -1037,6 +1154,8 @@ selection rules, the search-term rule, the rendering a model receives, and the
 fixed owner-visible notices. It imports no Maria module, reads nothing, stores
 nothing, and logs nothing. Since V1-22 Tier A also holds enabled open tasks
 and reminders after the memories; see "Task and reminder context" below.
+Since V1-24 it also holds the active project's facts between the memories
+and the tasks; see "Project fact context" below.
 
 `CONTEXT_MAX_ITEMS = 16`, `CONTEXT_MAX_BYTES = 2048`, and
 `CONTEXT_QUERY_LIMIT = 17`
@@ -1057,10 +1176,11 @@ characters, 24 items and 4,096 fully rendered bytes across both tiers, and 64
 supplied records a conversation may carry.
 
 `ContextSource.MEMORY`, `ContextSource.NOTE`, `ContextSource.SUMMARY`,
-`ContextSource.TASK`, `ContextSource.REMINDER`, `ContextTier.A`,
-`ContextTier.B`,
+`ContextSource.PROJECT_FACT`, `ContextSource.TASK`, `ContextSource.REMINDER`,
+`ContextTier.A`, `ContextTier.B`,
 `ContextItem(source, record_id, text, title=None, tier=ContextTier.A,
-timing=None)`, and `ContextFingerprint(source, record_id, digest)`
+timing=None, project_id=None)`, and `ContextFingerprint(source, record_id,
+digest)`
 
 A `ContextItem` is one stored record supplied to reasoning: an exact
 `ContextSource`, the positive `int` id Maria read, non-empty, encodable text of
@@ -1069,18 +1189,22 @@ summary's text, or a task's or reminder's text — and a note's title under the
 same bound, with `title` None for any other source. `timing` is a task's due
 date, `YYYY-MM-DD` or None, or a reminder's saved canonical time, printable
 ASCII of at most `CONTEXT_TIMING_MAX_CHARACTERS` (128), and None for every
-other source. Only a memory, task, or reminder can be a Tier A item, and a
-summary is always an untitled Tier B item. Anything else raises
+other source. `project_id` is a project fact's project, a positive `int`, and
+None for every other source. Only a memory, project fact, task, or reminder
+can be a Tier A item, and a summary is always an untitled Tier B item.
+Anything else raises
 `ValueError(CONTEXT_ITEM_MESSAGE)`. `item.fingerprint` returns its
 `ContextFingerprint`, whose `digest` is the SHA-256 of the exact text, or for a
 note `note_digest(title, body)`: the SHA-256 of both as one compact JSON
 array; `summary_digest(body)` is a summary's, the SHA-256 of its exact text;
 `task_digest(text, due_date)` a task's, the SHA-256 of the compact JSON array
-`[text, due_date or ""]`; and `reminder_digest(text, remind_time)` a
-reminder's, of `[text, remind_time]`. Neither `repr()` shows text or digest.
-A later stage that makes another record type eligible adds a `ContextSource`
-member, as V1-20 added `SUMMARY` and V1-22 `TASK` and `REMINDER`; a saved
-conversation is deliberately not a source.
+`[text, due_date or ""]`; `reminder_digest(text, remind_time)` a
+reminder's, of `[text, remind_time]`; and a project fact's is the SHA-256 of
+the compact JSON array `[project_id, text]`, exactly its approval digest.
+Neither `repr()` shows text or digest. A later stage that makes another record
+type eligible adds a `ContextSource` member, as V1-20 added `SUMMARY`, V1-22
+`TASK` and `REMINDER`, and V1-24 `PROJECT_FACT`, declared before the tasks so
+Tier A orders it there; a saved conversation is deliberately not a source.
 
 `search_terms(request) -> tuple[str, ...]` and
 `memory_search_after(memories) -> int | None`
@@ -1141,6 +1265,36 @@ reminders (reference data):`; each renders as
 `task <id>: {"text": ..., "due": ...}` or
 `reminder <id>: {"text": ..., "when": ...}`. Without one, every framing,
 header, and byte is exactly as before V1-22.
+
+**Project fact context.** `enabled_facts(rows, limit, project_id)` settles the
+snapshot's bounded fact read into `(id, project_id, text)` triples, or raises
+`ValueError(ENABLED_FACTS_MESSAGE)` for anything but at most `limit` rows in
+strictly ascending id order, each with an exact positive `int` id, an exact
+`int` project id equal to `project_id`, and valid text within
+`CONTEXT_MAX_BYTES`; with no active project there can be no row.
+`select_fact_context(memory_items, facts, byte_budget) -> FactSelection`
+considers the first 16 facts in ascending id order, after the memories Tier A
+already chose, and takes each whole only while Tier A as a whole stays within
+16 items, `CONTEXT_MAX_BYTES`, and `byte_budget`; one that does not fit is
+left out by id and the next is still considered. `FactSelection(items=(),
+omitted_ids=(), more_eligible=False)` holds the facts sent, those left out,
+and whether the read returned a seventeenth row. `fact_supplied_notice(items)`
+names them with `FACT_UNCERTAINTY_NOTICE`, `Maria cannot verify whether these
+facts are still current.`, `fact_selected_notice(items)` after a failure with
+`FACT_SELECTED_TAIL`, `Maria cannot confirm that the local model received
+them.`, and `fact_omission_notice(selection)` the ones left out, ending `more
+project facts beyond the first 16.` when the read returned more. With a fact
+among the items, `context_instructions` returns `FACT_CONTEXT_INSTRUCTIONS`,
+which covers every source and adds the candor sentence `When the owner asks
+you to review a plan, a document, code, or tests, say plainly when you would
+recommend a different approach and why, instead of simply agreeing.`, and the
+Tier A header is `FACT_DATA_HEADER`, `Owner memories, active-project facts,
+tasks, and reminders (reference data):`; a fact renders as
+`project fact <id>: <text as one JSON string>`. `supplied_still_current(...,
+facts=())` takes the recheck as triples and finds a supplied fact current
+only with its project id and text. `FACT_CLEARED_NOTICE` is the fact's own
+cleared notice. Without a fact, every framing, header, and byte is exactly as
+before V1-24.
 
 `render_context_data(items) -> str`, `rendered_context_bytes(items) -> int`,
 and `context_content_bytes(context) -> int`
@@ -2153,6 +2307,78 @@ Every storage failure of these methods raises `DeliveryStorageError`, a
 `DELIVERY_STORAGE_MESSAGE` otherwise, after its handler has ended, with no
 cause or context; a malformed argument raises `ValueError` before any SQL.
 
+### Projects
+
+The project tables of schema 9 (V1-24-R1); `docs/database.md` describes the
+rules. Every value object comes from `core/project_records.py`, and every read
+is bounded inside SQLite before Python settles it.
+
+`Memory.create_project(name, root, folder) -> int | None`,
+`Memory.retitle_project(project_id, name) -> bool`, and
+`Memory.delete_project(project_id) -> ProjectDeletion`
+
+`create_project` stores one project and returns its id, or None when the
+location is equal to, inside, or around another project's, compared ignoring
+case, checked under the write lock. `retitle_project` replaces the name and
+returns whether a project matched. `delete_project` returns `DELETED`,
+`NOT_FOUND`, `ACTIVE`, or `HAS_FACTS`, deleting only for the first.
+
+`Memory.list_projects(limit=51) -> ProjectListing`,
+`Memory.get_project(project_id) -> ProjectReading`, and
+`Memory.project_choices(limit=50) -> ProjectChoices`
+
+One read transaction each, together with the activation: a listing of at most
+`limit` projects by id, one project, or None, with its fact count, and the
+selector's `(id, name)` pairs with the active id. A project row Maria could
+not have written refuses the read.
+
+`Memory.project_activation() -> ActivationSnapshot`,
+`Memory.activate_project(project_id) -> ActivationResult`, and
+`Memory.deactivate_project() -> DeactivationChange`
+
+`project_activation` is one bounded read of the setting:
+`ActivationSnapshot(state, project_id=None, serial=0, changed_at=None)`, in
+the state `NEVER_ACTIVATED`, `ACTIVE`, `INACTIVE`, or `UNREADABLE`, whose
+`token` is `(project_id, serial)`, or None while unreadable, and whose
+`active_project_id` names the project only while active. `activate_project`
+returns `ActivationResult(change, replaced_project_id=None)`, the change
+`ACTIVATED`, `ALREADY_ACTIVE`, `NOT_FOUND`, or `AT_LIMIT`;
+`deactivate_project` returns `DEACTIVATED` or `NONE_ACTIVE`. Both follow the
+serial rules and are the only methods whose SQL writes the setting.
+
+`Memory.add_project_fact(project_id, text) -> int | None`,
+`Memory.list_project_facts(project_id, limit=51) -> FactListing`,
+`Memory.get_project_fact(fact_id) -> ProjectFact | None`,
+`Memory.edit_project_fact(fact_id, text, expected_digest) -> FactEdit`, and
+`Memory.delete_project_fact(fact_id) -> bool`
+
+`add_project_fact` stores the text and its approval digest, or returns None
+when no project has the id. `edit_project_fact` writes the new text and
+digest only while the fact still holds exactly `expected_digest`, returning
+`EDITED`, `NOT_FOUND`, or `CHANGED`. A fact whose digest is not its own
+project id and text is a row Maria could not have written, and refuses the
+read that meets it.
+
+`Memory.project_context_snapshot(limit, max_text_bytes, supplied_fact_ids=())
+-> ProjectContextRead` and `Memory.active_project() -> ProjectContextRead`
+
+A request's one snapshot, from one read transaction:
+`ProjectContextRead(activation, project=None, facts=(), supplied_facts=())`,
+holding the project exactly while one is active and no fact otherwise, and
+refusing any other combination with `ValueError`. Its facts are at most
+`limit`, 0 to 100, of the active project's eligible facts by ascending id, and
+its supplied facts those named in `supplied_fact_ids` that are still eligible
+facts of that project, each a mapping of `id`, `project_id`, and `text`. A
+fact is eligible only when its guarded values pass a registered deterministic
+check that recomputes its digest, so a refused fact is never returned or
+counted. `active_project()` is the snapshot with no fact, a deterministic
+command's.
+
+Every storage failure raises `RuntimeError` with the shared busy message for
+contention and `PROJECT_STORAGE_MESSAGE`, `Unable to read or write projects.`,
+otherwise, after its handler has ended, with no cause or context; a malformed
+argument raises `ValueError` before any SQL.
+
 ## Tool Execution Result
 
 `ToolExecutionResult(success: bool, message: str, data: Any = None, recorded_message: str | None = None)`
@@ -2517,12 +2743,159 @@ unless you move it to a different time.`, the channel reading `as a desktop
 notice`, `in the command line`, or `in the desktop window`. The tool itself
 still delivers, notifies, schedules, and polls nothing.
 
+## Projects Tool
+
+`tools.projects.ProjectsTool(memory: Memory, reader: ProjectFileReader,
+logger=None)` and `tools.projects.build_tool(config, memory, **_)`
+
+The projects tool of V1-24-R1, name `projects`, with the thirteen actions
+`list`, `create`, `read`, `retitle`, `delete`, `activate`, `deactivate`,
+`list_facts`, `add_fact`, `edit_fact`, `delete_fact`, `list_files`, and
+`read_file`, none model-eligible; "Projects Tool" in `docs/tools.md` lists
+their commands and arguments. `build_tool` builds the reader from
+`config.filesystem_roots` and `config.filesystem_protections`.
+`confirmation_binding(action, arguments)` returns, for `retitle`, `delete`,
+`activate`, `add_fact`, `edit_fact`, and `delete_fact`, a
+`ConfirmationBinding` whose preview quotes what the approval covers, read
+once, and for `edit_fact` pins `{"text_digest": <the fact's approval
+digest>}`; anything it cannot show returns `{}`, and a read failure is logged
+as a fixed line. `execute(action, arguments) -> ToolExecutionResult`
+dispatches through one table; a `RuntimeError` answers with the shared busy
+text or `PROJECT_STORAGE_MESSAGE`, and a `ValueError` with the latter.
+`list_files` and `read_file` read the activation and the active project
+through `Memory.active_project()` and work only while one is active. Every
+successful result sets `recorded_message` to a fixed line naming ids at
+most; it is the only module that calls `Memory.activate_project` or
+`Memory.deactivate_project`.
+
+## Project Records
+
+`core/project_records.py` is the project vocabulary (V1-24-R1). It imports
+only the standard library and `core/task_records.py`, and holds no SQL, I/O,
+or logging.
+
+- Limits: `PROJECT_NAME_MAX_BYTES = 64`, `PROJECT_FACT_MAX_BYTES = 512`,
+  `PROJECT_PATH_MAX_BYTES = 512`, `PROJECT_COMPONENT_MAX_CHARACTERS = 255`,
+  `PROJECT_LIST_LIMIT = 50`, `FACT_LIST_LIMIT = 50`, `FILE_OPEN_MAX_BYTES =
+  524_288`, `FILE_SHOW_MAX_BYTES = 131_072`, `FILE_PART_MAX_BYTES = 16_384`,
+  `FILE_REFERENCE_LIMIT = 3`, `FILE_BLOCK_MAX_BYTES = 32_768`,
+  `LISTING_SCAN_LIMIT = 2_000`, `LISTING_SHOW_LIMIT = 200`, and
+  `LINE_NUMBER_MAX = 999_999`; the activation serials run from
+  `ACTIVATION_SERIAL_FIRST = 1` to `ACTIVATION_SERIAL_MAX = 2**63 - 1`, and
+  `NEVER_ACTIVATED_SERIAL = 0` is the token's serial before any activation.
+- Rules: `is_project_name`, `is_fact_text`, `is_fact_digest`,
+  `is_project_path`, which applies the path grammar, `is_project_folder`,
+  `is_project_location`, `parse_location(value) -> (root, folder) | None`,
+  `describe_location`, `locations_overlap`, which compares ignoring case,
+  `is_admitted_workspace_file`, `is_activation_serial`, `parse_line_number`,
+  and `parse_line_range`.
+- `fact_digest(project_id, text) -> str`: the lowercase hexadecimal SHA-256 of
+  the UTF-8 of the compact JSON array `[project_id, text]`, non-ASCII kept.
+- `settle_activation(row_count, project_id, serial, changed_at,
+  project_exists) -> ActivationSnapshot` and `replacement_serial(stored, *,
+  activating) -> int | None`: the four states and the serial that replaces an
+  unreadable setting, s + 1 below the largest, None for an activation and s
+  for a deactivation at the largest, and 1 with no usable serial.
+- Value objects, each refusing what Maria could not have written and none
+  showing a name, text, or path in its `repr`: `Project`, `ProjectFact`,
+  `ActivationSnapshot`, `ActivationResult`, `ProjectListing`,
+  `ProjectReading`, `FactListing`, `ProjectContextRead`, `ProjectChoices`, and
+  `ProjectFilePart(project_id, path, start, end, of_lines, size, sha256,
+  text)`, whose `lines` property is `<start>-<end>`; and the enums
+  `ActivationState`, `ActivationChange`, `DeactivationChange`,
+  `ProjectDeletion`, and `FactEdit`.
+- Texts: every fixed reply and refusal of decision D12, the model refusal
+  `model_refusal(reason)` with its reasons, `active_project_notice(id)`,
+  `file_parts_notice(parts, *, delivered)`, `FILE_PART_INSTRUCTIONS`, and
+  `PROJECT_MARIA_PREVIEW`.
+- The file block: `render_file_block(parts)`, the fixed header and one line
+  per part, `file <n>: ` and one JSON object of `project`, `path`, `lines`,
+  `of_lines`, `bytes`, `sha256`, and `text`, with U+0085, U+2028, and U+2029
+  escaped; `validated_file_parts(parts)`, which reads every part again and
+  allows at most three; and `file_parts_bytes(parts, *, with_context) -> int`,
+  F + D, which raises `ValueError` over `FILE_BLOCK_MAX_BYTES`.
+
+## Project Files
+
+`core/project_files.py` is the project file reader (V1-24-R1). It calls
+Windows only through `core/project_file_access.py`, and logs fixed step codes
+and Windows error numbers only, never a path or file text.
+
+`ProjectFileReader(roots, protections, logger=None,
+access_loader=load_access)`
+
+Every operation runs the lexical phase first and makes no filesystem call
+when it refuses, then the filesystem phase described in "Projects and Project
+Files" in `docs/architecture.md`. The Windows functions are looked up once,
+through `access_loader`; with none, every operation returns
+`FileRefusal.UNAVAILABLE` before any call, and once the process-wide latch
+has recorded a failed placeholder-mode restore, `FileRefusal.STOPPED`.
+
+- `check_workspace_folder(folder) -> str | FileRefusal` checks a workspace
+  folder for `create project` and returns its on-disk spelling.
+- `list_folder(project, folder) -> FolderListing | FileRefusal` lists one
+  folder: `FolderListing(folder, entries, scan_stopped)`, each entry a
+  `ListedEntry(name, directory, size)` from find data alone, sorted ignoring
+  case, at most 2,000 examined.
+- `read_file(project, path) -> FileContent | FileRefusal` reads one admitted
+  file whole: `FileContent(path, data, size, sha256)`, the path in the
+  approved list's or the on-disk spelling.
+
+`FileRefusal` is `UNREADABLE`, `TOO_LARGE`, `OPEN_FOR_CHANGES`, `CHANGED`,
+`INCOMPLETE`, `UNAVAILABLE`, `STOPPED`, `NOT_UTF8`, `EMPTY`, `LINE_RANGE`,
+`SHOW_TOO_LARGE`, or `PART_TOO_LARGE`; `refusal_message(refusal, *,
+folder=False)` is its fixed owner text and `refusal_reason(refusal)` its
+fixed reason for a refused model request.
+
+`decode_file(content) -> DecodedFile | FileRefusal`,
+`file_display(project_id, decoded, lines) -> str | FileRefusal`,
+`scan_references(request) -> ReferenceScan`, and
+`file_parts(reader, project, references) -> tuple[ProjectFilePart, ...] | str`
+
+`decode_file` removes one UTF-8 byte-order mark and refuses NUL, invalid
+UTF-8, and an empty file; lines end at line feeds. `file_display` renders a
+`read project file` display within `FILE_SHOW_MAX_BYTES`. `scan_references`
+returns `ReferenceScan(present, references=(), reason=None)`: whether the
+request holds a word beginning with exactly one `@`, its distinct
+`FileReference(path, lines)` values in first-seen order, and a fixed reason
+when the request must be refused. `file_parts` reads each distinct file once
+and returns its parts, or the first refusal's fixed reason.
+
+## Project File Access
+
+`core/project_file_access.py` (V1-24-R1) is the only module that calls the
+nine Windows functions project file reading uses, through standard-library
+`ctypes` with every argument and result type pinned: kernel32's CreateFileW,
+GetFileInformationByHandle, GetFileInformationByHandleEx (FileAttributeTagInfo
+and FileStandardInfo), GetFinalPathNameByHandleW, FindFirstFileExW,
+FindNextFileW, FindClose, and CloseHandle, and ntdll's
+RtlSetThreadPlaceholderCompatibilityMode.
+
+`load_access() -> WindowsFileAccess | None` returns None off Windows or when
+any function is missing. `WindowsFileAccess` offers `set_placeholder_mode`,
+`create_file`, `attribute_tag`, `standard_info`, `file_identity`,
+`final_path`, `find_first`, `find_next`, `find_close`, and `close_handle`,
+and the descriptor steps `open_descriptor`, `set_binary`, `inheritable`,
+`read`, `descriptor_handle`, and `close_descriptor`. A failing return raises
+`AccessError(call, error)`, naming the call and the Windows error number only.
+`AttributeTag`, `StandardInfo`, `FileIdentity`, and `FindEntry` hold the
+values read, and `FindEntry`'s `repr` never shows its name.
+
+## Project Maria Manifest
+
+`core/project_maria_manifest.py` (V1-24-R1) is data only: a docstring, the
+future import, and two literal tuples. `APPROVED_PATHS` is the sorted tuple of
+unique ASCII paths, relative to the repository and written with "/", that a
+Project Maria path must equal, ignoring ASCII letter case; `NOT_APPROVED_PATHS`
+names the files in the places the manifest tests examine that were decided
+against. Nothing reads the repository or Git at run time.
+
 ## Action Contracts
 
 `ActionContractRegistry.validate(tool_name, action, arguments) -> ContractViolation | None`
 
 `core/action_contracts.py` declares `BUILT_IN_ACTION_CONTRACTS`, the immutable
-positive allowlist of all 65 built-in tool actions and their arguments. The
+positive allowlist of all 78 built-in tool actions and their arguments. The
 table is written by hand and is independent of Tool Manager's runtime
 inventory, of `PermissionManager`, and of the planner; it is never generated
 from a tool's `actions` set, read from configuration, or persisted. Declaring
@@ -2550,10 +2923,11 @@ whether a reasoning model may ever propose the action and decides nothing
 else; `core/plan_compiler.py` compiles a proposal only when it and the
 compiler's own allowlist agree. Five actions are `MODEL_ELIGIBLE`:
 `calculator.calculate`, `filesystem.list`, `system.current_time`,
-`tasks.create`, and `reminders.create`. The other 60, the three audit
+`tasks.create`, and `reminders.create`. The other 73, the three audit
 actions, the eleven conversation-record actions, the other twenty task and
-reminder actions, and the three argument-free reminder-delivery actions of
-V1-23-R1 included, are `NOT_MODEL_ELIGIBLE`.
+reminder actions, the three argument-free reminder-delivery actions of
+V1-23-R1, and the thirteen project actions of V1-24-R1 included, are
+`NOT_MODEL_ELIGIBLE`.
 
 A str field may also be closed. `ArgumentContract.allowed_values`, a tuple of
 exact texts or None, admits only those values, and
@@ -3225,12 +3599,12 @@ owner-controlled local model. It contains no transport, no model, and no
 provider; the conversation module is the one caller that asks a provider
 anything. Its own imports include no network, threading, asynchronous, or
 subprocess module, and it imports nothing from Maria except `core.context`,
-`core.failures`, and `core.logger`, so it has no path to planning,
-permissions, tool dispatch, or persistence.
+`core.failures`, `core.logger`, and, since V1-24, `core.project_records`, so it
+has no path to planning, permissions, tool dispatch, or persistence.
 
 `ReasoningRequest(prompt: str, history: tuple[ReasoningExchange, ...] = (),
-context: tuple[ContextItem, ...] = (), proposal_instructions: bool = False)`
-and `ReasoningResponse(text: str)`
+context: tuple[ContextItem, ...] = (), proposal_instructions: bool = False,
+files: tuple[ProjectFilePart, ...] = ())` and `ReasoningResponse(text: str)`
 
 Frozen dataclasses. The prompt and the response text must each be an exact,
 non-empty, UTF-8-encodable `str` of at most 1,048,576 UTF-8 bytes
@@ -3253,9 +3627,14 @@ Maria's fixed `PROPOSAL_INSTRUCTIONS` and carries no text of its own; it must
 be exactly `True` or `False`, or
 `ValueError(REASONING_PROPOSAL_INSTRUCTIONS_MESSAGE)` is raised, and it is
 `False` by default, which leaves a request exactly what it was before the flag
-existed. There is no field for a system prompt or a template a caller could
-fill, raw interaction history, a credential, a header, an endpoint, a port, or
-a model path.
+existed. `files` (V1-24-R1) holds at most three owner-named project file
+parts, each read again as `validated_file_parts` requires, or
+`ValueError(FILE_PART_MESSAGE)` is raised; a request carrying parts may carry
+no history and no proposal instructions, or
+`ValueError(REASONING_FILES_MESSAGE)` is raised, and with none a request is
+exactly what it was. There is no field for a system prompt or a template a
+caller could fill, raw interaction history, a credential, a header, an
+endpoint, a port, or a model path.
 `repr()`, `str()`, and formatting show `<redacted>` rather than any text.
 
 `ReasoningExchange(user: str, assistant: str)`
@@ -3269,7 +3648,7 @@ representation.
 
 `PROPOSAL_INSTRUCTIONS`, `INSTRUCTION_SEPARATOR = "\n\n"`,
 `proposal_instruction_bytes(with_context: bool) -> int`, and
-`system_instructions(context, proposal_instructions) -> str | None`
+`system_instructions(context, proposal_instructions, files=()) -> str | None`
 
 `PROPOSAL_INSTRUCTIONS` is Maria's fixed text, 2,045 ASCII bytes in 24 lines
 since V1-22, which added 718 to V1-19's 1,327 (itself 312 more than V1-18's
@@ -3291,7 +3670,9 @@ returns the one system message a request carries: `None` with neither the
 flag nor context, the context instructions alone with context only,
 `PROPOSAL_INSTRUCTIONS` alone with the flag only, and with both,
 `PROPOSAL_INSTRUCTIONS`, `INSTRUCTION_SEPARATOR`, and the context
-instructions, in that order. `proposal_instruction_bytes` is what the
+instructions, in that order; with file parts, `FILE_PART_INSTRUCTIONS` is
+joined last, after the context instructions when there are any, by the same
+separator. `proposal_instruction_bytes` is what the
 instructions add to a request's size: 2,045 bytes, plus 2 for the separator
 when the request also carries context, whose framing is counted with the
 context. No budget grew with them: under the 8,192-byte conversation ceiling,
@@ -3300,7 +3681,7 @@ prompt bytes in proposal mode, and one that does not fit is refused before the
 provider is asked anything.
 
 `request_content_bytes(prompt, history, maximum_bytes, context=(),
-proposal_instructions=False) -> int` and
+proposal_instructions=False, files=()) -> int` and
 `history_content_bytes(history, maximum_bytes) -> int`
 
 The one definition of a request's size: the UTF-8 length of the prompt, plus
@@ -3308,7 +3689,11 @@ the UTF-8 length of every exchange's `user` and `assistant` text, plus the
 fully rendered context, which is nothing when the context is empty, plus, when
 `proposal_instructions` is true, `proposal_instruction_bytes`: the fixed
 instructions and, with context, the separator that joins them to the context
-framing. No role name, message structure, other separator, model identifier,
+framing, plus, with file parts, `file_parts_bytes(files, with_context=bool(
+context))`: the file framing, its separator when there is context, and the
+rendered file block. File parts together with history or proposal
+instructions raise `ValueError(REASONING_FILES_MESSAGE)`. No role name,
+message structure, other separator, model identifier,
 or transport framing counts. Every text is read again rather than trusted, and
 counting stops as soon as the total passes `maximum_bytes`, so the result is
 then only some value above the bound. A prompt that is not exact, encodable,
@@ -3514,7 +3899,11 @@ on and the context instructions when the request carries context, joined by
 conversation; the context instructions are `CONTEXT_INSTRUCTIONS` unless a
 Tier B item is present, when they are `SEARCH_CONTEXT_INSTRUCTIONS`, and no
 stored text is ever placed in the system message. Brain's production path
-always turns the flag on.
+always turns the flag on, except for a request that names project files
+(V1-24-R1): then the system message ends with `FILE_PART_INSTRUCTIONS`, and the
+rendered file block follows the context as its own `{"role": "user",
+"content": <file block>}` just before the prompt, never in the system message;
+such a request carries no history, and its parts count in the measured size.
 
 | Outcome | Result |
 | --- | --- |
@@ -3665,7 +4054,17 @@ too, five at a time, and marked overdue when more than fifteen minutes late;
 and `reminders.disable_delivery` has one stating that turning delivery off
 stops every new notice from the moment it is saved, while one already started
 may still appear and be recorded and a box already on screen stays until it is
-closed. There are ten notices in all.
+closed. Under V1-24-R1, `projects.activate` has one stating that, while a
+project is active, each of its facts may be sent to the local reasoning model
+on every conversational turn, within Maria's memory context limits, and that
+Maria can read the project's files when the owner asks with project commands
+or `@` references and reads none on her own, and that the project stays
+active, also after Maria restarts, until the owner deactivates it or
+activates another; and `projects.add_fact` and `projects.edit_fact` share one
+stating that, while its project is active, the fact may be sent on every
+conversational turn within those limits, so it is not always sent, and that
+Maria does not check it for passwords or other secrets. There are thirteen
+notices in all.
 
 `PermissionManager.confirmation_notice(tool_name, action) -> str | None`
 
@@ -3691,9 +4090,11 @@ baseline: `audit.delete`, `conversations.delete`,
 `notes.delete`, `notes.enable_context`, `notes.disable_context`,
 `memory.update`, `memory.forget`, `memory.enable_context`,
 `memory.disable_context`, `create`, `edit`, `reschedule`, `delete`,
-`enable_context`, and `disable_context` for both `tasks` and `reminders`, and
-`reminders.enable_delivery` and `reminders.disable_delivery`, thirty-three
-actions, require confirmation, while `filesystem.delete` and
+`enable_context`, and `disable_context` for both `tasks` and `reminders`,
+`reminders.enable_delivery` and `reminders.disable_delivery`, and
+`projects.retitle`, `projects.delete`, `projects.activate`,
+`projects.add_fact`, `projects.edit_fact`, and `projects.delete_fact`,
+thirty-nine actions, require confirmation, while `filesystem.delete` and
 `filesystem.write` are denied.
 Configuration can add restrictions but cannot remove this baseline.
 `PermissionManager` applies the same mandatory policy when constructed
