@@ -2890,12 +2890,47 @@ Project Maria path must equal, ignoring ASCII letter case; `NOT_APPROVED_PATHS`
 names the files in the places the manifest tests examine that were decided
 against. Nothing reads the repository or Git at run time.
 
+## File Organization
+
+`FilesystemTool(roots, protections, logger=None, access_loader=None, scandir=None)` gains the
+action `organize` (V1-25-R1). `access_loader` returns the object that makes the Windows calls,
+or None where they cannot be made (the default is `core.organize_access.load_access`), and
+`scandir` lists a folder's names for the offer (the default is `os.scandir`); both exist so
+a test can stand in for Windows.
+
+`FilesystemTool.confirmation_binding("organize", {"folder": text})` returns a
+`ConfirmationBinding`. Its arguments are, for each of at most five eligible files numbered
+from 1, `source_N`, `destination_N`, and `identity_N`, and `create_N` only when the category
+folder is absent; its preview lists each move. A step with anything but its folder, another
+action, or a refused offer adds no argument, and the preview then states the fixed reason.
+`FilesystemTool.execute("organize", arguments)` runs exactly the pinned operations and returns a
+`ToolExecutionResult` whose `message` is the report, whose `data` is the six counts, and whose
+`recorded_message` is counts only (`Organize folder: refused before any change.` for a
+refusal).
+
+`core.file_organization`: `plan_offer(access, root_path, folder_parts, protected, scandir)`
+returns an `Offer` of pins and a preview; `validate_pins(...)` checks every pin's shape,
+category, digest, distinctness, and protection with no Windows call; `run_pinned(...)`
+validates, then `run_batch(...)` runs, returning a `BatchResult` with one `OperationOutcome`
+per planned operation; `render_report`, `recorded_response`, and `count_line` produce the
+report, the counts-only record, and the one fixed line an interrupted run logs. `Refusal`
+carries only a fixed code. An interruption (`KeyboardInterrupt` or `SystemExit`) is re-raised
+after every handle was attempted, with the partial result in `maria_partial`.
+
+`core.organize_access.OrganizeAccess` exposes `create_file`, `open_relative`, `rename_into`,
+`file_info`, `final_path`, `filesystem_name`, and `close_handle`, each over one pinned Windows
+function (CreateFileW, NtCreateFile, NtSetInformationFile, GetFileInformationByHandle,
+GetFinalPathNameByHandleW, GetVolumeInformationByHandleW, CloseHandle). `load_access()` returns None
+off 64-bit Windows. `AccessError` carries the call, the code, and the kind (`win32` or
+`nt`) and never the text of a path; `PendingError` is raised for `STATUS_PENDING`, keeps the
+request's memory for the life of the process, and latches `pending_latched()`.
+
 ## Action Contracts
 
 `ActionContractRegistry.validate(tool_name, action, arguments) -> ContractViolation | None`
 
 `core/action_contracts.py` declares `BUILT_IN_ACTION_CONTRACTS`, the immutable
-positive allowlist of all 78 built-in tool actions and their arguments. The
+positive allowlist of all 79 built-in tool actions and their arguments. The
 table is written by hand and is independent of Tool Manager's runtime
 inventory, of `PermissionManager`, and of the planner; it is never generated
 from a tool's `actions` set, read from configuration, or persisted. Declaring
@@ -2990,9 +3025,11 @@ malformed value never reaches a text operation. A blank, too-short, too-long,
 or out-of-range value all report `OUT_OF_RANGE`.
 The supplied mapping is read, never rebuilt or copied into a mutable mapping,
 so a `Plan` fingerprint is unchanged by validation. `RootClass` has one member,
-`NAMED_FILESYSTEM_ROOT`, and all six filesystem path fields declare it:
-`read.path`, `list.path`, `rename.source`, `rename.destination`, `move.source`,
-and `move.destination`. It is classification metadata and stays that: the
+`NAMED_FILESYSTEM_ROOT`, and every filesystem path field declares it: the six
+of `read`, `list`, `rename`, and `move` (`read.path`, `list.path`,
+`rename.source`, `rename.destination`, `move.source`, and `move.destination`)
+and, since V1-25-R1, `organize.folder` with each operation's `source_N`,
+`destination_N`, and `create_N`. It is classification metadata and stays that: the
 registry creates no `Path`, resolves nothing, selects no root, reads no
 filesystem, consults no configuration or other ambient state, and decides no
 permission. Which named root a path lands in, and whether it is reachable at
@@ -4086,15 +4123,15 @@ baseline: `audit.delete`, `conversations.delete`,
 `conversation_summaries.create`, `conversation_summaries.edit`,
 `conversation_summaries.delete`, `conversation_summaries.enable_context`,
 `conversation_summaries.disable_context`, `filesystem.rename`,
-`filesystem.move`, `history.delete`, `notes.retitle`, `notes.edit`,
-`notes.delete`, `notes.enable_context`, `notes.disable_context`,
-`memory.update`, `memory.forget`, `memory.enable_context`,
-`memory.disable_context`, `create`, `edit`, `reschedule`, `delete`,
+`filesystem.move`, `filesystem.organize`, `history.delete`, `notes.retitle`,
+`notes.edit`, `notes.delete`, `notes.enable_context`,
+`notes.disable_context`, `memory.update`, `memory.forget`,
+`memory.enable_context`, `memory.disable_context`, `create`, `edit`, `reschedule`, `delete`,
 `enable_context`, and `disable_context` for both `tasks` and `reminders`,
 `reminders.enable_delivery` and `reminders.disable_delivery`, and
 `projects.retitle`, `projects.delete`, `projects.activate`,
 `projects.add_fact`, `projects.edit_fact`, and `projects.delete_fact`,
-thirty-nine actions, require confirmation, while `filesystem.delete` and
+forty actions, require confirmation, while `filesystem.delete` and
 `filesystem.write` are denied.
 Configuration can add restrictions but cannot remove this baseline.
 `PermissionManager` applies the same mandatory policy when constructed

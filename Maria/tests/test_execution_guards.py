@@ -55,8 +55,10 @@ from tests.test_memory import (
 from tests.test_project_context import REPLY, _harness
 
 
-# The production modules this stage adds.
+# The production modules this stage adds, V1-24-R1's and V1-25-R1's.
 NEW_PRODUCTION_MODULES = (
+    "core/file_organization.py",
+    "core/organize_access.py",
     "core/project_file_access.py",
     "core/project_files.py",
     "core/project_maria_manifest.py",
@@ -133,6 +135,27 @@ WINDOWS_FUNCTIONS = frozenset(
     }
 )
 
+# V1-25-R1: the seven Windows functions file organization calls (four of them
+# are bound separately by the project reader too), and the two the closed-app
+# notice calls. Each ctypes module owns exactly the functions its row names.
+ORGANIZE_FUNCTIONS = frozenset(
+    {
+        "CloseHandle",
+        "CreateFileW",
+        "GetFileInformationByHandle",
+        "GetFinalPathNameByHandleW",
+        "GetVolumeInformationByHandleW",
+        "NtCreateFile",
+        "NtSetInformationFile",
+    }
+)
+NOTICE_FUNCTIONS = frozenset({"MessageBoxW", "SHQueryUserNotificationState"})
+OWNED_WINDOWS_FUNCTIONS = {
+    "core/desktop_notice.py": NOTICE_FUNCTIONS,
+    "core/organize_access.py": ORGANIZE_FUNCTIONS,
+    "core/project_file_access.py": WINDOWS_FUNCTIONS,
+}
+
 ACTIVATION_METHODS = frozenset({"activate_project", "deactivate_project"})
 
 # Every project command and two model requests, one naming a file.
@@ -201,18 +224,21 @@ def _execution_findings(tree: ast.Module, relative: str) -> list[str]:
     return findings
 
 
-def _named_windows_functions(tree: ast.Module) -> set[str]:
-    """Return which of the nine functions a module names in code."""
+def _named_windows_functions(
+    tree: ast.Module,
+    functions: frozenset[str] = WINDOWS_FUNCTIONS,
+) -> set[str]:
+    """Return which of the given Windows functions a module names in code."""
     named: set[str] = set()
     for node in ast.walk(tree):
-        if isinstance(node, ast.Attribute) and node.attr in WINDOWS_FUNCTIONS:
+        if isinstance(node, ast.Attribute) and node.attr in functions:
             named.add(node.attr)
-        elif isinstance(node, ast.Name) and node.id in WINDOWS_FUNCTIONS:
+        elif isinstance(node, ast.Name) and node.id in functions:
             named.add(node.id)
         elif (
             isinstance(node, ast.Constant)
             and isinstance(node.value, str)
-            and node.value in WINDOWS_FUNCTIONS
+            and node.value in functions
         ):
             named.add(node.value)
     return named
@@ -381,18 +407,34 @@ class StaticExecutionGuardTests(unittest.TestCase):
 class OwnershipGuardTests(unittest.TestCase):
     """The stage's Windows calls, activation writes, and SQL stay where they belong."""
 
-    def test_only_the_file_access_module_names_the_nine_windows_functions(
+    def test_each_ctypes_module_names_exactly_the_windows_functions_it_owns(
         self,
     ) -> None:
+        everything = frozenset().union(*OWNED_WINDOWS_FUNCTIONS.values())
         naming = {
             _relative(module): names
             for module in production_modules()
-            if (names := _named_windows_functions(_parse(module)))
+            if (names := _named_windows_functions(_parse(module), everything))
         }
 
         self.assertEqual(
             naming,
-            {"core/project_file_access.py": set(WINDOWS_FUNCTIONS)},
+            {
+                module: set(functions)
+                for module, functions in OWNED_WINDOWS_FUNCTIONS.items()
+            },
+        )
+        self.assertEqual(len(ORGANIZE_FUNCTIONS), 7)
+        self.assertEqual(len(WINDOWS_FUNCTIONS), 9)
+
+    def test_the_organizer_logic_module_names_no_windows_function(self) -> None:
+        everything = frozenset().union(*OWNED_WINDOWS_FUNCTIONS.values())
+
+        self.assertEqual(
+            _named_windows_functions(
+                _parse(MARIA_ROOT / "core" / "file_organization.py"), everything
+            ),
+            set(),
         )
 
     def test_only_the_projects_tool_calls_the_two_activation_methods(self) -> None:

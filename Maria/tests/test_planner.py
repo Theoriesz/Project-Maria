@@ -202,6 +202,7 @@ class PlannerMemoryTests(unittest.TestCase):
             "- read file <path>",
             "- rename <source> to <destination>",
             "- move <source> to <destination>",
+            "- organize folder <folder>",
             "- create note <title>: <body>",
             "- notes",
             "- read note <id or exact title>",
@@ -858,6 +859,52 @@ class TaskAndReminderCommandTests(unittest.TestCase):
                     Plan(
                         original_request=request,
                         steps=(PlanStep("filesystem", action, arguments),),
+                    ),
+                )
+
+    def test_organize_folder_plans_one_filesystem_step_with_the_folder_text(self) -> None:
+        for request, folder in (
+            ("organize folder inbox", "inbox"),
+            ("Organize Folder Inbox", "Inbox"),
+            ("ORGANIZE FOLDER docs/old files", "docs/old files"),
+            ("organize folder .", "."),
+        ):
+            with self.subTest(request=request):
+                self.assertEqual(
+                    self.plan(request),
+                    Plan(
+                        original_request=request,
+                        steps=(PlanStep("filesystem", "organize", {"folder": folder}),),
+                    ),
+                )
+
+    def test_organize_folder_without_a_folder_returns_its_usage(self) -> None:
+        for request in ("organize folder", "Organize Folder", "organize folder   "):
+            with self.subTest(request=request):
+                plan = self.plan(request)
+                self.assertEqual(plan.steps, ())
+                self.assertEqual(
+                    plan.response_if_no_action,
+                    "Use: organize folder <folder>",
+                )
+
+    def test_near_organize_forms_are_not_commands(self) -> None:
+        for request in (
+            "organize",
+            "organize files",
+            "organize my folder inbox",
+            "organizefolder inbox",
+            "please organize folder inbox",
+            "organize  folder inbox",
+            "reorganize folder inbox",
+        ):
+            with self.subTest(request=request):
+                self.assertEqual(
+                    self.plan(request),
+                    Plan(
+                        original_request=request,
+                        steps=(),
+                        response_if_no_action=UNSUPPORTED_RESPONSE,
                     ),
                 )
 

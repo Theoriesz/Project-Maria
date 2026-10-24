@@ -33,7 +33,7 @@ rather than assume. **All application code lives in `Maria/`.**
 |---|---|
 | `Maria/main.py` | entry point: selects the CLI, or the desktop GUI with `--gui`, and composes the runtime |
 | `Maria/deliver_reminders.py` | the closed-app reminder-delivery entry point (V1-23-R1): one pass, then exit; not an interface, and builds no Brain |
-| `Maria/core/` | `brain`, `planner`, `memory`, `permissions`, `tool_manager`, `logger`, `config`, `constants`, `action_contracts`, `audit`, `context`, `conversation`, `conversation_records`, `desktop_notice`, `failures`, `filesystem_roots`, `ollama_adapter`, `plan_compiler`, `project_file_access`, `project_files`, `project_maria_manifest`, `project_records`, `reasoning`, `reminder_delivery`, `runtime_paths`, `session`, `task_records`, `task_requests`, `time_resolution` |
+| `Maria/core/` | `brain`, `planner`, `memory`, `permissions`, `tool_manager`, `logger`, `config`, `constants`, `action_contracts`, `audit`, `context`, `conversation`, `conversation_records`, `desktop_notice`, `failures`, `file_organization`, `filesystem_roots`, `ollama_adapter`, `organize_access`, `plan_compiler`, `project_file_access`, `project_files`, `project_maria_manifest`, `project_records`, `reasoning`, `reminder_delivery`, `runtime_paths`, `session`, `task_records`, `task_requests`, `time_resolution` |
 | `Maria/tools/` | `audit`, `calculator`, `conversation_summaries`, `conversations`, `filesystem`, `history`, `memory`, `notes`, `projects`, `reminders`, `system`, `tasks` |
 | `Maria/gui/` | the optional desktop GUI: `controller` (Qt-free), `session_worker` (the one worker thread), `window` (the only Qt module) |
 | `Maria/tests/` | standard-library `unittest` suite |
@@ -287,6 +287,22 @@ The reminder-delivery contract (V1-23-R1):
 - `Maria/core/project_maria_manifest.py` — data only: Project Maria's approved path list
   and the files decided against, compared ignoring ASCII case and never read from the
   repository at run time.
+- `Maria/core/organize_access.py` — the only module that calls the seven Windows functions
+  file organization uses (V1-25-R1), through standard-library `ctypes` with every argument
+  and result type pinned: kernel32's CreateFileW, GetFileInformationByHandle,
+  GetFinalPathNameByHandleW, GetVolumeInformationByHandleW and CloseHandle, and ntdll's
+  NtCreateFile and NtSetInformationFile. It decides nothing and holds no policy: each
+  method makes one call, and a failure carries only the call's fixed name and a code. Its
+  rename is always FileRenameInformation with ReplaceIfExists false, completed only by a
+  returned STATUS_SUCCESS. STATUS_PENDING is its own error: every object the pending request
+  owns is kept for the life of the process, and a process-wide latch then refuses creation
+  and renaming until Maria restarts. It starts no thread and never waits, polls, or cancels.
+- `Maria/core/file_organization.py` — the handle logic of `filesystem.organize`
+  (V1-25-R1): the root and its NTFS check, the held chain, lookups, one operation's
+  checks, rename, verification and classification, the batch's stop rules and counts, the
+  release rules, the fixed category table, the offer, the pin checks, and the fixed texts.
+  It imports no configuration and no protections: the tool hands it a protection predicate.
+  It never reads SQL, logs a path, or calls a Windows function itself.
 - `Maria/tools/projects.py` — the projects tool's thirteen commands, and the only module
   that calls the memory layer's `activate_project` and `deactivate_project`.
 - `Maria/core/planner.py` — turns user input into structured `Plan` and `PlanStep` objects,
@@ -366,7 +382,7 @@ faster.
 `Maria/core/permissions.py` defines two mandatory frozensets:
 
 - `MANDATORY_DENIED_ACTIONS` — `filesystem.delete` and `filesystem.write`
-- `MANDATORY_CONFIRMATION_ACTIONS` — `filesystem.rename`, `filesystem.move`,
+- `MANDATORY_CONFIRMATION_ACTIONS` — `filesystem.rename`, `filesystem.move`, `filesystem.organize`,
   `history.delete`, `notes.retitle`, `notes.edit`, `notes.delete`,
   `notes.enable_context`, `notes.disable_context`, `memory.update`,
   `memory.forget`, `memory.enable_context`, `memory.disable_context`,
@@ -379,8 +395,8 @@ faster.
   `reminders.disable_context`, `reminders.enable_delivery`,
   `reminders.disable_delivery`, `projects.retitle`, `projects.delete`,
   `projects.activate`, `projects.add_fact`, `projects.edit_fact`, and
-  `projects.delete_fact` (thirty-nine in all; the two delivery actions under V1-23-R1,
-  and the six project actions under V1-24-R1)
+  `projects.delete_fact` (forty in all; the two delivery actions under V1-23-R1,
+  the six project actions under V1-24-R1, and `filesystem.organize` under V1-25-R1)
 
 `PermissionManager.__init__` and `Maria/core/config.py` union these into whatever
 configuration supplies, so **configuration can extend the mandatory baseline but can never
@@ -429,7 +445,9 @@ from the two mandatory sets above, which it does not change. Only `calculator.ca
 `filesystem.list`, `system.current_time`, `tasks.create`, and `reminders.create` are
 model-eligible; every new action contract must state its model eligibility explicitly.
 The three reminder-delivery actions of V1-23-R1 and the thirteen project actions of
-V1-24-R1 are all not model-eligible.
+V1-24-R1 are all not model-eligible, and so is `filesystem.organize` of V1-25-R1; `filesystem.rename`
+and `filesystem.move` stay closed to the model too, so no model proposal can mutate the
+filesystem.
 
 A model request that names project files with `@` (V1-24-R1) is sent with proposal mode
 off: it carries no proposal instructions and no earlier exchange, and its reply is shown
@@ -499,10 +517,13 @@ interaction, the cleaned `user_input` is preserved unchanged. `history.read`,
 (`projects.list`, `projects.create`, `projects.read`, `projects.retitle`,
 `projects.delete`, `projects.activate`, `projects.deactivate`, `projects.list_facts`,
 `projects.add_fact`, `projects.edit_fact`, `projects.delete_fact`,
-`projects.list_files`, and `projects.read_file`) are the only current actions that set
-this field, thirty-two in all, each using a fixed content-free summary; a project
+`projects.list_files`, and `projects.read_file`) and `filesystem.organize` (V1-25-R1) are the only current actions that set
+this field, thirty-three in all, each using a fixed content-free summary; a project
 command's summary names ids only, never a name, location, path, fact, or file text,
-while its request half keeps the command as typed, as a note command's does. Brain
+while its request half keeps the command as typed, as a note command's does;
+`filesystem.organize` records counts only, and its request half is likewise kept as typed,
+so the folder named in it stays in history while no file name, path, or report text is
+recorded. Brain
 applies the field generically, with
 no tool-specific branch. A model-originated plan is transient, so neither its request nor
 its result ever becomes an interaction row, and so is every outcome of
@@ -648,6 +669,62 @@ never read for context, planning, or reasoning or sent to a model. Maria's fixed
 instructions and summary prompt are her own code text, never stored text. See "Tier A
 Memory Context" and "Tier B Search Context" in `Maria/docs/architecture.md`.
 
+## File Organization (V1-25-R1)
+
+`organize folder <folder>` (deterministic; never model-proposed) tidies the top level of one
+folder of the one organize root, `workspace`, into the fixed category folders. It is one
+`filesystem.organize` step of at most five pinned operations, always confirmed, and runs
+only on 64-bit Windows over an NTFS volume.
+
+- **Offer.** The tool lists the folder's names with `os.scandir` (path-based; stops at entry
+  1,001 and refuses a larger folder), re-opens every name relative to a held folder handle,
+  and pins for each of at most five eligible files its source, destination, a metadata
+  digest (volume serial, file index, size, last-write time: checked metadata, not a content
+  hash), and, only when the category folder is absent, the one folder creation approved.
+  Nothing is held while the owner decides. Execution enumerates, globs, and expands nothing.
+- **Pins.** `create_i` must equal the destination's category parent exactly; the
+  destination must be the folder, the table category of the name, and the name; digests
+  are matched with an exact full match; every violation refuses with no native call and no
+  change. The existing protection checks run on every source, destination, creation path,
+  and every prefix of each (the root included) through a predicate the tool hands down, and
+  again on the final path of every held directory.
+- **Handles.** One held chain (root, components, folder). The root's file system must be
+  exactly `NTFS`, asked of the held root handle at the offer and at execution before any
+  creation or rename. Every handle is owned by a handle set, released newest first exactly
+  once and never retried; an interruption during release still attempts every handle and is
+  re-raised afterwards, carrying the known outcomes. A handle the checks before the first
+  move cannot release is counted, reported, and stops the run before any creation or rename,
+  even when a refusal is already known.
+- **Rename.** `NtSetInformationFile(FileRenameInformation)` of the held source into the held
+  category folder by a simple name, ReplaceIfExists false. A destination observed as
+  existing before the call is refused; a link count other than one before the rename is a
+  refusal; after a verified move one more read of the held source handle that shows more
+  than one name (at most 1,024) is the EXTRA_NAME warning, and zero, invalid, failed, or
+  changed information is "reported but unconfirmed", never a clean success.
+- **Outcomes.** Each operation is moved, reported but unconfirmed, not moved after an
+  attempt, outcome unknown, refused before an attempt, or not attempted, and the six counts
+  sum to the planned count. The run stops after anything but a clean move, a release
+  failure, a warning, an unexpected STATUS_PENDING, or an interruption; success needs every
+  operation moved and no warning. Nothing is copied, overwritten, deleted, retried,
+  undone, or rolled back, and Maria never removes an additional name of a file. Folder
+  results survive an interruption or an unexpected failure: a creation that returned but was
+  not verified is unconfirmed, and a creation call that was interrupted or failed
+  unexpectedly, with no known result, is unknown. Only a failure the rename call itself
+  reported natively is classified as not moved or unknown; a failure nobody expected inside
+  an operation is reported rather than opaque: outcome unknown once the rename was called,
+  refused before it, with only its type name logged.
+- **Records.** The request is recorded as typed and the response as counts only; logs hold
+  fixed text and counts; no file name, path, or report text is recorded or logged.
+- **Limits that are stated, not enforced.** The offer's path-based listing; a same-path
+  directory replacement before it was held; content changed while size and last-write
+  time are restored; a second name appearing at any moment but the one post-move read; a
+  link to the same file appearing at the destination after the destination check (the
+  rename can then succeed and the source name disappears); cloud folders and placeholders
+  on NTFS; case-sensitive directories; privileged callers; and builds other than the one
+  tested. Legacy `rename` and `move` are Windows-only, need an existing destination parent,
+  use `os.rename` only, never move a folder into itself, log fixed text, and keep their
+  path-based check-then-act race; they receive none of this protection.
+
 ## Scope Boundaries
 
 The following are currently outside Maria's scope. Do not implement any of them without
@@ -681,6 +758,13 @@ treat them as gated pending approval rather than as permanent exclusions:
   under cloud synchronization, or detecting cloud providers or the files they manage;
   holding the activation setting across a send; project file reading off Windows; and any
   automatic activation of a project, of Project Maria above all
+- Any file organization beyond V1-25-R1's: deleting, copying, overwriting, or writing
+  file content; organizing recursively, in more than one root, or more than five files per
+  approval; any model-eligible filesystem mutation; any organization off 64-bit Windows or
+  off an NTFS volume; replacing a destination; undoing or rolling back a move; removing or
+  enumerating a file's other names at execution; detecting cloud folders, placeholders on
+  NTFS, case-sensitive directories, or network shares; and any scheduled, background, or
+  automatic organization
 
 If a task seems to require one of these, stop and flag it instead of working around the
 boundary.
@@ -747,8 +831,18 @@ the CLI does.
   Windows functions project file reading uses, with every argument and result type
   pinned: CreateFileW, GetFileInformationByHandle, GetFileInformationByHandleEx,
   GetFinalPathNameByHandleW, FindFirstFileExW, FindNextFileW, FindClose, CloseHandle,
-  and RtlSetThreadPlaceholderCompatibilityMode (V1-24-R1). No other production module
-  names them.
+  and RtlSetThreadPlaceholderCompatibilityMode (V1-24-R1).
+- Only `Maria/core/organize_access.py`, a second additional `ctypes` module, calls the
+  seven Windows functions file organization uses, with every argument and result type
+  pinned: CreateFileW, GetFileInformationByHandle, GetFinalPathNameByHandleW,
+  GetVolumeInformationByHandleW, CloseHandle, NtCreateFile, and NtSetInformationFile
+  (V1-25-R1). The ownership of Windows functions is this exact map, and a guard test holds
+  it: `core/project_file_access.py` names its nine; `core/organize_access.py` names its
+  seven (four share a name with the other module and are declared separately on purpose,
+  so V1-24's read-only reader keeps its approved purpose, and neither imports the other);
+  `core/desktop_notice.py` names MessageBoxW and SHQueryUserNotificationState; no other
+  production module names any of them. The organization module starts no thread and
+  never waits, polls, or cancels a request.
 - No production module starts a process, runs a shell command, or evaluates, compiles,
   or executes code; registered-tool dispatch through ToolManager's fixed module list is
   the one dynamic import (V1-24-R1).
@@ -786,6 +880,12 @@ python -m unittest discover -s tests -v
   manifest tests that look at files run only in an isolated copy that holds every
   explicitly approved application path, new unstaged files included, and no private,
   runtime, or Git file; nothing is staged or committed to build it.
+- File organization tests (V1-25-R1) make real Windows calls only on temporary folders the
+  test creates, on a volume the test confirms is NTFS (skipped with a reason otherwise); every
+  race, failure, interruption, cleanup, and pending-request case goes through the fakes of
+  `Maria/tests/organize_fakes.py`, which can fail each call in turn. A real pending request, a
+  real wrong-length rename, and a malformed native buffer are never induced. Tests of the
+  organizer never rename, move, or create anything outside the folders they create.
 - Any behavior change needs a corresponding focused test. A task that changes behavior
   without adding or updating tests is not done.
 - **Never state that the suite passes unless you actually executed it and saw the output.**

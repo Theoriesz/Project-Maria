@@ -10,7 +10,7 @@ autonomous decomposition, or long-running task execution.
 Supported command families:
 
 - Calculator commands
-- Safe filesystem commands
+- Safe filesystem commands, including the one batch, `organize folder <folder>`
 - Notes commands
 - Explicit persistent-memory commands
 - Interaction-history commands
@@ -809,6 +809,23 @@ before `system`, with one more line on `@` references, fourteen lines in all:
 An `@` reference is not planner grammar: a request holding one reaches the
 generic fallback like any other unsupported text, and Brain settles its
 references against the active project only on the model path.
+
+## Filesystem Organization Grammar
+
+`organize folder <folder>` is the one organization command (V1-25-R1). The two words are
+case-insensitive and separated by exactly one space; everything after them, stripped, is the
+folder text and keeps its case. It creates this step, and nothing else:
+
+```text
+PlanStep("filesystem", "organize", {"folder": "<folder text>"})
+```
+
+The planner reads no folder and decides no file. The step later gains its pinned operations
+when confirmation is offered, through the tool's `confirmation_binding`, never in the
+planner. `organize folder` alone answers `Use: organize folder <folder>`. Text that merely
+resembles the command (`organize`, `organize files`, `organize  folder x`, `please organize
+folder x`, or `reorganize folder x`) matches no command and reaches the generic fallback. The
+request is recorded as typed, and no model ever sees it as a command.
 
 ## Plan Shape
 

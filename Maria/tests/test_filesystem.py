@@ -5,7 +5,7 @@ from __future__ import annotations
 import errno
 import logging
 import os
-import shutil
+import sqlite3
 import subprocess
 import unittest
 from contextlib import contextmanager
@@ -14,10 +14,14 @@ from tempfile import TemporaryDirectory
 from typing import Any, Iterator
 from unittest.mock import Mock, call, patch
 
+import core.file_organization as organization
 import core.filesystem_roots as filesystem_roots_module
+import core.organize_access as organize_native
 import tools.filesystem as filesystem_module
+from core.brain import MariaBrain
 from core.config import MariaConfig
 from core.constants import (
+    APP_VERSION,
     DEFAULT_TEXT_READ_LIMIT_BYTES,
     PROJECT_ROOT,
     REPOSITORY_ROOT,
@@ -28,17 +32,32 @@ from core.filesystem_roots import (
     FilesystemRoots,
     RootPolicy,
 )
-from core.tool_manager import ToolExecutionResult
+from core.memory import Memory
+from core.permissions import PermissionManager
+from core.planner import Planner
+from core.session import MariaSession
+from core.tool_manager import ConfirmationBinding, ToolExecutionResult, ToolManager
 from tests.log_assertions import assert_log_omits
+from tests.organize_fakes import FakeVolume, fake_scandir
 from tools.filesystem import (
     CROSS_ROOT_MESSAGE,
+    DESTINATION_FOLDER_MISSING_MESSAGE,
+    MOVE_INTO_ITSELF_MESSAGE,
+    ORGANIZE_OFFER_FAILED_LOG,
+    ORGANIZE_REFUSED_RECORD,
+    ORGANIZE_UNEXPECTED_LOG,
     PATH_EXCLUDED_MESSAGE,
     PATH_NOT_TEXT_MESSAGE,
     PATH_OUTSIDE_ROOT_MESSAGE,
     PATH_READ_ONLY_ROOT_MESSAGE,
     PATH_REQUIRED_MESSAGE,
     UNCONTAINED_DISPLAY,
+    MOVE_FAILED_LOG,
+    MOVED_LOG_LINE,
+    RENAME_FAILED_LOG,
+    RENAMED_LOG_LINE,
     UNSPECIFIED_FAILURE_REASON,
+    WINDOWS_ONLY_LEGACY_MESSAGE,
     FilesystemTool,
     build_tool,
 )
@@ -208,7 +227,7 @@ class FilesystemToolTests(unittest.TestCase):
         self.assertEqual(self.tool.name, "filesystem")
         self.assertEqual(
             self.tool.actions,
-            frozenset({"read", "list", "rename", "move"}),
+            frozenset({"read", "list", "rename", "move", "organize"}),
         )
         self.assertIsInstance(factory_tool, FilesystemTool)
         self.assertEqual(factory_tool.roots, self.roots)
@@ -512,9 +531,10 @@ class FilesystemToolTests(unittest.TestCase):
         self.assertTrue(source.exists())
         self.assertFalse(destination.exists())
 
-    def test_move_file_succeeds_and_creates_missing_destination_parents(self) -> None:
+    def test_move_file_succeeds_into_an_existing_destination_parent(self) -> None:
         source = self.root / "source.txt"
         destination = self.root / "new" / "deep" / "destination.txt"
+        destination.parent.mkdir(parents=True)
         source.write_text("moved", encoding="utf-8")
 
         result = self.tool.execute(
@@ -536,6 +556,7 @@ class FilesystemToolTests(unittest.TestCase):
     def test_move_directory_succeeds(self) -> None:
         source = self.root / "source-directory"
         destination = self.root / "archive" / "destination-directory"
+        destination.parent.mkdir()
         source.mkdir()
         (source / "child.txt").write_text("child", encoding="utf-8")
 
@@ -624,14 +645,14 @@ class FilesystemToolTests(unittest.TestCase):
         )
         self.assertNotIn("read blocked", result.message)
 
-    def test_mocked_shutil_move_failure_does_not_report_success(self) -> None:
+    def test_mocked_rename_failure_in_a_move_does_not_report_success(self) -> None:
         source = self.root / "source.txt"
         destination = self.root / "destination.txt"
         source.write_text("source", encoding="utf-8")
 
         with patch.object(
-            filesystem_module.shutil,
-            "move",
+            filesystem_module.os,
+            "rename",
             side_effect=OSError("move blocked"),
         ):
             result = self.tool.execute(
@@ -657,8 +678,8 @@ class FilesystemToolTests(unittest.TestCase):
         cross_device_error = OSError(errno.EXDEV, "Invalid cross-device link")
 
         with patch.object(
-            filesystem_module.shutil,
-            "move",
+            filesystem_module.os,
+            "rename",
             side_effect=cross_device_error,
         ):
             result = self.tool.execute(
@@ -792,6 +813,7 @@ class FilesystemDisplayPathTests(unittest.TestCase):
         source = self.root / "inbox" / "Customer Order.txt"
         destination = self.root / "archive" / "processed" / "Customer Order.txt"
         source.parent.mkdir()
+        destination.parent.mkdir(parents=True)
         source.write_text("order", encoding="utf-8")
 
         result = self.tool.execute(
@@ -929,8 +951,8 @@ class FilesystemFailureSanitizationTests(unittest.TestCase):
                 {"source": "source.txt", "destination": "moved.txt"},
                 "Move failed",
                 lambda exc: patch.object(
-                    filesystem_module.shutil,
-                    "move",
+                    filesystem_module.os,
+                    "rename",
                     side_effect=exc,
                 ),
             ),
@@ -960,16 +982,18 @@ class FilesystemFailureSanitizationTests(unittest.TestCase):
         )
         self.assertNotIn(str(self.root_path), result.message)
 
-    def test_shutil_error_with_absolute_paths_uses_the_generic_fallback(self) -> None:
+    def test_an_oserror_with_absolute_paths_and_no_errno_uses_the_generic_fallback(
+        self,
+    ) -> None:
         destination = self.root / "nested" / "destination.txt"
-        failure = shutil.Error(
+        destination.parent.mkdir()
+        failure = OSError(
             f"Cannot move a directory '{self.source.resolve()}' "
             f"into itself '{destination.resolve()}'."
         )
-        self.assertIsInstance(failure, OSError)
         self.assertIsNone(failure.errno)
 
-        with patch.object(filesystem_module.shutil, "move", side_effect=failure):
+        with patch.object(filesystem_module.os, "rename", side_effect=failure):
             result = self.tool.execute(
                 "move",
                 {"source": "source.txt", "destination": "nested/destination.txt"},
@@ -1022,7 +1046,7 @@ class FilesystemFailureSanitizationTests(unittest.TestCase):
         self.assertEqual(str(required.exception), PATH_REQUIRED_MESSAGE)
         self.assertEqual(str(outside.exception), PATH_OUTSIDE_ROOT_MESSAGE)
 
-    def test_temporary_log_keeps_diagnostics_the_response_no_longer_shows(self) -> None:
+    def test_temporary_log_of_a_failed_move_holds_only_a_fixed_line(self) -> None:
         log_directory = self.temporary_path / "logs"
         log_directory.mkdir()
         log_file = log_directory / "maria-test.log"
@@ -1041,7 +1065,7 @@ class FilesystemFailureSanitizationTests(unittest.TestCase):
         )
         error = self._poisoned_error()
 
-        with patch.object(filesystem_module.shutil, "move", side_effect=error):
+        with patch.object(filesystem_module.os, "rename", side_effect=error):
             result = tool.execute(
                 "move",
                 {"source": "source.txt", "destination": "destination.txt"},
@@ -1055,11 +1079,28 @@ class FilesystemFailureSanitizationTests(unittest.TestCase):
             f"Move failed: {os.strerror(errno.EACCES)}",
         )
         self.assertNotIn(str(self.root_path), result.message)
-        self.assertIn(str(self.root_path), logged)
-        # OSError renders filenames through repr(), so the log holds the
-        # escaped form of each absolute path.
-        self.assertIn(repr(error.filename), logged)
-        self.assertIn(repr(error.filename2), logged)
+        # V1-25-R1 (D5-B): a move logs the exception type and its numbers,
+        # never a path, a name, or the exception's own text.
+        self.assertEqual(
+            logged.splitlines(),
+            [
+                f"WARNING | Move failed: {type(error).__name__} "
+                f"errno={errno.EACCES} winerror=None"
+            ],
+        )
+        assert_log_omits(
+            self,
+            log_file,
+            (
+                str(self.root_path),
+                self.root_path.as_posix(),
+                error.strerror,
+                error.filename,
+                error.filename2,
+                repr(error.filename),
+                repr(error.filename2),
+            ),
+        )
 
 
 class FilesystemListLoggingTests(unittest.TestCase):
@@ -1067,10 +1108,10 @@ class FilesystemListLoggingTests(unittest.TestCase):
 
     A reasoning model may propose ``filesystem.list``, so its operational log
     lines name neither the resolved directory, the submitted path, nor an
-    exception's text. ``read``, ``rename``, and ``move`` are not model
-    eligible and deliberately keep their path-bearing lines. That
-    deterministic exception is pinned here too, so neither rule can drift
-    into the other unnoticed.
+    exception's text. ``read`` is not model eligible and deliberately keeps
+    its path-bearing line, while ``rename`` and ``move`` log fixed text under
+    V1-25-R1 (D5-B). Both rules are pinned here, so neither can drift into the
+    other unnoticed.
     """
 
     def setUp(self) -> None:
@@ -1326,15 +1367,16 @@ class FilesystemListLoggingTests(unittest.TestCase):
             ),
         )
 
-    def test_read_rename_and_move_keep_their_path_bearing_log_lines(self) -> None:
-        # The deliberate deterministic exception: none of these actions is
-        # model eligible, so each keeps the log line it had before listing
-        # lost its path, resolved path and exception included.
+    def test_read_keeps_its_path_bearing_log_lines_while_rename_and_move_log_fixed_text(
+        self,
+    ) -> None:
+        # ``read`` is not model eligible and keeps the line it always had
+        # (its path logging is outside V1-25-R1 and is flagged for V1-29).
+        # Under V1-25-R1 (D5-B) ``rename`` and ``move`` log fixed text only.
         source = self.directory / "source.txt"
         source.write_text("source", encoding="utf-8")
         resolved_source = source.resolve()
-        renamed = (self.directory / "renamed.txt").resolve()
-        moved = (self.directory / "nested" / "moved.txt").resolve()
+        (self.directory / "nested").mkdir()
         inside = LIST_DIRECTORY_SENTINEL
 
         read = self.tool.execute("read", {"path": f"{inside}/source.txt"})
@@ -1360,11 +1402,14 @@ class FilesystemListLoggingTests(unittest.TestCase):
             self.logger.method_calls,
             [
                 call.info("Read file: %s", resolved_source),
-                call.info("Renamed %s to %s", resolved_source, renamed),
-                call.info("Moved %s to %s", renamed, moved),
+                call.info(RENAMED_LOG_LINE),
+                call.info(MOVED_LOG_LINE),
             ],
         )
         self.assertIn(LIST_DIRECTORY_SENTINEL, self._logged())
+        mutation_lines = " ".join(str(entry) for entry in self.logger.method_calls[1:])
+        self.assertNotIn(LIST_DIRECTORY_SENTINEL, mutation_lines)
+        self.assertNotIn(str(self.root_path), mutation_lines)
 
         error = self._sentinel_error()
         moved_argument = f"{inside}/nested/moved.txt"
@@ -1376,21 +1421,25 @@ class FilesystemListLoggingTests(unittest.TestCase):
                 "rename",
                 {"source": moved_argument, "destination": f"{inside}/again.txt"},
             )
-        with patch.object(filesystem_module.shutil, "move", side_effect=error):
+        with patch.object(filesystem_module.os, "rename", side_effect=error):
             self.tool.execute(
                 "move",
                 {"source": moved_argument, "destination": f"{inside}/again.txt"},
             )
 
+        signature = f"{type(error).__name__} errno={errno.EACCES} winerror=None"
         self.assertEqual(
             self.logger.method_calls,
             [
                 call.warning("File read failed: %s", error),
-                call.warning("Rename failed: %s", error),
-                call.warning("Move failed: %s", error),
+                call.warning(RENAME_FAILED_LOG, signature),
+                call.warning(MOVE_FAILED_LOG, signature),
             ],
         )
         self.assertIn(LIST_ERROR_SENTINEL, self._logged())
+        failure_lines = " ".join(str(entry) for entry in self.logger.method_calls[1:])
+        self.assertNotIn(LIST_ERROR_SENTINEL, failure_lines)
+        self.assertNotIn(str(self.root_path), failure_lines)
 
 
 class FilesystemRootPolicyTests(unittest.TestCase):
@@ -1584,12 +1633,24 @@ class FilesystemRootPolicyTests(unittest.TestCase):
                 self.assertNotIn("workspace", result.message)
                 self.assertNotIn("second_workspace", result.message)
 
-    def test_a_move_still_creates_a_missing_destination_parent_inside_one_root(
+    def test_a_move_no_longer_creates_a_missing_destination_parent_inside_one_root(
         self,
     ) -> None:
+        # V1-25-R1 (D5-B): a move needs an existing destination parent, and
+        # creates nothing on its way, so a failure cannot leave one behind.
         source = self.workspace / "note.txt"
         source.write_text("organize", encoding="utf-8")
 
+        refused = self.tool.execute(
+            "move",
+            {"source": "note.txt", "destination": "archive/2026/note.txt"},
+        )
+        self.assertFalse(refused.success)
+        self.assertEqual(refused.message, DESTINATION_FOLDER_MISSING_MESSAGE)
+        self.assertTrue(source.is_file())
+        self.assertFalse((self.workspace / "archive" / "2026").exists())
+
+        (self.workspace / "archive" / "2026").mkdir(parents=True)
         result = self.tool.execute(
             "move",
             {"source": "note.txt", "destination": "archive/2026/note.txt"},
@@ -2683,6 +2744,7 @@ class FilesystemProtectedMutationTests(unittest.TestCase):
             "ordinary",
         )
 
+        (self.workspace / "archive").mkdir(exist_ok=True)
         moved = self.tool.execute(
             "move",
             {"source": "renamed", "destination": "archive/renamed"},
@@ -3153,3 +3215,1091 @@ class FilesystemSidecarDescendantTests(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+class FilesystemLegacyMutationTests(unittest.TestCase):
+    """V1-25-R1 (D5-B): ``rename`` and ``move`` never copy, create, or log paths.
+
+    ``move`` used to call ``shutil.move``, which, when a rename failed for any
+    reason, copied the source and then deleted it. It also created missing
+    destination parents and logged both absolute paths. These regressions pin
+    the replacement: ``os.rename`` only, an existing destination parent, a
+    folder never moved into itself, Windows only, and fixed log lines.
+    """
+
+    def setUp(self) -> None:
+        self.temporary_directory = TemporaryDirectory()
+        self.addCleanup(self.temporary_directory.cleanup)
+        self.temporary_path = Path(self.temporary_directory.name)
+        self.root = self.temporary_path / "safe root"
+        self.root.mkdir()
+        self.root_path = self.root.resolve()
+        self.roots = organizing_roots(self.root)
+        self.protections = unreachable_protections(self.root)
+        self.logger = Mock(spec=logging.Logger)
+        self.tool = FilesystemTool(self.roots, self.protections, logger=self.logger)
+
+    def snapshot(self) -> dict[str, object]:
+        """Return every path under the root with its bytes, for exact comparison."""
+        found: dict[str, object] = {}
+        for path in sorted(self.root.rglob("*")):
+            relative = path.relative_to(self.root).as_posix()
+            found[relative] = "directory" if path.is_dir() else path.read_bytes()
+        return found
+
+    def test_the_tool_module_no_longer_imports_shutil(self) -> None:
+        self.assertFalse(hasattr(filesystem_module, "shutil"))
+
+    def test_a_failed_file_move_leaves_the_source_and_creates_nothing(self) -> None:
+        (self.root / "source.txt").write_text("payload", encoding="utf-8")
+        (self.root / "target").mkdir()
+        before = self.snapshot()
+
+        with patch.object(
+            filesystem_module.os,
+            "rename",
+            side_effect=PermissionError(errno.EACCES, "denied"),
+        ):
+            result = self.tool.execute(
+                "move",
+                {"source": "source.txt", "destination": "target/source.txt"},
+            )
+
+        self.assertEqual(
+            result,
+            ToolExecutionResult(False, f"Move failed: {os.strerror(errno.EACCES)}"),
+        )
+        self.assertEqual(self.snapshot(), before)
+
+    def test_a_failed_directory_move_leaves_no_copy_and_deletes_nothing(self) -> None:
+        source = self.root / "folder"
+        source.mkdir()
+        (source / "child.txt").write_text("child", encoding="utf-8")
+        (self.root / "target").mkdir()
+        before = self.snapshot()
+
+        with patch.object(
+            filesystem_module.os,
+            "rename",
+            side_effect=OSError(errno.EXDEV, "cross-device"),
+        ):
+            result = self.tool.execute(
+                "move",
+                {"source": "folder", "destination": "target/folder"},
+            )
+
+        self.assertFalse(result.success)
+        self.assertEqual(self.snapshot(), before)
+
+    def test_move_calls_os_rename_once_with_both_resolved_paths(self) -> None:
+        (self.root / "source.txt").write_text("payload", encoding="utf-8")
+        (self.root / "target").mkdir()
+
+        with patch.object(filesystem_module.os, "rename") as renamed:
+            self.tool.execute(
+                "move",
+                {"source": "source.txt", "destination": "target/source.txt"},
+            )
+
+        renamed.assert_called_once()
+
+    def test_a_missing_destination_parent_is_refused_and_nothing_is_created(self) -> None:
+        (self.root / "source.txt").write_text("payload", encoding="utf-8")
+        before = self.snapshot()
+
+        result = self.tool.execute(
+            "move",
+            {"source": "source.txt", "destination": "new/deep/source.txt"},
+        )
+
+        self.assertEqual(
+            result,
+            ToolExecutionResult(False, DESTINATION_FOLDER_MISSING_MESSAGE),
+        )
+        self.assertEqual(self.snapshot(), before)
+
+    def test_a_folder_is_never_moved_or_renamed_into_itself(self) -> None:
+        source = self.root / "folder"
+        (source / "inner").mkdir(parents=True)
+        before = self.snapshot()
+        cases = (
+            ("move", "folder/inner/folder"),
+            ("move", "folder/new"),
+            ("rename", "folder/inner/renamed"),
+            ("move", "FOLDER/inner/other"),
+        )
+
+        for action, destination in cases:
+            with self.subTest(action=action, destination=destination):
+                with patch.object(filesystem_module.os, "rename") as renamed:
+                    result = self.tool.execute(
+                        action,
+                        {"source": "folder", "destination": destination},
+                    )
+                self.assertEqual(
+                    result,
+                    ToolExecutionResult(False, MOVE_INTO_ITSELF_MESSAGE),
+                )
+                renamed.assert_not_called()
+                self.assertEqual(self.snapshot(), before)
+
+    def test_a_file_whose_name_is_a_prefix_of_a_sibling_is_not_inside_itself(self) -> None:
+        (self.root / "dir").mkdir()
+        (self.root / "dir2").mkdir()
+
+        result = self.tool.execute(
+            "move",
+            {"source": "dir", "destination": "dir2/dir"},
+        )
+
+        self.assertTrue(result.success)
+        self.assertTrue((self.root / "dir2" / "dir").is_dir())
+
+    def test_both_commands_refuse_before_any_change_off_windows(self) -> None:
+        (self.root / "source.txt").write_text("payload", encoding="utf-8")
+        (self.root / "target").mkdir()
+        before = self.snapshot()
+
+        with patch.object(filesystem_module, "_is_windows", return_value=False):
+            with patch.object(filesystem_module.os, "rename") as renamed:
+                moved = self.tool.execute(
+                    "move",
+                    {"source": "source.txt", "destination": "target/source.txt"},
+                )
+                renamed_result = self.tool.execute(
+                    "rename",
+                    {"source": "source.txt", "destination": "other.txt"},
+                )
+
+        expected = ToolExecutionResult(False, WINDOWS_ONLY_LEGACY_MESSAGE)
+        self.assertEqual(moved, expected)
+        self.assertEqual(renamed_result, expected)
+        renamed.assert_not_called()
+        self.assertEqual(self.snapshot(), before)
+
+    def test_rename_and_move_log_fixed_lines_with_no_name_or_path(self) -> None:
+        sentinel = "legacy-log-sentinel-7c41e9"
+        (self.root / f"{sentinel}.txt").write_text("payload", encoding="utf-8")
+        (self.root / sentinel).mkdir()
+
+        renamed = self.tool.execute(
+            "rename",
+            {"source": f"{sentinel}.txt", "destination": f"{sentinel}-b.txt"},
+        )
+        moved = self.tool.execute(
+            "move",
+            {"source": f"{sentinel}-b.txt", "destination": f"{sentinel}/{sentinel}.txt"},
+        )
+        refused = self.tool.execute(
+            "rename",
+            {"source": f"../{sentinel}.txt", "destination": "x.txt"},
+        )
+        missing = self.tool.execute(
+            "move",
+            {"source": f"{sentinel}-missing.txt", "destination": f"{sentinel}/x.txt"},
+        )
+
+        self.assertTrue(renamed.success)
+        self.assertTrue(moved.success)
+        self.assertFalse(refused.success)
+        self.assertFalse(missing.success)
+        self.assertEqual(
+            self.logger.method_calls,
+            [
+                call.info(RENAMED_LOG_LINE),
+                call.info(MOVED_LOG_LINE),
+                call.warning(RENAME_FAILED_LOG, PATH_OUTSIDE_ROOT_MESSAGE),
+            ],
+        )
+        logged = " ".join(str(entry) for entry in self.logger.method_calls)
+        self.assertNotIn(sentinel, logged)
+        self.assertNotIn(str(self.root_path), logged)
+
+    def test_the_owner_still_sees_the_relative_paths_after_a_move(self) -> None:
+        (self.root / "a").mkdir()
+        (self.root / "b").mkdir()
+        (self.root / "a" / "f.txt").write_text("x", encoding="utf-8")
+
+        result = self.tool.execute(
+            "move",
+            {"source": "a/f.txt", "destination": "b/f.txt"},
+        )
+
+        self.assertEqual(result.message, "Moved a/f.txt to b/f.txt.")
+
+
+def real_organize_unavailable(path: Path) -> str | None:
+    """Return why real organization cannot run on a folder, or None when it can.
+
+    A real call is made only on the temporary folder a test created: the folder
+    is opened and its file system name read, exactly as the offer does.
+    """
+    access = organize_native.load_access()
+    if access is None:
+        return "Organizing folders needs 64-bit Windows."
+    try:
+        handle = access.create_file(
+            str(path),
+            organize_native.ROOT_ACCESS,
+            organize_native.OPEN_DIRECTORY_SHARE,
+            organize_native.ROOT_OPEN_FLAGS,
+        )
+    except organize_native.AccessError:
+        return "The temporary folder could not be opened."
+    try:
+        name = access.filesystem_name(handle)
+    except organize_native.AccessError:
+        name = ""
+    finally:
+        access.close_handle(handle)
+    return None if name == "NTFS" else "The temporary folder is not on NTFS."
+
+
+class OrganizeToolCase(unittest.TestCase):
+    """A temporary workspace holding a folder of mixed files, and a real tool."""
+
+    SENTINEL = "organize-log-sentinel-5b2d90"
+
+    def setUp(self) -> None:
+        organize_native._PENDING_LATCH = False
+        self.addCleanup(setattr, organize_native, "_PENDING_LATCH", False)
+        self.temporary_directory = TemporaryDirectory()
+        self.addCleanup(self.temporary_directory.cleanup)
+        self.temporary_path = Path(self.temporary_directory.name)
+        self.root = self.temporary_path / "safe root"
+        self.root.mkdir()
+        self.root_path = self.root.resolve()
+        self.inbox = self.root / "inbox"
+        self.inbox.mkdir()
+        for name in ("a.pdf", "b.png", "c.txt", "d.exe", "notes"):
+            (self.inbox / name).write_text(f"content of {name}", encoding="utf-8")
+        self.roots = organizing_roots(self.root)
+        self.protections = unreachable_protections(self.root)
+        self.logger = Mock(spec=logging.Logger)
+
+    def tool_for(self, **options: Any) -> FilesystemTool:
+        return FilesystemTool(
+            self.roots,
+            self.protections,
+            logger=self.logger,
+            **options,
+        )
+
+    def snapshot(self) -> dict[str, object]:
+        """Return every path under the root with its bytes, for exact comparison."""
+        found: dict[str, object] = {}
+        for path in sorted(self.root.rglob("*")):
+            relative = path.relative_to(self.root).as_posix()
+            found[relative] = "directory" if path.is_dir() else path.read_bytes()
+        return found
+
+
+class FilesystemOrganizeToolTests(OrganizeToolCase):
+    """The organize action end to end on a real temporary NTFS folder."""
+
+    def setUp(self) -> None:
+        super().setUp()
+        unavailable = real_organize_unavailable(self.root)
+        if unavailable is not None:
+            self.skipTest(unavailable)
+        self.tool = self.tool_for()
+
+    def bind(self, folder: str = "inbox") -> ConfirmationBinding:
+        binding = self.tool.confirmation_binding("organize", {"folder": folder})
+        self.assertIsInstance(binding, ConfirmationBinding)
+        return binding
+
+    def approved(self, binding: ConfirmationBinding, folder: str = "inbox") -> dict[str, Any]:
+        """The arguments of the plan the owner approves: the step plus its pins."""
+        return {"folder": folder, **binding.arguments}
+
+    def test_the_binding_pins_every_eligible_file_and_changes_nothing(self) -> None:
+        before = self.snapshot()
+
+        binding = self.bind()
+
+        self.assertEqual(self.snapshot(), before)
+        arguments = dict(binding.arguments)
+        identities = {key: arguments.pop(key) for key in list(arguments) if key.startswith("identity_")}
+        self.assertEqual(
+            arguments,
+            {
+                "source_1": "inbox/a.pdf",
+                "destination_1": "inbox/Documents/a.pdf",
+                "create_1": "inbox/Documents",
+                "source_2": "inbox/b.png",
+                "destination_2": "inbox/Images/b.png",
+                "create_2": "inbox/Images",
+                "source_3": "inbox/c.txt",
+                "destination_3": "inbox/Documents/c.txt",
+                "create_3": "inbox/Documents",
+            },
+        )
+        self.assertEqual(sorted(identities), ["identity_1", "identity_2", "identity_3"])
+        for identity in identities.values():
+            self.assertRegex(identity, "^[0-9a-f]{64}$")
+        self.assertIn('1. "inbox/a.pdf" -> "inbox/Documents/a.pdf"', binding.preview)
+        self.assertIn('2. "inbox/b.png" -> "inbox/Images/b.png"', binding.preview)
+        self.assertNotIn("d.exe", binding.preview)
+        self.assertNotIn("notes", binding.preview)
+
+    def test_approving_the_bound_plan_makes_exactly_the_previewed_moves(self) -> None:
+        binding = self.bind()
+        before = self.snapshot()
+
+        result = self.tool.execute("organize", self.approved(binding))
+
+        self.assertTrue(result.success)
+        self.assertIn("All 3 planned moves completed.", result.message)
+        expected = {
+            key: value
+            for key, value in before.items()
+            if key not in {"inbox/a.pdf", "inbox/b.png", "inbox/c.txt"}
+        }
+        expected["inbox/Documents"] = "directory"
+        expected["inbox/Images"] = "directory"
+        expected["inbox/Documents/a.pdf"] = before["inbox/a.pdf"]
+        expected["inbox/Documents/c.txt"] = before["inbox/c.txt"]
+        expected["inbox/Images/b.png"] = before["inbox/b.png"]
+        self.assertEqual(self.snapshot(), expected)
+
+    def test_the_recorded_message_is_counts_only_and_the_display_is_not(self) -> None:
+        binding = self.bind()
+
+        result = self.tool.execute("organize", self.approved(binding))
+
+        self.assertEqual(
+            result.recorded_message,
+            "Organize folder: 3 planned; 3 moved, 0 reported but unconfirmed, "
+            "0 not moved after an attempt, 0 outcome unknown, 0 refused before "
+            "an attempt, 0 not attempted; folders: 2 created, 0 unconfirmed; "
+            "warnings: 0.",
+        )
+        self.assertIn('"inbox/a.pdf"', result.message)
+        for name in ("a.pdf", "b.png", "c.txt", "inbox", "Documents", "Images"):
+            self.assertNotIn(name, result.recorded_message)
+
+    def test_a_step_with_no_bound_moves_runs_nothing(self) -> None:
+        before = self.snapshot()
+
+        result = self.tool.execute("organize", {"folder": "inbox"})
+
+        self.assertEqual(
+            result,
+            ToolExecutionResult(
+                False,
+                organization.REFUSAL_TEXTS["NOTHING"],
+                None,
+                ORGANIZE_REFUSED_RECORD,
+            ),
+        )
+        self.assertEqual(self.snapshot(), before)
+
+    def test_a_file_added_after_the_offer_is_never_moved(self) -> None:
+        binding = self.bind()
+        (self.inbox / "late.pdf").write_text("late", encoding="utf-8")
+
+        result = self.tool.execute("organize", self.approved(binding))
+
+        self.assertTrue(result.success)
+        self.assertTrue((self.inbox / "late.pdf").is_file())
+        self.assertFalse((self.inbox / "Documents" / "late.pdf").exists())
+
+    def test_a_pinned_file_replaced_after_the_offer_refuses_the_whole_batch(self) -> None:
+        binding = self.bind()
+        (self.inbox / "a.pdf").unlink()
+        (self.inbox / "a.pdf").write_text("a different and longer file", encoding="utf-8")
+        before = self.snapshot()
+
+        result = self.tool.execute("organize", self.approved(binding))
+
+        self.assertFalse(result.success)
+        self.assertIn("move 1 cannot run", result.message)
+        self.assertEqual(self.snapshot(), before)
+        self.assertFalse((self.inbox / "Documents").exists())
+
+    def test_a_pinned_file_moved_out_of_the_root_is_refused_and_nothing_else_moves(self) -> None:
+        binding = self.bind()
+        (self.inbox / "b.png").rename(self.temporary_path / "outside.png")
+        before = self.snapshot()
+
+        result = self.tool.execute("organize", self.approved(binding))
+
+        self.assertFalse(result.success)
+        self.assertIn("move 2 cannot run", result.message)
+        self.assertEqual(self.snapshot(), before)
+
+    def test_a_category_folder_that_vanished_is_not_created_unapproved(self) -> None:
+        (self.inbox / "Documents").mkdir()
+        binding = self.bind()
+        self.assertNotIn("create_1", binding.arguments)
+        (self.inbox / "Documents").rmdir()
+        before = self.snapshot()
+
+        result = self.tool.execute("organize", self.approved(binding))
+
+        self.assertFalse(result.success)
+        self.assertIn("move 1 cannot run", result.message)
+        self.assertEqual(self.snapshot(), before)
+
+    def test_a_tampered_or_incomplete_pin_list_runs_nothing(self) -> None:
+        binding = self.bind()
+        good = self.approved(binding)
+        folded = dict(good, destination_1="inbox/Images/a.pdf")
+        cases = {
+            "wrong category": folded,
+            "wrong create": dict(good, create_1="inbox/Documents/"),
+            "create without triple": {**good, "create_4": "inbox/Documents"},
+            "missing identity": {k: v for k, v in good.items() if k != "identity_1"},
+            "gap": {k: v for k, v in good.items() if not k.endswith("_2")},
+            "unknown key": dict(good, extra_1="x"),
+            "bad digest": dict(good, identity_1=good["identity_1"] + chr(10)),
+            "foreign source": dict(good, source_1="other/a.pdf"),
+            "non text": dict(good, source_1=5),
+        }
+        before = self.snapshot()
+
+        for label, arguments in cases.items():
+            with self.subTest(label):
+                result = self.tool.execute("organize", arguments)
+                self.assertFalse(result.success)
+                self.assertEqual(self.snapshot(), before)
+                self.assertEqual(result.recorded_message, ORGANIZE_REFUSED_RECORD)
+
+    def test_the_folder_must_be_a_directory_inside_an_organizing_root(self) -> None:
+        cases = (
+            ("../elsewhere", PATH_OUTSIDE_ROOT_MESSAGE),
+            ("   ", PATH_REQUIRED_MESSAGE),
+        )
+        for folder, reason in cases:
+            with self.subTest(folder=folder):
+                binding = self.tool.confirmation_binding("organize", {"folder": folder})
+                self.assertEqual(dict(binding.arguments), {})
+                self.assertIn(reason, binding.preview)
+                self.assertIn("Approving changes nothing.", binding.preview)
+                result = self.tool.execute("organize", {"folder": folder})
+                self.assertFalse(result.success)
+                self.assertIn(reason, result.message)
+                self.assertEqual(result.recorded_message, ORGANIZE_REFUSED_RECORD)
+
+        not_a_folder = self.tool.confirmation_binding("organize", {"folder": "inbox/a.pdf"})
+        self.assertIn('Not a directory: "inbox/a.pdf"', not_a_folder.preview)
+        result = self.tool.execute("organize", {"folder": "inbox/a.pdf"})
+        self.assertEqual(result.message, 'Not a directory: "inbox/a.pdf"')
+
+    def test_a_read_only_root_cannot_be_organized(self) -> None:
+        read_only = FilesystemRoots(
+            (
+                FilesystemRoot(
+                    name="workspace",
+                    path=self.root,
+                    policy=RootPolicy.READ_ONLY,
+                    enabled=True,
+                ),
+            ),
+            "workspace",
+        )
+        tool = FilesystemTool(read_only, self.protections, logger=self.logger)
+        before = self.snapshot()
+
+        binding = tool.confirmation_binding("organize", {"folder": "inbox"})
+        result = tool.execute("organize", {"folder": "inbox"})
+
+        self.assertEqual(dict(binding.arguments), {})
+        self.assertIn(PATH_READ_ONLY_ROOT_MESSAGE, binding.preview)
+        self.assertFalse(result.success)
+        self.assertIn(PATH_READ_ONLY_ROOT_MESSAGE, result.message)
+        self.assertEqual(self.snapshot(), before)
+
+    def test_a_protected_folder_is_refused_at_the_offer_and_at_execution(self) -> None:
+        protections = FilesystemProtections(
+            database_path=self.temporary_path / "maria-runtime" / "database" / "maria.db",
+            log_dir=self.inbox,
+            prompt_path=self.temporary_path / "maria-runtime" / "prompts" / "p.txt",
+        )
+        tool = FilesystemTool(self.roots, protections, logger=self.logger)
+        before = self.snapshot()
+
+        binding = tool.confirmation_binding("organize", {"folder": "inbox"})
+        result = tool.execute("organize", {"folder": "inbox"})
+
+        self.assertEqual(dict(binding.arguments), {})
+        self.assertIn(PATH_EXCLUDED_MESSAGE, binding.preview)
+        self.assertFalse(result.success)
+        self.assertIn(PATH_EXCLUDED_MESSAGE, result.message)
+        self.assertEqual(self.snapshot(), before)
+
+    def test_a_protected_location_below_the_folder_stops_the_offer_and_a_forged_pin(
+        self,
+    ) -> None:
+        # The mutation check refuses a path that contains an active runtime
+        # location, and organization asks it of every prefix of every path, so
+        # a protected Documents folder inside the folder refuses the plan.
+        forged = self.approved(self.bind())
+        protections = FilesystemProtections(
+            database_path=self.temporary_path / "maria-runtime" / "database" / "maria.db",
+            log_dir=self.inbox / "Documents",
+            prompt_path=self.temporary_path / "maria-runtime" / "prompts" / "p.txt",
+        )
+        tool = FilesystemTool(self.roots, protections, logger=self.logger)
+        before = self.snapshot()
+
+        binding = tool.confirmation_binding("organize", {"folder": "inbox"})
+        result = tool.execute("organize", forged)
+
+        self.assertEqual(dict(binding.arguments), {})
+        self.assertIn(PATH_EXCLUDED_MESSAGE, binding.preview)
+        self.assertFalse(result.success)
+        self.assertEqual(self.snapshot(), before)
+
+    def test_a_protected_location_beside_the_folder_is_caught_by_the_predicate_alone(
+        self,
+    ) -> None:
+        # The folder does not contain the protected location, so the folder's own
+        # gate passes it; only the predicate, asked of the root as a prefix, sees
+        # that the workspace holds an active runtime location.
+        binding = self.bind()
+        forged = self.approved(binding)
+        (self.root / "other").mkdir()
+        protections = FilesystemProtections(
+            database_path=self.temporary_path / "maria-runtime" / "database" / "maria.db",
+            log_dir=self.root / "other" / "logs",
+            prompt_path=self.temporary_path / "maria-runtime" / "prompts" / "p.txt",
+        )
+        tool = FilesystemTool(self.roots, protections, logger=self.logger)
+        before = self.snapshot()
+
+        offered = tool.confirmation_binding("organize", {"folder": "inbox"})
+        result = tool.execute("organize", forged)
+
+        self.assertEqual(dict(offered.arguments), {})
+        self.assertFalse(result.success)
+        self.assertEqual(self.snapshot(), before)
+
+    def test_deletion_and_writing_stay_unreachable_and_content_is_preserved(self) -> None:
+        binding = self.bind()
+        before = self.snapshot()
+
+        self.tool.execute("organize", self.approved(binding))
+
+        after = self.snapshot()
+        files_before = sorted(value for value in before.values() if value != "directory")
+        files_after = sorted(value for value in after.values() if value != "directory")
+        self.assertEqual(files_after, files_before)
+        self.assertEqual(
+            sum(1 for value in after.values() if value == "directory"),
+            sum(1 for value in before.values() if value == "directory") + 2,
+        )
+        for action in ("delete", "write", "copy"):
+            self.assertNotIn(action, self.tool.actions)
+
+    def test_nothing_eligible_pins_nothing_and_says_so(self) -> None:
+        empty = self.root / "empty"
+        empty.mkdir()
+        (empty / "x.exe").write_text("x", encoding="utf-8")
+
+        binding = self.tool.confirmation_binding("organize", {"folder": "empty"})
+
+        self.assertEqual(dict(binding.arguments), {})
+        self.assertIn("approving changes nothing", binding.preview)
+
+    def test_more_than_five_eligible_files_are_offered_five_at_a_time(self) -> None:
+        for index in range(7):
+            (self.inbox / f"n{index}.md").write_text("x", encoding="utf-8")
+        first = self.bind()
+        self.assertEqual(
+            len([key for key in first.arguments if key.startswith("source_")]), 5
+        )
+        self.assertIn("more eligible files stay for a later request", first.preview)
+
+        self.tool.execute("organize", self.approved(first))
+        second = self.bind()
+
+        self.assertEqual(
+            len([key for key in second.arguments if key.startswith("source_")]), 5
+        )
+
+    def test_a_step_that_already_carries_pins_gets_nothing_added(self) -> None:
+        binding = self.tool.confirmation_binding(
+            "organize", {"folder": "inbox", "source_1": "inbox/a.pdf"}
+        )
+        self.assertEqual(binding, {})
+
+    def test_other_actions_bind_nothing(self) -> None:
+        for action in ("read", "list", "rename", "move"):
+            self.assertEqual(self.tool.confirmation_binding(action, {"path": "x"}), {})
+
+    def test_logs_hold_fixed_text_and_counts_only(self) -> None:
+        for name in (f"{self.SENTINEL}.pdf", f"{self.SENTINEL}.png"):
+            (self.inbox / name).write_text("x", encoding="utf-8")
+        binding = self.bind()
+        result = self.tool.execute("organize", self.approved(binding))
+        self.assertTrue(result.success)
+        self.tool.execute("organize", {"folder": "../" + self.SENTINEL})
+        self.tool.execute("organize", {"folder": "inbox"})
+
+        logged = " ".join(str(entry) for entry in self.logger.method_calls)
+        for forbidden in (self.SENTINEL, "inbox", "Documents", "a.pdf", str(self.root_path)):
+            self.assertNotIn(forbidden, logged)
+        self.assertIn("Organize run finished: moved=5", logged)
+
+    def test_an_interruption_logs_one_count_line_and_is_re_raised(self) -> None:
+        binding = self.bind()
+        partial = organization.BatchResult(
+            [organization.OperationOutcome("unknown")], interrupted=True
+        )
+        interruption = KeyboardInterrupt()
+        interruption.maria_partial = partial
+
+        with patch.object(filesystem_module.organization, "run_pinned", side_effect=interruption):
+            with self.assertRaises(KeyboardInterrupt):
+                self.tool.execute("organize", self.approved(binding))
+
+        self.logger.warning.assert_called_once_with(organization.count_line(partial))
+        logged = " ".join(str(entry) for entry in self.logger.method_calls)
+        self.assertNotIn("inbox", logged)
+
+    def test_an_interruption_without_a_partial_result_is_re_raised_without_a_log_line(self) -> None:
+        binding = self.bind()
+
+        with patch.object(filesystem_module.organization, "run_pinned", side_effect=SystemExit(2)):
+            with self.assertRaises(SystemExit):
+                self.tool.execute("organize", self.approved(binding))
+
+        self.logger.warning.assert_not_called()
+
+    def test_an_unexpected_failure_while_preparing_the_offer_is_contained(self) -> None:
+        with patch.object(
+            filesystem_module.organization,
+            "plan_offer",
+            side_effect=RuntimeError(f"leaks {self.root_path}"),
+        ):
+            binding = self.tool.confirmation_binding("organize", {"folder": "inbox"})
+
+        self.assertEqual(dict(binding.arguments), {})
+        self.assertIn(organization.REFUSAL_TEXTS["OFFER_FAILED"], binding.preview)
+        self.logger.warning.assert_called_once_with(ORGANIZE_OFFER_FAILED_LOG, "RuntimeError")
+        self.assertNotIn(str(self.root_path), str(self.logger.method_calls))
+
+    def test_a_pending_request_stops_organizing_at_the_offer_and_at_execution(self) -> None:
+        binding = self.bind()
+        organize_native.latch_pending()
+        before = self.snapshot()
+
+        after_latch = self.tool.confirmation_binding("organize", {"folder": "inbox"})
+        result = self.tool.execute("organize", self.approved(binding))
+
+        self.assertEqual(dict(after_latch.arguments), {})
+        self.assertIn(organization.REFUSAL_TEXTS["STOPPED_AFTER_PENDING"], after_latch.preview)
+        self.assertFalse(result.success)
+        self.assertEqual(self.snapshot(), before)
+
+    def test_off_windows_the_offer_and_execution_refuse(self) -> None:
+        binding = self.bind()
+        tool = self.tool_for(access_loader=lambda: None)
+        before = self.snapshot()
+
+        offered = tool.confirmation_binding("organize", {"folder": "inbox"})
+        result = tool.execute("organize", self.approved(binding))
+
+        self.assertEqual(dict(offered.arguments), {})
+        self.assertIn(organization.REFUSAL_TEXTS["WINDOWS_ONLY"], offered.preview)
+        self.assertEqual(
+            result,
+            ToolExecutionResult(
+                False, organization.REFUSAL_TEXTS["WINDOWS_ONLY"], None, ORGANIZE_REFUSED_RECORD
+            ),
+        )
+        self.assertEqual(self.snapshot(), before)
+
+    def test_a_file_system_that_is_not_ntfs_refuses_the_offer_and_execution(self) -> None:
+        volume = FakeVolume(root_path=str(self.root_path))
+        volume.filesystem = "exFAT"
+        inbox = volume.mkdir(volume.root, "inbox")
+        volume.mkfile(inbox, "a.pdf")
+        tool = self.tool_for(access_loader=lambda: volume, scandir=fake_scandir(inbox))
+
+        offered = tool.confirmation_binding("organize", {"folder": "inbox"})
+        result = tool.execute("organize", self.approved(self.bind()))
+
+        self.assertEqual(dict(offered.arguments), {})
+        self.assertIn(organization.REFUSAL_TEXTS["FILESYSTEM_UNSUPPORTED"], offered.preview)
+        self.assertFalse(result.success)
+        self.assertEqual(volume.counts["rename"], 0)
+
+    def test_a_planned_folder_of_one_thousand_and_one_entries_is_refused(self) -> None:
+        volume = FakeVolume(root_path=str(self.root_path))
+        inbox = volume.mkdir(volume.root, "inbox")
+        volume.mkfile(inbox, "a.pdf")
+        scandir = fake_scandir(inbox, [f"n{index}.xyz" for index in range(1000)])
+        tool = self.tool_for(access_loader=lambda: volume, scandir=scandir)
+
+        offered = tool.confirmation_binding("organize", {"folder": "inbox"})
+
+        self.assertEqual(dict(offered.arguments), {})
+        self.assertIn(organization.REFUSAL_TEXTS["TOO_LARGE"], offered.preview)
+        self.assertEqual(scandir.listings[0].yielded, 1001)
+
+
+class FilesystemOrganizeFakeVolumeTests(OrganizeToolCase):
+    """The organize action through the tool, over an in-memory volume.
+
+    The volume can make a rename fail, report only a pending completion, or be
+    interrupted, none of which a real call can be made to do on demand.
+    """
+
+    def setUp(self) -> None:
+        super().setUp()
+        self.volume = FakeVolume(root_path=str(self.root_path))
+        self.fake_inbox = self.volume.mkdir(self.volume.root, "inbox")
+        self.fake_files = {
+            name: self.volume.mkfile(self.fake_inbox, name)
+            for name in ("a.pdf", "b.png", "c.txt")
+        }
+        self.tool = self.tool_for(
+            access_loader=lambda: self.volume,
+            scandir=fake_scandir(self.fake_inbox),
+        )
+
+    def bound(self) -> dict[str, Any]:
+        binding = self.tool.confirmation_binding("organize", {"folder": "inbox"})
+        self.assertTrue(binding.arguments)
+        return {"folder": "inbox", **binding.arguments}
+
+    def test_a_failed_move_is_reported_and_the_run_stops_with_nothing_undone(self) -> None:
+        arguments = self.bound()
+        self.volume.failures[("rename", 1)] = organize_native.AccessError(
+            "NtSetInformationFile", 0xC0000022, "nt"
+        )
+
+        result = self.tool.execute("organize", arguments)
+
+        self.assertFalse(result.success)
+        self.assertIn("Windows refused the move: Access is denied.", result.message)
+        self.assertIn("Nothing was undone.", result.message)
+        self.assertIn("1 not moved after an attempt", result.message)
+        self.assertIn("2 not attempted", result.message)
+        self.assertEqual(
+            result.recorded_message,
+            organization.recorded_response(
+                organization.BatchResult(
+                    [
+                        organization.OperationOutcome("not_moved", folder="created"),
+                        organization.OperationOutcome("not_attempted"),
+                        organization.OperationOutcome("not_attempted"),
+                    ]
+                )
+            ),
+        )
+
+    def test_a_pending_completion_is_unknown_latches_and_stops_the_next_request(self) -> None:
+        arguments = self.bound()
+        self.volume.pending_on_rename = True
+
+        result = self.tool.execute("organize", arguments)
+        again = self.tool.confirmation_binding("organize", {"folder": "inbox"})
+
+        self.assertFalse(result.success)
+        self.assertIn("cannot confirm what happened. Check both places.", result.message)
+        self.assertTrue(organize_native.pending_latched())
+        self.assertEqual(dict(again.arguments), {})
+        self.assertIn(organization.REFUSAL_TEXTS["STOPPED_AFTER_PENDING"], again.preview)
+
+    def test_an_interrupted_run_logs_counts_and_re_raises_with_every_handle_released(self) -> None:
+        arguments = self.bound()
+        self.volume.interrupt_on_rename = True
+
+        with self.assertRaises(KeyboardInterrupt):
+            self.tool.execute("organize", arguments)
+
+        self.assertEqual(self.volume.handles, {})
+        self.logger.warning.assert_called_once()
+        line = self.logger.warning.call_args.args[0]
+        self.assertTrue(line.startswith("Organize run interrupted: "))
+        self.assertIn("unknown=1", line)
+        self.assertNotIn("inbox", line)
+
+    def test_an_unexpected_failure_is_reported_with_fixed_text_and_logs_only_its_type(self) -> None:
+        arguments = self.bound()
+
+        with patch.object(
+            filesystem_module.organization,
+            "_open_source",
+            side_effect=RuntimeError(f"leaks {self.root_path}"),
+        ):
+            result = self.tool.execute("organize", arguments)
+
+        self.assertFalse(result.success)
+        self.assertIn(organization.REFUSAL_TEXTS["UNEXPECTED"], result.message)
+        self.assertNotIn(str(self.root_path), result.message)
+        self.logger.warning.assert_any_call(ORGANIZE_UNEXPECTED_LOG, "RuntimeError")
+        self.assertNotIn(str(self.root_path), str(self.logger.method_calls))
+        self.assertEqual(self.volume.handles, {})
+
+    def test_an_unexpected_exception_from_the_rename_call_is_reported_and_logs_only_its_type(self) -> None:
+        arguments = self.bound()
+        self.volume.failures[("rename", 1)] = RuntimeError(f"leaks {self.root_path}")
+
+        result = self.tool.execute("organize", arguments)
+
+        self.assertFalse(result.success)
+        self.assertIn("cannot confirm what happened. Check both places.", result.message)
+        self.assertIn("1 outcome unknown", result.message)
+        self.assertNotIn(str(self.root_path), result.message)
+        self.assertNotIn(str(self.root_path), result.recorded_message)
+        self.logger.warning.assert_any_call(ORGANIZE_UNEXPECTED_LOG, "RuntimeError")
+        self.assertNotIn(str(self.root_path), str(self.logger.method_calls))
+        self.assertEqual(self.volume.counts["rename"], 1)
+        self.assertEqual(self.volume.handles, {})
+
+    def test_a_release_failure_in_the_preflight_changes_nothing_and_is_reported_and_logged(self) -> None:
+        arguments = self.bound()
+        self.volume.close_fails.add(id(self.fake_files["a.pdf"]))
+        before = sorted(self.volume.listing(self.fake_inbox))
+
+        result = self.tool.execute("organize", arguments)
+
+        self.assertFalse(result.success)
+        self.assertEqual(self.volume.counts["rename"], 0)
+        self.assertEqual(sorted(self.volume.listing(self.fake_inbox)), before)
+        self.assertTrue(result.message.startswith("Nothing was changed."))
+        self.assertIn("could not release a file handle (while checking the moves)", result.message)
+        self.assertEqual(result.recorded_message, "Organize folder: refused before any change.")
+        line = self.logger.info.call_args.args[0]
+        self.assertTrue(line.startswith("Organize run finished: "))
+        self.assertTrue(line.endswith("warnings=1"))
+        self.assertEqual(self.volume.handles, {})
+
+    def test_a_second_name_is_a_warning_in_the_report_and_the_closing_line(self) -> None:
+        arguments = self.bound()
+        self.volume.hooks["rename"] = [
+            lambda volume, detail: setattr(self.fake_files["a.pdf"], "links", 2)
+        ]
+
+        result = self.tool.execute("organize", arguments)
+
+        self.assertFalse(result.success)
+        self.assertIn("also had another name", result.message)
+        self.assertIn("Nothing was undone.", result.message)
+        self.assertIn("warnings: 1.", result.recorded_message)
+
+    def test_the_protection_predicate_reaches_every_path_the_batch_names(self) -> None:
+        asked: list[str] = []
+        original = self.tool._organize_protected
+
+        def spy(path: str) -> bool:
+            asked.append(path)
+            return original(path)
+
+        arguments = self.bound()
+        with patch.object(self.tool, "_organize_protected", side_effect=spy):
+            self.tool.execute("organize", arguments)
+
+        root = str(self.root_path)
+        for expected in (
+            root,
+            root + os.sep + "inbox",
+            root + os.sep + "inbox" + os.sep + "a.pdf",
+            root + os.sep + "inbox" + os.sep + "Documents",
+            root + os.sep + "inbox" + os.sep + "Documents" + os.sep + "a.pdf",
+        ):
+            self.assertIn(expected, asked)
+
+
+class FilesystemOrganizeEndToEndTests(OrganizeToolCase):
+    """An organize request through the real session, Brain, tool, and database.
+
+    The request carries a folder name, so the typed request is the one place a
+    name legitimately appears: it is recorded as typed, while the recorded
+    response and the log hold counts and fixed text only.
+    """
+
+    FOLDER = "inbox-sentinel-3e8a1c"
+    FILES = ("report-sentinel-91f.pdf", "photo-sentinel-91f.png")
+
+    def setUp(self) -> None:
+        super().setUp()
+        unavailable = real_organize_unavailable(self.root)
+        if unavailable is not None:
+            self.skipTest(unavailable)
+        self.folder = self.root / self.FOLDER
+        self.folder.mkdir()
+        for name in self.FILES:
+            (self.folder / name).write_text(f"content of {name}", encoding="utf-8")
+        runtime = self.temporary_path / "maria-runtime"
+        self.database_path = runtime / "database" / "maria.db"
+        self.log_file = self.temporary_path / "end-to-end.log"
+        logger = logging.getLogger("maria-organize-end-to-end-test")
+        logger.setLevel(logging.DEBUG)
+        logger.propagate = False
+        handler = logging.FileHandler(self.log_file, encoding="utf-8")
+        handler.setFormatter(logging.Formatter("%(levelname)s | %(message)s"))
+        logger.addHandler(handler)
+        self.addCleanup(logger.removeHandler, handler)
+        self.addCleanup(handler.close)
+        config = MariaConfig(
+            app_name="Maria",
+            version=APP_VERSION,
+            environment="test",
+            database_path=self.database_path,
+            log_dir=runtime / "logs",
+            prompt_path=runtime / "prompts" / "system.txt",
+            filesystem_roots=self.roots,
+            filesystem_protections=FilesystemProtections(
+                database_path=self.database_path,
+                log_dir=runtime / "logs",
+                prompt_path=runtime / "prompts" / "system.txt",
+            ),
+            log_level="DEBUG",
+            confirmation_required=frozenset(),
+            denied_actions=frozenset(),
+        )
+        self.memory = Memory(self.database_path, logger=logger)
+        self.memory.initialize()
+        tool_manager = ToolManager(config=config, memory=self.memory, logger=logger)
+        tool_manager.load_tools()
+        # ``build_tool`` gives the tool its own module logger; the test reads
+        # one log, so the loaded tool logs through the same logger.
+        tool_manager._tools["filesystem"].logger = logger
+        self.brain = MariaBrain(
+            config=config,
+            planner=Planner(logger=logger),
+            memory=self.memory,
+            tool_manager=tool_manager,
+            permissions=PermissionManager(
+                confirmation_required=config.confirmation_required,
+                denied_actions=config.denied_actions,
+                logger=logger,
+            ),
+            logger=logger,
+        )
+        self.session = MariaSession(self.brain, logger=logger)
+        self.request = f"organize folder {self.FOLDER}"
+
+    def rows(self) -> tuple[tuple[str, str], ...]:
+        connection = sqlite3.connect(self.database_path)
+        try:
+            found = connection.execute(
+                "SELECT user_input, response FROM interactions ORDER BY id"
+            ).fetchall()
+        finally:
+            connection.close()
+        return tuple((row[0], row[1]) for row in found)
+
+    def logged(self) -> str:
+        return self.log_file.read_text(encoding="utf-8")
+
+    def test_the_approval_shows_the_notice_and_every_move_and_changes_nothing(self) -> None:
+        before = self.snapshot()
+
+        offered = self.session.submit(self.request)
+
+        self.assertTrue(offered.needs_confirmation)
+        self.assertIn("Maria moves only the files listed below", offered.text)
+        self.assertIn(
+            f'1. "{self.FOLDER}/{self.FILES[1]}" -> '
+            f'"{self.FOLDER}/Images/{self.FILES[1]}"',
+            offered.text,
+        )
+        self.assertIn(
+            f'2. "{self.FOLDER}/{self.FILES[0]}" -> '
+            f'"{self.FOLDER}/Documents/{self.FILES[0]}"',
+            offered.text,
+        )
+        self.assertEqual(self.snapshot(), before)
+        self.assertEqual(self.rows(), ())
+
+    def test_the_request_is_recorded_as_typed_and_the_response_as_counts_only(self) -> None:
+        self.session.submit(self.request)
+
+        done = self.session.confirm()
+
+        self.assertIn("All 2 planned moves completed.", done.text)
+        self.assertIn(f'"{self.FOLDER}/{self.FILES[0]}"', done.text)
+        ((typed, recorded),) = self.rows()
+        self.assertEqual(typed, self.request)
+        self.assertEqual(
+            recorded,
+            "Organize folder: 2 planned; 2 moved, 0 reported but unconfirmed, "
+            "0 not moved after an attempt, 0 outcome unknown, 0 refused before "
+            "an attempt, 0 not attempted; folders: 2 created, 0 unconfirmed; "
+            "warnings: 0.",
+        )
+        for sentinel in (self.FOLDER, *self.FILES, "Documents", "Images"):
+            self.assertNotIn(sentinel, recorded)
+        self.assertTrue((self.folder / "Documents" / self.FILES[0]).is_file())
+        self.assertTrue((self.folder / "Images" / self.FILES[1]).is_file())
+
+    def test_logs_never_hold_the_request_a_name_or_a_path(self) -> None:
+        self.session.submit(self.request)
+        self.session.confirm()
+
+        logged = self.logged()
+
+        for forbidden in (
+            self.FOLDER,
+            *self.FILES,
+            "Documents",
+            "Images",
+            str(self.root_path),
+            self.request,
+        ):
+            self.assertNotIn(forbidden, logged)
+        self.assertIn("Organize run finished: moved=2", logged)
+
+    def test_the_preview_and_the_report_are_displayed_but_never_recorded(self) -> None:
+        offered = self.session.submit(self.request)
+        done = self.session.confirm()
+
+        stored = " ".join(" ".join(row) for row in self.rows())
+
+        for shown in (offered.text, done.text):
+            self.assertIn(self.FILES[0], shown)
+        self.assertNotIn(self.FILES[0], stored)
+        self.assertEqual(len(self.rows()), 1)
+
+    def test_a_new_request_discards_the_pending_approval_and_nothing_runs(self) -> None:
+        self.session.submit(self.request)
+        self.session.submit("help")
+        before = self.snapshot()
+
+        refused = self.session.confirm()
+
+        self.assertFalse(refused.needs_confirmation)
+        self.assertEqual(self.snapshot(), before)
+
+    def test_cancelling_changes_nothing(self) -> None:
+        before = self.snapshot()
+        self.session.submit(self.request)
+
+        self.assertTrue(self.session.cancel())
+
+        self.assertEqual(self.snapshot(), before)
+
+    def test_a_file_added_after_the_offer_is_not_moved_when_the_owner_approves(self) -> None:
+        self.session.submit(self.request)
+        (self.folder / "late-sentinel.pdf").write_text("late", encoding="utf-8")
+
+        done = self.session.confirm()
+
+        self.assertIn("All 2 planned moves completed.", done.text)
+        self.assertTrue((self.folder / "late-sentinel.pdf").is_file())
+
+    def test_an_offer_that_could_not_be_prepared_runs_nothing_and_records_a_refusal(self) -> None:
+        before = self.snapshot()
+        with patch.object(
+            filesystem_module.organization,
+            "plan_offer",
+            side_effect=RuntimeError("offer failed"),
+        ):
+            offered = self.session.submit(self.request)
+        self.assertTrue(offered.needs_confirmation)
+        self.assertIn(organization.REFUSAL_TEXTS["OFFER_FAILED"], offered.text)
+
+        done = self.session.confirm()
+
+        self.assertEqual(self.snapshot(), before)
+        self.assertIn(organization.REFUSAL_TEXTS["NOTHING"], done.text)
+        ((typed, recorded),) = self.rows()
+        self.assertEqual(typed, self.request)
+        self.assertEqual(recorded, ORGANIZE_REFUSED_RECORD)

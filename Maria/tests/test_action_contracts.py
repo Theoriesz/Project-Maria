@@ -27,6 +27,7 @@ from core.action_contracts import (
     MAXIMUM_TASK_TEXT_LENGTH,
     MAXIMUM_TRANSCRIPT_LENGTH,
     MINIMUM_LIST_LIMIT,
+    ORGANIZE_OPERATION_LIMIT,
     REPEAT_VALUES,
     TASK_STATUSES,
     ActionContract,
@@ -38,6 +39,7 @@ from core.action_contracts import (
     RootClass,
     TextFormat,
 )
+from core import file_organization as organization
 from core.config import MariaConfig
 from core.filesystem_roots import (
     FilesystemProtections,
@@ -73,6 +75,7 @@ EXPECTED_ACTION_IDENTIFIERS = frozenset(
         "filesystem.list",
         "filesystem.rename",
         "filesystem.move",
+        "filesystem.organize",
         "history.list",
         "history.search",
         "history.read",
@@ -142,6 +145,14 @@ EXPECTED_PATH_FIELDS = frozenset(
         ("filesystem", "rename", "destination"),
         ("filesystem", "move", "source"),
         ("filesystem", "move", "destination"),
+        # V1-25-R1: the folder, and each of at most five pinned operations'
+        # source, destination, and approved folder creation.
+        ("filesystem", "organize", "folder"),
+    }
+    | {
+        ("filesystem", "organize", f"{kind}_{number}")
+        for number in range(1, 6)
+        for kind in ("source", "destination", "create")
     }
 )
 UNREGISTERED_ACTIONS = ("write", "delete")
@@ -480,8 +491,8 @@ class RegistryCompletenessTests(unittest.TestCase):
         # V1-20 added four saved-conversation and seven conversation-summary
         # actions to V1-18's twenty-nine, V1-22 eleven task and eleven
         # reminder actions, V1-23-R1 three delivery actions, and V1-24-R1
-        # thirteen project actions.
-        self.assertEqual(len(EXPECTED_ACTION_IDENTIFIERS), 78)
+        # thirteen project actions, and V1-25-R1 one organize action.
+        self.assertEqual(len(EXPECTED_ACTION_IDENTIFIERS), 79)
 
     def test_registry_and_loaded_tool_inventory_agree_in_both_directions(self) -> None:
         with TemporaryDirectory() as name:
@@ -519,7 +530,7 @@ class RegistryCompletenessTests(unittest.TestCase):
         ]
 
         self.assertEqual(len(identifiers), len(set(identifiers)))
-        self.assertEqual(len(identifiers), 78)
+        self.assertEqual(len(identifiers), 79)
 
     def test_no_contract_exists_for_a_mandatorily_denied_filesystem_action(
         self,
@@ -566,8 +577,10 @@ class RegistryCompletenessTests(unittest.TestCase):
         # reschedule, and the pinned identity). V1-24-R1 adds eight: a
         # project's name and location on create, the new name, a fact's text
         # on add and on edit, an edit's pinned digest, a listing's folder, and
-        # a read's path.
-        self.assertEqual(len(text_fields), 47)
+        # a read's path. V1-25-R1 adds twenty-one: the folder to organize, and
+        # for each of at most five operations a source, a destination, a
+        # creation, and a pinned identity.
+        self.assertEqual(len(text_fields), 68)
         for contract, argument in text_fields:
             with self.subTest(field=f"{contract.identifier}.{argument.name}"):
                 self.assertIsInstance(argument.allow_blank, bool)
@@ -637,6 +650,12 @@ class RegistryCompletenessTests(unittest.TestCase):
                 "projects.edit_fact.text_digest": FACT_DIGEST_LENGTH,
                 "projects.list_files.folder": MAXIMUM_PROJECT_PATH_LENGTH,
                 "projects.read_file.path": MAXIMUM_PROJECT_PATH_LENGTH,
+                # V1-25-R1: each pinned organization identity is exactly a
+                # SHA-256 of checked file metadata.
+                **{
+                    f"filesystem.organize.identity_{number}": FACT_DIGEST_LENGTH
+                    for number in range(1, 6)
+                },
             },
         )
         self.assertEqual(MAXIMUM_EXPRESSION_LENGTH, 200)
@@ -658,6 +677,10 @@ class RegistryCompletenessTests(unittest.TestCase):
                 "tasks.enable_context.text_digest",
                 "reminders.enable_context.text_digest",
                 "projects.edit_fact.text_digest",
+                *{
+                    f"filesystem.organize.identity_{number}"
+                    for number in range(1, 6)
+                },
             },
         )
         digest = BUILT_IN_ACTION_CONTRACTS.contract_for(
@@ -687,6 +710,90 @@ class RegistryCompletenessTests(unittest.TestCase):
                     argument.root_class,
                     RootClass.NAMED_FILESYSTEM_ROOT,
                 )
+
+    def test_filesystem_organize_declares_its_folder_and_closed_pin_arguments(
+        self,
+    ) -> None:
+        contract = BUILT_IN_ACTION_CONTRACTS.contract_for("filesystem", "organize")
+
+        self.assertEqual(ORGANIZE_OPERATION_LIMIT, organization.MAXIMUM_OPERATIONS)
+
+        self.assertIs(
+            contract.model_eligibility, ModelEligibility.NOT_MODEL_ELIGIBLE
+        )
+        expected = ["folder"] + [
+            f"{kind}_{number}"
+            for number in range(1, 6)
+            for kind in ("source", "destination", "create", "identity")
+        ]
+        self.assertEqual(
+            sorted(argument.name for argument in contract.arguments),
+            sorted(expected),
+        )
+        by_name = {argument.name: argument for argument in contract.arguments}
+        self.assertTrue(by_name["folder"].required)
+        for name, argument in by_name.items():
+            if name != "folder":
+                self.assertFalse(argument.required, name)
+        for number in range(1, 6):
+            identity = by_name[f"identity_{number}"]
+            self.assertEqual(
+                (identity.minimum_length, identity.maximum_length),
+                (64, 64),
+            )
+            self.assertFalse(identity.allow_blank)
+            self.assertIsNone(identity.root_class)
+
+    def test_filesystem_organize_accepts_a_bound_plan_and_refuses_the_rest(
+        self,
+    ) -> None:
+        digest = "a" * 64
+        bound = {"folder": "inbox"}
+        for number, name in enumerate(("a.pdf", "b.png"), start=1):
+            category = "Documents" if name.endswith("pdf") else "Images"
+            bound.update(
+                {
+                    f"source_{number}": f"inbox/{name}",
+                    f"destination_{number}": f"inbox/{category}/{name}",
+                    f"create_{number}": f"inbox/{category}",
+                    f"identity_{number}": digest,
+                }
+            )
+        valid = BUILT_IN_ACTION_CONTRACTS.validate("filesystem", "organize", bound)
+        self.assertIsNone(valid)
+        self.assertIsNone(
+            BUILT_IN_ACTION_CONTRACTS.validate(
+                "filesystem", "organize", {"folder": "inbox"}
+            )
+        )
+
+        cases = (
+            ("no folder", {k: v for k, v in bound.items() if k != "folder"},
+             ContractFailure.MISSING_REQUIRED_ARGUMENT, "folder"),
+            ("blank folder", {**bound, "folder": "  "},
+             ContractFailure.OUT_OF_RANGE, "folder"),
+            ("a sixth operation", {**bound, "source_6": "inbox/f.pdf"},
+             ContractFailure.EXTRA_ARGUMENT, "source_6"),
+            ("an unknown field", {**bound, "wildcard": "*"},
+             ContractFailure.EXTRA_ARGUMENT, "wildcard"),
+            ("a short identity", {**bound, "identity_1": "a" * 63},
+             ContractFailure.OUT_OF_RANGE, "identity_1"),
+            ("a long identity", {**bound, "identity_1": "a" * 65},
+             ContractFailure.OUT_OF_RANGE, "identity_1"),
+            ("a blank identity", {**bound, "identity_1": " "},
+             ContractFailure.OUT_OF_RANGE, "identity_1"),
+            ("a non-text source", {**bound, "source_1": 7},
+             ContractFailure.WRONG_TYPE, "source_1"),
+            ("a blank destination", {**bound, "destination_1": ""},
+             ContractFailure.OUT_OF_RANGE, "destination_1"),
+        )
+        for label, arguments, kind, field in cases:
+            with self.subTest(label):
+                violation = BUILT_IN_ACTION_CONTRACTS.validate(
+                    "filesystem", "organize", arguments
+                )
+                self.assertIsNotNone(violation)
+                self.assertEqual((violation.kind, violation.field), (kind, field))
 
     def test_no_non_path_field_carries_a_path_root_class(self) -> None:
         for contract in BUILT_IN_ACTION_CONTRACTS.contracts:
@@ -757,6 +864,13 @@ class RegistryCompletenessTests(unittest.TestCase):
             optional,
             {
                 ("filesystem", "list", "path"),
+                # V1-25-R1: every pinned operation is absent from the planner's
+                # plan and added when confirmation is offered.
+                *{
+                    ("filesystem", "organize", f"{kind}_{number}")
+                    for number in range(1, 6)
+                    for kind in ("source", "destination", "create", "identity")
+                },
                 ("memory", "search", "limit"),
                 ("memory", "list", "limit"),
                 ("notes", "list", "limit"),
@@ -834,7 +948,7 @@ class ModelEligibilityClassificationTests(unittest.TestCase):
         )
         self.assertEqual(eligible, EXPECTED_MODEL_ELIGIBLE)
         self.assertEqual(closed, EXPECTED_NOT_MODEL_ELIGIBLE)
-        self.assertEqual((len(eligible), len(closed)), (5, 73))
+        self.assertEqual((len(eligible), len(closed)), (5, 74))
         for identifier, decision in classified.items():
             with self.subTest(action=identifier):
                 self.assertIs(type(decision), ModelEligibility)
@@ -1020,7 +1134,7 @@ class RegistryConstructionTests(unittest.TestCase):
                 "sample", "run", model_eligibility=NOT_ELIGIBLE
             )
 
-        self.assertEqual(len(BUILT_IN_ACTION_CONTRACTS.action_identifiers), 78)
+        self.assertEqual(len(BUILT_IN_ACTION_CONTRACTS.action_identifiers), 79)
 
     def test_unsupported_declared_type_is_rejected(self) -> None:
         with self.assertRaises(ValueError):
@@ -2288,6 +2402,7 @@ class TypeAndCoercionTests(unittest.TestCase):
             ("filesystem", "read", {"path": "notes.txt"}),
             ("filesystem", "rename", {"source": "a", "destination": "b"}),
             ("filesystem", "move", {"source": "a", "destination": "b"}),
+            ("filesystem", "organize", {"folder": "inbox"}),
             ("history", "list", {}),
             ("history", "search", {"query": "calculate"}),
             ("history", "read", {"id": 1}),
@@ -2307,7 +2422,7 @@ class TypeAndCoercionTests(unittest.TestCase):
             ("system", "current_time", {}),
         )
 
-        self.assertEqual(len(emitted), 25)
+        self.assertEqual(len(emitted), 26)
         for tool_name, action, arguments in emitted:
             with self.subTest(action=f"{tool_name}.{action}"):
                 self.assertIsNone(

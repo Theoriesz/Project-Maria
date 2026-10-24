@@ -114,6 +114,27 @@ DISABLE_REMINDER_DELIVERY_NOTICE = (
     "may still appear and be recorded, and a message box already on screen "
     "stays until you close it."
 )
+# V1-25-R1's file organization notice, pinned the same way. It promises no
+# detection it cannot give, and what it says about names concerns an additional
+# name of a file, never the one name a move itself changes.
+ORGANIZE_NOTICE = (
+    "Maria moves only the files listed below, one at a time and in order, and "
+    "creates only the folders listed. Nothing is copied, overwritten, or "
+    "deleted, and nothing is ever rolled back: if a check fails, a move fails, "
+    "or Maria cannot confirm a result, she stops there; earlier moves and "
+    "created folders stay, and the report says which moves were confirmed, "
+    "unconfirmed, not made, refused, or not attempted. After each move Maria "
+    "checks once whether the file now has more than one name; if she sees one, "
+    "she warns you and stops, but she cannot see a name that another program "
+    "adds or removes at any other moment, and she never removes, or rolls "
+    "back, any additional name (the only name she changes is the one the move "
+    "itself changes, from the source to the destination). If another program "
+    "makes the destination name appear as another name for the same file just "
+    "before a move, the move can still succeed and the original name will be "
+    "gone. If another program renames or replaces a folder in the workspace "
+    "while she works, she cannot guarantee where a file ends up. Maria works "
+    "only on NTFS volumes."
+)
 # V1-24-R1's three project notices, pinned word for word as approved.
 ACTIVATE_PROJECT_NOTICE = (
     "While a project is active, each of its facts may be sent to your local "
@@ -427,6 +448,8 @@ class PermissionManagerTests(unittest.TestCase):
                     "audit.delete",
                     "filesystem.rename",
                     "filesystem.move",
+                    # V1-25-R1: tidying one folder into its category folders.
+                    "filesystem.organize",
                     "history.delete",
                     "notes.retitle",
                     "notes.edit",
@@ -476,7 +499,7 @@ class PermissionManagerTests(unittest.TestCase):
                 }
             ),
         )
-        self.assertEqual(len(MANDATORY_CONFIRMATION_ACTIONS), 39)
+        self.assertEqual(len(MANDATORY_CONFIRMATION_ACTIONS), 40)
         self.assertEqual(
             MANDATORY_DENIED_ACTIONS,
             frozenset({"filesystem.delete", "filesystem.write"}),
@@ -678,6 +701,8 @@ class PermissionManagerTests(unittest.TestCase):
                         reason = f"{reason} {ACTIVATE_PROJECT_NOTICE}"
                     if action_id in {"projects.add_fact", "projects.edit_fact"}:
                         reason = f"{reason} {PROJECT_FACT_NOTICE}"
+                    if action_id == "filesystem.organize":
+                        reason = f"{reason} {ORGANIZE_NOTICE}"
                     with self.subTest(action_id=action_id):
                         self.assertEqual(
                             manager.check(tool_name, action),
@@ -705,10 +730,11 @@ class PermissionManagerTests(unittest.TestCase):
             "projects.activate": ACTIVATE_PROJECT_NOTICE,
             "projects.add_fact": PROJECT_FACT_NOTICE,
             "projects.edit_fact": PROJECT_FACT_NOTICE,
+            "filesystem.organize": ORGANIZE_NOTICE,
         }
 
         self.assertEqual(set(expected), set(CONFIRMATION_NOTICES))
-        self.assertEqual(len(CONFIRMATION_NOTICES), 13)
+        self.assertEqual(len(CONFIRMATION_NOTICES), 14)
         for action_id, notice in expected.items():
             with self.subTest(action=action_id):
                 tool_name, action = action_id.split(".")
@@ -731,6 +757,23 @@ class PermissionManagerTests(unittest.TestCase):
         manager.logger.reset_mock()
         manager.confirmation_notice("reminders", "create")
         self.assertEqual(manager.logger.mock_calls, [])
+
+    def test_the_organize_notice_separates_additional_names_from_the_moved_name(
+        self,
+    ) -> None:
+        notice = CONFIRMATION_NOTICES["filesystem.organize"]
+
+        self.assertIn(
+            "she never removes, or rolls back, any additional name (the only name "
+            "she changes is the one the move itself changes, from the source to "
+            "the destination)",
+            notice,
+        )
+        self.assertNotIn("she never removes a name", notice)
+        self.assertIn("nothing is ever rolled back", notice)
+        self.assertIn("Maria works only on NTFS volumes.", notice)
+        for promise in ("always", "every hard link", "guarantees"):
+            self.assertNotIn(promise, notice)
 
     def test_a_denied_or_unconfirmed_action_carries_no_approval_notice(
         self,

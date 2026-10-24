@@ -61,6 +61,15 @@ STAGE_FILES = (
     "Maria/tools/projects.py",
 )
 
+# Every file V1-25-R1 adds, each classified in its pull request.
+STAGE_FILES_V1_25 = (
+    "Maria/core/file_organization.py",
+    "Maria/core/organize_access.py",
+    "Maria/tests/organize_fakes.py",
+    "Maria/tests/test_file_organization.py",
+    "Maria/tests/test_organize_access.py",
+)
+
 # Path fragments no member may hold, compared ignoring case.
 FORBIDDEN_FRAGMENTS = (
     "database/",
@@ -101,13 +110,13 @@ class MemberRuleTests(unittest.TestCase):
                     self.assertNotIn(fragment, folded)
 
     def test_the_count_is_stated_against_this_tree(self) -> None:
-        # 139 candidates at base commit 175c4ce, and the 18 files V1-24-R1
-        # adds, every one proposed as a member.
-        self.assertEqual(len(APPROVED_PATHS), 157)
+        # 139 candidates at base commit 175c4ce, the 18 files V1-24-R1 adds,
+        # and the 5 files V1-25-R1 adds, every one proposed as a member.
+        self.assertEqual(len(APPROVED_PATHS), 162)
         self.assertEqual(len(NOT_APPROVED_PATHS), 3)
 
     def test_every_file_this_stage_adds_is_classified(self) -> None:
-        for path in STAGE_FILES:
+        for path in STAGE_FILES + STAGE_FILES_V1_25:
             with self.subTest(path=path):
                 self.assertIn(path, APPROVED_PATHS)
         self.assertFalse(set(APPROVED_PATHS) & set(NOT_APPROVED_PATHS))

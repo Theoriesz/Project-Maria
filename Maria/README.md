@@ -141,6 +141,7 @@ list .
 read file README.md
 rename old.txt to new.txt
 move source.txt to docs/source.txt
+organize folder inbox
 create note Idea: Keep the foundation simple.
 notes
 read note 1
@@ -223,7 +224,7 @@ read audit 1
 delete audit 1
 ```
 
-File rename and move operations, `delete interaction <id>`, the three note
+File rename, move, and organize operations, `delete interaction <id>`, the three note
 lifecycle commands `retitle note <id>: <new title>`, `edit note <id>: <new
 body>`, and `delete note <id>`, the two note context consent commands
 `enable note context <id>` and `disable note context <id>`, the two memory
@@ -771,8 +772,8 @@ open until her process ends.
 
 ## Filesystem Access
 
-Maria reads, lists, renames, and moves files only inside named filesystem roots
-declared in `config/config.toml`. The shipped declaration is exactly two:
+Maria reads, lists, renames, moves, and organizes files only inside named
+filesystem roots declared in `config/config.toml`. The shipped declaration is exactly two:
 
 | Name | Configured path | Policy | Enabled |
 |---|---|---|---|
@@ -788,9 +789,9 @@ never creates a read-only root, and it never creates a disabled one.
 beneath it is refused exactly like any path outside Maria's roots, and the refusal
 names neither the path nor the root.
 
-A `read_only` root permits `read` and `list` only. Rename and move are refused
-there, and a rename or move whose source and destination are in different roots is
-refused as well, even when both roots organize.
+A `read_only` root permits `read` and `list` only. Rename, move, and organize are
+refused there, and a rename or move whose source and destination are in different
+roots is refused as well, even when both roots organize.
 
 Some locations are permanently out of reach of every filesystem command:
 
@@ -828,8 +829,8 @@ renames and moves as usual.
 
 Separately, Maria's whole repository — its source, documentation, prompts, shipped
 configuration, and any untracked file beside them — is unavailable to the generic
-`read`, `list`, `rename`, and `move` commands. Declaring a root around the
-repository does not change that.
+`read`, `list`, `rename`, `move`, and `organize` commands. Declaring a root around
+the repository does not change that.
 
 Each rule is applied both to the path you asked for and to the path it actually
 resolves to, so a `..` traversal, a symbolic link, or a Windows junction cannot
@@ -850,6 +851,106 @@ Source and destination must be inside the same filesystem root.
 ```
 
 Filesystem delete and write functionality remains intentionally unimplemented.
+
+### Organizing a Folder
+
+```text
+organize folder inbox
+```
+
+`organize folder <folder>` tidies the top level of one folder of the
+`workspace` root (the root itself with `.`) into five fixed category folders.
+No language model takes part, and Maria never does it on her own. When you ask,
+she lists the folder once, chooses at most five eligible files in the order of
+their names ignoring case, and shows every move before you answer:
+
+```text
+Organize folder "inbox": 2 planned moves (at most 5 per approval); 0 more eligible files stay for a later request.
+1. "inbox/photo.png" -> "inbox/Images/photo.png" (creates folder "inbox/Images" if it is still missing)
+2. "inbox/report.pdf" -> "inbox/Documents/report.pdf" (creates folder "inbox/Documents" if it is still missing)
+```
+
+| Folder | Last extension of the file |
+|---|---|
+| `Documents` | pdf, doc, docx, odt, rtf, txt, md, csv, xls, xlsx, ods, ppt, pptx, odp |
+| `Images` | jpg, jpeg, png, gif, bmp, tif, tiff, webp, heic |
+| `Audio` | mp3, wav, flac, aac, ogg, m4a |
+| `Video` | mp4, mkv, mov, avi, wmv, webm |
+| `Archives` | zip, 7z, rar, tar, gz |
+
+Every other file stays where it is, and a folder of more than 1,000 entries is
+refused. A file is offered only when it is a plain file with exactly one name
+that is not hidden or system and is not a link, an offline file, or a file
+Windows marks as not stored locally, and its destination does not exist. More
+than five eligible files take several requests.
+
+Approving confirms exactly the list you saw. Each move is pinned with its
+source, its destination, a digest of checked metadata (volume, file index, size,
+and last write time: not a hash of the content), and, only when a category
+folder is missing, the one folder creation you approved. A file added afterwards
+is never moved, and a file replaced, moved away, or changed refuses the whole
+batch before anything changes. Maria then holds every folder on the way, and
+each file, without sharing deletion, which on the tested Windows build stops
+another program from renaming or deleting them by path meanwhile, and renames
+the held file into its held category folder with Windows's own no-replace
+rename. Nothing is copied, overwritten, deleted, retried, undone, or
+rolled back, and Maria never removes an additional name of a file.
+
+Every move ends in exactly one of six outcomes, and the report counts them:
+
+- moved,
+- reported by Windows but not confirmed by Maria's own checks afterwards,
+- not moved after an attempt,
+- outcome unknown (a request Windows left pending, or one Maria could not
+  settle),
+- refused before an attempt, or
+- not attempted, because an earlier one stopped the run.
+
+Maria stops at the first thing that is not a clean move. After a verified move
+she reads the held file once more; a file that then has more than one name is
+reported as a warning that stops the run and prevents calling it a clean
+success, and the move stays as it is. A request Windows leaves pending that
+Maria did not expect stops organizing until Maria is restarted. A handle that
+Maria cannot release while she checks the moves stops the run before the first
+one, changing nothing, and is reported. A failure nobody expected is reported
+too: outcome unknown once the rename was called, refused before it, and a folder
+whose creation call failed that way is unknown. "Nothing at all"
+therefore means only this: nothing changes when you cancel, never approve, send
+a new request, or when the checks before the first move refuse.
+
+Your request is recorded as you typed it, as every command is, and the response
+as counts only. The report, which names the files, is shown and never recorded,
+and Maria's log holds fixed text and counts, never a file or folder name or a
+path. A run interrupted with Ctrl+C logs its counts, releases every handle, and
+shows no report.
+
+Organizing works only on 64-bit Windows and only on an NTFS volume: Maria asks
+Windows which file system the workspace folder is on and refuses, changing
+nothing, when it does not say `NTFS`. It was tested on Windows 11 build
+10.0.26300 only. What it does not do, and cannot detect, is stated plainly:
+
+- The offer's folder listing is by path, before anything is held; every name it
+  returns is opened again and checked.
+- The final-path check compares spellings, so an ordinary folder replaced by
+  another of the same name before Maria held it is not noticed.
+- The digest does not notice a rewrite that keeps the same size and last write
+  time.
+- A second name that appears at any moment except the one read after the move
+  is not seen, and a program that makes the destination name appear as another
+  name for the same file just before a move lets the move succeed and the
+  original name go away.
+- Cloud folders and placeholders on NTFS, case-sensitive folders, network
+  shares, other file systems, privileged programs, and other Windows builds are
+  unsupported and not detected.
+
+`rename` and `move` changed with it. Both now work only on Windows, call one
+`os.rename` with no copy or delete fallback (so a cross-volume or locked move
+fails instead of copying and then deleting), refuse to move a folder into
+itself, and log fixed text instead of paths. `move` no longer creates missing
+parent folders: the destination folder must already exist, otherwise Maria says
+`The destination folder does not exist.` Both remain path-based
+check-then-act, so a folder replaced between the checks and the rename is not
+detected, and they have none of the protection `organize` has.
 
 ## Local Reasoning Settings
 

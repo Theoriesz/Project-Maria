@@ -4154,6 +4154,67 @@ they find gets its own focused `fix/<topic>` branch, never a release branch.
 
 - Branch: `feature/safe-root-file-organization`
 - Prerequisites: V1-08, V1-19
+- Owner-approved amendment (V1-25-R1). The read-only V1-25 entry audit (2026-10-24, at
+  `main` fda5c80, with its addenda and proposal revision 2, SHA-256 374386dc...) and its
+  scratch investigation on Windows 11 build 10.0.26300 found that this entry, as written,
+  could not be implemented as stated. The owner approved the resolution below in writing
+  before the branch opened. The text after this amendment stays recorded exactly as it was
+  written, except where this amendment says it is superseded.
+  - Findings. The existing `move` copies and then deletes when a rename fails (through
+    `shutil.move`), and `rename` and `move` log absolute paths. A tidy-up cannot fit the
+    universal five-step bound as five independent steps, and a model proposal cannot be
+    bound to source identities on today's path. "Or nothing at all" contradicts this
+    entry's own partial-failure criterion, and no filesystem transaction exists. The
+    Win32 relative-name rename (`SetFileInformationByHandle`) was refused on this build, while
+    the native `NtSetInformationFile` with a held directory handle worked.
+  - Scope. One new deterministic command, `organize folder <folder>`, tidies the top
+    level of one folder of the one organize root, `workspace`, into five fixed category
+    folders by file extension (Documents, Images, Audio, Video, Archives; the table is in
+    the code and the documentation). It is one `filesystem.organize` step of at most five
+    pinned operations, always confirmed, so the five-step bound is unchanged; a larger
+    folder needs several requests. Nothing is model-eligible: `organize`, `rename`, and
+    `move` stay closed to the model, which **supersedes** this entry's "filesystem mutation
+    becomes model-eligible here and only here" and its model-driven completion criterion,
+    replaced by a test that every model proposal of them is refused. Project Maria and
+    every read-only root stay unreachable.
+  - Mechanism (D4-B, enforced NTFS). One additional `ctypes` module,
+    `core/organize_access.py`, calls exactly seven functions (CreateFileW,
+    GetFileInformationByHandle, GetFinalPathNameByHandleW, GetVolumeInformationByHandleW,
+    CloseHandle, NtCreateFile, NtSetInformationFile) under a per-module ownership map. The
+    logic is `core/file_organization.py`. The root's file system must be exactly NTFS, asked
+    of the held root handle at the offer and at execution. A held chain, a held category
+    folder and a held source are used; the source is renamed into the held category
+    folder with ReplaceIfExists false.
+  - Outcomes replace "or nothing at all". Nothing changes when the owner cancels or
+    does not approve, when a new request replaces the pending one, or when the
+    preflight refuses; after the first change each operation is exactly one of moved,
+    reported but unconfirmed, not moved after an attempt, outcome unknown, refused before
+    an attempt, or not attempted, the six counts sum to the planned count, the run stops
+    at the first thing that is not a clean move, and nothing is copied, overwritten, deleted,
+    retried, undone, or rolled back. A link count above one read once after a verified move
+    is a warning that stops the run and prevents success without changing the move.
+    An unexpected STATUS_PENDING keeps the request's memory for the life of the process and
+    stops organization until Maria restarts. An interruption during release still attempts
+    every handle and is re-raised, with count-only logging and no owner report.
+  - Approval binds to the pinned list. A pin's `create_i` must equal the destination's
+    category parent exactly, digests are matched with an exact full match, and every
+    protection check runs on every path and prefix, and on the final path of every held
+    directory. A changed list invalidates approval; nothing is enumerated after approval.
+  - Declared limits. The offer's listing is path-based. The final-path check compares
+    spellings. The digest is checked metadata, not a content hash. A same-file link
+    appearing at the destination after the destination check can let the rename succeed,
+    and a second name appearing at any moment but the one post-move read is not detected.
+    Cloud folders, placeholders on NTFS, case-sensitive directories, network shares,
+    privileged callers, other filesystems and other Windows builds are unsupported and not
+    detected. Cross-volume renaming was not tested; a different volume is refused.
+  - Legacy commands (D5-B). `rename` and `move` become Windows-only, require an existing
+    destination parent, use `os.rename` only (no copy or delete fallback), refuse a
+    directory moved into itself, and log fixed text only. They remain path-based
+    check-then-act and do not receive the organizer's protection.
+  - Records. The request is recorded as typed and the response as counts only; logs hold
+    fixed text and counts; the older `filesystem.read` logging is outside this change.
+  - Inventory. 79 actions, 5 model-eligible, 40 mandatory confirmations, 14 confirmation
+    notices; schema 9 and version 0.2.0 unchanged; no dependency and no migration.
 - Purpose: Turn the named roots into an organizing capability, inspecting, renaming, and
   moving files within an organize-policy root, where every operation is enumerated in
   one immutable approved plan.

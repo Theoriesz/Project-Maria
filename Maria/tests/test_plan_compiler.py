@@ -250,6 +250,7 @@ VALID_ARGUMENTS: dict[str, dict[str, Any]] = {
     "filesystem.list": {"path": "docs"},
     "filesystem.rename": {"source": "old.txt", "destination": "new.txt"},
     "filesystem.move": {"source": "old.txt", "destination": "archive/old.txt"},
+    "filesystem.organize": {"folder": "inbox"},
     "history.list": {},
     "history.search": {"query": "weather"},
     "history.read": {"id": 1},
@@ -758,6 +759,42 @@ class AllowlistTests(unittest.TestCase):
                 outcome = _compile(_proposal(*_split(identifier), arguments))
 
                 self.assertIs(outcome, ProposalRejection.NOT_MODEL_ELIGIBLE)
+
+    def test_a_model_can_never_propose_organize_rename_or_move(self) -> None:
+        pinned = {
+            "folder": "inbox",
+            "source_1": "inbox/a.pdf",
+            "destination_1": "inbox/Documents/a.pdf",
+            "create_1": "inbox/Documents",
+            "identity_1": DIGEST,
+        }
+        proposals = {
+            "filesystem.organize": (VALID_ARGUMENTS["filesystem.organize"], pinned),
+            "filesystem.rename": (VALID_ARGUMENTS["filesystem.rename"],),
+            "filesystem.move": (VALID_ARGUMENTS["filesystem.move"],),
+        }
+        for identifier, argument_sets in proposals.items():
+            for arguments in argument_sets:
+                with self.subTest(action=identifier, arguments=sorted(arguments)):
+                    tool_name, action = _split(identifier)
+                    single = _compile(_proposal(tool_name, action, arguments))
+                    self.assertIs(single, ProposalRejection.NOT_MODEL_ELIGIBLE)
+                    envelope = json.dumps(
+                        {
+                            "steps": [
+                                {"tool": "calculator", "action": "calculate",
+                                 "arguments": {"expression": "2 + 2"}},
+                                {"tool": tool_name, "action": action,
+                                 "arguments": arguments},
+                            ]
+                        }
+                    )
+                    self.assertIsInstance(_compile(envelope), ProposalRejection)
+        self.assertNotIn("filesystem.organize", MODEL_ACTION_ALLOWLIST)
+        self.assertEqual(
+            BUILT_IN_ACTION_CONTRACTS.contract_for("filesystem", "organize").model_eligibility,
+            ModelEligibility.NOT_MODEL_ELIGIBLE,
+        )
 
     def test_every_open_action_compiles_from_valid_arguments(self) -> None:
         self.assertEqual(
