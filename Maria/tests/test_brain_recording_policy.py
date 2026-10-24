@@ -71,6 +71,7 @@ HELP_TEXT = (
     "- read file <path>\n"
     "- rename <source> to <destination>\n"
     "- move <source> to <destination>\n"
+    "- organize folder <folder>\n"
     "- create note <title>: <body>\n"
     "- notes\n"
     "- read note <id or exact title>\n"
@@ -279,6 +280,10 @@ COMMAND_CORPUS: tuple[CorpusEntry, ...] = (
     ),
     _records("move nothing", "Use: move <source> to <destination>"),
     _records_nothing("move inbox/alpha.txt to archive/alpha.txt", CANCEL),
+    # V1-25-R1: a cancelled organization changes and records nothing. The
+    # confirmed route is proved in test_filesystem.py, where the request is
+    # recorded as typed and the response as counts only.
+    _records_nothing("organize folder inbox", CANCEL),
     _records(
         "create note Release Check: Original body text",
         "Created note 1: Release Check",

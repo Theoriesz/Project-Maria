@@ -5,7 +5,7 @@ Tools are small modules that expose controlled capabilities to Maria.
 ## Declared Argument Contracts
 
 Every built-in tool action is declared once in `core/action_contracts.py`,
-which is the positive allowlist of the 78 supported tool actions and of the
+which is the positive allowlist of the 79 supported tool actions and of the
 arguments each one accepts. A tool's `actions` set answers only whether an
 action is registered; the contract answers which arguments it takes, whether
 each is required, its exact type, any numeric bound, and, for a path field, the
@@ -65,13 +65,14 @@ that already carries it is refused, and a contract that declares one can
 never be model-eligible.
 
 Every contract also states, with no default, whether a reasoning model may
-ever propose its action. Only five of the 78 actions are model-eligible:
+ever propose its action. Only five of the 79 actions are model-eligible:
 `calculator.calculate`, `filesystem.list`, `system.current_time`,
 `tasks.create`, and `reminders.create`, the last two only for a request in one
-of the four natural-language forms Maria reads herself. The other 73,
+of the four natural-language forms Maria reads herself. The other 74,
 including all three audit actions, all eleven saved-conversation and
 conversation-summary actions, the other twenty task and reminder actions, the
-three reminder-delivery actions, and all thirteen project actions, are closed
+three reminder-delivery actions, all thirteen project actions, and
+`filesystem.rename`, `filesystem.move`, and `filesystem.organize`, are closed
 to the model. The
 classification is independent of permission and approves nothing by itself:
 `core/plan_compiler.py` keeps its own closed allowlist and compiles a proposal
@@ -93,7 +94,8 @@ allows its action outright; see "Model-to-Plan Compilation Gate" and
   or off
 - `conversations`: save the current session's conversation, and list, read,
   and delete saved conversations
-- `filesystem`: read, list, rename, and move inside Maria's named filesystem roots
+- `filesystem`: read, list, rename, move, and organize inside Maria's named filesystem
+  roots
 - `history`: list, search, read, and delete SQLite-backed interaction-history
   rows
 - `memory`: store, search, list, update, and forget explicit SQLite-backed
@@ -127,10 +129,10 @@ math guarantees.
 
 ## Filesystem Tool
 
-The filesystem tool supports `read`, `list`, `rename`, and `move` inside Maria's named
-filesystem roots. Rename and move always require explicit confirmation. There is no
-write, delete, copy, overwrite, glob, recursion, bulk, or archive action, and none is
-reachable by argument.
+The filesystem tool supports `read`, `list`, `rename`, `move`, and `organize` inside
+Maria's named filesystem roots. Rename, move, and organize always require explicit
+confirmation. There is no write, delete, copy, overwrite, glob, recursion, or archive
+action, and none is reachable by argument; `organize` is the one bounded batch.
 
 `list` is the only filesystem action a reasoning model may propose, and the compiler
 accepts a proposed `path` only as plain text relative to the default root: never
@@ -154,9 +156,10 @@ root, an absolute path is accepted only inside an enabled root, and a `~` prefix
 expands first. The current working directory is never consulted, so Maria's roots do
 not move with the shell that started it.
 
-A root's policy decides what may happen inside it. An `organize` root permits all four
-actions. A `read_only` root permits `read` and `list` only; `rename` and `move` are
-refused there, on the source operand and on the destination operand alike.
+A root's policy decides what may happen inside it. An `organize` root permits all five
+actions. A `read_only` root permits `read` and `list` only; `rename`, `move`, and
+`organize` are refused there, on the source operand and on the destination operand
+alike.
 
 `project_maria` is declared but disabled, reserved for a later Project Maria capability.
 A path beneath a disabled root is treated exactly as a path outside Maria's roots and
@@ -255,8 +258,8 @@ of them remain readable, listable, and movable.
 
 The second rule is the *general filesystem repository barrier*. Any path at or beneath
 Maria's repository root — by spelling or by target — is unavailable to
-`filesystem.read`, `filesystem.list`, `filesystem.rename`, and `filesystem.move`. That
-covers tracked source, documentation, prompts, `config.toml`, and any untracked file
+`filesystem.read`, `filesystem.list`, `filesystem.rename`, `filesystem.move`, and
+`filesystem.organize`. That covers tracked source, documentation, prompts, `config.toml`, and any untracked file
 beside them. Declaring a root around the repository does not defeat it, and neither
 does a repository path that links outward nor a workspace path that links in.
 
@@ -321,7 +324,7 @@ No response reveals the submitted absolute path, the owner's home location, the
 repository location, a root name, an excluded filename, raw OS exception text, or an
 object repr or address.
 
-Failures are reported with a sanitized reason. Raw `OSError` and `shutil.Error` text is
+Failures are reported with a sanitized reason. Raw `OSError` text is
 never copied into a response, and neither are the `filename`, `filename2`, `strerror`,
 or `args` fields those exceptions carry. A reason is chosen as follows:
 
@@ -337,8 +340,8 @@ or `args` fields those exceptions carry. A reason is chosen as follows:
   Source and destination must be inside the same filesystem root.
   ```
 
-- Every other `ValueError`, and any failure without a usable numeric error code —
-  including `shutil.Error` — uses the fixed fallback:
+- Every other `ValueError`, and any failure without a usable numeric error code,
+  uses the fixed fallback:
 
   ```text
   The operating system reported an unspecified error.
@@ -354,17 +357,81 @@ Rename failed: This filesystem root is read-only.
 Move failed: The operating system reported an unspecified error.
 ```
 
-Path-bearing tool result `data` is unchanged and still contains canonical absolute
-paths. The operational log lines of `read`, `rename`, and `move` are unchanged too and
-still contain canonical absolute paths and full raw exception diagnostics, which is
-where the per-filename detail omitted from responses remains available. `list` is the
-exception: because a reasoning model may propose it, it logs only the fixed lines
-`Listed a directory.` and `Directory listing failed.`, never the directory, the
-submitted path, or exception text. What a listing shows the owner is unchanged.
+Path-bearing tool result `data` of `read`, `rename`, and `move` is unchanged and still
+contains canonical absolute paths. The operational log line of `read` is unchanged too
+and still contains the canonical absolute path and the full raw exception diagnostics
+(its path logging is outside V1-25-R1 and is flagged for the later privacy audit).
+`list` logs only the fixed lines `Listed a directory.` and `Directory listing
+failed.`, never the directory, the submitted path, or exception text, because a
+reasoning model may propose it. Since V1-25-R1, `rename` and `move` log fixed text too,
+and `organize` logs fixed text and counts only (see "Legacy Rename and Move" and
+"Organizing a Folder" below). What each shows the owner is unchanged.
 
 Two limits are worth stating plainly. Recorded request text is not sanitized, so an
 absolute path a user typed explicitly can still be retained in interaction history. The
 change is also prospective only: existing interaction-history rows are not rewritten.
+
+### Organizing a Folder
+
+`filesystem.organize` is the one batch action, reached only by the deterministic
+`organize folder <folder>` command. It is always confirmation-required, never
+model-eligible, and runs only on 64-bit Windows over an NTFS volume. Its step carries
+the folder; when the owner is about to decide, `FilesystemTool.confirmation_binding`
+adds up to five pinned operations and shows the same list as the preview, so the
+approved plan, and the fingerprint the approval binds, name exactly the files that
+will move. Execution never lists, globs, or expands anything.
+
+The declared arguments are `folder` (required) and, for each of five numbered
+operations, `source_N`, `destination_N`, `identity_N`, and `create_N` (all optional,
+absent from the planner's plan). The tool, not the contract, requires complete
+operations numbered from 1 without a gap, and
+`core/file_organization.py` checks every pin before any Windows call: `source_N` is a
+direct child of the folder, `destination_N` is exactly the folder, the category the
+table gives the file's last extension, and the file name, `create_N`, when present, is
+exactly the destination's category folder, `identity_N` is exactly 64 lowercase
+hexadecimal characters, and no two sources or destinations are equal ignoring case.
+Any violation refuses with no Windows call and no change.
+
+The category table is fixed in code: `Documents` (pdf, doc, docx, odt, rtf, txt, md,
+csv, xls, xlsx, ods, ppt, pptx, odp), `Images` (jpg, jpeg, png, gif, bmp, tif, tiff,
+webp, heic), `Audio` (mp3, wav, flac, aac, ogg, m4a), `Video` (mp4, mkv, mov, avi, wmv,
+webm), and `Archives` (zip, 7z, rar, tar, gz). A folder of more than 1,000 entries is
+refused, and the name of a file or folder may be at most 255 UTF-16 units.
+
+Protection is the existing protection. The tool hands the handle logic one predicate,
+built from `FilesystemProtections.excludes` and `intersects_mutation` and the
+repository barrier, and the logic asks it of every source, destination, and creation
+path and of every prefix of each, the root included, before any call, and again of the
+final path of every held directory. `core/file_organization.py` imports no
+configuration and no protections, and `core/organize_access.py` holds no policy.
+
+The seven Windows calls live in `core/organize_access.py` (`CreateFileW`,
+`GetFileInformationByHandle`, `GetFinalPathNameByHandleW`,
+`GetVolumeInformationByHandleW`, `CloseHandle`, `NtCreateFile`, and
+`NtSetInformationFile`), each with every argument and result type pinned. Directories
+and files are opened relative to a held parent without delete sharing, a directory
+creation uses its own exact set, and the move is `FileRenameInformation` of the held
+source into the held category folder by a simple name with replacement off. The root's
+file system must be exactly `NTFS`, asked of the held root handle at the offer and again
+at execution before anything is created or renamed.
+
+Outcomes, counts, stop rules, the interrupted-run behaviour, and the fixed wording are
+described under "Filesystem Access" in `README.md`; the notice shown with every
+approval is `CONFIRMATION_NOTICES["filesystem.organize"]`. The request is recorded as
+typed, the response as counts only, and the log holds fixed text and counts; the
+report, which names the files, is displayed and never recorded.
+
+### Legacy Rename and Move
+
+Under V1-25-R1 (D5-B) `rename` and `move` are Windows-only, call `os.rename` and nothing
+that could copy or delete, refuse to move a folder into itself
+(`A folder cannot be moved into itself.`), and log fixed text only: `Renamed a file or
+folder.`, `Moved a file or folder.`, and on failure an `OSError`'s type with its `errno`
+and `winerror` numbers, one of Maria's own refusals as its fixed message, and any other
+failure as its type name. `move` requires an existing destination parent
+(`The destination folder does not exist.`) and creates nothing. Off Windows they answer
+`Renaming and moving files needs Windows; nothing was changed.` They stay path-based
+check-then-act and receive none of the handle protection `organize` has.
 
 ## History Tool
 

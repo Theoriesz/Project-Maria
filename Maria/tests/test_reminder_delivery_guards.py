@@ -332,17 +332,23 @@ class SubsystemImportGuardTests(unittest.TestCase):
         self.assertNotIn("core.desktop_notice", reached)
         self.assertNotIn("sqlite3", _standard_imports("core.reminder_delivery"))
 
-    def test_only_the_notice_module_and_the_system_tool_import_ctypes(self) -> None:
+    def test_only_the_known_modules_import_ctypes(self) -> None:
         importers = set()
         for path in production_modules():
             names, _ = imports_of(path)
             if any(entry.split(".")[0] == "ctypes" for entry in names):
                 importers.add(module_name(path))
 
-        # V1-24-R1 adds the one project file access module.
+        # V1-24-R1 adds the one project file access module, and V1-25-R1 the
+        # one file organization access module.
         self.assertEqual(
             importers,
-            {"core.desktop_notice", "tools.system", "core.project_file_access"},
+            {
+                "core.desktop_notice",
+                "tools.system",
+                "core.project_file_access",
+                "core.organize_access",
+            },
         )
 
     def test_the_subsystem_names_no_planning_tool_or_provider_symbol(self) -> None:

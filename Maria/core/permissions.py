@@ -21,6 +21,7 @@ MANDATORY_CONFIRMATION_ACTIONS = frozenset(
         "conversations.delete",
         "filesystem.rename",
         "filesystem.move",
+        "filesystem.organize",
         "history.delete",
         "notes.retitle",
         "notes.edit",
@@ -78,6 +79,26 @@ CONFIRMATION_NOTICES = MappingProxyType(
             "in it, within Maria's context limits. Maria does not check the "
             "summary for passwords or other secrets, and enabling it does not "
             "mean it contains none."
+        ),
+        "filesystem.organize": (
+            "Maria moves only the files listed below, one at a time and in "
+            "order, and creates only the folders listed. Nothing is copied, "
+            "overwritten, or deleted, and nothing is ever rolled back: if a "
+            "check fails, a move fails, or Maria cannot confirm a result, she "
+            "stops there; earlier moves and created folders stay, and the "
+            "report says which moves were confirmed, unconfirmed, not made, "
+            "refused, or not attempted. After each move Maria checks once "
+            "whether the file now has more than one name; if she sees one, "
+            "she warns you and stops, but she cannot see a name that another "
+            "program adds or removes at any other moment, and she never "
+            "removes, or rolls back, any additional name (the only name she "
+            "changes is the one the move itself changes, from the source to "
+            "the destination). If another program makes the destination name "
+            "appear as another name for the same file just before a move, "
+            "the move can still succeed and the original name will be gone. "
+            "If another program renames or replaces a folder in the "
+            "workspace while she works, she cannot guarantee where a file "
+            "ends up. Maria works only on NTFS volumes."
         ),
         "memory.enable_context": (
             "Once enabled, this memory may be sent to your local reasoning "

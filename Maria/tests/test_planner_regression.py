@@ -849,6 +849,7 @@ class PlannerRegressionTests(unittest.TestCase):
             ("rename to destination-only", "Use: rename <source> to <destination>"),
             ("move source-only", "Use: move <source> to <destination>"),
             ("move to destination-only", "Use: move <source> to <destination>"),
+            ("organize folder", "Use: organize folder <folder>"),
         )
 
         for request, expected_response in cases:
@@ -938,6 +939,7 @@ class PlannerRegressionTests(unittest.TestCase):
             "- read file <path>",
             "- rename <source> to <destination>",
             "- move <source> to <destination>",
+            "- organize folder <folder>",
             "- create note <title>: <body>",
             "- notes",
             "- read note <id or exact title>",

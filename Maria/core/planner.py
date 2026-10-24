@@ -676,6 +676,18 @@ class Planner:
                 {"source": source, "destination": destination},
             )
 
+        if lowered == "organize folder":
+            return self._no_action(text, "Use: organize folder <folder>")
+
+        if lowered.startswith("organize folder "):
+            folder = text[len("organize folder ") :].strip()
+            return self._single_step(
+                text,
+                "filesystem",
+                "organize",
+                {"folder": folder},
+            )
+
         if lowered.startswith(("create note ", "note ")):
             note_text = _remove_note_prefix(text)
             parsed_note = _parse_note(note_text)
@@ -1584,6 +1596,7 @@ def _help_text() -> str:
         "- read file <path>\n"
         "- rename <source> to <destination>\n"
         "- move <source> to <destination>\n"
+        "- organize folder <folder>\n"
         "- create note <title>: <body>\n"
         "- notes\n"
         "- read note <id or exact title>\n"

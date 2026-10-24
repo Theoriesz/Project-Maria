@@ -59,8 +59,14 @@ MAXIMUM_EXPRESSION_LENGTH = 200
 
 # The length of a hexadecimal SHA-256, the text identity an enable approval
 # carries: a memory's fact, a note's title and body together, or a
-# conversation summary's text.
+# conversation summary's text. It is also the length of a file's metadata
+# digest in a pinned organization.
 FACT_DIGEST_LENGTH = 64
+
+# The most operations one organization approval pins, a coarse ceiling the
+# contract can check by naming its fields; ``core.file_organization`` holds
+# the exact rules, and a test holds this to its bound.
+ORGANIZE_OPERATION_LIMIT = 5
 
 # The longest conversation summary and the longest saved-conversation
 # transcript, in characters, measured as every text argument is. Each is a
@@ -1096,6 +1102,33 @@ def _named_root_path(name: str, required: bool = True) -> ArgumentContract:
     )
 
 
+def _organize_operations() -> tuple[ArgumentContract, ...]:
+    """Declare the pinned operations an organization approval may carry.
+
+    Each operation is a source, a destination, an identity, and, only when its
+    category folder was absent at the offer, the one folder creation the owner
+    approves. All four are absent from the planner's plan and are pinned when
+    confirmation is offered, so the approved plan names exactly the files it
+    moves. Which of them are complete, numbered without gaps, and consistent
+    with one another is the tool's rule, not the contract's.
+    """
+    fields: list[ArgumentContract] = []
+    for number in range(1, ORGANIZE_OPERATION_LIMIT + 1):
+        fields.append(_named_root_path(f"source_{number}", required=False))
+        fields.append(_named_root_path(f"destination_{number}", required=False))
+        fields.append(_named_root_path(f"create_{number}", required=False))
+        fields.append(
+            _text(
+                f"identity_{number}",
+                required=False,
+                allow_blank=False,
+                minimum_length=FACT_DIGEST_LENGTH,
+                maximum_length=FACT_DIGEST_LENGTH,
+            )
+        )
+    return tuple(fields)
+
+
 # Model eligibility is stated on every declaration below and decided
 # independently of permission. Only five actions are open to a reasoning
 # model: arithmetic, listing a directory beneath the default named root,
@@ -1258,6 +1291,12 @@ BUILT_IN_ACTION_CONTRACTS = ActionContractRegistry(
             "filesystem",
             "move",
             (_named_root_path("source"), _named_root_path("destination")),
+            model_eligibility=ModelEligibility.NOT_MODEL_ELIGIBLE,
+        ),
+        ActionContract(
+            "filesystem",
+            "organize",
+            (_named_root_path("folder"), *_organize_operations()),
             model_eligibility=ModelEligibility.NOT_MODEL_ELIGIBLE,
         ),
         ActionContract(

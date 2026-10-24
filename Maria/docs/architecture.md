@@ -197,7 +197,10 @@ In the current implementation, successful `history.read`, `audit.list`,
 `conversation_summaries.list`, and `conversation_summaries.read` results,
 and V1-22's twelve, `create`, `list`, `due`, `read`, `edit`, and `reschedule`
 for tasks and for reminders, and V1-24-R1's thirteen project actions, are the
-only ones that supply a non-`None` `recorded_message`: thirty-two actions.
+only ones that supply a non-`None` `recorded_message`, and V1-25-R1's
+`filesystem.organize`: thirty-three actions. The organize action records the counts of
+a run, or that it was refused before any change, and never a file name or path; the
+request itself is recorded as typed.
 Each project action records a fixed line naming ids at most, such as
 `Listed projects.`, `Created project <id>.`, `Activated project <id>.`,
 `Added fact <id> to project <id>.`, `Listed project files.`, or
@@ -328,8 +331,9 @@ knows what its own failure may safely say. The filesystem tool's `list` action
 deliberately keeps less: because a reasoning model may propose it, it logs
 only the fixed lines `Listed a directory.` and `Directory listing failed.`,
 never the resolved directory, the submitted path, or an exception's text,
-while `read`, `rename`, and `move` keep their diagnostics and what the owner
-is shown is unchanged.
+while `read` keeps its diagnostics and what the owner is shown is unchanged.
+Since V1-25-R1, `rename` and `move` log fixed text only, and `organize` logs fixed
+text and counts.
 
 `Memory.record_interaction()` separately writes request and response text to
 SQLite. A log message that omits full request or response content does not
@@ -702,20 +706,20 @@ injects a Brain factory gets none unless it also injects a projects factory.
 ## Permission Policy
 
 All planned actions pass through `PermissionManager`.
-`filesystem.rename` and `filesystem.move` always require confirmation, while
-`filesystem.delete` and `filesystem.write` are always denied. TOML
+`filesystem.rename`, `filesystem.move`, and `filesystem.organize` always require
+confirmation, while `filesystem.delete` and `filesystem.write` are always denied. TOML
 configuration may add restrictions but cannot remove these mandatory
 protections. Missing permission arrays retain the secure baseline, and
 malformed present arrays stop configuration loading instead of weakening it.
 When an action is both denied and confirmation-required, denial wins.
 
 In the current implementation, the mandatory confirmation baseline is
-thirty-nine actions: `audit.delete`, `conversations.delete`,
+forty actions: `audit.delete`, `conversations.delete`,
 `conversation_summaries.create`, `conversation_summaries.edit`,
 `conversation_summaries.delete`, `conversation_summaries.enable_context`,
 `conversation_summaries.disable_context`, `filesystem.rename`,
-`filesystem.move`, `history.delete`, `notes.retitle`, `notes.edit`,
-`notes.delete`, `notes.enable_context`, `notes.disable_context`,
+`filesystem.move`, `filesystem.organize`, `history.delete`, `notes.retitle`,
+`notes.edit`, `notes.delete`, `notes.enable_context`, `notes.disable_context`,
 `memory.update`, `memory.forget`, `memory.enable_context`,
 `memory.disable_context`, from V1-22, `create`, `edit`, `reschedule`,
 `delete`, `enable_context`, and `disable_context` for both `tasks` and
@@ -1110,7 +1114,7 @@ owner-visible text, a log record, or result data.
 The general filesystem repository barrier lives in `tools/filesystem.py` instead,
 because it is a property of the four generic commands rather than of the path
 model. It makes any path at or beneath the repository root unreachable by `read`,
-`list`, `rename`, and `move`, and it is applied symmetrically to both identities,
+`list`, `rename`, `move`, and `organize`, and it is applied symmetrically to both identities,
 which keeps tracked source, documentation, prompts, `config.toml`, and arbitrary
 untracked repository files out of generic filesystem reach even under a root
 declared around them.
@@ -2555,6 +2559,73 @@ process, runs a shell command, or evaluates, compiles, or executes code;
 registered-tool dispatch through ToolManager's fixed module list is the one
 dynamic import.
 
+## File Organization
+
+V1-25-R1 adds one batch to the filesystem tool and keeps everything else of it as it was.
+`organize folder <folder>` is a deterministic planner command that yields one
+`filesystem.organize` step carrying only the folder. The action is declared not
+model-eligible, so a reasoning model can never propose it, and neither `rename` nor
+`move`; a model proposal naming any of the three is refused by the compiler's closed
+allowlist before permissions are asked.
+
+Three modules and one tool method share the work, each on one side of a line. The tool
+(`tools/filesystem.py`) settles the folder through the existing path gates, builds the
+protection predicate from the existing protections, and is the only one that knows
+configuration. `core/file_organization.py` holds the decisions: the offer, the check of
+every pin, the held chain, one operation's checks, the rename and its verification and
+classification, the stop and release rules, the counts, and every fixed text; it calls
+no Windows function and imports no configuration. `core/organize_access.py` is the one
+additional `ctypes` module of this stage, calling exactly seven Windows functions with
+every argument and result type pinned, and holds no policy. `core/project_file_access.py`
+and `core/desktop_notice.py` keep their own functions, and no two of the three import each
+other.
+
+When the owner is about to decide, `ToolManager.prepare_confirmation` asks the tool for its
+`confirmation_binding`, which reads the folder once and adds the pinned operations to the
+step, so the approved plan, and the fingerprint the approval binds, name exactly the files
+that will move. A failed binding adds nothing, and a step with no pinned operation runs
+nothing. Nothing is held while the owner decides. After approval the session confirms the
+very plan it offered, and the tool runs only the pinned operations: it enumerates nothing.
+
+Execution holds one chain of directory handles from the root to the folder, every handle
+opened relative to its held parent without delete sharing, and requires the root's file
+system to be exactly NTFS. Each operation opens its category folder, creating it only when
+that was pinned, opens the source, checks it and its digest, looks the destination up, and
+renames the held source into the held category folder with replacement off. Every handle
+belongs to a handle set that releases it exactly once, newest first, attempts every handle
+even when a release fails or is interrupted, and re-raises an interruption only afterwards.
+A handle that the checks before the first move cannot release is counted on the batch, even
+when a refusal is already known, and stops the run before any creation or rename.
+An unexpected `STATUS_PENDING` keeps the request's memory for the life of the process and
+stops organization until Maria restarts.
+
+Each operation ends as moved, reported but unconfirmed, not moved after an attempt, outcome
+unknown, refused before an attempt, or not attempted, and the six counts add up to the
+planned count. The run stops at the first operation that is not a clean move. Only a native
+failure reported by the rename call is classified as not moved or unknown; a failure nobody
+expected is outcome unknown once the rename was called and refused before it, and a folder
+whose creation call failed unexpectedly is unknown, with only the type name logged. Nothing is
+copied, overwritten, deleted, retried, or rolled back; there is no transaction, so "nothing
+at all" means only that nothing changes when the owner does not approve, a new request
+replaces the pending one, or the checks before the first move refuse.
+
+The request is recorded as typed (as every command is), the response as counts only
+through `ToolExecutionResult.recorded_message`, which Brain applies generically, and the
+log holds fixed text and counts. The report, which names the files, and the preview are
+displayed and never recorded or logged. An interrupted run logs one count line, releases
+every handle, and shows no report. Brain, the session, Tool Manager, the compiler, the
+memory layer, and the interfaces are unchanged.
+
+What this does not promise is stated, not enforced: the offer's listing is by path; the
+final-path check compares spellings; the digest is checked metadata, not a content hash; a
+second name that appears at any moment except the one read after the move is not seen; a
+program that makes the destination appear as another name for the same file just before a
+move lets the move succeed; and cloud folders, case-sensitive folders, network shares,
+other file systems, privileged callers, and Windows builds other than 10.0.26300 are
+unsupported. Legacy `rename` and `move` are Windows-only, call `os.rename` only, need an
+existing destination parent, never move a folder into itself, log fixed text, and stay
+path-based check-then-act without any of this protection.
+
 ## Boundaries
 
 The brain does not run SQL or perform tool work directly. The planner does not
@@ -2667,7 +2738,10 @@ This foundation intentionally excludes autonomous agents, voice, browser
 automation, internet search, and user interfaces beyond the command line and
 the optional desktop GUI of Stage V1-21; the closed-app reminder message box
 of V1-23-R1 is the one owner-facing surface beyond them, and it accepts no
-command. Project assistance (V1-24-R1) is read-only: it writes, renames, and
+command. File organization (V1-25-R1) moves at most five owner-approved files of one
+folder of the organize root into five fixed category folders, on 64-bit Windows over
+NTFS only, and never deletes, copies, overwrites, writes, retries, or rolls back.
+Project assistance (V1-24-R1) is read-only: it writes, renames, and
 moves no project file, searches or indexes nothing, offers no automatic file
 context, keeps no file part in a conversation, sends no project name or
 location to a model, moves no project, adds no third root, runs no Git or any

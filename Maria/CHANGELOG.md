@@ -2,6 +2,46 @@
 
 ## Unreleased
 
+- Maria can now tidy one folder of her workspace on request (V1-25, amendment
+  V1-25-R1). `organize folder <folder>` lists the folder once and proposes at
+  most five moves of plain files into five fixed category folders, `Documents`,
+  `Images`, `Audio`, `Video`, and `Archives`, by the file's last extension, with
+  every move and every folder she would create shown before you answer. It needs
+  confirmation, shows a fixed notice, and is never proposed by a model, as
+  `rename` and `move` are not. Approval pins each move's source, destination, a
+  digest of checked metadata, and the one folder creation you approved, so a
+  file added afterwards is never moved, and a file replaced, moved away, or
+  changed refuses the whole batch before anything changes. Execution holds every
+  folder on the way and each file, renames the held file into its held category
+  folder with Windows's own no-replace rename, and reports each move as exactly
+  one of moved, reported but unconfirmed, not moved after an attempt, outcome
+  unknown, refused before an attempt, or not attempted, with counts that add up,
+  stopping at the first that is not a clean move. A second name found on a moved
+  file once, right after the move, is a warning that stops the run and prevents
+  calling it a clean success. A file handle that cannot be released while the
+  moves are checked stops the run before any change, and a failure nobody
+  expected is reported, as outcome unknown once the rename was called and
+  refused before it, with only its type name logged. Nothing is copied,
+  overwritten, deleted, retried,
+  undone, or rolled back, and "nothing at all" now means only that nothing
+  changes when you cancel, never approve, or the checks before the first move
+  refuse. The request is recorded as you typed it and the response as counts
+  only; logs hold fixed text and counts, never a name or path. It works only on
+  64-bit Windows over an NTFS volume, which Maria checks on the held workspace
+  folder, and was tested on one Windows build. Seven Windows functions, in one
+  new module, make the calls; the stated limits are the path-based listing, the
+  spelling-only final-path check, the metadata digest, a second name added at any
+  other moment, a same-file destination link added just before a move, and cloud
+  folders, case-sensitive folders, network shares, and privileged programs.
+  `rename` and `move` change deliberately: they are Windows-only, call
+  `os.rename` only, so a failed move no longer copies the source and deletes it,
+  refuse a folder moved into itself, log fixed text instead of paths, and `move`
+  no longer creates missing parent folders (`The destination folder does not
+  exist.`); both stay path-based and keep none of the new protection. The
+  actions grow from 78 to 79 with the five model-eligible ones unchanged, the
+  mandatory confirmations from 39 to 40, and the confirmation notices from 13 to
+  14. Schema version 9, `requirements.txt`, the shipped configuration, and the
+  version stay unchanged.
 - Maria now keeps named projects with explicit activation, owner-approved
   project facts available as Tier A context, and bounded, read-only project
   file reading with file-identity provenance (V1-24, amendment V1-24-R1).

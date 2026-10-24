@@ -88,7 +88,13 @@ EXPECTED_AUDITED_ACTIONS = frozenset(
 
 # Every registered action whose contract declares a path argument.
 PATH_ACTIONS = frozenset(
-    {"filesystem.read", "filesystem.list", "filesystem.rename", "filesystem.move"}
+    {
+        "filesystem.read",
+        "filesystem.list",
+        "filesystem.rename",
+        "filesystem.move",
+        "filesystem.organize",
+    }
 )
 
 SUMMARY_MESSAGE = (
@@ -877,7 +883,7 @@ class AuditTargetTests(unittest.TestCase):
 
     def test_every_registered_contract_has_its_target(self) -> None:
         contracts = BUILT_IN_ACTION_CONTRACTS.contracts
-        self.assertEqual(len(contracts), 78)
+        self.assertEqual(len(contracts), 79)
         for contract in contracts:
             with self.subTest(action=contract.identifier):
                 expected = (
